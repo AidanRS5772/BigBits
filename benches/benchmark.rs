@@ -31,7 +31,12 @@ fn ubi_eq_bench(c: &mut Criterion) {
         })
         .collect();
 
-    let mut group = c.benchmark_group("ubi_equal");
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("ubi_equal_{}", arch));
     for (size, (ubi1, ubi2)) in sizes.iter().zip(bitvec_pairs.iter()) {
         group.bench_with_input(
             BenchmarkId::from_parameter(size),
@@ -71,7 +76,12 @@ fn ubi_cmp_bench(c: &mut Criterion) {
         })
         .collect();
 
-    let mut group = c.benchmark_group("ubi_cmp");
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("ubi_cmp_{}", arch));
     for (size, (ubi1, ubi2)) in sizes.iter().zip(bitvec_pairs.iter()) {
         group.bench_with_input(
             BenchmarkId::from_parameter(size),
@@ -111,7 +121,12 @@ fn ubi_add_bench(c: &mut Criterion) {
         })
         .collect();
 
-    let mut group = c.benchmark_group("ubi_add");
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("ubi_add_{}", arch));
     for (size, (ubi1, ubi2)) in sizes.iter().zip(bitvec_pairs.iter()) {
         group.bench_with_input(
             BenchmarkId::from_parameter(size),
@@ -151,7 +166,12 @@ fn ubi_sub_bench(c: &mut Criterion) {
         })
         .collect();
 
-    let mut group = c.benchmark_group("ubi_sub");
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("ubi_sub_{}", arch));
     for (size, (ubi1, ubi2)) in sizes.iter().zip(bitvec_pairs.iter()) {
         group.bench_with_input(
             BenchmarkId::from_parameter(size),
@@ -191,7 +211,12 @@ fn ubi_mul_bench(c: &mut Criterion) {
         })
         .collect();
 
-    let mut group = c.benchmark_group("ubi_mul");
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("ubi_mul_{}", arch));
     for (size, (ubi1, ubi2)) in sizes.iter().zip(bitvec_pairs.iter()) {
         group.bench_with_input(
             BenchmarkId::from_parameter(size),
@@ -227,7 +252,12 @@ fn ubi_shl_bench(c: &mut Criterion) {
         })
         .collect();
 
-    let mut group = c.benchmark_group("ubi_shl");
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("ubi_shl_{}", arch));
     for (size, (ubi1, shl)) in sizes.iter().zip(bitvec_pairs.iter()) {
         group.bench_with_input(
             BenchmarkId::from_parameter(size),
@@ -263,7 +293,12 @@ fn ubi_shr_bench(c: &mut Criterion) {
         })
         .collect();
 
-    let mut group = c.benchmark_group("ubi_shr");
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("ubi_shr_{}", arch));
     for (size, (ubi1, shl)) in sizes.iter().zip(bitvec_pairs.iter()) {
         group.bench_with_input(
             BenchmarkId::from_parameter(size),
@@ -303,7 +338,12 @@ fn ubi_div_bench(c: &mut Criterion) {
         })
         .collect();
 
-    let mut group = c.benchmark_group("ubi_div");
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("ubi_div_{}", arch));
     for (size, (ubi1, ubi2)) in sizes.iter().zip(bitvec_pairs.iter()) {
         group.bench_with_input(
             BenchmarkId::from_parameter(size),
@@ -354,7 +394,12 @@ fn bf_eq_bench(c: &mut Criterion) {
         })
         .collect();
 
-    let mut group = c.benchmark_group("bf_equal");
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("bf_eq_{}", arch));
     for (size, (bf1, bf2)) in sizes.iter().zip(bitfloat_pairs.iter()) {
         group.bench_with_input(
             BenchmarkId::from_parameter(size),
@@ -405,7 +450,12 @@ fn bf_cmp_bench(c: &mut Criterion) {
         })
         .collect();
 
-    let mut group = c.benchmark_group("bf_cmp");
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("bf_cmp_{}", arch));
     for (size, (bf1, bf2)) in sizes.iter().zip(bitfloat_pairs.iter()) {
         group.bench_with_input(
             BenchmarkId::from_parameter(size),
@@ -456,7 +506,12 @@ fn bf_add_bench(c: &mut Criterion) {
         })
         .collect();
 
-    let mut group = c.benchmark_group("bf_add");
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("bf_add_{}", arch));
     for (size, (bf1, bf2)) in sizes.iter().zip(bitfloat_pairs.iter()) {
         group.bench_with_input(
             BenchmarkId::from_parameter(size),
@@ -507,7 +562,12 @@ fn bf_mul_bench(c: &mut Criterion) {
         })
         .collect();
 
-    let mut group = c.benchmark_group("bf_mul");
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("bf_mul_{}", arch));
     for (size, (bf1, bf2)) in sizes.iter().zip(bitfloat_pairs.iter()) {
         group.bench_with_input(
             BenchmarkId::from_parameter(size),
@@ -558,7 +618,12 @@ fn bf_stbl_mul_bench(c: &mut Criterion) {
         })
         .collect();
 
-    let mut group = c.benchmark_group("bf_stbl_mul");
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("bf_stbl_mul_{}", arch));
     for (size, (bf1, bf2)) in sizes.iter().zip(bitfloat_pairs.iter()) {
         group.bench_with_input(
             BenchmarkId::from_parameter(size),
@@ -609,7 +674,12 @@ fn bf_div_bench(c: &mut Criterion) {
         })
         .collect();
 
-    let mut group = c.benchmark_group("bf_div");
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("bf_div_{}", arch));
     for (size, (bf1, bf2)) in sizes.iter().zip(bitfloat_pairs.iter()) {
         group.bench_with_input(
             BenchmarkId::from_parameter(size),
@@ -644,7 +714,12 @@ fn bf_exp_bench(c: &mut Criterion) {
         })
         .collect();
 
-    let mut group = c.benchmark_group("bf_exp");
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("bf_exp_{}", arch));
     for (size, bf) in sizes.iter().zip(bitfloats.iter()) {
         group.bench_with_input(
             BenchmarkId::from_parameter(size),
@@ -679,7 +754,12 @@ fn bf_ln_bench(c: &mut Criterion) {
         })
         .collect();
 
-    let mut group = c.benchmark_group("bf_ln");
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("bf_ln_{}", arch));
     for (size, bf) in sizes.iter().zip(bitfloats.iter()) {
         group.bench_with_input(
             BenchmarkId::from_parameter(size),
@@ -718,7 +798,12 @@ fn ubis_add_bench(c: &mut Criterion) {
     ];
     let mut rng = StdRng::from_seed(seed);
 
-    let mut group = c.benchmark_group("ubis_add");
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("ubis_add_{}", arch));
 
     benchmark_ubis_op!(group, rng, +, 4, 16, 64);
 
@@ -733,7 +818,12 @@ fn ubis_sub_bench(c: &mut Criterion) {
     ];
     let mut rng = StdRng::from_seed(seed);
 
-    let mut group = c.benchmark_group("ubis_sub");
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("ubis_sub_{}", arch));
 
     benchmark_ubis_op!(group, rng, -, 4, 16, 64);
 
@@ -748,7 +838,12 @@ fn ubis_mul_bench(c: &mut Criterion) {
     ];
     let mut rng = StdRng::from_seed(seed);
 
-    let mut group = c.benchmark_group("ubis_mul");
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("ubis_mul_{}", arch));
 
     benchmark_ubis_op!(group, rng, *, 4, 8, 16, 32, 64, 128, 256, 512, 1024);
 
@@ -763,7 +858,12 @@ fn ubis_div_bench(c: &mut Criterion) {
     ];
     let mut rng = StdRng::from_seed(seed);
 
-    let mut group = c.benchmark_group("ubis_div");
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("ubis_div_{}", arch));
 
     benchmark_ubis_op!(group, rng, /, 4, 16, 64);
 
