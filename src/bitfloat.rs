@@ -1,105 +1,42 @@
 use crate::bitfrac::BitFrac;
-use crate::bitint::*;
+use crate::bitint::BitInt;
 use crate::ubitint::*;
 use core::fmt;
 use once_cell::sync::Lazy;
-use std::arch::asm;
-use std::cmp::*;
-use std::isize;
 use std::ops::*;
-use std::usize;
+use std::cmp::*;
 
 #[inline]
 fn add_bf(m1: &mut Vec<usize>, m2: &[usize], sh: usize) -> bool {
     let mut idx = m2.len() + sh;
     if idx <= m1.len() {
-        let mut c = 0_usize;
-        for (s, l) in m2.iter().rev().zip(m1[..idx].iter_mut().rev()) {
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                asm!(
-                    "adds {l}, {l}, {s}",
-                    "cset {tmp}, cs",
-                    "adds {l}, {l}, {c}",
-                    "cset {c}, cs",
-                    "orr {c}, {c}, {tmp}",
-                    l = inout(reg) *l,
-                    s = in(reg) *s,
-                    c = inout(reg) c,
-                    tmp = out(reg) _
-                )
-            }
-        }
-
-        for l in m1[..idx - m2.len()].iter_mut().rev() {
-            if c == 0 {
-                break;
-            }
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                asm!(
-                    "adds {l}, {l}, {c}", // l + c -> l
-                    "cset {c}, cs",       // put overflow of l + c into c
-                    l = inout(reg) *l,
-                    c = inout(reg) c,
-                );
-            }
-        }
-
-        if let Some(idx) = m1.iter().rposition(|&x| x != 0) {
-            m1.truncate(idx + 1);
-        } else {
-            m1.clear();
-        }
-
-        if c == 1 {
-            m1.insert(0, 1);
-            return true;
-        }
-
-        return false;
-    } else {
-        if sh > m1.len() {
-            idx = sh - m1.len();
-            m1.extend(std::iter::repeat(0).take(idx));
-            m1.extend(m2.iter().cloned());
-            return false;
-        } else {
-            idx = m1.len() - sh;
-            let mut c = 0_usize;
-            for (s, l) in m2[..idx].iter().rev().zip(m1.iter_mut().rev()) {
+        unsafe {
+            let mut c: u8 = 0;
+            for (s, l) in m2.iter().rev().zip(m1[..idx].iter_mut().rev()) {
                 #[cfg(target_arch = "aarch64")]
-                unsafe {
-                    asm!(
-                        "adds {l}, {l}, {s}",
-                        "cset {tmp}, cs",
-                        "adds {l}, {l}, {c}",
-                        "cset {c}, cs",
-                        "orr {c}, {c}, {tmp}",
-                        l = inout(reg) *l,
-                        s = in(reg) *s,
-                        c = inout(reg) c,
-                        tmp = out(reg) _
-                    )
-                }
+                add_with_carry_aarch64(l, *s, &mut c);
+
+                #[cfg(target_arch = "x86_64")]
+                add_with_carry_x86_64(l, *s, &mut c);
             }
 
-            for l in m1[..sh].iter_mut().rev() {
+            for l in m1[..idx - m2.len()].iter_mut().rev() {
                 if c == 0 {
                     break;
                 }
+
                 #[cfg(target_arch = "aarch64")]
-                unsafe {
-                    asm!(
-                        "adds {l}, {l}, {c}", // l + c -> l
-                        "cset {c}, cs",       // put overflow of l + c into c
-                        l = inout(reg) *l,
-                        c = inout(reg) c,
-                    );
-                }
+                add_carry_arch64(l, &mut c);
+
+                #[cfg(target_arch = "x86_64")]
+                add_carry_x86_64(l, &mut c);
             }
 
-            m1.extend(m2[idx..].iter().cloned());
+            if let Some(idx) = m1.iter().rposition(|&x| x != 0) {
+                m1.truncate(idx + 1);
+            } else {
+                m1.clear();
+            }
 
             if c == 1 {
                 m1.insert(0, 1);
@@ -108,6 +45,46 @@ fn add_bf(m1: &mut Vec<usize>, m2: &[usize], sh: usize) -> bool {
 
             return false;
         }
+    } else {
+        if sh > m1.len() {
+            idx = sh - m1.len();
+            m1.extend(std::iter::repeat(0).take(idx));
+            m1.extend(m2.iter().cloned());
+            return false;
+        } else {
+            unsafe {
+                idx = m1.len() - sh;
+                let mut c:u8 = 0;
+                for (s, l) in m2[..idx].iter().rev().zip(m1.iter_mut().rev()) {
+                    #[cfg(target_arch = "aarch64")]
+                    add_with_carry_aarch64(l, *s, &mut c);
+
+                    #[cfg(target_arch = "x86_64")]
+                    add_with_carry_x86_64(l, *s, &mut c);
+                }
+
+                for l in m1[..sh].iter_mut().rev() {
+                    if c == 0 {
+                        break;
+                    }
+
+                    #[cfg(target_arch = "aarch64")]
+                    add_carry_arch64(l, &mut c);
+
+                    #[cfg(target_arch = "x86_64")]
+                    add_carry_x86_64(l, &mut c);
+                }
+
+                m1.extend(m2[idx..].iter().cloned());
+
+                if c == 1 {
+                    m1.insert(0, 1);
+                    return true;
+                }
+
+                return false;
+            }
+        }
     }
 }
 
@@ -115,34 +92,22 @@ fn add_bf(m1: &mut Vec<usize>, m2: &[usize], sh: usize) -> bool {
 pub fn sub_bf(m1: &mut Vec<usize>, m2: &[usize], sh: usize) -> usize {
     let mut idx = m2.len() + sh;
     if idx <= m1.len() {
-        let mut c = 1_usize;
-        for (s, l) in m2.iter().rev().zip(m1[..idx].iter_mut().rev()) {
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                asm!(
-                    "adds {l}, {l}, {s}",
-                    "cset {tmp}, cs",
-                    "adds {l}, {l}, {c}",
-                    "cset {c}, cs",
-                    "orr {c}, {c}, {tmp}",
-                    l = inout(reg) *l,
-                    s = in(reg) !(*s),
-                    c = inout(reg) c,
-                    tmp = out(reg) _
-                )
-            }
-        }
-        if c == 0 {
-            for l in m1[..idx - m2.len()].iter_mut().rev() {
-                c ^= 1;
+        unsafe {
+            let mut c: u8 = 1;
+            for (s, l) in m2.iter().rev().zip(m1[..idx].iter_mut().rev()) {
                 #[cfg(target_arch = "aarch64")]
-                unsafe {
-                    asm!(
-                        "subs {l}, {l}, {c}",
-                        "cset {c}, cs",
-                        l = inout(reg) *l,
-                        c = inout(reg) c
-                    )
+                add_with_carry_aarch64(l, !*s, &mut c);
+
+                #[cfg(target_arch = "x86_64")]
+                add_with_carry_x86_64(l, !*s, &mut c);
+            }
+            if c == 0 {
+                for l in m1[..idx - m2.len()].iter_mut().rev() {
+                    #[cfg(target_arch = "aarch64")]
+                    sub_prop_carry_aarch64(l, &mut c);
+
+                    #[cfg(target_arch = "x86_64")]
+                    sub_prop_carry_x86_64(l, &mut c);
                 }
             }
         }
@@ -171,36 +136,24 @@ pub fn sub_bf(m1: &mut Vec<usize>, m2: &[usize], sh: usize) -> usize {
             m1[m1_len - 1] += 1;
             return 0;
         } else {
-            idx = m1.len() - sh;
-            let mut c = 0_usize;
-            for (s, l) in m2[..idx].iter().rev().zip(m1.iter_mut().rev()) {
-                #[cfg(target_arch = "aarch64")]
-                unsafe {
-                    asm!(
-                        "adds {l}, {l}, {s}",
-                        "cset {tmp}, cs",
-                        "adds {l}, {l}, {c}",
-                        "cset {c}, cs",
-                        "orr {c}, {c}, {tmp}",
-                        l = inout(reg) *l,
-                        s = in(reg) !(*s),
-                        c = inout(reg) c,
-                        tmp = out(reg) _
-                    )
-                }
-            }
-
-            if c == 0 {
-                for l in m1[..sh].iter_mut().rev() {
-                    c ^= 1;
+            unsafe {
+                idx = m1.len() - sh;
+                let mut c:u8 = 0;
+                for (s, l) in m2[..idx].iter().rev().zip(m1.iter_mut().rev()) {
                     #[cfg(target_arch = "aarch64")]
-                    unsafe {
-                        asm!(
-                            "subs {l}, {l}, {c}",
-                            "cset {c}, cs",
-                            l = inout(reg) *l,
-                            c = inout(reg) c
-                        )
+                    add_with_carry_aarch64(l, !*s, &mut c);
+
+                    #[cfg(target_arch = "x86_64")]
+                    add_with_carry_x86_64(l, !*s, &mut c);
+                }
+
+                if c == 0 {
+                    for l in m1[..sh].iter_mut().rev() {
+                        #[cfg(target_arch = "aarch64")]
+                        sub_prop_carry_aarch64(l, &mut c);
+
+                        #[cfg(target_arch = "x86_64")]
+                        sub_prop_carry_x86_64(l, &mut c);
                     }
                 }
             }
@@ -264,32 +217,25 @@ fn mul_bf(m1: &[usize], m2: &[usize], acc: usize) -> (Vec<usize>, bool) {
 fn shl_bf_sup(m: &mut Vec<usize>, sh: usize) -> bool {
     let mv_sz = USZ_MEM * 8 - sh;
     let mut carry = 0_usize;
-    for elem in m.iter_mut().rev() {
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            asm!(
-                "lsr {tmp}, {e}, {ms}",
-                "lsl {e}, {e}, {sh}",
-                "orr {e}, {e}, {c}",
-                "mov {c}, {tmp}",
-                e = inout(reg) *elem,
-                c = inout(reg) carry,
-                ms = in(reg) mv_sz,
-                sh = in(reg) sh,
-                tmp = out(reg) _,
-            )
-        }
-    }
+    unsafe {
+        for elem in m.iter_mut().rev() {
+            #[cfg(target_arch = "aarch64")]
+            shl_carry_aarch64(elem, &mut carry, sh, mv_sz);
 
-    let mut out = false;
-    if carry > 0 {
-        m.insert(0, carry);
-        out = true;
+            #[cfg(target_arch = "x86_64")]
+            shl_carry_x86_64(elem, &mut carry, sh, mv_sz);
+        }
+
+        let mut out = false;
+        if carry > 0 {
+            m.insert(0, carry);
+            out = true;
+        }
+        if m[m.len() - 1] == 0 {
+            m.pop();
+        }
+        return out;
     }
-    if m[m.len() - 1] == 0 {
-        m.pop();
-    }
-    return out;
 }
 
 pub static TWO: Lazy<BitFloat> = Lazy::new(|| BitFloat {

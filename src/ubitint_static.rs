@@ -1,47 +1,78 @@
 #![allow(dead_code)]
 
-use crate::ubitint::USZ_MEM;
+use crate::ubitint::*;
 use std::arch::asm;
-use std::ops::*;
 use std::fmt;
+use std::ops::*;
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn add4_with_carry_aarch64(lhs: &mut [usize], rhs: &[usize], c: &mut u8) {
+    asm!(
+        "adds {c}, {c}, #0xFFFFFFFFFFFFFFFF",
+        "adcs {l0}, {l0}, {r0}",
+        "adcs {l1}, {l1}, {r1}",
+        "adcs {l2}, {l2}, {r2}",
+        "adcs {l3}, {l3}, {r3}",
+        "cset {c}, cs",
+        l0 = inout(reg) *l0,
+        l1 = inout(reg) *l1,
+        l2 = inout(reg) *l2,
+        l3 = inout(reg) *l3,
+        r0 = in(reg) r0,
+        r1 = in(reg) r1,
+        r2 = in(reg) r2,
+        r3 = in(reg) r3,
+        c = inout(reg) *c,
+        options(nostack)
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn add4_with_carry_x86_64(lhs: &mut [usize], rhs: &[usize], c: &mut u8) {
+    asm!(
+        "add {c}, {c}, #0xFFFFFFFFFFFFFFFF",
+        "adc {l0}, {l0}, {r0}",
+        "adc {l1}, {l1}, {r1}",
+        "adc {l2}, {l2}, {r2}",
+        "adc {l3}, {l3}, {r3}",
+        "setc {c}",
+        l0 = inout(reg) lhs[0],
+        l1 = inout(reg) lhs[1],
+        l2 = inout(reg) lhs[2],
+        l3 = inout(reg) lhs[3],
+        r0 = in(reg) rhs[0],
+        r1 = in(reg) rhs[1],
+        r2 = in(reg) rhs[2],
+        r3 = in(reg) rhs[3],
+        c = inout(reg_byte) *c,
+        options(nostack)
+    );
+}
 
 #[inline]
-pub fn add_ubis<const N: usize>(lhs: &mut [usize], rhs: &[usize], mut c: usize) -> bool {
+pub fn add_ubis<const N: usize>(lhs: &mut [usize], rhs: &[usize], mut c: u8) -> bool {
     let mut i = 4;
     unsafe {
         while i <= N {
             #[cfg(target_arch = "aarch64")]
-            asm!(
-                "adds {c}, {c}, #0xFFFFFFFFFFFFFFFF", //sets carry flag
-                "adcs {l0}, {l0}, {r0}",
-                "adcs {l1}, {l1}, {r1}",
-                "adcs {l2}, {l2}, {r2}",
-                "adcs {l3}, {l3}, {r3}",
-                "cset {c}, cs",
-                l0 = inout(reg) lhs[i-4],
-                l1 = inout(reg) lhs[i-3],
-                l2 = inout(reg) lhs[i-2],
-                l3 = inout(reg) lhs[i-1],
-                r0 = in(reg) rhs[i-4],
-                r1 = in(reg) rhs[i-3],
-                r2 = in(reg) rhs[i-2],
-                r3 = in(reg) rhs[i-1],
-                c = inout(reg) c,
-            );
+            add4_with_carry_aarch64(&mut lhs[i - 4..i], &rhs[i - 4..i], &mut c);
+
+            #[cfg(target_arch = "x86_64")]
+            add4_with_carry_x86_64(&mut lhs[i - 4..i], &rhs[i - 4..i], &mut c);
+
             i += 4;
         }
 
         i -= 4;
         while i < N {
             #[cfg(target_arch = "aarch64")]
-            asm!(
-                "adds {c}, {c}, #0xFFFFFFFFFFFFFFFF",
-                "adcs {l}, {l}, {r}",
-                "cset {c}, cs",
-                l = inout(reg) lhs[i],
-                r = in(reg) rhs[i],
-                c = inout(reg) c,
-            );
+            add_with_carry_aarch64(&mut lhs[i], rhs[i], &mut c);
+
+            #[cfg(target_arch = "x86_64")]
+            add_with_carry_x86_64(&mut lhs[i], rhs[i], &mut c);
+
             i += 1;
         }
     }
@@ -51,35 +82,30 @@ pub fn add_ubis<const N: usize>(lhs: &mut [usize], rhs: &[usize], mut c: usize) 
 
 #[inline]
 fn add_ubis_prim(ubis: &mut [usize], prim: usize) {
-    let mut c: usize;
     unsafe {
         #[cfg(target_arch = "aarch64")]
-        asm!(
-            "adcs {l}, {l}, {r}",
-            "cset {c}, cs",
-            l = inout(reg) ubis[0],
-            r = in(reg) prim,
-            c = out(reg) c,
-        )
-    }
+        let mut c: u8 = add_prop_carry_aarch64(&mut ubis[0], prim);
 
-    for val in &mut ubis[1..] {
+        #[cfg(target_arch = "x86_64")]
+        let mut c: u8 = add_prop_carry_x86_64(&mut ubis[0], prim);
+
         if c == 0 {
-            break;
-        }
-        unsafe {
-            #[cfg(target_arch = "aarch64")]
-            asm!(
-                "adds {l}, {l}, {c}",
-                "cset {c}, cs",
-                l = inout(reg) *val,
-                c = inout(reg) c
-            )
+            for l in &mut ubis[1..] {
+                if c == 0 {
+                    break;
+                }
+
+                #[cfg(target_arch = "aarch64")]
+                add_carry_aarch64(l, &mut c);
+
+                #[cfg(target_arch = "x86_64")]
+                add_carry_x86_64(l, &mut c);
+            }
         }
     }
 }
 
-#[inline]
+#[inline(always)]
 pub fn one_comp(val: &mut [usize]) {
     for e in val {
         *e = !*e
@@ -88,29 +114,20 @@ pub fn one_comp(val: &mut [usize]) {
 
 #[inline]
 fn sub_ubis_prim(ubis: &mut [usize], prim: usize) {
-    let mut c: usize;
-    #[cfg(target_arch = "aarch64")]
     unsafe {
-        asm!(
-            "adds {l}, {l}, {r}",
-            "cset {c}, cs",
-            l = inout(reg) ubis[0],
-            r = in(reg) !prim+1,
-            c = out(reg) c,
-        )
-    }
+        #[cfg(target_arch = "aarch64")]
+        let mut c: u8 = add_prop_carry_aarch64(&mut ubis[0], !prim + 1);
 
-    if c == 0 {
-        for l in &mut ubis[1..] {
-            c ^= 1;
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                asm!(
-                    "subs {l}, {l}, {c}",
-                    "cset {c}, cs",
-                    l = inout(reg) *l,
-                    c = inout(reg) c
-                )
+        #[cfg(target_arch = "x86_64")]
+        let mut c: u8 = add_prop_carry_x86_64(&mut ubis[0], !prim + 1);
+
+        if c == 0 {
+            for l in &mut ubis[1..] {
+                #[cfg(target_arch = "aarch64")]
+                sub_prop_carry_aarch64(l, &mut c);
+
+                #[cfg(target_arch = "x86_64")]
+                sub_prop_carry_x86_64(l, &mut c);
             }
         }
     }
@@ -151,89 +168,78 @@ fn mul_ubis<const N: usize>(a: &[usize], b: &[usize]) -> [usize; N] {
 }
 
 #[inline]
-fn shr_ubis<const N:usize>(ubis: &mut [usize], sh: u128){
+fn shr_ubis<const N: usize>(ubis: &mut [usize], sh: u128) {
     if sh == 0 {
         return;
     }
     let div = (sh / (USZ_MEM * 8) as u128) as usize;
     let rem = (sh % (USZ_MEM * 8) as u128) as usize;
     let mv_sz = USZ_MEM * 8 - rem;
-    if div != 0{
+    if div != 0 {
         ubis.copy_within(div..N, 0);
-        ubis[(N-div)..N].fill(0);
+        ubis[(N - div)..N].fill(0);
     }
 
-    if rem != 0{
-        let mut carry = 0_usize;
-        for i in (0..(N-div)).rev(){
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                asm!(
-                    "lsl {tmp}, {e}, {ms}",
-                    "lsr {e}, {e}, {r}",
-                    "orr {e}, {e}, {c}",
-                    "mov {c}, {tmp}",
-                    e = inout(reg) ubis[i],
-                    c = inout(reg) carry,
-                    r = in(reg) rem,
-                    ms = in(reg) mv_sz,
-                    tmp = out(reg) _
-                )
+    unsafe {
+        if rem != 0 {
+            let mut carry = 0_usize;
+            for i in (0..(N - div)).rev() {
+                #[cfg(target_arch = "aarch64")]
+                shr_carry_aarch64(&mut ubis[i], &mut carry, rem, mv_sz);
+
+                #[cfg(target_arch = "x86_64")]
+                shr_carry_x86_64(&mut ubis[i], &mut carry, rem, mv_sz);
             }
         }
     }
 }
 
 #[inline]
-fn shl_ubis<const N:usize>(ubis: &mut [usize], sh:u128){
-    if sh == 0{
+fn shl_ubis<const N: usize>(ubis: &mut [usize], sh: u128) {
+    if sh == 0 {
         return;
     }
 
     let div = (sh / (USZ_MEM * 8) as u128) as usize;
     let rem = (sh % (USZ_MEM * 8) as u128) as usize;
     let mv_sz = USZ_MEM * 8 - rem;
-    ubis.copy_within(0..(N-div), div);
+    if div != 0 {
+        ubis.copy_within(0..(N - div), div);
+        ubis[0..div].fill(0);
+    }
 
-    let mut carry = 0_usize;
-    for i in 0..N{
-        if i < div{
-            ubis[i] = 0;
-        }
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            asm!(
-                "lsr {tmp}, {e}, {ms}",
-                "lsl {e}, {e}, {r}",
-                "orr {e}, {e}, {c}",
-                "mov {c}, {tmp}",
-                e = inout(reg) ubis[i],
-                c = inout(reg) carry,
-                r = in(reg) rem,
-                ms = in(reg) mv_sz,
-                tmp = out(reg) _
-            )
+    unsafe {
+        if rem != 0 {
+            let mut carry = 0_usize;
+            for i in div..N {
+                #[cfg(target_arch = "aarch64")]
+                shl_carry_aarch64(&mut ubis[i], &mut carry, rem, mv_sz);
+
+                #[cfg(target_arch = "x86_64")]
+                shl_carry_x86_64(&mut ubis[i], &mut carry, rem, mv_sz);
+            }
         }
     }
 }
 
-fn log2_ubis(ubis: &[usize]) -> u128{
-    if let Some(idx) = ubis.iter().rposition(|&x| x != 0){
-        return (idx as u128)*((USZ_MEM*8) as u128) + (USZ_MEM*8 - ubis[idx].leading_zeros() as usize - 1) as u128;
-    }else{
+fn log2_ubis(ubis: &[usize]) -> u128 {
+    if let Some(idx) = ubis.iter().rposition(|&x| x != 0) {
+        return (idx as u128) * ((USZ_MEM * 8) as u128)
+            + (USZ_MEM * 8 - ubis[idx].leading_zeros() as usize - 1) as u128;
+    } else {
         return 0;
     }
 }
 
-fn div_ubis<const N:usize>(n: &mut UBitIntStatic<N>, d: UBitIntStatic<N>) -> UBitIntStatic<N>{
-    match (*n).partial_cmp(&d){
-        Some(std::cmp::Ordering::Less) => return UBitIntStatic::<N>{ data:[0;N] },
+fn div_ubis<const N: usize>(n: &mut UBitIntStatic<N>, d: UBitIntStatic<N>) -> UBitIntStatic<N> {
+    match (*n).partial_cmp(&d) {
+        Some(std::cmp::Ordering::Less) => return UBitIntStatic::<N> { data: [0; N] },
         Some(std::cmp::Ordering::Equal) => {
-            *n = UBitIntStatic::<N>{ data:[0;N] };
-            let mut data = [0;N];
+            *n = UBitIntStatic::<N> { data: [0; N] };
+            let mut data = [0; N];
             data[0] = 1;
-            return UBitIntStatic::<N>{data};
-        },
+            return UBitIntStatic::<N> { data };
+        }
         Some(std::cmp::Ordering::Greater) => (),
         None => unreachable!(),
     }
@@ -245,7 +251,7 @@ fn div_ubis<const N:usize>(n: &mut UBitIntStatic<N>, d: UBitIntStatic<N>) -> UBi
     let mut sub = d;
     sub <<= init_log2;
 
-    if sub > *n{
+    if sub > *n {
         sub >>= 1_u128;
         init_log2 -= 1_u128;
     }
@@ -255,11 +261,11 @@ fn div_ubis<const N:usize>(n: &mut UBitIntStatic<N>, d: UBitIntStatic<N>) -> UBi
     let mut div = add;
     *n -= sub;
 
-    while *n >= d{
+    while *n >= d {
         let log2 = log2_ubis(&sub.data) - log2_ubis(&n.data);
         sub >>= log2;
         add >>= log2;
-        if sub > *n{
+        if sub > *n {
             sub >>= 1_u128;
             add >>= 1_u128;
         }
@@ -372,17 +378,17 @@ impl<const N: usize> UBitIntStatic<N> {
 
     #[inline]
     pub fn to(&self) -> Result<u128, String> {
-        if let Some(idx) = self.data.iter().rposition(|&x| x != 0){
-            if idx == 0{
+        if let Some(idx) = self.data.iter().rposition(|&x| x != 0) {
+            if idx == 0 {
                 return Ok(self.data[0] as u128);
-            }else if idx == 1{
+            } else if idx == 1 {
                 let mut out = self.data[0] as u128;
                 out |= (self.data[1] as u128) << ((USZ_MEM * 8) as u128);
                 return Ok(out);
-            }else{
+            } else {
                 return Err("Static UBitInt is to large to be converted to a u128".to_string());
             }
-        }else{
+        } else {
             return Ok(0);
         }
     }
@@ -391,7 +397,7 @@ impl<const N: usize> UBitIntStatic<N> {
     pub fn from_str(num: &str) -> Result<UBitIntStatic<N>, String> {
         use std::f64::consts::LN_10;
         use std::f64::consts::LN_2;
-        if (num.len() as f64)*LN_10 > ((USZ_MEM*(8 as usize)*N) as f64)*LN_2{
+        if (num.len() as f64) * LN_10 > ((USZ_MEM * (8 as usize) * N) as f64) * LN_2 {
             return Err("String is to long for Static UBitInt Size".to_string());
         }
 
@@ -410,17 +416,17 @@ impl<const N: usize> UBitIntStatic<N> {
     }
 
     #[inline]
-    pub fn log2(self) -> u128{
+    pub fn log2(self) -> u128 {
         log2_ubis(&self.data)
     }
 
     #[inline]
-    pub fn mod2(self) -> bool{
+    pub fn mod2(self) -> bool {
         (self.data[0] & 1) == 1
     }
 }
 
-impl<const N:usize> fmt::Display for UBitIntStatic<N> {
+impl<const N: usize> fmt::Display for UBitIntStatic<N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut ubi = self.clone();
         let mut out: String = "".to_string();
@@ -685,7 +691,7 @@ macro_rules! impl_mul_ubis_prim {
         $(
             impl<const N: usize> Mul<$t> for UBitIntStatic<N> {
                 type Output = UBitIntStatic<N>;
-            
+
                 #[inline]
                 fn mul(self, rhs: $t) -> Self::Output {
                     let mut lhs = self.data;
@@ -698,7 +704,7 @@ macro_rules! impl_mul_ubis_prim {
 
             impl<const N: usize> Mul<UBitIntStatic<N>> for $t {
                 type Output = UBitIntStatic<N>;
-            
+
                 #[inline]
                 fn mul(self, rhs: UBitIntStatic<N>) -> Self::Output {
                     rhs * self
@@ -710,10 +716,10 @@ macro_rules! impl_mul_ubis_prim {
 
 impl_mul_ubis_prim!(u64, usize, u32, u16, u8);
 
-impl<const N:usize> MulAssign for UBitIntStatic<N>{
+impl<const N: usize> MulAssign for UBitIntStatic<N> {
     fn mul_assign(&mut self, rhs: Self) {
-        *self = UBitIntStatic::<N>{
-            data: mul_ubis(&self.data, &rhs.data)
+        *self = UBitIntStatic::<N> {
+            data: mul_ubis(&self.data, &rhs.data),
         }
     }
 }
@@ -732,13 +738,13 @@ macro_rules! impl_mul_assign_ubis_prim {
 
 impl_mul_assign_ubis_prim!(u64, usize, u32, u16, u8);
 
-impl<const N:usize> Shl<u128> for UBitIntStatic<N>{
+impl<const N: usize> Shl<u128> for UBitIntStatic<N> {
     type Output = UBitIntStatic<N>;
 
     fn shl(self, rhs: u128) -> Self::Output {
         let mut lhs = self.data;
         shl_ubis::<N>(&mut lhs, rhs);
-        UBitIntStatic::<N> { data: lhs}
+        UBitIntStatic::<N> { data: lhs }
     }
 }
 
@@ -747,7 +753,7 @@ macro_rules! impl_shl_ubis_prim {
         $(
             impl<const N: usize> Shl<$t> for UBitIntStatic<N> {
                 type Output = UBitIntStatic<N>;
-            
+
                 #[inline]
                 fn shl(self, rhs: $t) -> Self::Output {
                     let mut lhs = self.data;
@@ -763,7 +769,7 @@ macro_rules! impl_shl_ubis_prim {
 
 impl_shl_ubis_prim!(u64, usize, u32, u16, u8);
 
-impl<const N:usize> ShlAssign<u128> for UBitIntStatic<N>{
+impl<const N: usize> ShlAssign<u128> for UBitIntStatic<N> {
     fn shl_assign(&mut self, rhs: u128) {
         shl_ubis::<N>(&mut self.data, rhs);
     }
@@ -783,13 +789,13 @@ macro_rules! impl_shl_assign_ubis_prim {
 
 impl_shl_assign_ubis_prim!(u64, usize, u32, u16, u8);
 
-impl<const N:usize> Shr<u128> for UBitIntStatic<N>{
+impl<const N: usize> Shr<u128> for UBitIntStatic<N> {
     type Output = UBitIntStatic<N>;
 
     fn shr(self, rhs: u128) -> Self::Output {
         let mut lhs = self.data;
         shr_ubis::<N>(&mut lhs, rhs);
-        UBitIntStatic::<N> { data: lhs}
+        UBitIntStatic::<N> { data: lhs }
     }
 }
 
@@ -798,7 +804,7 @@ macro_rules! impl_shr_ubis_prim {
         $(
             impl<const N: usize> Shr<$t> for UBitIntStatic<N> {
                 type Output = UBitIntStatic<N>;
-            
+
                 #[inline]
                 fn shr(self, rhs: $t) -> Self::Output {
                     let mut lhs = self.data;
@@ -814,7 +820,7 @@ macro_rules! impl_shr_ubis_prim {
 
 impl_shr_ubis_prim!(u64, usize, u32, u16, u8);
 
-impl<const N:usize> ShrAssign<u128> for UBitIntStatic<N>{
+impl<const N: usize> ShrAssign<u128> for UBitIntStatic<N> {
     fn shr_assign(&mut self, rhs: u128) {
         shr_ubis::<N>(&mut self.data, rhs);
     }
@@ -834,7 +840,7 @@ macro_rules! impl_shr_assign_ubis_prim {
 
 impl_shr_assign_ubis_prim!(u64, usize, u32, u16, u8);
 
-impl<const N:usize> Div for UBitIntStatic<N>{
+impl<const N: usize> Div for UBitIntStatic<N> {
     type Output = UBitIntStatic<N>;
 
     fn div(self, rhs: Self) -> Self::Output {
@@ -848,7 +854,7 @@ macro_rules! impl_div_ubis_prim {
         $(
             impl<const N:usize> Div<$t> for UBitIntStatic<N>{
                 type Output = UBitIntStatic<N>;
-            
+
                 fn div(self, rhs: $t) -> Self::Output {
                     let mut lhs = self;
                     div_ubis::<N>(&mut lhs, UBitIntStatic::<N>::from(rhs))
@@ -860,7 +866,7 @@ macro_rules! impl_div_ubis_prim {
 
 impl_div_ubis_prim!(u128, u64, usize, u32, u16, u8);
 
-impl<const N:usize> DivAssign for UBitIntStatic<N>{
+impl<const N: usize> DivAssign for UBitIntStatic<N> {
     fn div_assign(&mut self, rhs: Self) {
         *self = div_ubis::<N>(self, rhs);
     }
@@ -880,7 +886,7 @@ macro_rules! impl_div_assign_ubis_prim {
 
 impl_div_assign_ubis_prim!(u128, u64, usize, u32, u16, u8);
 
-impl<const N:usize> Rem for UBitIntStatic<N>{
+impl<const N: usize> Rem for UBitIntStatic<N> {
     type Output = UBitIntStatic<N>;
 
     fn rem(self, rhs: Self) -> Self::Output {
@@ -895,7 +901,7 @@ macro_rules! impl_rem_ubis_prim {
         $(
             impl<const N:usize> Rem<$t> for UBitIntStatic<N>{
                 type Output = UBitIntStatic<N>;
-            
+
                 fn rem(self, rhs: $t) -> Self::Output {
                     let mut lhs = self;
                     div_ubis::<N>(&mut lhs, UBitIntStatic::<N>::from(rhs));
@@ -908,7 +914,7 @@ macro_rules! impl_rem_ubis_prim {
 
 impl_rem_ubis_prim!(u128, u64, usize, u32, u16, u8);
 
-impl<const N:usize> RemAssign for UBitIntStatic<N>{
+impl<const N: usize> RemAssign for UBitIntStatic<N> {
     fn rem_assign(&mut self, rhs: Self) {
         div_ubis::<N>(self, rhs);
     }

@@ -7,80 +7,185 @@ use std::ops::*;
 
 pub const USZ_MEM: usize = std::mem::size_of::<usize>();
 
+
+// adds values with carry and propogates carry on aarch64
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn add_with_carry_aarch64(l: &mut usize, s: usize, c: &mut u8) {
+    asm!(
+        "adds {c}, {c}, #0xFFFFFFFFFFFFFFFF", // c -> cf
+        "adcs {l}, {l}, {s}", // l+s+cf -> l , updates cf
+        "cset {c}, cs", // cf -> c
+        l = inout(reg) *l,
+        s = in(reg) s,
+        c = inout(reg) *c,
+        options(nostack)
+    );
+}
+
+// adds values with carry and propogates carry on x86
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn add_with_carry_x86_64(l: &mut usize, s: usize, c: &mut u8) {
+    asm!(
+        "add {c} , 0xFFFFFFFFFFFFFFFF", // carry -> cf
+        "adc {l}, {s}", // l+s+cf -> l , updates cf
+        "setc {c}", // cf -> c
+        c = inout(reg_byte) *c,
+        l = inout(reg) *l,
+        s = in(reg) s,
+        options(nostack)
+    );
+}
+
+
+//propogates carry on aarch64
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn add_carry_aarch64(l: &mut usize, c: &mut u8) {
+    asm!(
+        "adds {l}, {l}, {c}", // l + c -> l
+        "cset {c}, cs",       // cf -> c
+        l = inout(reg) * l,
+        c = inout(reg) * c,
+        options(nostack)
+    );
+}
+
+//propogates carry on x86
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn add_carry_x86_64(l: &mut usize, c: &mut u8) {
+    asm!(
+        "add {l}, {c}", // l + c -> l
+        "setc {c}",     // cf -> c
+        c = inout(reg_byte) * c,
+        l = inout(reg) * l,
+        options(nostack)
+    );
+}
+
 //the first input must be larger then the second because of the assymetry
 //of the input being mutable and non-mutable
 #[inline]
 pub fn add_ubi(longer: &mut Vec<usize>, shorter: &[usize]) {
-    let mut c = 0_usize;
-    for (s, l) in shorter.iter().zip(longer.iter_mut()) {
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            asm!(
-                "adds {c}, {c}, #0xFFFFFFFFFFFFFFFF",
-                "adcs {l}, {l}, {s}",
-                "cset {c}, cs",
-                l = inout(reg) *l,
-                s = in(reg) *s,
-                c = inout(reg) c,
-            )
-        }
-    }
-
-    for l in &mut longer[shorter.len()..] {
-        if c == 0 {
-            break;
-        }
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            asm!(
-                "adds {l}, {l}, {c}", // l + c -> l
-                "cset {c}, cs",       // put overflow of l + c into c
-                l = inout(reg) *l,
-                c = inout(reg) c,
-            );
-        }
-    }
-
-    if c == 1 {
-        longer.push(1);
-    }
-}
-
-// simplified algorithm for adding a primitive type less then usize
-#[inline]
-fn add_prim(ubi: &mut Vec<usize>, prim: usize) {
-    let mut c: usize;
-    #[cfg(target_arch = "aarch64")]
     unsafe {
-        asm!(
-            "adds {l}, {l}, {s}", // l + s -> l
-            "cset {c}, cs", // put overflow of l + s into tmp
-            l = inout(reg) ubi[0],
-            s = in(reg) prim,
-            c = out(reg) c
-        );
-    }
+        let mut c: u8 = 0;
+        for (s, l) in shorter.iter().zip(longer.iter_mut()) {
+            #[cfg(target_arch = "aarch64")]
+            add_with_carry_aarch64(l, *s, &mut c);
 
-    if c != 0 {
-        for l in &mut ubi[1..] {
+            #[cfg(target_arch = "x86_64")]
+            add_with_carry_x86_64(l, *s, &mut c);
+        }
+
+        for l in &mut longer[shorter.len()..] {
             if c == 0 {
                 break;
             }
+
             #[cfg(target_arch = "aarch64")]
-            unsafe {
-                asm!(
-                    "adds {l}, {l}, {c}", // l + c -> l
-                    "cset {c}, cs",       // put overflow of l + c into c
-                    l = inout(reg) *l,
-                    c = inout(reg) c,
-                );
-            }
+            add_carry_aarch64(l, &mut c);
+
+            #[cfg(target_arch = "x86_64")]
+            add_carry_x86_64(l, &mut c);
         }
 
         if c == 1 {
-            ubi.push(1)
-        };
+            longer.push(1);
+        }
     }
+}
+
+//adds then propogates the carry on aarch64
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn add_prop_carry_aarch64(l: &mut usize, s: usize) -> u8 {
+    let c: u8;
+    asm!(
+        "adds {l}, {l}, {s}", // l + s -> l
+        "cset {c}, cs", // cf -> c
+        l = inout(reg) *l,
+        s = in(reg) s,
+        c = out(reg) c,
+        options(nostack)
+    );
+
+    c
+}
+
+//adds then propogates the carry on x86
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn add_prop_carry_x86_64(l: &mut usize, s: usize) -> u8 {
+    let c: u8;
+    asm!(
+        "add {l}, {s}", // l+s -> l
+        "setc {c}", // cf -> c
+        l = inout(reg) *l,
+        s = in(reg) s,
+        c = out(reg_byte) c,
+        options(nostack)
+    );
+
+    c
+}
+
+// simplified algorithm for adding a primitive type less then or equal to usize
+#[inline]
+fn add_prim(ubi: &mut Vec<usize>, prim: usize) {
+    unsafe {
+        #[cfg(target_arch = "aarch64")]
+        let mut c: u8 = add_prop_carry_aarch64(&mut ubi[0], prim);
+
+        #[cfg(target_arch = "x86_64")]
+        let mut c: u8 = add_prop_carry_x86_64(&mut ubi[0], prim);
+
+        if c != 0 {
+            for l in &mut ubi[1..] {
+                if c == 0 {
+                    break;
+                }
+
+                #[cfg(target_arch = "aarch64")]
+                add_carry_aarch64(l, &mut c);
+
+                #[cfg(target_arch = "x86_64")]
+                add_carry_x86_64(l, &mut c);
+            }
+
+            if c == 1 {
+                ubi.push(1)
+            };
+        }
+    }
+}
+
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn sub_prop_carry_aarch64(l: &mut usize, c: &mut u8){
+    asm!(
+        "eor {c}, {c}, #1", //flip carry
+        "subs {l}, {l}, {c}", // subtract fliped carry
+        "cset {c}, cs", // set carry
+        l = inout(reg) *l,
+        c = inout(reg) *c,
+        options(nostack)
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn sub_prop_carry_x86_64(l: &mut usize, c: &mut u8){
+    asm!(
+        "xor {c}, 1",   // flip carry
+        "sub {l}, {c}", // subtract flipped carry
+        "setc {c}",     // set carry
+        l = inout(reg) *l,
+        c = inout(reg_byte) *c,
+        options(nostack)
+    );
 }
 
 //the rhs is the subtractor and lhs is the minued and is implcitly
@@ -88,32 +193,25 @@ fn add_prim(ubi: &mut Vec<usize>, prim: usize) {
 //this will lead to undefined behavior
 #[inline]
 pub fn sub_ubi(lhs: &mut Vec<usize>, rhs: &[usize]) {
-    let mut c = 1_usize;
-    for (r, l) in rhs.iter().zip(lhs.iter_mut()) {
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            asm!(
-                "adds {c}, {c}, #0xFFFFFFFFFFFFFFFF",
-                "adcs {l}, {l}, {r}",
-                "cset {c}, cs",
-                l = inout(reg) *l,
-                r = in(reg) !(*r),
-                c = inout(reg) c,
-            )
-        }
-    }
+    unsafe {
+        let mut c: u8 = 1;
+        for (r, l) in rhs.iter().zip(lhs.iter_mut()) {
 
-    if c == 0 {
-        for l in &mut lhs[rhs.len()..] {
-            c ^= 1;
             #[cfg(target_arch = "aarch64")]
-            unsafe {
-                asm!(
-                    "subs {l}, {l}, {c}",
-                    "cset {c}, cs",
-                    l = inout(reg) *l,
-                    c = inout(reg) c
-                )
+            add_with_carry_aarch64(l, !*r, &mut c);
+
+            #[cfg(target_arch = "x86_64")]
+            add_with_carry_x86_64(l, !*r, &mut c);
+        }
+
+        if c == 0 {
+            for l in &mut lhs[rhs.len()..] {
+
+                #[cfg(target_arch = "aarch64")]
+                sub_prop_carry_aarch64(l, &mut c);
+
+                #[cfg(target_arch = "x86_64")]
+                sub_prop_carry_x86_64(l, &mut c);
             }
         }
     }
@@ -125,38 +223,32 @@ pub fn sub_ubi(lhs: &mut Vec<usize>, rhs: &[usize]) {
     }
 }
 
-//subtracting primitive types from a UbitInt
+//simplified algorithm for subtracting primitive type
 #[inline]
 pub fn sub_prim(lhs: &mut Vec<usize>, rhs: usize) {
-    let mut c: usize;
-    #[cfg(target_arch = "aarch64")]
     unsafe {
-        asm!(
-            "adds {l}, {l}, {r}",
-            "cset {c}, cs",
-            l = inout(reg) lhs[0],
-            r = in(reg) !rhs+1,
-            c = out(reg) c,
-        )
-    }
 
-    if c == 0 {
-        for l in &mut lhs[1..] {
-            c ^= 1;
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                asm!(
-                    "subs {l}, {l}, {c}",
-                    "cset {c}, cs",
-                    l = inout(reg) *l,
-                    c = inout(reg) c
-                )
+        #[cfg(target_arch = "aarch64")]
+        let mut c: u8 = add_prop_carry_aarch64(&mut lhs[0], !rhs + 1);
+
+        #[cfg(target_arch = "x86_64")]
+        let mut c: u8 = add_prop_carry_x86_64(&mut lhs[0], !rhs + 1);
+
+        if c == 0 {
+            for l in &mut lhs[1..] {
+                #[cfg(target_arch = "aarch64")]
+                sub_prop_carry_aarch64(l, &mut c);
+
+                #[cfg(target_arch = "x86_64")]
+                sub_prop_carry_x86_64(l, &mut c);
             }
         }
     }
 
     if let Some(idx) = lhs.iter().rposition(|&x| x != 0) {
         lhs.truncate(idx + 1);
+    } else {
+        lhs.clear();
     }
 }
 
@@ -197,7 +289,6 @@ fn mul_ubi_short(a: &[usize], b: &[usize]) -> Vec<usize> {
     for k in 0..=(a_len + b_len) {
         let mut term: u128 = carry;
         carry = 0;
-
         for j in k.saturating_sub(b_len)..=std::cmp::min(a_len, k) {
             let val = (a[j] as u128) * (b[k - j] as u128);
             term += val & mask;
@@ -277,6 +368,42 @@ fn log2_ubi(ubi: &[usize]) -> u128 {
         + ((ubi.len() - 1) as u128) * ((USZ_MEM * 8) as u128)
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn shr_carry_aarch64(e: &mut usize, c: &mut usize, rem: usize, mv_sz: usize){
+    asm!(
+        "lsl {tmp}, {e}, {ms}", // put the last bits of the e into tmp
+        "lsr {e}, {e}, {r}", // shift e by rem
+        "orr {e}, {e}, {c}", // put the last bits of previous e at the start of e
+        "mov {c}, {tmp}", // put tmp into carry
+        e = inout(reg) *e,
+        c = inout(reg) *c,
+        r = in(reg) rem,
+        ms = in(reg) mv_sz,
+        tmp = out(reg) _,
+        options(nostack)
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn shr_carry_x86_64(e: &mut usize, c: &mut usize, rem: usize, mv_sz: usize){
+    asm!(
+        "mov {tmp}, {e}", // put e into tmp
+        "shl {tmp}, {ms}", // get last digits of e into tmp
+        "shr {e}, {r}", // shift e by rem
+        "or {e}, {c}", // put the last bits of previous e at the start of e
+        "mov {c}, {tmp}", // put tmp into carry
+        e = inout(reg) *e,
+        c = inout(reg) *c,
+        r = in(reg) rem,
+        ms = in(reg) mv_sz,
+        tmp = out(reg) _,
+        options(nostack)
+    );
+}
+
+
 #[inline]
 fn shr_ubi(ubi: &mut Vec<usize>, sh: u128) {
     if sh == 0 {
@@ -285,31 +412,60 @@ fn shr_ubi(ubi: &mut Vec<usize>, sh: u128) {
     let div = sh / (USZ_MEM * 8) as u128;
     let rem = (sh % (USZ_MEM * 8) as u128) as usize;
     let mv_sz = USZ_MEM * 8 - rem;
-
     ubi.drain(0..(div as usize));
-    if ubi.len() > 0 && rem != 0 {
-        let mut carry = 0_usize;
-        for elem in ubi.iter_mut().rev() {
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                asm!(
-                    "lsl {tmp}, {e}, {ms}",
-                    "lsr {e}, {e}, {r}",
-                    "orr {e}, {e}, {c}",
-                    "mov {c}, {tmp}",
-                    e = inout(reg) *elem,
-                    c = inout(reg) carry,
-                    r = in(reg) rem,
-                    ms = in(reg) mv_sz,
-                    tmp = out(reg) _
-                )
+
+    unsafe {
+        if ubi.len() > 0 && rem != 0 {
+            let mut carry = 0_usize;
+            for elem in ubi.iter_mut().rev() {
+
+                #[cfg(target_arch = "aarch64")]
+                shr_carry_aarch64(elem, &mut carry, rem, mv_sz);
+
+                #[cfg(target_arch = "x86_64")]
+                shr_carry_x86_64(elem, &mut carry, rem, mv_sz);
+            }
+
+            if ubi[ubi.len() - 1] == 0 {
+                ubi.pop();
             }
         }
-
-        if ubi[ubi.len() - 1] == 0 {
-            ubi.pop();
-        }
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn shl_carry_aarch64(e: &mut usize, c: &mut usize, rem: usize, mv_sz: usize){
+    asm!(
+        "lsr {tmp}, {e}, {ms}", // put the last bits of the e into tmp
+        "lsl {e}, {e}, {r}", // shift e by rem
+        "orr {e}, {e}, {c}", // put the last bits of previous e at the start of e
+        "mov {c}, {tmp}", // put tmp into carry
+        e = inout(reg) *e,
+        c = inout(reg) *c,
+        r = in(reg) rem,
+        ms = in(reg) mv_sz,
+        tmp = out(reg) _,
+        options(nostack)
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn shl_carry_x86_64(e: &mut usize, c: &mut usize, rem: usize, mv_sz: usize){
+    asm!(
+        "mov {tmp}, {e}", // put e into tmp
+        "shr {tmp}, {ms}", // get last digits of e into tmp
+        "shl {e}, {r}", // shift e by rem
+        "or {e}, {c}", // put the last bits of previous e at the start of e
+        "mov {c}, {tmp}", // put tmp into carry
+        e = inout(reg) *e,
+        c = inout(reg) *c,
+        r = in(reg) rem,
+        ms = in(reg) mv_sz,
+        tmp = out(reg) _,
+        options(nostack)
+    );
 }
 
 #[inline]
@@ -323,30 +479,26 @@ pub fn shl_ubi(ubi: &mut Vec<usize>, sh: u128) {
 
     let len = ubi.len();
     ubi.resize(len + div, 0);
-    ubi.copy_within(0..len, div);
-    ubi[0..div].fill(0);
+    if div != 0{
+        ubi.copy_within(0..len, div);
+        ubi[0..div].fill(0);
+    }
+    
 
-    if rem != 0 {
-        let mut carry = 0_usize;
-        for i in div..len + div {
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                asm!(
-                    "lsr {tmp}, {e}, {ms}",
-                    "lsl {e}, {e}, {r}",
-                    "orr {e}, {e}, {c}",
-                    "mov {c}, {tmp}",
-                    e = inout(reg) ubi[i],
-                    c = inout(reg) carry,
-                    r = in(reg) rem,
-                    ms = in(reg) mv_sz,
-                    tmp = out(reg) _
-                )
+    unsafe {
+        if rem != 0 {
+            let mut carry = 0_usize;
+            for i in div..len + div {
+                #[cfg(target_arch = "aarch64")]
+                shl_carry_aarch64(&mut ubi[i], &mut carry, rem, mv_sz);
+
+                #[cfg(target_arch = "x86_64")]
+                shl_carry_x86_64(&mut ubi[i], &mut carry, rem, mv_sz);
             }
-        }
 
-        if carry > 0 {
-            ubi.push(carry);
+            if carry > 0 {
+                ubi.push(carry);
+            }
         }
     }
 }
@@ -380,12 +532,15 @@ pub fn div_ubi(n: &mut Vec<usize>, d: &Vec<usize>) -> Vec<usize> {
     let mut div = add.clone();
 
     while cmp_ubi(n, d) != Less {
-        shr_ubi(&mut sub, 1);
-        shr_ubi(&mut add, 1);
-        if cmp_ubi(n, &sub) != Less {
-            sub_ubi(n, &sub);
-            add_ubi(&mut div, &add);
+        let log2 = log2_ubi(&sub) - log2_ubi(&n);
+        shr_ubi(&mut sub, log2);
+        shr_ubi(&mut add, log2);
+        if cmp_ubi(&sub, &n) == Greater {
+            shr_ubi(&mut sub, 1);
+            shr_ubi(&mut add, 1);
         }
+        sub_ubi(n, &sub);
+        add_ubi(&mut div, &add);
     }
 
     div
