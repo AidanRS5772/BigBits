@@ -42,7 +42,7 @@ pub unsafe fn add_with_carry_x86_64(l: &mut usize, s: usize, c: &mut u8) {
 //propogates carry on aarch64
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub unsafe fn add_carry_aarch64(l: &mut usize, c: &mut u8) {
+pub unsafe fn add_carry_aarch64(l: &mut usize, c: &mut usize) {
     asm!(
         "adds {l}, {l}, {c}", // l + c -> l
         "cset {c}, cs",       // cf -> c
@@ -57,9 +57,10 @@ pub unsafe fn add_carry_aarch64(l: &mut usize, c: &mut u8) {
 #[inline(always)]
 pub unsafe fn add_carry_x86_64(l: &mut usize, c: &mut u8) {
     asm!(
-        "add {l}, {c}", // l + c -> l
+        "add {l}, {tmp}", // l + c -> l
         "setc {c}",     // cf -> c
         c = inout(reg_byte) * c,
+        tmp = in(reg) *c as usize,
         l = inout(reg) * l,
         options(nostack)
     );
@@ -179,10 +180,11 @@ pub unsafe fn sub_prop_carry_aarch64(l: &mut usize, c: &mut u8){
 #[inline(always)]
 pub unsafe fn sub_prop_carry_x86_64(l: &mut usize, c: &mut u8){
     asm!(
-        "xor {c}, 1",   // flip carry
-        "sub {l}, {c}", // subtract flipped carry
+        "xor {tmp}, 1",   // flip carry
+        "sub {l}, {tmp}", // subtract flipped carry
         "setc {c}",     // set carry
         l = inout(reg) *l,
+        tmp = in(reg) *c as usize,
         c = inout(reg_byte) *c,
         options(nostack)
     );
@@ -387,17 +389,19 @@ pub unsafe fn shr_carry_aarch64(e: &mut usize, c: &mut usize, rem: usize, mv_sz:
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-pub unsafe fn shr_carry_x86_64(e: &mut usize, c: &mut usize, rem: usize, mv_sz: usize){
+pub unsafe fn shr_carry_x86_64(e: &mut usize, c: &mut usize, rem: u8, mv_sz: u8){
     asm!(
         "mov {tmp}, {e}", // put e into tmp
-        "shl {tmp}, {ms}", // get last digits of e into tmp
-        "shr {e}, {r}", // shift e by rem
+        "mov cl , {ms}", // move into cl reg
+        "shl {tmp}, cl", // get last digits of e into tmp
+        "mov cl , {r}", // move into cl reg
+        "shr {e}, cl", // shift e by rem
         "or {e}, {c}", // put the last bits of previous e at the start of e
         "mov {c}, {tmp}", // put tmp into carry
         e = inout(reg) *e,
         c = inout(reg) *c,
-        r = in(reg) rem,
-        ms = in(reg) mv_sz,
+        r = in(reg_byte) rem,
+        ms = in(reg_byte) mv_sz,
         tmp = out(reg) _,
         options(nostack)
     );
@@ -409,10 +413,10 @@ fn shr_ubi(ubi: &mut Vec<usize>, sh: u128) {
     if sh == 0 {
         return;
     }
-    let div = sh / (USZ_MEM * 8) as u128;
-    let rem = (sh % (USZ_MEM * 8) as u128) as usize;
-    let mv_sz = USZ_MEM * 8 - rem;
-    ubi.drain(0..(div as usize));
+    let div = (sh / (USZ_MEM * 8) as u128) as usize;
+    let rem = (sh % (USZ_MEM * 8) as u128) as u8;
+    let mv_sz = (USZ_MEM * 8) as u8 - rem;
+    ubi.drain(0..div);
 
     unsafe {
         if ubi.len() > 0 && rem != 0 {
@@ -435,7 +439,7 @@ fn shr_ubi(ubi: &mut Vec<usize>, sh: u128) {
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub unsafe fn shl_carry_aarch64(e: &mut usize, c: &mut usize, rem: usize, mv_sz: usize){
+pub unsafe fn shl_carry_aarch64(e: &mut usize, c: &mut usize, rem: u8, mv_sz: u8){
     asm!(
         "lsr {tmp}, {e}, {ms}", // put the last bits of the e into tmp
         "lsl {e}, {e}, {r}", // shift e by rem
@@ -452,17 +456,19 @@ pub unsafe fn shl_carry_aarch64(e: &mut usize, c: &mut usize, rem: usize, mv_sz:
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-pub unsafe fn shl_carry_x86_64(e: &mut usize, c: &mut usize, rem: usize, mv_sz: usize){
+pub unsafe fn shl_carry_x86_64(e: &mut usize, c: &mut usize, rem: u8, mv_sz: u8){
     asm!(
         "mov {tmp}, {e}", // put e into tmp
-        "shr {tmp}, {ms}", // get last digits of e into tmp
-        "shl {e}, {r}", // shift e by rem
+        "mov cl , {ms}", // move into cl reg
+        "shr {tmp}, cl", // get last digits of e into tmp
+        "mov cl , {r}", // move into cl reg
+        "shl {e}, cl", // shift e by rem
         "or {e}, {c}", // put the last bits of previous e at the start of e
         "mov {c}, {tmp}", // put tmp into carry
         e = inout(reg) *e,
         c = inout(reg) *c,
-        r = in(reg) rem,
-        ms = in(reg) mv_sz,
+        r = in(reg_byte) rem,
+        ms = in(reg_byte) mv_sz,
         tmp = out(reg) _,
         options(nostack)
     );
@@ -474,8 +480,8 @@ pub fn shl_ubi(ubi: &mut Vec<usize>, sh: u128) {
         return;
     }
     let div = (sh / (USZ_MEM * 8) as u128) as usize;
-    let rem = (sh % (USZ_MEM * 8) as u128) as usize;
-    let mv_sz = USZ_MEM * 8 - rem;
+    let rem = (sh % (USZ_MEM * 8) as u128) as u8;
+    let mv_sz = (USZ_MEM * 8) as u8 - rem;
 
     let len = ubi.len();
     ubi.resize(len + div, 0);

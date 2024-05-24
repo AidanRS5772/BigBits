@@ -173,8 +173,8 @@ fn shr_ubis<const N: usize>(ubis: &mut [usize], sh: u128) {
         return;
     }
     let div = (sh / (USZ_MEM * 8) as u128) as usize;
-    let rem = (sh % (USZ_MEM * 8) as u128) as usize;
-    let mv_sz = USZ_MEM * 8 - rem;
+    let rem = (sh % (USZ_MEM * 8) as u128) as u8;
+    let mv_sz = (USZ_MEM * 8) as u8 - rem;
     if div != 0 {
         ubis.copy_within(div..N, 0);
         ubis[(N - div)..N].fill(0);
@@ -201,8 +201,8 @@ fn shl_ubis<const N: usize>(ubis: &mut [usize], sh: u128) {
     }
 
     let div = (sh / (USZ_MEM * 8) as u128) as usize;
-    let rem = (sh % (USZ_MEM * 8) as u128) as usize;
-    let mv_sz = USZ_MEM * 8 - rem;
+    let rem = (sh % (USZ_MEM * 8) as u128) as u8;
+    let mv_sz = (USZ_MEM * 8) as u8 - rem;
     if div != 0 {
         ubis.copy_within(0..(N - div), div);
         ubis[0..div].fill(0);

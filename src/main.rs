@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 
 use bit_ops_2::{bitfloat::* , bitfrac::*, bitint::*, ubitint::*, ubitint_static::*};
-use bit_ops_2::ubitint::*;
 use rand::{rngs::OsRng, rngs::StdRng, Rng, RngCore, SeedableRng};
 use std::arch::asm;
 use std::f64::consts::*;

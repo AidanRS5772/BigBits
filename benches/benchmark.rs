@@ -870,5 +870,11 @@ fn ubis_div_bench(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, ubis_div_bench);
+criterion_group!(
+    benches,
+    ubi_shl_bench,
+    ubi_shr_bench,
+    ubi_div_bench
+);
+
 criterion_main!(benches);

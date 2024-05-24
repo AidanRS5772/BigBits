@@ -214,8 +214,8 @@ fn mul_bf(m1: &[usize], m2: &[usize], acc: usize) -> (Vec<usize>, bool) {
 }
 
 #[inline]
-fn shl_bf_sup(m: &mut Vec<usize>, sh: usize) -> bool {
-    let mv_sz = USZ_MEM * 8 - sh;
+fn shl_bf_sup(m: &mut Vec<usize>, sh: u8) -> bool {
+    let mv_sz = (USZ_MEM * 8) as u8 - sh;
     let mut carry = 0_usize;
     unsafe {
         for elem in m.iter_mut().rev() {
@@ -260,9 +260,9 @@ fn div_bf_gs(n: &mut BitFloat, d: &mut BitFloat) {
     let acc = (n.m.len().max(d.m.len()) + 1).max(3);
     n.exp -= d.exp + 1;
     d.exp = -1;
-    let sh = d.m[0].leading_zeros();
-    shl_bf_sup(&mut d.m, sh as usize);
-    n.exp += shl_bf_sup(&mut n.m, sh as usize) as isize;
+    let sh = d.m[0].leading_zeros() as u8;
+    shl_bf_sup(&mut d.m, sh);
+    n.exp += shl_bf_sup(&mut n.m, sh) as isize;
     let n_sign = n.sign;
     let d_sign = d.sign;
     n.abs();
@@ -636,7 +636,7 @@ pub fn exp_bf(x: &BitFloat) -> BitFloat {
         let mut val = x.clone();
         val.abs();
         val.exp = 0;
-        let sh = (val.m[0].leading_zeros() + 1) as usize;
+        let sh = (val.m[0].leading_zeros() + 1) as u8;
         shl_bf_sup(&mut val.m, sh);
 
         let mut sum = val.clone();
@@ -693,7 +693,7 @@ pub fn ln_bf(x: &BitFloat) -> BitFloat {
     let mut val = x.clone();
     val.abs();
     val.exp = 0;
-    let sh = (val.m[0].leading_zeros() + 1) as usize;
+    let sh = (val.m[0].leading_zeros() + 1) as u8;
     shl_bf_sup(&mut val.m, sh);
     val -= &*ONE;
     val /= &*TWO + &val;
