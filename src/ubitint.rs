@@ -28,7 +28,7 @@ pub unsafe fn add_with_carry_aarch64(l: &mut usize, s: usize, c: &mut u8) {
 #[inline(always)]
 pub unsafe fn add_with_carry_x86_64(l: &mut usize, s: usize, c: &mut u8) {
     asm!(
-        "add {c} , 0xFFFFFFFFFFFFFFFF", // carry -> cf
+        "add {c} , 0xFF", // carry -> cf
         "adc {l}, {s}", // l+s+cf -> l , updates cf
         "setc {c}", // cf -> c
         c = inout(reg_byte) *c,
@@ -403,6 +403,7 @@ pub unsafe fn shr_carry_x86_64(e: &mut usize, c: &mut usize, rem: u8, mv_sz: u8)
         r = in(reg_byte) rem,
         ms = in(reg_byte) mv_sz,
         tmp = out(reg) _,
+        out("cl") _ ,
         options(nostack)
     );
 }
@@ -470,6 +471,7 @@ pub unsafe fn shl_carry_x86_64(e: &mut usize, c: &mut usize, rem: u8, mv_sz: u8)
         r = in(reg_byte) rem,
         ms = in(reg_byte) mv_sz,
         tmp = out(reg) _,
+        out("cl") _ ,
         options(nostack)
     );
 }
@@ -644,6 +646,11 @@ impl UBitInt {
             data.clear();
         }
         UBitInt { data }
+    }
+
+    #[inline]
+    pub fn make(data: Vec<usize>) -> UBitInt{
+        UBitInt{ data }
     }
 
     #[inline]

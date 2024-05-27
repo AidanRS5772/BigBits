@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
-use bit_ops_2::{bitfloat::*, bitfrac::*, ubitint::*, ubitint_static::*};
+use bit_ops_2::{
+    bitfloat::*, bitfrac::*, bitint_static::BitIntStatic, ubitint::*, ubitint_static::*,
+};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use rand::{rngs::OsRng, rngs::StdRng, Rng, RngCore, SeedableRng};
 use std::cmp::Ordering;
@@ -870,11 +872,80 @@ fn ubis_div_bench(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    ubi_shl_bench,
-    ubi_shr_bench,
-    ubi_div_bench
-);
+fn bis_add_prim_bench(c: &mut Criterion) {
+    let seed = [
+        0xDD, 0x06, 0x24, 0xDE, 0x38, 0xD3, 0xFD, 0xD3, 0x4F, 0x68, 0xE8, 0x5C, 0x21, 0xD7, 0xB0,
+        0xB1, 0x1A, 0x1C, 0x3F, 0x3D, 0x77, 0xEF, 0x99, 0x6F, 0x5B, 0x97, 0x20, 0xDE, 0x12, 0xE2,
+        0x52, 0xC9,
+    ];
+
+    let mut rng = StdRng::from_seed(seed);
+
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut data4 = [0; 4];
+    for i in 0..4 {
+        data4[i] = rng.gen::<usize>();
+    }
+    let bis4 = BitIntStatic::<4>::make(data4, rng.gen::<bool>());
+    let prim4 = rng.gen::<isize>();
+
+    let mut data16 = [0; 16];
+    for i in 0..16 {
+        data16[i] = rng.gen::<usize>();
+    }
+    let bis16 = BitIntStatic::<16>::make(data16, rng.gen::<bool>());
+    let prim16 = rng.gen::<isize>();
+
+    let mut data64 = [0; 64];
+    for i in 0..64 {
+        data64[i] = rng.gen::<usize>();
+    }
+    let bis64 = BitIntStatic::<64>::make(data64, rng.gen::<bool>());
+    let prim64 = rng.gen::<isize>();
+
+    let mut group = c.benchmark_group(format!("ubis_add_prim_{}", arch));
+
+    group.bench_with_input(BenchmarkId::from_parameter(4), &4, |bencher, _| {
+        bencher.iter(|| black_box(bis4) + black_box(prim4));
+    });
+
+    group.bench_with_input(BenchmarkId::from_parameter(16), &16, |bencher, _| {
+        bencher.iter(|| black_box(bis16) + black_box(prim16));
+    });
+
+    group.bench_with_input(BenchmarkId::from_parameter(64), &64, |bencher, _| {
+        bencher.iter(|| black_box(bis64) + black_box(prim64));
+    });
+}
+
+// criterion_group!(
+//     benches,
+//     ubi_eq_bench,
+//     ubi_cmp_bench,
+//     ubi_add_bench,
+//     ubi_sub_bench,
+//     ubi_mul_bench,
+//     ubi_shl_bench,
+//     ubi_shr_bench,
+//     ubi_div_bench,
+// );
+
+// criterion_group!(
+//     benches,
+//     bf_eq_bench,
+//     bf_cmp_bench,
+//     bf_add_bench,
+//     bf_mul_bench,
+//     bf_stbl_mul_bench,
+//     bf_div_bench,
+//     bf_exp_bench,
+//     bf_ln_bench,
+// );
+
+criterion_group!(benches, bis_add_prim_bench);
 
 criterion_main!(benches);

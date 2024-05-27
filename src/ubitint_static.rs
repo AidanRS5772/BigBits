@@ -32,11 +32,11 @@ unsafe fn add4_with_carry_aarch64(lhs: &mut [usize], rhs: &[usize], c: &mut u8) 
 #[inline(always)]
 unsafe fn add4_with_carry_x86_64(lhs: &mut [usize], rhs: &[usize], c: &mut u8) {
     asm!(
-        "add {c}, {c}, #0xFFFFFFFFFFFFFFFF",
-        "adc {l0}, {l0}, {r0}",
-        "adc {l1}, {l1}, {r1}",
-        "adc {l2}, {l2}, {r2}",
-        "adc {l3}, {l3}, {r3}",
+        "add {c}, 0xFF",
+        "adc {l0}, {r0}",
+        "adc {l1}, {r1}",
+        "adc {l2}, {r2}",
+        "adc {l3}, {r3}",
         "setc {c}",
         l0 = inout(reg) lhs[0],
         l1 = inout(reg) lhs[1],
@@ -81,7 +81,7 @@ pub fn add_ubis<const N: usize>(lhs: &mut [usize], rhs: &[usize], mut c: u8) -> 
 }
 
 #[inline]
-fn add_ubis_prim(ubis: &mut [usize], prim: usize) {
+pub fn add_ubis_prim(ubis: &mut [usize], prim: usize) {
     unsafe {
         #[cfg(target_arch = "aarch64")]
         let mut c: u8 = add_prop_carry_aarch64(&mut ubis[0], prim);
@@ -113,7 +113,7 @@ pub fn one_comp(val: &mut [usize]) {
 }
 
 #[inline]
-fn sub_ubis_prim(ubis: &mut [usize], prim: usize) {
+pub fn sub_ubis_prim(ubis: &mut [usize], prim: usize) {
     unsafe {
         #[cfg(target_arch = "aarch64")]
         let mut c: u8 = add_prop_carry_aarch64(&mut ubis[0], !prim + 1);
@@ -134,7 +134,7 @@ fn sub_ubis_prim(ubis: &mut [usize], prim: usize) {
 }
 
 #[inline]
-fn mul_ubis_prim(a: &mut [usize], b: u128) {
+pub fn mul_ubis_prim(a: &mut [usize], b: u128) {
     let usz = (USZ_MEM * 8) as u128;
     let mut carry = 0_u128;
     for val in a {
@@ -145,7 +145,7 @@ fn mul_ubis_prim(a: &mut [usize], b: u128) {
 }
 
 #[inline]
-fn mul_ubis<const N: usize>(a: &[usize], b: &[usize]) -> [usize; N] {
+pub fn mul_ubis<const N: usize>(a: &[usize], b: &[usize]) -> [usize; N] {
     let mut out = [0; N];
 
     let usz = (USZ_MEM * 8) as u128;
@@ -168,7 +168,7 @@ fn mul_ubis<const N: usize>(a: &[usize], b: &[usize]) -> [usize; N] {
 }
 
 #[inline]
-fn shr_ubis<const N: usize>(ubis: &mut [usize], sh: u128) {
+pub fn shr_ubis<const N: usize>(ubis: &mut [usize], sh: u128) {
     if sh == 0 {
         return;
     }
@@ -195,7 +195,7 @@ fn shr_ubis<const N: usize>(ubis: &mut [usize], sh: u128) {
 }
 
 #[inline]
-fn shl_ubis<const N: usize>(ubis: &mut [usize], sh: u128) {
+pub fn shl_ubis<const N: usize>(ubis: &mut [usize], sh: u128) {
     if sh == 0 {
         return;
     }
@@ -222,7 +222,8 @@ fn shl_ubis<const N: usize>(ubis: &mut [usize], sh: u128) {
     }
 }
 
-fn log2_ubis(ubis: &[usize]) -> u128 {
+#[inline]
+pub fn log2_ubis(ubis: &[usize]) -> u128 {
     if let Some(idx) = ubis.iter().rposition(|&x| x != 0) {
         return (idx as u128) * ((USZ_MEM * 8) as u128)
             + (USZ_MEM * 8 - ubis[idx].leading_zeros() as usize - 1) as u128;
@@ -231,7 +232,8 @@ fn log2_ubis(ubis: &[usize]) -> u128 {
     }
 }
 
-fn div_ubis<const N: usize>(n: &mut UBitIntStatic<N>, d: UBitIntStatic<N>) -> UBitIntStatic<N> {
+#[inline]
+pub fn div_ubis<const N: usize>(n: &mut UBitIntStatic<N>, d: UBitIntStatic<N>) -> UBitIntStatic<N> {
     match (*n).partial_cmp(&d) {
         Some(std::cmp::Ordering::Less) => return UBitIntStatic::<N> { data: [0; N] },
         Some(std::cmp::Ordering::Equal) => {
@@ -360,8 +362,8 @@ impl_to_usize_arr_uprim!(u32, u16, u8);
 
 impl<const N: usize> UBitIntStatic<N> {
     #[inline]
-    pub fn get_data(&self) -> &[usize] {
-        &self.data
+    pub fn get_data(&self) -> [usize;N] {
+        self.data
     }
 
     #[inline]
@@ -460,6 +462,60 @@ impl<const N: usize> PartialEq for UBitIntStatic<N> {
     }
 }
 
+impl<const N:usize> PartialEq<usize> for UBitIntStatic<N>{
+    #[inline]
+    fn eq(&self, other: &usize) -> bool {
+        if let Some(idx) = self.data.iter().rposition(|&x| x != 0){
+            if idx > 0{
+                return false
+            }else{
+                return self.data[0] == *other
+            }
+        }else{
+            return *other == 0_usize;
+        }
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+impl<const N:usize> PartialEq<u64> for UBitIntStatic<N>{
+    #[inline]
+    fn eq(&self, other: &u64) -> bool {
+        if let Some(idx) = self.data.iter().rposition(|&x| x != 0){
+            if idx > 0{
+                return false
+            }else{
+                return self.data[0] == *other as usize
+            }
+        }else{
+            return *other == 0_u64
+        }
+    }
+}
+
+macro_rules! impl_partial_eq_ubis_prim {
+    ($($t:ty),*) => {
+        $(
+            impl<const N:usize> PartialEq<$t> for UBitIntStatic<N>{
+                #[inline]
+                fn eq(&self, other: &$t) -> bool {
+                    if let Some(idx) = self.data.iter().rposition(|&x| x != 0){
+                        if idx > 0{
+                            return false
+                        }else{
+                            return self.data[0] == *other as usize
+                        }
+                    }else{
+                        return *other == 0
+                    }
+                }
+            }
+        )*
+    };
+}
+
+impl_partial_eq_ubis_prim!(u32, u16, u8);
+
 impl<const N: usize> PartialOrd for UBitIntStatic<N> {
     #[inline]
     fn partial_cmp(&self, other: &UBitIntStatic<N>) -> Option<std::cmp::Ordering> {
@@ -474,6 +530,80 @@ impl<const N: usize> PartialOrd for UBitIntStatic<N> {
         return Some(std::cmp::Ordering::Equal);
     }
 }
+
+impl<const N:usize> PartialOrd<usize> for UBitIntStatic<N>{
+    fn partial_cmp(&self, other: &usize) -> Option<std::cmp::Ordering> {
+        if let Some(idx) = self.data.iter().rposition(|&x| x != 0){
+            if idx > 0{
+                return Some(std::cmp::Ordering::Greater)
+            }else{
+                return self.data[0].partial_cmp(other)
+            }
+        }else{
+            if *other == 0_usize{
+                return Some(std::cmp::Ordering::Equal)
+            }else{
+                return Some(std::cmp::Ordering::Greater)
+            }
+        }
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+impl<const N:usize> PartialOrd<u64> for UBitIntStatic<N>{
+    fn partial_cmp(&self, other: &u64) -> Option<std::cmp::Ordering> {
+        if let Some(idx) = self.data.iter().rposition(|&x| x != 0){
+            if idx > 0{
+                return Some(std::cmp::Ordering::Greater)
+            }else{
+                return self.data[0].partial_cmp(&(*other as usize))
+            }
+        }else{
+            if *other == 0_u64{
+                return Some(std::cmp::Ordering::Equal)
+            }else{
+                return Some(std::cmp::Ordering::Greater)
+            }
+        }
+    }
+}
+
+macro_rules! impl_partial_ord_ubis_prim {
+    ($($t:ty),*) => {
+        $(
+            impl<const N:usize> PartialOrd<$t> for UBitIntStatic<N>{
+                fn partial_cmp(&self, other: &$t) -> Option<std::cmp::Ordering> {
+                    if let Some(idx) = self.data.iter().rposition(|&x| x != 0){
+                        if idx > 0{
+                            return Some(std::cmp::Ordering::Greater)
+                        }else{
+                            return self.data[0].partial_cmp(&(*other as usize))
+                        }
+                    }else{
+                        if *other == 0{
+                            return Some(std::cmp::Ordering::Equal)
+                        }else{
+                            return Some(std::cmp::Ordering::Greater)
+                        }
+                    }
+                }
+            }
+        )*
+    };
+}
+
+impl_partial_ord_ubis_prim!(u32, u16, u8);
+
+impl<const N:usize> Eq for UBitIntStatic<N>{
+
+}
+
+impl<const N:usize> Ord for UBitIntStatic<N>{
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap()
+    }
+}
+
 
 impl<const N: usize> Add for UBitIntStatic<N> {
     type Output = UBitIntStatic<N>;
@@ -886,12 +1016,12 @@ macro_rules! impl_div_assign_ubis_prim {
 
 impl_div_assign_ubis_prim!(u128, u64, usize, u32, u16, u8);
 
-impl<const N: usize> Rem for UBitIntStatic<N> {
+impl<const N:usize> Rem for UBitIntStatic<N>{
     type Output = UBitIntStatic<N>;
 
     fn rem(self, rhs: Self) -> Self::Output {
         let mut lhs = self;
-        div_ubis::<N>(&mut lhs, rhs);
+        div_ubis(&mut lhs, rhs);
         lhs
     }
 }
@@ -901,10 +1031,10 @@ macro_rules! impl_rem_ubis_prim {
         $(
             impl<const N:usize> Rem<$t> for UBitIntStatic<N>{
                 type Output = UBitIntStatic<N>;
-
+            
                 fn rem(self, rhs: $t) -> Self::Output {
                     let mut lhs = self;
-                    div_ubis::<N>(&mut lhs, UBitIntStatic::<N>::from(rhs));
+                    div_ubis(&mut lhs, UBitIntStatic::<N>::from(rhs));
                     lhs
                 }
             }
@@ -914,22 +1044,67 @@ macro_rules! impl_rem_ubis_prim {
 
 impl_rem_ubis_prim!(u128, u64, usize, u32, u16, u8);
 
-impl<const N: usize> RemAssign for UBitIntStatic<N> {
+impl<const N:usize> RemAssign for UBitIntStatic<N>{
     fn rem_assign(&mut self, rhs: Self) {
-        div_ubis::<N>(self, rhs);
+        div_ubis(self, rhs);
     }
 }
 
-macro_rules! impl_rem_ubis_prim {
+macro_rules! impl_rem_assign_ubis_prim {
     ($($t:ty),*) => {
         $(
             impl<const N:usize> RemAssign<$t> for UBitIntStatic<N>{
                 fn rem_assign(&mut self, rhs: $t) {
-                    div_ubis::<N>(self, UBitIntStatic::<N>::from(rhs));
+                    div_ubis(self, UBitIntStatic::<N>::from(rhs));
                 }
             }
         )*
     };
 }
 
-impl_rem_ubis_prim!(u128, u64, usize, u32, u16, u8);
+impl_rem_assign_ubis_prim!(u128, u64, usize, u32, u16, u8);
+
+pub trait Pow< RHS = Self> {
+    type Output;
+    fn pow(self, rhs: RHS) -> Self::Output;
+}
+
+impl<const N:usize> Pow for UBitIntStatic::<N>{
+    type Output = UBitIntStatic<N>;
+
+    fn pow(self, rhs: Self) -> Self::Output {
+        if rhs == 0_usize{
+            return UBitIntStatic::<N>::from(1_usize);
+        }else if rhs == 1_usize{
+            return self
+        }else if rhs.mod2(){
+            return self * (self * self).pow(rhs >> 1_usize)
+        }else{
+            return (self * self).pow(rhs >> 1_usize);
+        }
+    }
+}
+
+macro_rules! impl_pow_ubis_prim {
+    ($($t:ty),*) => {
+        $(
+            impl<const N:usize> Pow<$t> for UBitIntStatic<N>{
+                type Output = UBitIntStatic<N>;
+            
+                fn pow(self, rhs: $t) -> Self::Output {
+                    if rhs == 0{
+                        return UBitIntStatic::<N>::from(1_usize);
+                    }else if rhs == 1{
+                        return self
+                    }else if rhs & 1 == 1{
+                        return self * (self * self).pow(rhs >> 1)
+                    }else{
+                        return (self * self).pow(rhs >> 1);
+                    }
+                }
+            }
+        )*
+    };
+}
+
+impl_pow_ubis_prim!(u128, u64, usize, u32, u16, u8);
