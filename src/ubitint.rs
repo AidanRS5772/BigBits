@@ -5,9 +5,6 @@ use std::arch::asm;
 use std::cmp::Ordering::*;
 use std::ops::*;
 
-pub const USZ_MEM: usize = std::mem::size_of::<usize>();
-
-
 // adds values with carry and propogates carry on aarch64
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -37,7 +34,6 @@ pub unsafe fn add_with_carry_x86_64(l: &mut usize, s: usize, c: &mut u8) {
         options(nostack)
     );
 }
-
 
 //propogates carry on aarch64
 #[cfg(target_arch = "aarch64")]
@@ -80,7 +76,7 @@ pub fn add_ubi(longer: &mut Vec<usize>, shorter: &[usize]) {
             add_with_carry_x86_64(l, *s, &mut c);
         }
 
-        for l in &mut longer[shorter.len()..] {
+        for l in longer.iter_mut().skip(shorter.len()) {
             if c == 0 {
                 break;
             }
@@ -162,23 +158,22 @@ fn add_prim(ubi: &mut Vec<usize>, prim: usize) {
     }
 }
 
-
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub unsafe fn sub_prop_carry_aarch64(l: &mut usize, c: &mut u8){
+pub unsafe fn sub_carry_aarch64(l: &mut usize, c: &mut u8) {
     asm!(
-        "eor {c}, {c}, #1", //flip carry
+        "eor {c}, {c}, #1",   //flip carry
         "subs {l}, {l}, {c}", // subtract fliped carry
-        "cset {c}, cs", // set carry
-        l = inout(reg) *l,
-        c = inout(reg) *c,
+        "cset {c}, cs",       // set carry
+        l = inout(reg) * l,
+        c = inout(reg) * c,
         options(nostack)
     );
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-pub unsafe fn sub_prop_carry_x86_64(l: &mut usize, c: &mut u8){
+pub unsafe fn sub_carry_x86_64(l: &mut usize, c: &mut u8) {
     asm!(
         "xor {tmp}, 1",   // flip carry
         "sub {l}, {tmp}", // subtract flipped carry
@@ -198,7 +193,6 @@ pub fn sub_ubi(lhs: &mut Vec<usize>, rhs: &[usize]) {
     unsafe {
         let mut c: u8 = 1;
         for (r, l) in rhs.iter().zip(lhs.iter_mut()) {
-
             #[cfg(target_arch = "aarch64")]
             add_with_carry_aarch64(l, !*r, &mut c);
 
@@ -207,13 +201,12 @@ pub fn sub_ubi(lhs: &mut Vec<usize>, rhs: &[usize]) {
         }
 
         if c == 0 {
-            for l in &mut lhs[rhs.len()..] {
-
+            for l in lhs.iter_mut().skip(rhs.len()) {
                 #[cfg(target_arch = "aarch64")]
-                sub_prop_carry_aarch64(l, &mut c);
+                sub_carry_aarch64(l, &mut c);
 
                 #[cfg(target_arch = "x86_64")]
-                sub_prop_carry_x86_64(l, &mut c);
+                sub_carry_x86_64(l, &mut c);
             }
         }
     }
@@ -229,7 +222,6 @@ pub fn sub_ubi(lhs: &mut Vec<usize>, rhs: &[usize]) {
 #[inline]
 pub fn sub_prim(lhs: &mut Vec<usize>, rhs: usize) {
     unsafe {
-
         #[cfg(target_arch = "aarch64")]
         let mut c: u8 = add_prop_carry_aarch64(&mut lhs[0], !rhs + 1);
 
@@ -239,10 +231,10 @@ pub fn sub_prim(lhs: &mut Vec<usize>, rhs: usize) {
         if c == 0 {
             for l in &mut lhs[1..] {
                 #[cfg(target_arch = "aarch64")]
-                sub_prop_carry_aarch64(l, &mut c);
+                sub_carry_aarch64(l, &mut c);
 
                 #[cfg(target_arch = "x86_64")]
-                sub_prop_carry_x86_64(l, &mut c);
+                sub_carry_x86_64(l, &mut c);
             }
         }
     }
@@ -263,7 +255,7 @@ fn mul_prim(ubi: &[usize], prim: u128) -> Vec<usize> {
     for elem in ubi {
         let val = ((*elem as u128) * prim).wrapping_add(carry);
         out.push(val as usize);
-        carry = val >> USZ_MEM * 8;
+        carry = val >> 64;
     }
 
     if carry > 0 {
@@ -284,8 +276,7 @@ fn mul_ubi_short(a: &[usize], b: &[usize]) -> Vec<usize> {
 
     let mut out: Vec<usize> = Vec::with_capacity(a_len + b_len + 1);
 
-    let usz = (USZ_MEM * 8) as u128;
-    let mask = (1u128 << usz) - 1;
+    let mask = (1u128 << 64) - 1;
 
     let mut carry: u128 = 0;
     for k in 0..=(a_len + b_len) {
@@ -294,9 +285,9 @@ fn mul_ubi_short(a: &[usize], b: &[usize]) -> Vec<usize> {
         for j in k.saturating_sub(b_len)..=std::cmp::min(a_len, k) {
             let val = (a[j] as u128) * (b[k - j] as u128);
             term += val & mask;
-            carry += val >> usz;
+            carry += val >> 64;
         }
-        carry += term >> usz;
+        carry += term >> 64;
         out.push(term as usize);
     }
 
@@ -327,11 +318,11 @@ fn mul_ubi(a: &[usize], b: &[usize]) -> Vec<usize> {
     let z0 = mul_ubi(l0, s0);
 
     let mut l1_vec = l1.to_vec();
-    let mut s1_vec = s1.to_vec();
+    let mut s0_vec = s0.to_vec();
 
     add_ubi(&mut l1_vec, l0);
-    add_ubi(&mut s1_vec, s0);
-    let mut z1 = mul_ubi(&l1_vec, &s1_vec);
+    add_ubi(&mut s0_vec, s1);
+    let mut z1 = mul_ubi(&l1_vec, &s0_vec);
     sub_ubi(&mut z1, &z2);
     sub_ubi(&mut z1, &z0);
 
@@ -366,13 +357,12 @@ pub fn cmp_ubi(lhs: &[usize], rhs: &[usize]) -> std::cmp::Ordering {
 
 #[inline]
 fn log2_ubi(ubi: &[usize]) -> u128 {
-    (USZ_MEM * 8 - ubi[ubi.len() - 1].leading_zeros() as usize - 1) as u128
-        + ((ubi.len() - 1) as u128) * ((USZ_MEM * 8) as u128)
+    (64 - ubi[ubi.len() - 1].leading_zeros() as usize - 1) as u128 + ((ubi.len() - 1) as u128) * 64
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub unsafe fn shr_carry_aarch64(e: &mut usize, c: &mut usize, rem: usize, mv_sz: usize){
+pub unsafe fn shr_carry_aarch64(e: &mut usize, c: &mut usize, rem: usize, mv_sz: usize) {
     asm!(
         "lsl {tmp}, {e}, {ms}", // put the last bits of the e into tmp
         "lsr {e}, {e}, {r}", // shift e by rem
@@ -389,7 +379,7 @@ pub unsafe fn shr_carry_aarch64(e: &mut usize, c: &mut usize, rem: usize, mv_sz:
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-pub unsafe fn shr_carry_x86_64(e: &mut usize, c: &mut usize, rem: u8, mv_sz: u8){
+pub unsafe fn shr_carry_x86_64(e: &mut usize, c: &mut usize, rem: u8, mv_sz: u8) {
     asm!(
         "mov {tmp}, {e}", // put e into tmp
         "mov cl , {ms}", // move into cl reg
@@ -408,22 +398,20 @@ pub unsafe fn shr_carry_x86_64(e: &mut usize, c: &mut usize, rem: u8, mv_sz: u8)
     );
 }
 
-
 #[inline]
 fn shr_ubi(ubi: &mut Vec<usize>, sh: u128) {
     if sh == 0 {
         return;
     }
-    let div = (sh / (USZ_MEM * 8) as u128) as usize;
-    let rem = (sh % (USZ_MEM * 8) as u128) as u8;
-    let mv_sz = (USZ_MEM * 8) as u8 - rem;
+    let div = (sh / 64) as usize;
+    let rem = (sh % 64) as u8;
+    let mv_sz = 64 - rem;
     ubi.drain(0..div);
 
     unsafe {
         if ubi.len() > 0 && rem != 0 {
             let mut carry = 0_usize;
             for elem in ubi.iter_mut().rev() {
-
                 #[cfg(target_arch = "aarch64")]
                 shr_carry_aarch64(elem, &mut carry, rem, mv_sz);
 
@@ -440,7 +428,7 @@ fn shr_ubi(ubi: &mut Vec<usize>, sh: u128) {
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub unsafe fn shl_carry_aarch64(e: &mut usize, c: &mut usize, rem: u8, mv_sz: u8){
+pub unsafe fn shl_carry_aarch64(e: &mut usize, c: &mut usize, rem: u8, mv_sz: u8) {
     asm!(
         "lsr {tmp}, {e}, {ms}", // put the last bits of the e into tmp
         "lsl {e}, {e}, {r}", // shift e by rem
@@ -457,7 +445,7 @@ pub unsafe fn shl_carry_aarch64(e: &mut usize, c: &mut usize, rem: u8, mv_sz: u8
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-pub unsafe fn shl_carry_x86_64(e: &mut usize, c: &mut usize, rem: u8, mv_sz: u8){
+pub unsafe fn shl_carry_x86_64(e: &mut usize, c: &mut usize, rem: u8, mv_sz: u8) {
     asm!(
         "mov {tmp}, {e}", // put e into tmp
         "mov cl , {ms}", // move into cl reg
@@ -481,17 +469,16 @@ pub fn shl_ubi(ubi: &mut Vec<usize>, sh: u128) {
     if sh == 0 {
         return;
     }
-    let div = (sh / (USZ_MEM * 8) as u128) as usize;
-    let rem = (sh % (USZ_MEM * 8) as u128) as u8;
-    let mv_sz = (USZ_MEM * 8) as u8 - rem;
+    let div = (sh / 64) as usize;
+    let rem = (sh % 64) as u8;
+    let mv_sz = 64 - rem;
 
     let len = ubi.len();
     ubi.resize(len + div, 0);
-    if div != 0{
+    if div != 0 {
         ubi.copy_within(0..len, div);
         ubi[0..div].fill(0);
     }
-    
 
     unsafe {
         if rem != 0 {
@@ -534,8 +521,8 @@ pub fn div_ubi(n: &mut Vec<usize>, d: &Vec<usize>) -> Vec<usize> {
         intit_log2 -= 1;
     }
 
-    let mut add: Vec<usize> = vec![0; (intit_log2 / (USZ_MEM * 8) as u128) as usize];
-    add.push(1_usize << (intit_log2 % (USZ_MEM * 8) as u128) as usize);
+    let mut add: Vec<usize> = vec![0; (intit_log2 / 64) as usize];
+    add.push(1_usize << (intit_log2 % 64) as usize);
     sub_ubi(n, &sub);
     let mut div = add.clone();
 
@@ -568,30 +555,16 @@ pub trait ToUsizeVec {
 impl ToUsizeVec for u128 {
     #[inline]
     fn to_usize_vec(self) -> Vec<usize> {
-        if USZ_MEM == 8 {
-            let lower = (self & 0xFFFFFFFFFFFFFFFF) as usize;
-            let upper = (self >> 64) as usize;
-            vec![lower, upper]
-        } else {
-            let lowest = (self & 0xFFFFFFFF) as usize;
-            let next_lowest = ((self >> 32) & 0xFFFFFFFF) as usize;
-            let next_highest = ((self >> 64) & 0xFFFFFFFF) as usize;
-            let highest = ((self >> 96) & 0xFFFFFFFF) as usize;
-            vec![lowest, next_lowest, next_highest, highest]
-        }
+        let lower = (self & 0xFFFFFFFFFFFFFFFF) as usize;
+        let upper = (self >> 64) as usize;
+        vec![lower, upper]
     }
 }
 
 impl ToUsizeVec for u64 {
     #[inline]
     fn to_usize_vec(self) -> Vec<usize> {
-        if USZ_MEM == 8 {
-            vec![self as usize]
-        } else {
-            let lower = (self & 0xFFFFFFFF) as usize;
-            let upper = (self >> 32) as usize;
-            vec![lower, upper]
-        }
+        vec![self as usize]
     }
 }
 
@@ -649,8 +622,8 @@ impl UBitInt {
     }
 
     #[inline]
-    pub fn make(data: Vec<usize>) -> UBitInt{
-        UBitInt{ data }
+    pub fn make(data: Vec<usize>) -> UBitInt {
+        UBitInt { data }
     }
 
     #[inline]
@@ -661,7 +634,7 @@ impl UBitInt {
             return Ok(self.data[0] as u128);
         } else if self.data.len() == 2 {
             let mut out = self.data[0] as u128;
-            out |= (self.data[1] as u128) << ((USZ_MEM * 8) as u128);
+            out |= (self.data[1] as u128) << 64;
             return Ok(out);
         } else {
             return Err("UBitInt is to large to be converted to a primitive".to_string());
@@ -760,36 +733,14 @@ impl PartialEq<u128> for UBitInt {
 
 impl PartialEq<u64> for UBitInt {
     fn eq(&self, other: &u64) -> bool {
-        if USZ_MEM == 8 {
-            if self.data.is_empty() {
-                return *other == 0;
-            }
-            if self.data.len() != 1 {
-                return false;
-            }
-
-            return self.data[0] == *other as usize;
-        } else {
-            if self.data.is_empty() {
-                return *other == 0;
-            }
-            if self.data.len() > 2 {
-                return false;
-            }
-
-            let rhs = UBitInt::from(*other);
-            if rhs.data.len() != self.data.len() {
-                return false;
-            }
-
-            for (l, r) in self.data.iter().zip(rhs.data.iter()) {
-                if l != r {
-                    return false;
-                }
-            }
-
-            return true;
+        if self.data.is_empty() {
+            return *other == 0;
         }
+        if self.data.len() != 1 {
+            return false;
+        }
+
+        return self.data[0] == *other as usize;
     }
 }
 
@@ -847,43 +798,20 @@ impl PartialOrd for UBitInt {
 
 impl PartialOrd<u128> for UBitInt {
     fn partial_cmp(&self, other: &u128) -> Option<std::cmp::Ordering> {
-        match self.data.len().cmp(&(16 / USZ_MEM)) {
-            Greater => return Some(Greater),
-            Less => return Some(Less),
-            Equal => {
-                let rhs = UBitInt::from(*other).data;
-                for (l, r) in self.data.iter().zip(rhs.iter()).rev() {
-                    if l > r {
-                        return Some(Greater);
-                    } else if r > l {
-                        return Some(Less);
-                    }
-                }
+        if self.data.len() > 2 {
+            return Some(Greater);
+        }
 
-                Some(Equal)
+        let rhs = UBitInt::from(*other).data;
+        for (l, r) in self.data.iter().zip(rhs.iter()).rev() {
+            if l > r {
+                return Some(Greater);
+            } else if r > l {
+                return Some(Less);
             }
         }
-    }
-}
 
-impl PartialOrd<u64> for UBitInt {
-    fn partial_cmp(&self, other: &u64) -> Option<std::cmp::Ordering> {
-        match self.data.len().cmp(&(8 / USZ_MEM)) {
-            Greater => return Some(Greater),
-            Less => return Some(Less),
-            Equal => {
-                let rhs = UBitInt::from(*other).data;
-                for (l, r) in self.data.iter().zip(rhs.iter()).rev() {
-                    if l > r {
-                        return Some(Greater);
-                    } else if r > l {
-                        return Some(Less);
-                    }
-                }
-
-                Some(Equal)
-            }
-        }
+        Some(Equal)
     }
 }
 
@@ -913,7 +841,7 @@ macro_rules! impl_pord_ubi_prim {
     };
 }
 
-impl_pord_ubi_prim!(u32, u16, u8);
+impl_pord_ubi_prim!(u64, u32, u16, u8);
 
 impl Eq for UBitInt {}
 
@@ -1046,14 +974,9 @@ impl Add<u64> for UBitInt {
 
     #[inline]
     fn add(self, rhs: u64) -> UBitInt {
-        if USZ_MEM == 8 {
-            let mut ubi = self.data;
-            add_prim(&mut ubi, rhs as usize);
-            UBitInt { data: ubi }
-        } else {
-            let prim = UBitInt::from(rhs);
-            self + prim
-        }
+        let mut ubi = self.data;
+        add_prim(&mut ubi, rhs as usize);
+        UBitInt { data: ubi }
     }
 }
 
@@ -1062,14 +985,9 @@ impl Add<u64> for &UBitInt {
 
     #[inline]
     fn add(self, rhs: u64) -> UBitInt {
-        if USZ_MEM == 8 {
-            let mut ubi = self.data.clone();
-            add_prim(&mut ubi, rhs as usize);
-            UBitInt { data: ubi }
-        } else {
-            let prim = UBitInt::from(rhs);
-            self + prim
-        }
+        let mut ubi = self.data.clone();
+        add_prim(&mut ubi, rhs as usize);
+        UBitInt { data: ubi }
     }
 }
 
@@ -1218,12 +1136,7 @@ impl AddAssign<u128> for UBitInt {
 impl AddAssign<u64> for UBitInt {
     #[inline]
     fn add_assign(&mut self, rhs: u64) {
-        if USZ_MEM == 8 {
-            add_prim(&mut self.data, rhs as usize);
-        } else {
-            let prim = UBitInt::from(rhs);
-            *self += prim;
-        }
+        add_prim(&mut self.data, rhs as usize);
     }
 }
 
@@ -1345,11 +1258,9 @@ impl Sub<u64> for UBitInt {
     #[inline]
     fn sub(self, rhs: u64) -> Self::Output {
         let mut lhs = self.data;
-        if USZ_MEM == 8 {
-            sub_prim(&mut lhs, rhs as usize);
-        } else {
-            sub_ubi(&mut lhs, &UBitInt::from(rhs).data);
-        }
+
+        sub_prim(&mut lhs, rhs as usize);
+
         UBitInt { data: lhs }
     }
 }
@@ -1360,11 +1271,9 @@ impl Sub<u64> for &UBitInt {
     #[inline]
     fn sub(self, rhs: u64) -> Self::Output {
         let mut lhs = self.data.clone();
-        if USZ_MEM == 8 {
-            sub_prim(&mut lhs, rhs as usize);
-        } else {
-            sub_ubi(&mut lhs, &UBitInt::from(rhs).data);
-        }
+
+        sub_prim(&mut lhs, rhs as usize);
+
         UBitInt { data: lhs }
     }
 }
@@ -1374,14 +1283,8 @@ impl Sub<UBitInt> for u64 {
 
     #[inline]
     fn sub(self, rhs: UBitInt) -> Self::Output {
-        if USZ_MEM == 8 {
-            UBitInt {
-                data: vec![(self as usize) - rhs.data[0]],
-            }
-        } else {
-            let mut lhs = UBitInt::from(self).data;
-            sub_ubi(&mut lhs, &rhs.data);
-            UBitInt { data: lhs }
+        UBitInt {
+            data: vec![(self as usize) - rhs.data[0]],
         }
     }
 }
@@ -1391,15 +1294,11 @@ impl Sub<&UBitInt> for u64 {
 
     #[inline]
     fn sub(self, rhs: &UBitInt) -> Self::Output {
-        if USZ_MEM == 8 {
+        
             UBitInt {
                 data: vec![(self as usize) - rhs.data[0]],
             }
-        } else {
-            let mut lhs = UBitInt::from(self).data;
-            sub_ubi(&mut lhs, &rhs.data);
-            UBitInt { data: lhs }
-        }
+        
     }
 }
 
@@ -1526,11 +1425,9 @@ impl SubAssign<u128> for UBitInt {
 impl SubAssign<u64> for UBitInt {
     #[inline]
     fn sub_assign(&mut self, rhs: u64) {
-        if USZ_MEM == 8 {
+        
             sub_prim(&mut self.data, rhs as usize);
-        } else {
-            sub_ubi(&mut self.data, &UBitInt::from(rhs).data);
-        }
+
     }
 }
 

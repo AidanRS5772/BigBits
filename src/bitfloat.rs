@@ -15,7 +15,7 @@ fn add_bf(m1: &mut Vec<usize>, m2: &[usize], sh: usize) -> bool {
             for (s, l) in m2.iter().rev().zip(m1[..idx].iter_mut().rev()) {
                 #[cfg(target_arch = "aarch64")]
                 add_with_carry_aarch64(l, *s, &mut c);
-
+    
                 #[cfg(target_arch = "x86_64")]
                 add_with_carry_x86_64(l, *s, &mut c);
             }
@@ -104,10 +104,10 @@ pub fn sub_bf(m1: &mut Vec<usize>, m2: &[usize], sh: usize) -> usize {
             if c == 0 {
                 for l in m1[..idx - m2.len()].iter_mut().rev() {
                     #[cfg(target_arch = "aarch64")]
-                    sub_prop_carry_aarch64(l, &mut c);
+                    sub_carry_aarch64(l, &mut c);
 
                     #[cfg(target_arch = "x86_64")]
-                    sub_prop_carry_x86_64(l, &mut c);
+                    sub_carry_x86_64(l, &mut c);
                 }
             }
         }
@@ -150,10 +150,10 @@ pub fn sub_bf(m1: &mut Vec<usize>, m2: &[usize], sh: usize) -> usize {
                 if c == 0 {
                     for l in m1[..sh].iter_mut().rev() {
                         #[cfg(target_arch = "aarch64")]
-                        sub_prop_carry_aarch64(l, &mut c);
+                        sub_carry_aarch64(l, &mut c);
 
                         #[cfg(target_arch = "x86_64")]
-                        sub_prop_carry_x86_64(l, &mut c);
+                        sub_carry_x86_64(l, &mut c);
                     }
                 }
             }
@@ -183,19 +183,18 @@ fn mul_bf(m1: &[usize], m2: &[usize], acc: usize) -> (Vec<usize>, bool) {
 
     let mut out: Vec<usize> = Vec::with_capacity(m1_len + m2_len + 1);
 
-    let usz = (USZ_MEM * 8) as u128;
-    let mask = (1u128 << usz) - 1;
+    let mask = (1u128 << 64) - 1;
 
     let mut carry: u128 = 0;
     for i in acc..=(m1_len + m2_len) {
         let mut term: u128 = carry;
-        let mut next_carry: u128 = 0;
+        carry = 0;
         for j in i.saturating_sub(m2_len)..=i.min(m1_len) {
             let val = (m1[m1_len - j] as u128) * (m2[m2_len - (i - j)] as u128);
             term += val & mask;
-            next_carry += val >> usz;
+            carry += val >> 64;
         }
-        carry = next_carry + (term >> usz);
+        carry += term >> 64;
         out.push(term as usize);
     }
 
@@ -215,7 +214,7 @@ fn mul_bf(m1: &[usize], m2: &[usize], acc: usize) -> (Vec<usize>, bool) {
 
 #[inline]
 fn shl_bf_sup(m: &mut Vec<usize>, sh: u8) -> bool {
-    let mv_sz = (USZ_MEM * 8) as u8 - sh;
+    let mv_sz = 64 - sh;
     let mut carry = 0_usize;
     unsafe {
         for elem in m.iter_mut().rev() {
@@ -260,9 +259,13 @@ fn div_bf_gs(n: &mut BitFloat, d: &mut BitFloat) {
     let acc = (n.m.len().max(d.m.len()) + 1).max(3);
     n.exp -= d.exp + 1;
     d.exp = -1;
+
     let sh = d.m[0].leading_zeros() as u8;
-    shl_bf_sup(&mut d.m, sh);
-    n.exp += shl_bf_sup(&mut n.m, sh) as isize;
+    if sh != 0{
+        shl_bf_sup(&mut d.m, sh);
+        n.exp += shl_bf_sup(&mut n.m, sh) as isize;
+    }
+
     let n_sign = n.sign;
     let d_sign = d.sign;
     n.abs();
@@ -756,318 +759,132 @@ pub struct BitFloat {
     pub sign: bool,
 }
 
-pub trait SignExpM {
+pub trait SEM {
     fn sign_exp_m(self) -> (bool, isize, Vec<usize>);
 }
 
-impl SignExpM for f64 {
-    #[inline]
+impl SEM for f64{
     fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
-        let sign = self < 0.0;
-        let bits: u64 = self.to_bits();
-        let mut exp_2 = (bits >> 52) as isize;
-        exp_2 &= 0x7FF;
-        exp_2 -= 1023;
-        let mut m_2 = (bits & 0xFFFFFFFFFFFFF) as u128;
-        m_2 |= 0x10000000000000;
+        let bits = self.to_bits();
+        let sign = (bits >> 63) == 1;
+        let exp2 = ((bits >> 52) & 0x7FF) as isize - 1023;
 
-        let exp = if exp_2 >= 0 {
-            exp_2 / (USZ_MEM * 8) as isize
+        let (exp, sh) = if exp2 >= 0 {
+            (exp2 / 64, exp2 % 64)
         } else {
-            exp_2 / (USZ_MEM * 8) as isize - 1
+            (exp2 / 64 - 1, 64 - exp2 % 64)
         };
 
-        let mut sh = 12 + exp_2 % 64;
-        if sh < 0 {
-            sh += 64;
-        }
-        m_2 <<= sh;
+        let m2 = (((bits & 0xFFFFFFFFFFFFF) | 0x10000000000000) as u128) << (sh + 12);
 
-        let mut m = if USZ_MEM == 8 {
-            let lower = (m_2 & 0xFFFFFFFFFFFFFFFF) as usize;
-            let upper = (m_2 >> 64) as usize;
-            vec![upper, lower]
-        } else {
-            let lowest = (m_2 & 0xFFFFFFFF) as usize;
-            let next_lowest = ((m_2 >> 32) & 0xFFFFFFFF) as usize;
-            let next_highest = ((m_2 >> 64) & 0xFFFFFFFF) as usize;
-            let highest = ((m_2 >> 96) & 0xFFFFFFFF) as usize;
-            vec![highest, next_highest, next_lowest, lowest]
-        };
+        let mut m = vec![];
+        let upper_m2 = (m2 >> 64) as usize;
 
-        if let Some(idx) = m.iter().rposition(|&x| x != 0) {
-            m.truncate(idx + 1);
-        } else {
-            m.clear();
-        }
-
-        if let Some(idx) = m.iter().position(|&x| x != 0) {
-            m.drain(..idx);
-        } else {
-            m.clear();
+        if upper_m2 == 0{
+            m.push(m2 as usize);
+        }else{
+            if m2 as usize != 0{
+                m.push(m2 as usize);
+            }
+            m.push(upper_m2);
         }
 
         (sign, exp, m)
     }
 }
 
-impl SignExpM for f32 {
-    #[inline]
+impl SEM for f32{
     fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
-        let sign = self < 0.0;
-        let bits: u32 = self.to_bits();
-        let mut exp_2 = (bits >> 23) as isize;
-        exp_2 &= 0xFF;
+        let bits = self.to_bits();
+        let sign = (bits >> 31) == 1;
+        let exp2 = ((bits >> 23) & 0xFF) as isize - 127;
 
-        let mut m_2 = (bits & 0x7FFFFF) as u64;
-        m_2 |= 0x800000;
-
-        let exp = if exp_2 >= 0 {
-            exp_2 / (USZ_MEM * 8) as isize
+        let (exp, sh) = if exp2 >= 0 {
+            (exp2 / 64, exp2 % 64 + 1)
         } else {
-            exp_2 / (USZ_MEM * 8) as isize - 1
+            (exp2 / 64 - 1, 64 - exp2 % 64 + 1)
         };
 
-        let mut sh = 9 + exp_2 % 32;
-        if sh < 0 {
-            sh += 32;
+        let m2 = (((bits & 0x7FFFF) | 0x80000) as u128) << sh;
+
+        let mut m = vec![];
+        let upper_m2 = (m2 >> 64) as usize;
+
+        if upper_m2 == 0{
+            m.push(m2 as usize);
+        }else{
+            if m2 as usize != 0{
+                m.push(m2 as usize);
+            }
+            m.push(upper_m2);
         }
-        m_2 <<= sh;
-
-        let m = if USZ_MEM == 8 {
-            if m_2 == 0 {
-                vec![]
-            } else {
-                vec![m_2 as usize]
-            }
-        } else {
-            let low = (m_2 & 0xFFFFFFFF) as usize;
-            let high = ((m_2 >> 32) & 0xFFFFFFFF) as usize;
-            let mut out: Vec<usize> = vec![];
-            if high != 0 {
-                out.push(high);
-            }
-            if low != 0 {
-                out.push(low);
-            }
-
-            out
-        };
 
         (sign, exp, m)
     }
 }
 
-impl SignExpM for u128 {
-    #[inline]
+impl SEM for i128{
     fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
-        let (mut m, mut exp) = if USZ_MEM == 8 {
-            let lower = (self & 0xFFFFFFFFFFFFFFFF) as usize;
-            let upper = (self >> 64) as usize;
-            (vec![upper, lower], 1_isize)
-        } else {
-            let lowest = (self & 0xFFFFFFFF) as usize;
-            let next_lowest = ((self >> 32) & 0xFFFFFFFF) as usize;
-            let next_highest = ((self >> 64) & 0xFFFFFFFF) as usize;
-            let highest = ((self >> 96) & 0xFFFFFFFF) as usize;
-            (vec![highest, next_highest, next_lowest, lowest], 3_isize)
-        };
-
-        if let Some(idx) = m.iter().rposition(|&x| x != 0) {
-            m.truncate(idx + 1);
-        } else {
-            m.clear();
-        }
-
-        if let Some(idx) = m.iter().position(|&x| x != 0) {
-            m.drain(..idx);
-            exp -= idx as isize;
-        } else {
-            m.clear();
-            exp = 0;
-        }
-
-        (false, exp, m)
-    }
-}
-
-impl SignExpM for i128 {
-    #[inline]
-    fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
-        let m_2 = self.unsigned_abs();
-
-        let (mut m, mut exp) = if USZ_MEM == 8 {
-            let lower = (m_2 & 0xFFFFFFFFFFFFFFFF) as usize;
-            let upper = (m_2 >> 64) as usize;
-            (vec![upper, lower], 1_isize)
-        } else {
-            let lowest = (m_2 & 0xFFFFFFFF) as usize;
-            let next_lowest = ((m_2 >> 32) & 0xFFFFFFFF) as usize;
-            let next_highest = ((m_2 >> 64) & 0xFFFFFFFF) as usize;
-            let highest = ((m_2 >> 96) & 0xFFFFFFFF) as usize;
-            (vec![highest, next_highest, next_lowest, lowest], 3_isize)
-        };
-
-        if let Some(idx) = m.iter().rposition(|&x| x != 0) {
-            m.truncate(idx + 1);
-        } else {
-            m.clear();
-        }
-
-        if let Some(idx) = m.iter().position(|&x| x != 0) {
-            m.drain(..idx);
-            exp -= idx as isize;
-        } else {
-            m.clear();
-            exp = 0;
-        }
-
-        (self < 0, exp, m)
-    }
-}
-
-impl SignExpM for u64 {
-    #[inline]
-    fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
-        let (m, exp) = if USZ_MEM == 8 {
-            if self == 0 {
-                (vec![], 0_isize)
-            } else {
-                (vec![self as usize], 0_isize)
+        let m1 = (self.unsigned_abs() & 0xFFFFFFFFFFFFFFFF) as usize;
+        let m2 = (self.unsigned_abs() >> 64) as usize;
+        let (exp, m) = if m2 == 0{
+            if m1 == 0{
+                (1_isize, vec![])
+            }else{
+                (1_isize, vec![m1])
             }
-        } else {
-            let low = (self & 0xFFFFFFFF) as usize;
-            let high = ((self >> 32) & 0xFFFFFFFF) as usize;
-            let mut out: Vec<usize> = vec![];
-            if high != 0 {
-                out.push(high);
-            }
-            if low != 0 {
-                out.push(low);
-            }
-            let exp = (out.len() - 1) as isize;
-            (out, exp)
-        };
-
-        (false, exp, m)
-    }
-}
-
-impl SignExpM for i64 {
-    #[inline]
-    fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
-        let m_2 = self.unsigned_abs();
-        let (m, exp) = if USZ_MEM == 8 {
-            if m_2 == 0 {
-                (vec![], 0_isize)
-            } else {
-                (vec![m_2 as usize], 0_isize)
-            }
-        } else {
-            let low = (m_2 & 0xFFFFFFFF) as usize;
-            let high = ((m_2 >> 32) & 0xFFFFFFFF) as usize;
-            let mut out: Vec<usize> = vec![];
-            if high != 0 {
-                out.push(high);
-            }
-            if low != 0 {
-                out.push(low);
-            }
-            let exp = (out.len() - 1) as isize;
-            (out, exp)
+        }else{
+            (2_isize, vec![m2, m1])
         };
 
         (self < 0, exp, m)
     }
 }
 
-impl SignExpM for usize {
-    #[inline]
+impl SEM for u128{
     fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
-        if self != 0 {
-            (false, 0, vec![self])
-        } else {
-            (false, 0, vec![])
-        }
+        let m1 = (self & 0xFFFFFFFFFFFFFFFF) as usize;
+        let m2 = (self >> 64) as usize;
+        let (exp, m) = if m2 == 0{
+            if m1 == 0{
+                (1_isize, vec![])
+            }else{
+                (1_isize, vec![m1])
+            }
+        }else{
+            (2_isize, vec![m2, m1])
+        };
+
+        (false, exp, m)
     }
 }
 
-impl SignExpM for isize {
-    #[inline]
-    fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
-        if self != 0 {
-            (self < 0, 0, vec![self.unsigned_abs()])
-        } else {
-            (false, 0, vec![])
-        }
-    }
+macro_rules! impl_sem_iprim {
+    ($($t:ty),*) => {
+        $(
+            impl SEM for $t{
+                fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
+                    (self < 0, 0, vec![self as usize])
+                }
+            }
+        )*
+    };
 }
 
-impl SignExpM for u32 {
-    #[inline]
-    fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
-        if self != 0 {
-            (false, 0, vec![self as usize])
-        } else {
-            (false, 0, vec![])
-        }
-    }
+macro_rules! impl_sem_uprim {
+    ($($t:ty),*) => {
+        $(
+            impl SEM for $t{
+                fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
+                    (false, 0, vec![self as usize])
+                }
+            }
+        )*
+    };
 }
 
-impl SignExpM for i32 {
-    #[inline]
-    fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
-        if self != 0 {
-            (self < 0, 0, vec![self.unsigned_abs() as usize])
-        } else {
-            (false, 0, vec![])
-        }
-    }
-}
-
-impl SignExpM for u16 {
-    #[inline]
-    fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
-        if self != 0 {
-            (false, 0, vec![self as usize])
-        } else {
-            (false, 0, vec![])
-        }
-    }
-}
-
-impl SignExpM for i16 {
-    #[inline]
-    fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
-        if self != 0 {
-            (self < 0, 0, vec![self.unsigned_abs() as usize])
-        } else {
-            (false, 0, vec![])
-        }
-    }
-}
-
-impl SignExpM for u8 {
-    #[inline]
-    fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
-        if self != 0 {
-            (false, 0, vec![self as usize])
-        } else {
-            (false, 0, vec![])
-        }
-    }
-}
-
-impl SignExpM for i8 {
-    #[inline]
-    fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
-        if self != 0 {
-            (self < 0, 0, vec![self.unsigned_abs() as usize])
-        } else {
-            (false, 0, vec![])
-        }
-    }
-}
+impl_sem_iprim!(i64, isize, i32, i16, i8);
+impl_sem_uprim!(u64, usize, u32, u16, u8);
 
 impl BitFloat {
     pub fn get_m(&self) -> Vec<usize> {
@@ -1083,7 +900,12 @@ impl BitFloat {
     }
 
     #[inline]
-    pub fn from<T: SignExpM>(val: T) -> BitFloat {
+    pub fn make(m:Vec<usize>, exp: isize, sign:bool) -> BitFloat{
+        BitFloat{m,exp,sign}
+    }
+
+    #[inline]
+    pub fn from<T: SEM>(val: T) -> BitFloat {
         let (sign, exp, m) = val.sign_exp_m();
         BitFloat { sign, exp, m }
     }
@@ -1151,7 +973,7 @@ impl BitFloat {
 
     #[inline]
     pub fn to(&self) -> Result<f64, String> {
-        if self.exp > 1023 / (USZ_MEM * 8) as isize || self.exp < -1022 / (USZ_MEM * 8) as isize {
+        if self.exp > 1023 / 64 || self.exp < -1022 / 64 {
             return Err("BitFloat is to large or small for f64".to_string());
         }
 

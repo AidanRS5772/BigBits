@@ -124,10 +124,10 @@ pub fn sub_ubis_prim(ubis: &mut [usize], prim: usize) {
         if c == 0 {
             for l in &mut ubis[1..] {
                 #[cfg(target_arch = "aarch64")]
-                sub_prop_carry_aarch64(l, &mut c);
+                sub_carry_aarch64(l, &mut c);
 
                 #[cfg(target_arch = "x86_64")]
-                sub_prop_carry_x86_64(l, &mut c);
+                sub_carry_x86_64(l, &mut c);
             }
         }
     }
@@ -135,7 +135,7 @@ pub fn sub_ubis_prim(ubis: &mut [usize], prim: usize) {
 
 #[inline]
 pub fn mul_ubis_prim(a: &mut [usize], b: u128) {
-    let usz = (USZ_MEM * 8) as u128;
+    let usz = 64 as u128;
     let mut carry = 0_u128;
     for val in a {
         let term = (*val as u128) * b + carry;
@@ -148,8 +148,7 @@ pub fn mul_ubis_prim(a: &mut [usize], b: u128) {
 pub fn mul_ubis<const N: usize>(a: &[usize], b: &[usize]) -> [usize; N] {
     let mut out = [0; N];
 
-    let usz = (USZ_MEM * 8) as u128;
-    let mask = (1u128 << usz) - 1;
+    let mask = (1u128 << 64) - 1;
 
     let mut carry: u128 = 0;
     for k in 0..N {
@@ -158,9 +157,9 @@ pub fn mul_ubis<const N: usize>(a: &[usize], b: &[usize]) -> [usize; N] {
         for j in 0..=k {
             let val = (a[j] as u128) * (b[k - j] as u128);
             term += val & mask;
-            carry += val >> usz;
+            carry += val >> 64;
         }
-        carry += term >> usz;
+        carry += term >> 64;
         out[k] = term as usize;
     }
 
@@ -172,9 +171,9 @@ pub fn shr_ubis<const N: usize>(ubis: &mut [usize], sh: u128) {
     if sh == 0 {
         return;
     }
-    let div = (sh / (USZ_MEM * 8) as u128) as usize;
-    let rem = (sh % (USZ_MEM * 8) as u128) as u8;
-    let mv_sz = (USZ_MEM * 8) as u8 - rem;
+    let div = (sh / 64) as usize;
+    let rem = (sh % 64) as u8;
+    let mv_sz = 64 - rem;
     if div != 0 {
         ubis.copy_within(div..N, 0);
         ubis[(N - div)..N].fill(0);
@@ -200,9 +199,9 @@ pub fn shl_ubis<const N: usize>(ubis: &mut [usize], sh: u128) {
         return;
     }
 
-    let div = (sh / (USZ_MEM * 8) as u128) as usize;
-    let rem = (sh % (USZ_MEM * 8) as u128) as u8;
-    let mv_sz = (USZ_MEM * 8) as u8 - rem;
+    let div = (sh / 64) as usize;
+    let rem = (sh % 64) as u8;
+    let mv_sz = 64 - rem;
     if div != 0 {
         ubis.copy_within(0..(N - div), div);
         ubis[0..div].fill(0);
@@ -225,8 +224,8 @@ pub fn shl_ubis<const N: usize>(ubis: &mut [usize], sh: u128) {
 #[inline]
 pub fn log2_ubis(ubis: &[usize]) -> u128 {
     if let Some(idx) = ubis.iter().rposition(|&x| x != 0) {
-        return (idx as u128) * ((USZ_MEM * 8) as u128)
-            + (USZ_MEM * 8 - ubis[idx].leading_zeros() as usize - 1) as u128;
+        return (idx as u128) * 64
+            + (64 - ubis[idx].leading_zeros() as usize - 1) as u128;
     } else {
         return 0;
     }
@@ -290,7 +289,7 @@ pub trait ToUsizeArray<const N: usize> {
 impl<const N: usize> ToUsizeArray<N> for u128 {
     fn to_usize_array(self) -> [usize; N] {
         let mut out: [usize; N] = [0; N];
-        if USZ_MEM == 8 {
+        
             let lower = (self & 0xFFFFFFFFFFFFFFFF) as usize;
             let upper = (self >> 64) as usize;
             if N < 2 {
@@ -298,19 +297,7 @@ impl<const N: usize> ToUsizeArray<N> for u128 {
             }
             out[0] = lower;
             out[1] = upper;
-        } else {
-            let lowest = (self & 0xFFFFFFFF) as usize;
-            let next_lowest = ((self >> 32) & 0xFFFFFFFF) as usize;
-            let next_highest = ((self >> 64) & 0xFFFFFFFF) as usize;
-            let highest = ((self >> 96) & 0xFFFFFFFF) as usize;
-            if N < 4 {
-                panic!("Static UBitInt is to small for type")
-            }
-            out[0] = lowest;
-            out[1] = next_lowest;
-            out[2] = next_highest;
-            out[3] = highest;
-        }
+        
 
         out
     }
@@ -319,17 +306,9 @@ impl<const N: usize> ToUsizeArray<N> for u128 {
 impl<const N: usize> ToUsizeArray<N> for u64 {
     fn to_usize_array(self) -> [usize; N] {
         let mut out: [usize; N] = [0; N];
-        if USZ_MEM == 8 {
+        
             out[0] = self as usize;
-        } else {
-            let lower = (self & 0xFFFFFFFF) as usize;
-            let upper = (self >> 32) as usize;
-            if N < 2 {
-                panic!("Static UBitInt is to small for type")
-            }
-            out[0] = lower;
-            out[1] = upper;
-        }
+        
 
         out
     }
@@ -385,7 +364,7 @@ impl<const N: usize> UBitIntStatic<N> {
                 return Ok(self.data[0] as u128);
             } else if idx == 1 {
                 let mut out = self.data[0] as u128;
-                out |= (self.data[1] as u128) << ((USZ_MEM * 8) as u128);
+                out |= (self.data[1] as u128) << 64;
                 return Ok(out);
             } else {
                 return Err("Static UBitInt is to large to be converted to a u128".to_string());
@@ -399,7 +378,7 @@ impl<const N: usize> UBitIntStatic<N> {
     pub fn from_str(num: &str) -> Result<UBitIntStatic<N>, String> {
         use std::f64::consts::LN_10;
         use std::f64::consts::LN_2;
-        if (num.len() as f64) * LN_10 > ((USZ_MEM * (8 as usize) * N) as f64) * LN_2 {
+        if (num.len() as f64) * LN_10 > ((64 * N) as f64) * LN_2 {
             return Err("String is to long for Static UBitInt Size".to_string());
         }
 
@@ -1063,6 +1042,37 @@ macro_rules! impl_rem_assign_ubis_prim {
 }
 
 impl_rem_assign_ubis_prim!(u128, u64, usize, u32, u16, u8);
+
+pub trait DivRem< RHS = Self>{
+    type Output;
+    fn div_rem(self, rhs: RHS) -> Self::Output;
+}
+
+impl<const N:usize> DivRem for UBitIntStatic<N>{
+    type Output = (UBitIntStatic<N>, UBitIntStatic<N>);
+
+    fn div_rem(self, rhs: Self) -> Self::Output {
+        let mut lhs = self;
+        let div = div_ubis(&mut lhs, rhs);
+        (div, self)
+    }
+}
+
+macro_rules! impl_div_rem_ubis_prim {
+    ($($t:ty),*) => {
+        $(
+            impl<const N:usize> DivRem<$t> for UBitIntStatic<N>{
+                type Output = (UBitIntStatic<N>, UBitIntStatic<N>);
+
+                fn div_rem(self, rhs: $t) -> Self::Output {
+                    self.div_rem(UBitIntStatic::<N>::from(rhs))
+                }
+            }
+        )*
+    };
+}
+
+impl_div_rem_ubis_prim!(u128, u64, usize, u32, u16, u8);
 
 pub trait Pow< RHS = Self> {
     type Output;

@@ -1,8 +1,12 @@
 #![allow(unused_imports)]
 #![allow(dead_code)]
 
-use bit_ops_2::ubitint_static::Pow;
-use bit_ops_2::{bitfloat::* , bitfrac::*, bitint::*, ubitint::*, ubitint_static::*, bitint_static::*};
+use bit_ops_2::bitfloat_static::PowI;
+use bit_ops_2::{
+    bitfloat::*, bitfloat_static::*, bitfrac::*, bitint::*, bitint_static::*, make_LN2,
+    make_harmonic, make_int, make_rep_LN2, ubitint::*, ubitint_static::*,
+};
+use criterion::measurement::ValueFormatter;
 use rand::{rngs::OsRng, rngs::StdRng, Rng, RngCore, SeedableRng};
 use std::arch::asm;
 use std::f64::consts::*;
@@ -13,7 +17,7 @@ use std::thread::sleep;
 use std::time::Duration;
 use std::time::Instant;
 
-fn print_seed(){
+fn print_seed() {
     let mut rng = rand::thread_rng();
     let seed: [u8; 32] = rng.gen();
 
@@ -29,8 +33,10 @@ fn print_seed(){
 }
 
 fn main() {
-    let a = BitIntStatic::<6>::from(2);
-    let b = BitIntStatic::<6>::from(-12);
+    let a = BitFloat::from(LN_2);
+    let b = BitFloat::from(1.0/LN_2);
 
-    println!("{:?}", a % b)
+    println!("a: {:?}", a);
+    println!("b: {:?}", b);
+    println!("{:?}", a*b)
 }

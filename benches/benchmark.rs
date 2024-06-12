@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 use bit_ops_2::{
-    bitfloat::*, bitfrac::*, bitint_static::BitIntStatic, ubitint::*, ubitint_static::*,
+    bitfloat::*, bitfloat_static::*, bitfrac::*, bitint_static::BitIntStatic, ubitint::*,
+    ubitint_static::*,
 };
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use rand::{rngs::OsRng, rngs::StdRng, Rng, RngCore, SeedableRng};
@@ -249,7 +250,7 @@ fn ubi_shl_bench(c: &mut Criterion) {
                     .map(|_| rng.gen::<usize>())
                     .collect::<Vec<usize>>(),
             };
-            let rusize = rng.gen_range(0..USZ_MEM * 8) as u128;
+            let rusize = rng.gen_range(0..64) as u128;
             (ubi, rusize * size)
         })
         .collect();
@@ -290,7 +291,7 @@ fn ubi_shr_bench(c: &mut Criterion) {
                     .map(|_| rng.gen::<usize>())
                     .collect::<Vec<usize>>(),
             };
-            let rusize = rng.gen_range(0..USZ_MEM * 8) as u128;
+            let rusize = rng.gen_range(0..64) as u128;
             (ubi, rusize * size)
         })
         .collect();
@@ -479,7 +480,7 @@ fn bf_add_bench(c: &mut Criterion) {
     ];
     let mut rng = StdRng::from_seed(seed);
 
-    let sizes = vec![4, 16, 64];
+    let sizes = vec![4, 16, 64, 256];
     let bitfloat_pairs: Vec<(BitFloat, BitFloat)> = sizes
         .iter()
         .map(|&size| {
@@ -792,6 +793,21 @@ macro_rules! benchmark_ubis_op {
     }
 }
 
+macro_rules! benchmark_ubis_sh {
+    ($group:expr, $rng:expr, $op:tt, $($size:expr),+) => {
+        $(
+            let mut data1 = [0; $size];
+            for i in 0..$size {
+                data1[i] = $rng.gen::<usize>();
+            }
+            let (ubis_a, sh) = (UBitIntStatic::make(data1), ($size as u128)*($rng.gen_range::<u128, _>(0..=64)));
+            $group.bench_with_input(BenchmarkId::from_parameter($size), &$size, |bencher, _| {
+                bencher.iter(|| black_box(ubis_a) $op sh);
+            });
+        )+
+    }
+}
+
 fn ubis_add_bench(c: &mut Criterion) {
     let seed = [
         0x4B, 0xCA, 0x50, 0xB6, 0x62, 0x60, 0x79, 0xC2, 0x55, 0xF3, 0x51, 0x63, 0x88, 0x67, 0x05,
@@ -847,7 +863,47 @@ fn ubis_mul_bench(c: &mut Criterion) {
 
     let mut group = c.benchmark_group(format!("ubis_mul_{}", arch));
 
-    benchmark_ubis_op!(group, rng, *, 4, 8, 16, 32, 64, 128, 256, 512, 1024);
+    benchmark_ubis_op!(group, rng, *, 4, 16, 64);
+
+    group.finish();
+}
+
+fn ubis_shl_bench(c: &mut Criterion) {
+    let seed = [
+        0xAE, 0xF9, 0xBC, 0xAA, 0xED, 0x8B, 0xA4, 0x58, 0xF2, 0x91, 0xAC, 0x92, 0xC0, 0xD4, 0x71,
+        0x4D, 0xE1, 0x8C, 0x00, 0xC9, 0x26, 0x01, 0xCB, 0xBD, 0x44, 0xE0, 0x07, 0x6B, 0x3B, 0xBC,
+        0xDD, 0x1E,
+    ];
+    let mut rng = StdRng::from_seed(seed);
+
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("ubis_shl_{}", arch));
+
+    benchmark_ubis_sh!(group, rng, <<, 4, 16, 64);
+
+    group.finish();
+}
+
+fn ubis_shr_bench(c: &mut Criterion) {
+    let seed = [
+        0x95, 0x0F, 0x51, 0x12, 0x3F, 0x34, 0x24, 0x23, 0x57, 0x15, 0xF1, 0x8E, 0xD7, 0x0D, 0x31,
+        0xE2, 0x27, 0xEE, 0xEE, 0x9F, 0xB9, 0x5B, 0xF7, 0x45, 0xDE, 0x15, 0x3A, 0x09, 0xB1, 0xDB,
+        0x8B, 0x04,
+    ];
+    let mut rng = StdRng::from_seed(seed);
+
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let mut group = c.benchmark_group(format!("ubis_shr_{}", arch));
+
+    benchmark_ubis_sh!(group, rng, >>, 4, 16, 64);
 
     group.finish();
 }
@@ -872,13 +928,35 @@ fn ubis_div_bench(c: &mut Criterion) {
     group.finish();
 }
 
-fn bis_add_prim_bench(c: &mut Criterion) {
-    let seed = [
-        0xDD, 0x06, 0x24, 0xDE, 0x38, 0xD3, 0xFD, 0xD3, 0x4F, 0x68, 0xE8, 0x5C, 0x21, 0xD7, 0xB0,
-        0xB1, 0x1A, 0x1C, 0x3F, 0x3D, 0x77, 0xEF, 0x99, 0x6F, 0x5B, 0x97, 0x20, 0xDE, 0x12, 0xE2,
-        0x52, 0xC9,
-    ];
+macro_rules! benchmark_bfs_op {
+    ($group:expr, $rng:expr, $op:tt, $($size:expr),+) => {
+        $(
+            let mut data1 = [0; $size];
+            let mut data2 = [0; $size];
+            for i in 0..$size {
+                data1[i] = $rng.gen::<usize>();
+                data2[i] = $rng.gen::<usize>();
+            }
 
+            let exp1 = $rng.gen_range::<i128, _>(-$size..=$size);
+            let exp2 = $rng.gen_range::<i128, _>(-$size..=$size);
+            let sign1 = $rng.gen::<bool>();
+            let sign2 = $rng.gen::<bool>();
+
+            let (bfs1, bfs2) = (BitFloatStatic::make(data1, exp1, sign1), BitFloatStatic::make(data2, exp2, sign2));
+            $group.bench_with_input(BenchmarkId::from_parameter($size), &$size, |bencher, _| {
+                bencher.iter(|| black_box(bfs1) $op black_box(bfs2));
+            });
+        )+
+    }
+}
+
+fn bfs_add_bench(c: &mut Criterion) {
+    let seed = [
+        0xF4, 0x0B, 0xFB, 0x49, 0x9D, 0x85, 0xC8, 0x74, 0xBD, 0x6B, 0xF5, 0xD7, 0x9C, 0x09, 0xC3,
+        0x45, 0x8E, 0xE9, 0xB9, 0x3C, 0xD2, 0x85, 0x2B, 0xEE, 0x2B, 0xD0, 0x09, 0x32, 0x7D, 0x91,
+        0x8C, 0x8F,
+    ];
     let mut rng = StdRng::from_seed(seed);
 
     #[cfg(target_arch = "x86_64")]
@@ -886,40 +964,11 @@ fn bis_add_prim_bench(c: &mut Criterion) {
     #[cfg(target_arch = "aarch64")]
     let arch = "aarch64";
 
-    let mut data4 = [0; 4];
-    for i in 0..4 {
-        data4[i] = rng.gen::<usize>();
-    }
-    let bis4 = BitIntStatic::<4>::make(data4, rng.gen::<bool>());
-    let prim4 = rng.gen::<isize>();
+    let mut group = c.benchmark_group(format!("bfs_add_{}", arch));
 
-    let mut data16 = [0; 16];
-    for i in 0..16 {
-        data16[i] = rng.gen::<usize>();
-    }
-    let bis16 = BitIntStatic::<16>::make(data16, rng.gen::<bool>());
-    let prim16 = rng.gen::<isize>();
+    benchmark_bfs_op!(group, rng, +, 4, 16, 64, 256);
 
-    let mut data64 = [0; 64];
-    for i in 0..64 {
-        data64[i] = rng.gen::<usize>();
-    }
-    let bis64 = BitIntStatic::<64>::make(data64, rng.gen::<bool>());
-    let prim64 = rng.gen::<isize>();
-
-    let mut group = c.benchmark_group(format!("ubis_add_prim_{}", arch));
-
-    group.bench_with_input(BenchmarkId::from_parameter(4), &4, |bencher, _| {
-        bencher.iter(|| black_box(bis4) + black_box(prim4));
-    });
-
-    group.bench_with_input(BenchmarkId::from_parameter(16), &16, |bencher, _| {
-        bencher.iter(|| black_box(bis16) + black_box(prim16));
-    });
-
-    group.bench_with_input(BenchmarkId::from_parameter(64), &64, |bencher, _| {
-        bencher.iter(|| black_box(bis64) + black_box(prim64));
-    });
+    group.finish();
 }
 
 // criterion_group!(
@@ -946,6 +995,32 @@ fn bis_add_prim_bench(c: &mut Criterion) {
 //     bf_ln_bench,
 // );
 
-criterion_group!(benches, bis_add_prim_bench);
+// criterion_group!(
+//     benches,
+//     ubis_add_bench,
+//     ubis_sub_bench,
+//     ubis_mul_bench,
+//     ubis_shl_bench,
+//     ubis_shr_bench,
+//     ubis_div_bench,
+// );
+
+// criterion_group!(
+//     benches,
+//     ubi_add_bench,
+//     ubis_add_bench,
+//     ubi_sub_bench,
+//     ubis_sub_bench,
+//     ubi_mul_bench,
+//     ubis_mul_bench,
+//     ubi_shl_bench,
+//     ubis_shl_bench,
+//     ubi_shr_bench,
+//     ubis_shr_bench,
+//     ubi_div_bench,
+//     ubis_div_bench,
+// );
+
+criterion_group!(benches, bfs_add_bench, bf_add_bench);
 
 criterion_main!(benches);

@@ -218,7 +218,6 @@ impl Add for BitFrac {
                 },
             }
         } else {
-            println!("here 4");
             BitFrac {
                 n: self.n * &rhs.d + rhs.n * &self.d,
                 d: self.d * rhs.d,
