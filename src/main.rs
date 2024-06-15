@@ -1,10 +1,8 @@
 #![allow(unused_imports)]
 #![allow(dead_code)]
 
-use bit_ops_2::bitfloat_static::PowI;
 use bit_ops_2::{
-    bitfloat::*, bitfloat_static::*, bitfrac::*, bitint::*, bitint_static::*, make_LN2,
-    make_harmonic, make_int, make_rep_LN2, ubitint::*, ubitint_static::*,
+    bitfloat::*, bitfrac::*, bitint::*, bitint_static::*, ubitint::*, ubitint_static::*,
 };
 use criterion::measurement::ValueFormatter;
 use rand::{rngs::OsRng, rngs::StdRng, Rng, RngCore, SeedableRng};
@@ -33,10 +31,8 @@ fn print_seed() {
 }
 
 fn main() {
-    let a = BitFloat::from(LN_2);
-    let b = BitFloat::from(1.0/LN_2);
+    let mut bf = BitFloat::from(PI);
 
-    println!("a: {:?}", a);
-    println!("b: {:?}", b);
-    println!("{:?}", a*b)
+    recipricol(&mut bf);
+    println!("{:?}", bf);
 }

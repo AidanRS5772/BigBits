@@ -267,7 +267,7 @@ fn mul_prim(ubi: &[usize], prim: u128) -> Vec<usize> {
 
 //multiplying a UBitInt by a smaller UBitInt
 #[inline]
-fn mul_ubi_short(a: &[usize], b: &[usize]) -> Vec<usize> {
+pub fn mul_ubi_short(a: &[usize], b: &[usize]) -> Vec<usize> {
     if a.is_empty() || b.is_empty() {
         return vec![];
     }
@@ -299,7 +299,7 @@ fn mul_ubi_short(a: &[usize], b: &[usize]) -> Vec<usize> {
 }
 
 #[inline]
-fn mul_ubi(a: &[usize], b: &[usize]) -> Vec<usize> {
+pub fn mul_ubi(a: &[usize], b: &[usize]) -> Vec<usize> {
     let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
     let half_len = long.len() / 2;
     if short.len() == 1 {
@@ -309,10 +309,8 @@ fn mul_ubi(a: &[usize], b: &[usize]) -> Vec<usize> {
         return mul_ubi_short(long, short);
     }
 
-    let l1 = &long[half_len..];
-    let l0 = &long[..half_len];
-    let s1 = &short[half_len..];
-    let s0 = &short[..half_len];
+    let (l0, l1) = long.split_at(half_len);
+    let (s0,s1) = short.split_at(half_len);
 
     let z2 = mul_ubi(l1, s1);
     let z0 = mul_ubi(l0, s0);

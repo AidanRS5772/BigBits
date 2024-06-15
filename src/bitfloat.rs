@@ -1,890 +1,295 @@
-use crate::bitfrac::BitFrac;
-use crate::bitint::BitInt;
 use crate::ubitint::*;
-use core::fmt;
-use once_cell::sync::Lazy;
 use std::ops::*;
-use std::cmp::*;
+use once_cell::sync::Lazy;
 
-#[inline]
-fn add_bf(m1: &mut Vec<usize>, m2: &[usize], sh: usize) -> bool {
-    let mut idx = m2.len() + sh;
-    if idx <= m1.len() {
-        unsafe {
-            let mut c: u8 = 0;
-            for (s, l) in m2.iter().rev().zip(m1[..idx].iter_mut().rev()) {
-                #[cfg(target_arch = "aarch64")]
-                add_with_carry_aarch64(l, *s, &mut c);
-    
-                #[cfg(target_arch = "x86_64")]
-                add_with_carry_x86_64(l, *s, &mut c);
-            }
+fn add_bf(a: &mut Vec<usize>, b: &[usize], sh: usize) -> isize {
+    let mut sstart = a.len() as isize - (b.len() + sh) as isize;
 
-            for l in m1[..idx - m2.len()].iter_mut().rev() {
+    if sstart < 0 {
+        let pad = vec![0; sstart.unsigned_abs()];
+        a.splice(0..0, pad);
+        sstart = 0;
+    }
+    let start = sstart.unsigned_abs();
+
+    let mut c: u8 = 0;
+    unsafe {
+        for (a_elem, &b_elem) in a[start..].iter_mut().zip(b) {
+            #[cfg(target_arch = "aarch64")]
+            add_with_carry_aarch64(a_elem, b_elem, &mut c);
+
+            #[cfg(target_arch = "x86_64")]
+            add_with_carry_x86_64(a_elem, b_elem, &mut c);
+        }
+
+        if c != 0 {
+            let a_len = a.len();
+            for a_elem in &mut a[a_len - sh..] {
                 if c == 0 {
                     break;
                 }
 
                 #[cfg(target_arch = "aarch64")]
-                add_carry_arch64(l, &mut c);
+                add_carry_aarch64(a_elem, &mut c);
 
                 #[cfg(target_arch = "x86_64")]
-                add_carry_x86_64(l, &mut c);
-            }
-
-            if let Some(idx) = m1.iter().rposition(|&x| x != 0) {
-                m1.truncate(idx + 1);
-            } else {
-                m1.clear();
-            }
-
-            if c == 1 {
-                m1.insert(0, 1);
-                return true;
-            }
-
-            return false;
-        }
-    } else {
-        if sh > m1.len() {
-            idx = sh - m1.len();
-            m1.extend(std::iter::repeat(0).take(idx));
-            m1.extend(m2.iter().cloned());
-            return false;
-        } else {
-            unsafe {
-                idx = m1.len() - sh;
-                let mut c:u8 = 0;
-                for (s, l) in m2[..idx].iter().rev().zip(m1.iter_mut().rev()) {
-                    #[cfg(target_arch = "aarch64")]
-                    add_with_carry_aarch64(l, *s, &mut c);
-
-                    #[cfg(target_arch = "x86_64")]
-                    add_with_carry_x86_64(l, *s, &mut c);
-                }
-
-                for l in m1[..sh].iter_mut().rev() {
-                    if c == 0 {
-                        break;
-                    }
-
-                    #[cfg(target_arch = "aarch64")]
-                    add_carry_arch64(l, &mut c);
-
-                    #[cfg(target_arch = "x86_64")]
-                    add_carry_x86_64(l, &mut c);
-                }
-
-                m1.extend(m2[idx..].iter().cloned());
-
-                if c == 1 {
-                    m1.insert(0, 1);
-                    return true;
-                }
-
-                return false;
+                add_carry_x86_64(a_elem, &mut c);
             }
         }
     }
+
+    if c == 1 {
+        a.push(1);
+    }
+
+    return c as isize;
 }
 
-#[inline]
-pub fn sub_bf(m1: &mut Vec<usize>, m2: &[usize], sh: usize) -> usize {
-    let mut idx = m2.len() + sh;
-    if idx <= m1.len() {
-        unsafe {
-            let mut c: u8 = 1;
-            for (s, l) in m2.iter().rev().zip(m1[..idx].iter_mut().rev()) {
-                #[cfg(target_arch = "aarch64")]
-                add_with_carry_aarch64(l, !*s, &mut c);
+fn sub_bf(a: &mut Vec<usize>, b: &[usize], sh: usize) -> isize {
+    let mut sstart = a.len() as isize - (b.len() + sh) as isize;
 
-                #[cfg(target_arch = "x86_64")]
-                add_with_carry_x86_64(l, !*s, &mut c);
-            }
-            if c == 0 {
-                for l in m1[..idx - m2.len()].iter_mut().rev() {
-                    #[cfg(target_arch = "aarch64")]
-                    sub_carry_aarch64(l, &mut c);
-
-                    #[cfg(target_arch = "x86_64")]
-                    sub_carry_x86_64(l, &mut c);
-                }
-            }
-        }
-
-        if let Some(idx) = m1.iter().rposition(|&x| x != 0) {
-            m1.truncate(idx + 1);
-        } else {
-            m1.clear();
-        }
-
-        if let Some(idx) = m1.iter().position(|&x| x != 0) {
-            m1.drain(..idx);
-            return idx;
-        } else {
-            m1.clear();
-            return 0;
-        }
-    } else {
-        if sh > m1.len() {
-            idx = sh - m1.len();
-            let mut m1_len = m1.len();
-            m1[m1_len - 1] -= 1;
-            m1.extend(std::iter::repeat(usize::MAX).take(idx));
-            m1.extend(m2.iter().map(|&x| !x));
-            m1_len = m1.len();
-            m1[m1_len - 1] += 1;
-            return 0;
-        } else {
-            unsafe {
-                idx = m1.len() - sh;
-                let mut c:u8 = 0;
-                for (s, l) in m2[..idx].iter().rev().zip(m1.iter_mut().rev()) {
-                    #[cfg(target_arch = "aarch64")]
-                    add_with_carry_aarch64(l, !*s, &mut c);
-
-                    #[cfg(target_arch = "x86_64")]
-                    add_with_carry_x86_64(l, !*s, &mut c);
-                }
-
-                if c == 0 {
-                    for l in m1[..sh].iter_mut().rev() {
-                        #[cfg(target_arch = "aarch64")]
-                        sub_carry_aarch64(l, &mut c);
-
-                        #[cfg(target_arch = "x86_64")]
-                        sub_carry_x86_64(l, &mut c);
-                    }
-                }
-            }
-
-            m1.extend(m2[idx..].iter().map(|&x| !x));
-            let m1_len = m1.len();
-            m1[m1_len - 1] += 1;
-
-            if let Some(idx) = m1.iter().position(|&x| x != 0) {
-                m1.drain(..idx);
-                return idx;
-            } else {
-                m1.clear();
-                return 0;
-            }
-        }
+    if sstart < 0 {
+        let pad = vec![0; sstart.unsigned_abs()];
+        a.splice(0..0, pad);
+        sstart = 0;
     }
-}
+    let start = sstart.unsigned_abs();
 
-#[inline]
-fn mul_bf(m1: &[usize], m2: &[usize], acc: usize) -> (Vec<usize>, bool) {
-    if m2.is_empty() || m1.is_empty() {
-        return (vec![], false);
-    }
-    let m1_len = m1.len() - 1;
-    let m2_len = m2.len() - 1;
+    println!("a: {:?}, b: {:?}", a, b);
 
-    let mut out: Vec<usize> = Vec::with_capacity(m1_len + m2_len + 1);
-
-    let mask = (1u128 << 64) - 1;
-
-    let mut carry: u128 = 0;
-    for i in acc..=(m1_len + m2_len) {
-        let mut term: u128 = carry;
-        carry = 0;
-        for j in i.saturating_sub(m2_len)..=i.min(m1_len) {
-            let val = (m1[m1_len - j] as u128) * (m2[m2_len - (i - j)] as u128);
-            term += val & mask;
-            carry += val >> 64;
-        }
-        carry += term >> 64;
-        out.push(term as usize);
-    }
-
-    let mut is_carry = false;
-    if carry > 0 {
-        out.push(carry as usize);
-        is_carry = true;
-    }
-    out.reverse();
-
-    if let Some(idx) = out.iter().rposition(|&x| x != 0) {
-        out.truncate(idx + 1);
-    }
-
-    (out, is_carry)
-}
-
-#[inline]
-fn shl_bf_sup(m: &mut Vec<usize>, sh: u8) -> bool {
-    let mv_sz = 64 - sh;
-    let mut carry = 0_usize;
     unsafe {
-        for elem in m.iter_mut().rev() {
+        let mut c: u8 = 1;
+        for (a_elem, &b_elem) in a[start..].iter_mut().zip(b) {
             #[cfg(target_arch = "aarch64")]
-            shl_carry_aarch64(elem, &mut carry, sh, mv_sz);
+            add_with_carry_aarch64(a_elem, !b_elem, &mut c);
 
             #[cfg(target_arch = "x86_64")]
-            shl_carry_x86_64(elem, &mut carry, sh, mv_sz);
+            add_with_carry_x86_64(a_elem, !b_elem, &mut c);
         }
 
-        let mut out = false;
-        if carry > 0 {
-            m.insert(0, carry);
-            out = true;
-        }
-        if m[m.len() - 1] == 0 {
-            m.pop();
-        }
-        return out;
-    }
-}
+        if c == 0 {
+            let a_len = a.len();
+            for a_elem in &mut a[a_len - sh..] {
+                #[cfg(target_arch = "aarch64")]
+                add_carry_aarch64(a_elem, &mut c);
 
-pub static TWO: Lazy<BitFloat> = Lazy::new(|| BitFloat {
-    m: vec![2],
-    exp: 0,
-    sign: false,
-});
-
-#[inline]
-fn stop_crit(m: &[usize], acc: usize) -> bool {
-    for e in m[1..acc.min(m.len())].iter() {
-        if *e != 0 {
-            return true;
+                #[cfg(target_arch = "x86_64")]
+                add_carry_x86_64(a_elem, &mut c);
+            }
         }
     }
 
-    return false;
-}
+    println!("a: {:?}", a);
 
-#[inline]
-fn div_bf_gs(n: &mut BitFloat, d: &mut BitFloat) {
-    let acc = (n.m.len().max(d.m.len()) + 1).max(3);
-    n.exp -= d.exp + 1;
-    d.exp = -1;
-
-    let sh = d.m[0].leading_zeros() as u8;
-    if sh != 0{
-        shl_bf_sup(&mut d.m, sh);
-        n.exp += shl_bf_sup(&mut n.m, sh) as isize;
-    }
-
-    let n_sign = n.sign;
-    let d_sign = d.sign;
-    n.abs();
-    d.abs();
-
-    let mut f = &*TWO - &*d;
-    while stop_crit(&f.m, acc) {
-        d.stbl_mul_assign(&f, acc);
-        n.stbl_mul_assign(&f, acc);
-        f = &*TWO - &*d;
-    }
-
-    n.sign = n_sign ^ d_sign;
-}
-
-pub static ONE: Lazy<BitFloat> = Lazy::new(|| BitFloat {
-    m: vec![1],
-    exp: 0,
-    sign: false,
-});
-
-#[inline]
-fn powi_ubi(x: BitFloat, n: UBitInt) -> BitFloat {
-    if n == 0_usize {
-        return (*ONE).clone();
-    } else if n == 1_usize {
-        return x.clone();
-    } else if n.mod2() {
-        return &x * powi_ubi(&x * &x, n >> 1_usize);
+    if let Some(idx) = a.iter().rposition(|&x| x != 0) {
+        a.truncate(idx + 1);
+        return -(a.len() as isize - idx as isize - 1);
     } else {
-        return powi_ubi(&x * &x, n >> 1_usize);
+        a.clear();
+        return 0;
     }
 }
 
-#[inline]
-fn powi_prim(x: BitFloat, n: u128) -> BitFloat {
-    if n == 0 {
-        return (*ONE).clone();
-    } else if n == 1 {
-        return x.clone();
-    } else if n % 2 == 1 {
-        return &x * powi_prim(&x * &x, n / 2);
-    } else {
-        return powi_prim(&x * &x, n / 2);
-    }
-}
+fn shl_bf(bf: &mut BitFloat, sh: u128){
+    let div = (sh / 64) as isize;
+    let rem = (sh % 64) as u8;
+    bf.exp += div;
 
-pub static HARMONICS: [Lazy<BitFloat>; 34] = [
-    Lazy::new(|| BitFloat {
-        m: vec![9223372036854775808],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            6148914691236517205,
-            6148914691236517205,
-            6148914691236517205,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![4611686018427387904],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            3689348814741910323,
-            3689348814741910323,
-            3689348814741910323,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            3074457345618258602,
-            12297829382473034410,
-            12297829382473034410,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            2635249153387078802,
-            5270498306774157604,
-            10540996613548315209,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![2305843009213693952],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            2049638230412172401,
-            14347467612885206812,
-            8198552921648689607,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            1844674407370955161,
-            11068046444225730969,
-            11068046444225730969,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            1676976733973595601,
-            8384883669867978007,
-            5030930201920786804,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            1537228672809129301,
-            6148914691236517205,
-            6148914691236517205,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            1418980313362273201,
-            4256940940086819603,
-            12770822820260458811,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            1317624576693539401,
-            2635249153387078802,
-            5270498306774157604,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            1229782938247303441,
-            1229782938247303441,
-            1229782938247303441,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![1152921504606846976],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            1085102592571150095,
-            1085102592571150095,
-            1085102592571150095,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            1024819115206086200,
-            16397105843297379214,
-            4099276460824344803,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            970881267037344821,
-            16504981539634861972,
-            3883525068149379287,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            922337203685477580,
-            14757395258967641292,
-            14757395258967641292,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            878416384462359600,
-            14054662151397753612,
-            3513665537849438403,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            838488366986797800,
-            13415813871788764811,
-            11738837137815169210,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            802032351030850070,
-            4812194106185100421,
-            10426420563401050913,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            768614336404564650,
-            12297829382473034410,
-            12297829382473034410,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            737869762948382064,
-            11805916207174113034,
-            4427218577690292387,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            709490156681136600,
-            11351842506898185609,
-            15608783446985005213,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            683212743470724133,
-            17080318586768103348,
-            2732850973882896535,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            658812288346769700,
-            10540996613548315209,
-            2635249153387078802,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            636094623231363848,
-            15266270957552732371,
-            15902365580784096220,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![614891469123651720, 9838263505978427528, 9838263505978427528],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![595056260442243600, 9520900167075897608, 4760450083537948804],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![576460752303423488],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![
-            558992244657865200,
-            8943875914525843207,
-            13974806116446630012,
-        ],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![542551296285575047, 9765923333140350855, 9765923333140350855],
-        exp: -1,
-        sign: false,
-    }),
-    Lazy::new(|| BitFloat {
-        m: vec![527049830677415760, 8432797290838652167, 5797548137451573365],
-        exp: -1,
-        sign: false,
-    }),
-];
+    let mv_sz = 64 - rem;
 
-#[inline]
-fn pow_pow_2(x: &BitFloat, n: u128, acc: usize) -> BitFloat {
-    let mut out = x.clone();
-    for _ in 0..n {
-        out = (&out).stbl_mul(&out, acc);
-    }
+    if rem != 0{
+        let mut carry:usize = 0;
+        unsafe{
+            for elem in  &mut bf.m{
+                #[cfg(target_arch = "aarch64")]
+                shl_carry_aarch64(elem, &mut carry, rem, mv_sz);
 
-    out
-}
-
-pub static EXP: Lazy<BitFloat> = Lazy::new(|| BitFloat {
-    m: vec![2, 13249961062380150784],
-    exp: 0,
-    sign: false,
-});
-
-#[inline]
-pub fn exp_bf(x: &BitFloat) -> BitFloat {
-    let sz = x.m.len().max(3);
-    let acc = ((x.exp as i128 - x.m.len() as i128 + 1) as isize).min(-1);
-    if x.exp < 0 {
-        let mut out = &*ONE + x;
-        let mut term = x.clone();
-
-        let mut flag = true;
-        for i in 0..34 {
-            term.stbl_mul_assign(x.stbl_mul(&*HARMONICS[i], sz), sz);
-            out += &term;
-            if term.exp < acc {
-                flag = false;
-                break;
+                #[cfg(target_arch = "x86_64")]
+                shl_carry_x86_64(elem, &mut carry, rem, mv_sz);
             }
         }
 
-        if flag {
-            let i: usize = 36;
-            while term.exp >= acc {
-                let div = BitFloat {
-                    m: vec![i],
-                    exp: 0,
-                    sign: false,
-                };
-                term.stbl_mul_assign(x, sz);
-                term /= div;
-                out += &term;
-            }
-        }
-
-        return out;
-    } else {
-        let mut val = x.clone();
-        val.abs();
-        val.exp = 0;
-        let sh = (val.m[0].leading_zeros() + 1) as u8;
-        shl_bf_sup(&mut val.m, sh);
-
-        let mut sum = val.clone();
-        val -= &*ONE;
-        let mut term = val.clone();
-
-        let mut flag = true;
-        for i in 0..34 {
-            term.stbl_mul_assign((&*HARMONICS[i]).stbl_mul(&val, sz), sz);
-            sum += &term;
-
-            if term.exp < acc {
-                flag = false;
-                break;
-            }
-        }
-
-        if flag {
-            let mut i: usize = 36;
-            while term.exp >= acc {
-                let div = BitFloat {
-                    m: vec![i],
-                    exp: 0,
-                    sign: false,
-                };
-                term.stbl_mul_assign(&val, sz);
-                term /= div;
-                sum += &term;
-                i += 1;
-            }
-        }
-
-        sum.stbl_mul_assign(&*EXP, sz);
-        let out = pow_pow_2(&sum, 64 * (x.exp as u128 + 1) - sh as u128, sz);
-
-        if x.sign {
-            return &*ONE / out;
-        } else {
-            return out;
+        if carry > 0{
+            bf.m.push(carry);
+            bf.exp += 1;
         }
     }
 }
 
-pub static LN2: Lazy<BitFloat> = Lazy::new(|| BitFloat {
-    m: vec![12786308645202655232],
-    exp: -1,
-    sign: false,
-});
+fn shr_bf(bf: &mut BitFloat, sh: u128){
+    let div = (sh / 64) as isize;
+    let rem = (sh % 64) as u8;
+    bf.exp -= div;
 
-#[inline]
-pub fn ln_bf(x: &BitFloat) -> BitFloat {
-    let sz = x.m.len().max(3);
-    let acc = ((x.exp as i128 - x.m.len() as i128 + 1) as isize).min(-1);
-    let mut val = x.clone();
-    val.abs();
-    val.exp = 0;
-    let sh = (val.m[0].leading_zeros() + 1) as u8;
-    shl_bf_sup(&mut val.m, sh);
-    val -= &*ONE;
-    val /= &*TWO + &val;
-    let mut sum = val.clone();
-    let mut term = val.clone();
-    val = (&val).stbl_mul(&val, sz);
+    let mv_sz = 64 - rem;
 
-    let mut flag = true;
-    for i in 0..17 {
-        term.stbl_mul_assign(&val, sz);
-        let add = (&term).stbl_mul(&*HARMONICS[2 * i + 1], sz);
-        sum += &add;
-        if add.exp < acc {
-            flag = false;
-            break;
+    if rem != 0{
+        let mut carry:usize = 0;
+        unsafe{
+            for elem in bf.m.iter_mut().rev() {
+                #[cfg(target_arch = "aarch64")]
+                shr_carry_aarch64(elem, &mut carry, rem, mv_sz);
+
+                #[cfg(target_arch = "x86_64")]
+                shr_carry_x86_64(elem, &mut carry, rem, mv_sz);
+            }
+        }
+
+        if bf.m[bf.m.len() - 1] == 0 {
+            bf.m.pop();
+            bf.exp -= 1;
         }
     }
-
-    if flag {
-        let mut i: usize = 37;
-        let mut add_exp = 0;
-        while add_exp >= acc {
-            let div = BitFloat {
-                m: vec![i],
-                exp: 0,
-                sign: false,
-            };
-            term.stbl_mul_assign(&val, sz);
-            let add = &term / div;
-            add_exp = add.exp;
-            sum += add;
-
-            i += 2
-        }
-    }
-
-    sum *= &*TWO;
-    sum += BitFloat::from(64 * (x.exp as i128 + 1) - sh as i128) * &*LN2;
-
-    return sum;
 }
 
-pub fn sqrt_bf(val: &BitFloat, acc: isize) -> BitFloat {
-    let mut x = val.clone();
+pub static A:Lazy<BitFloat> = Lazy::new(|| {BitFloat::from(256.0/99.0)});
+pub static B:Lazy<BitFloat> = Lazy::new(|| {BitFloat::from(-64.0/11.0)});
+pub static C:Lazy<BitFloat> = Lazy::new(|| {BitFloat::from(140.0/33.0)});
+pub static ONE:Lazy<BitFloat> = Lazy::new(|| {BitFloat::from(1)});
 
-    loop {
-        let term: BitFloat = (val / &x - &x) / 2.0;
-        x += &term;
-        if term.exp < acc {
-            break;
-        }
-    }
-    x
+pub fn recipricol(d: &mut BitFloat) {
+    let d_log2 = d.log2_int() + 1;
+    *d >>= d_log2;
+
+    println!("d: {:?}", (*d).to().unwrap());
+
+    let mut x = &*C + (&*d).mul_stbl((&*A).mul_stbl(&*d) + &*B);
+
+    println!("x: {:?}", x.to().unwrap());
+
+    let max_i = ((d.m.len()*64) as f64 / 6.62935662007960961).log(3.0) as usize;
+
+    println!("max i: {max_i}");
+    println!("d*x: {:?}", (&*d).mul_stbl(&x));
+    println!("1-d*x: {:?}", ((&*ONE) - (&*d).mul_stbl(&x)));
+
+    // for _ in 0..max_i{
+    //     let e = &*ONE - (&*d).mul_stbl(&x);
+    //     let y = (&x).mul_stbl(&e);
+    //     x += &y + (&y).mul_stbl(&e);
+
+    //     println!("\ne: {}", e.to().unwrap());
+    //     println!("y: {}", y.to().unwrap());
+    //     println!("x: {}\n", x.to().unwrap());
+    // }
+
+    // *d = x;
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BitFloat {
-    pub m: Vec<usize>,
-    pub exp: isize,
-    pub sign: bool,
+    m: Vec<usize>,
+    exp: isize,
+    sign: bool,
 }
 
-pub trait SEM {
-    fn sign_exp_m(self) -> (bool, isize, Vec<usize>);
+pub trait MES {
+    fn get_mes(self) -> (Vec<usize>, isize, bool);
 }
 
-impl SEM for f64{
-    fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
+impl MES for f64 {
+    fn get_mes(self) -> (Vec<usize>, isize, bool) {
         let bits = self.to_bits();
-        let sign = (bits >> 63) == 1;
-        let exp2 = ((bits >> 52) & 0x7FF) as isize - 1023;
+        let exp_2 = ((bits >> 52) & 0x7FF) as isize - 1023;
 
-        let (exp, sh) = if exp2 >= 0 {
-            (exp2 / 64, exp2 % 64)
+        let exp = if exp_2 < 0 {
+            exp_2 / 64 - 1
         } else {
-            (exp2 / 64 - 1, 64 - exp2 % 64)
+            exp_2 / 64
         };
 
-        let m2 = (((bits & 0xFFFFFFFFFFFFF) | 0x10000000000000) as u128) << (sh + 12);
+        let mut m_bin = (((bits & 0xFFFFFFFFFFFFF) | 0x10000000000000) as u128) << 12;
 
-        let mut m = vec![];
-        let upper_m2 = (m2 >> 64) as usize;
-
-        if upper_m2 == 0{
-            m.push(m2 as usize);
-        }else{
-            if m2 as usize != 0{
-                m.push(m2 as usize);
-            }
-            m.push(upper_m2);
+        if exp_2 < 0 {
+            m_bin <<= 64 + exp_2 % 64;
+        } else {
+            m_bin <<= exp_2 % 64
         }
 
-        (sign, exp, m)
-    }
-}
+        let mut m: Vec<usize> = vec![];
+        let m1: usize = (m_bin >> 64) as usize;
+        let m2: usize = m_bin as usize;
 
-impl SEM for f32{
-    fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
-        let bits = self.to_bits();
-        let sign = (bits >> 31) == 1;
-        let exp2 = ((bits >> 23) & 0xFF) as isize - 127;
-
-        let (exp, sh) = if exp2 >= 0 {
-            (exp2 / 64, exp2 % 64 + 1)
-        } else {
-            (exp2 / 64 - 1, 64 - exp2 % 64 + 1)
-        };
-
-        let m2 = (((bits & 0x7FFFF) | 0x80000) as u128) << sh;
-
-        let mut m = vec![];
-        let upper_m2 = (m2 >> 64) as usize;
-
-        if upper_m2 == 0{
-            m.push(m2 as usize);
-        }else{
-            if m2 as usize != 0{
-                m.push(m2 as usize);
-            }
-            m.push(upper_m2);
+        if m2 != 0 {
+            m.push(m2);
+        }
+        if m1 != 0 {
+            m.push(m1);
         }
 
-        (sign, exp, m)
+        return (m, exp, self < 0.0);
     }
 }
 
-impl SEM for i128{
-    fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
-        let m1 = (self.unsigned_abs() & 0xFFFFFFFFFFFFFFFF) as usize;
-        let m2 = (self.unsigned_abs() >> 64) as usize;
-        let (exp, m) = if m2 == 0{
-            if m1 == 0{
-                (1_isize, vec![])
-            }else{
-                (1_isize, vec![m1])
-            }
-        }else{
-            (2_isize, vec![m2, m1])
+impl MES for f32 {
+    fn get_mes(self) -> (Vec<usize>, isize, bool) {
+        let bits = self.to_bits();
+        let exp_2 = ((bits >> 23) & 0xFF) as isize - 127;
+
+        let exp = if exp_2 < 0 {
+            exp_2 / 64 - 1
+        } else {
+            exp_2 / 64
         };
 
-        (self < 0, exp, m)
+        let mut m_bin = (((bits & 0x7FFFFF) | 0x800000) as u128) << 41;
+
+        if exp_2 < 0 {
+            m_bin <<= 64 + exp_2 % 64;
+        } else {
+            m_bin <<= exp_2 % 64
+        }
+
+        let mut m: Vec<usize> = vec![];
+        let m1: usize = (m_bin >> 64) as usize;
+        let m2: usize = m_bin as usize;
+
+        if m2 != 0 {
+            m.push(m2);
+        }
+        if m1 != 0 {
+            m.push(m1);
+        }
+
+        return (m, exp, self < 0.0);
     }
 }
 
-impl SEM for u128{
-    fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
-        let m1 = (self & 0xFFFFFFFFFFFFFFFF) as usize;
-        let m2 = (self >> 64) as usize;
-        let (exp, m) = if m2 == 0{
-            if m1 == 0{
-                (1_isize, vec![])
-            }else{
-                (1_isize, vec![m1])
-            }
-        }else{
-            (2_isize, vec![m2, m1])
-        };
+impl MES for i128 {
+    fn get_mes(self) -> (Vec<usize>, isize, bool) {
+        let uval = self.unsigned_abs();
 
-        (false, exp, m)
+        let m1 = (uval >> 64) as usize;
+        let m2 = uval as usize;
+
+        let mut exp: isize = 0;
+        let mut m: Vec<usize> = vec![];
+
+        if m2 != 0 {
+            m.push(m2);
+        }
+        if m1 != 0 {
+            m.push(m1);
+            exp = 1;
+        }
+
+        return (m, exp, self < 0);
     }
 }
 
-macro_rules! impl_sem_iprim {
+macro_rules! impl_MES_bf_iprim {
     ($($t:ty),*) => {
         $(
-            impl SEM for $t{
-                fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
-                    (self < 0, 0, vec![self as usize])
+            impl MES for $t{
+                fn get_mes(self) -> (Vec<usize>, isize, bool){
+                    (vec![self as usize], 0, self < 0)
                 }
             }
         )*
     };
 }
 
-macro_rules! impl_sem_uprim {
-    ($($t:ty),*) => {
-        $(
-            impl SEM for $t{
-                fn sign_exp_m(self) -> (bool, isize, Vec<usize>) {
-                    (false, 0, vec![self as usize])
-                }
-            }
-        )*
-    };
-}
-
-impl_sem_iprim!(i64, isize, i32, i16, i8);
-impl_sem_uprim!(u64, usize, u32, u16, u8);
+impl_MES_bf_iprim!(i64, isize, i32, i16, i8);
 
 impl BitFloat {
     pub fn get_m(&self) -> Vec<usize> {
@@ -899,1802 +304,1014 @@ impl BitFloat {
         self.sign
     }
 
-    #[inline]
-    pub fn make(m:Vec<usize>, exp: isize, sign:bool) -> BitFloat{
-        BitFloat{m,exp,sign}
+    pub fn make(m: Vec<usize>, exp: isize, sign: bool) -> BitFloat {
+        BitFloat { m, exp, sign }
     }
 
-    #[inline]
-    pub fn from<T: SEM>(val: T) -> BitFloat {
-        let (sign, exp, m) = val.sign_exp_m();
-        BitFloat { sign, exp, m }
+    pub fn from<T: MES>(val: T) -> BitFloat {
+        let (m, exp, sign) = val.get_mes();
+        BitFloat { m, exp, sign }
     }
 
-    #[inline]
-    pub fn from_bi(val: BitInt) -> BitFloat {
-        let mut m = val.val.data;
-        let exp = m.len().saturating_sub(1) as isize;
-        m.reverse();
-
-        if let Some(idx) = m.iter().rposition(|&x| x != 0) {
-            m.truncate(idx + 1);
-        } else {
-            m.clear();
-        }
-
-        BitFloat {
-            m,
-            exp,
-            sign: val.sign,
-        }
-    }
-
-    #[inline]
-    pub fn from_bfr(val: BitFrac) -> BitFloat {
-        let n = BitFloat::from_bi(BitInt {
-            val: val.n,
-            sign: false,
-        });
-
-        let d = BitFloat::from_bi(BitInt {
-            val: val.d,
-            sign: false,
-        });
-
-        if val.sign {
-            -n / d
-        } else {
-            n / d
-        }
-    }
-
-    pub fn from_str(val: &str) -> Result<BitFloat, String> {
-        if let Some(idx) = val.find('.') {
-            let mut mul = (&*TEN).powi((idx - 1) as isize);
-            let mut sum = BitFloat::from(0);
-            for c in val.chars() {
-                if let Some(dig) = c.to_digit(10) {
-                    sum += BitFloat::from(dig) * &mul;
-                    mul /= &*TEN;
-                } else {
-                    if c == '.' {
-                        continue;
-                    } else {
-                        return Err("here 1 malformed string as an input".to_string());
-                    }
-                }
-            }
-
-            return Ok(sum);
-        } else {
-            return Err("here 2 malformed string as an input".to_string());
-        }
-    }
-
-    #[inline]
     pub fn to(&self) -> Result<f64, String> {
-        if self.exp > 1023 / 64 || self.exp < -1022 / 64 {
-            return Err("BitFloat is to large or small for f64".to_string());
-        }
-
-        let mut out = 0.0;
-        let base = (1_u128 << 64) as f64;
-        let mut mul = base.powi(self.exp as i32);
-        for elem in &self.m {
-            out += (*elem as f64) * mul;
-            mul /= base;
-        }
-
-        if self.sign {
-            Ok(-out)
+        let exp: i32 = if let Ok(exp) = self.exp.try_into() {
+            exp
         } else {
-            Ok(out)
+            return Err("BitFloat is too large or to small for f64".to_string());
+        };
+
+        let first_val = if let Some(&val) = self.m.get(self.m.len().saturating_sub(1)){
+            val
+        }else{
+            return Ok(0.0);
+        };
+
+        let base = 2_f64.powi(64);
+        let mut sc = 2_f64.powi(64 * exp);
+
+        let mut out = sc * first_val as f64;
+
+        if out.is_infinite() {
+            return Err("BitFloat is to large for f64".to_string());
         }
+
+        for &e in self.m[..(self.m.len() - 1)].iter().rev() {
+            sc /= base;
+            out += sc * e as f64;
+        }
+
+        Ok(out)
     }
 
-    #[inline]
-    pub fn abs_cmp(&self, other: &BitFloat) -> Ordering {
-        use Ordering::*;
-        let exp_cmp = self.exp.cmp(&other.exp);
-        if exp_cmp != Equal {
-            return exp_cmp;
+    pub fn abs_cmp(&self, other: &BitFloat) -> std::cmp::Ordering {
+        use std::cmp::Ordering::*;
+        let exp_ord = self.exp.cmp(&other.exp);
+        if exp_ord != Equal {
+            return exp_ord;
         }
 
-        for (l, r) in self.m.iter().zip(&other.m) {
-            if l > r {
-                return Greater;
-            } else if l < r {
-                return Less;
+        match (self.m.is_empty(), other.m.is_empty()){
+            (true, true) => return Equal,
+            (true, false) => return Less,
+            (false, true) => return Greater,
+            (false, false) => {},
+        }
+
+        let mut m_ord: std::cmp::Ordering;
+
+        for (&a, b) in self.m.iter().rev().zip(other.m.iter().rev()) {
+            m_ord = a.cmp(b);
+            if m_ord != Equal {
+                return m_ord;
             }
         }
 
-        return self.m.len().cmp(&other.m.len());
+        std::cmp::Ordering::Equal
     }
 
-    #[inline]
-    pub fn abs(&mut self) {
-        self.sign = false;
+    pub fn log2_int(&self) -> i128{
+        let mut out = self.exp as i128 * 64;
+        out += 64 - self.m[self.m.len()-1].leading_zeros() as i128 - 1;
+        return out;
     }
-
-    #[inline]
-    pub fn neg(&mut self) {
-        self.sign = !self.sign;
-    }
-}
-
-pub static LN10: Lazy<BitFloat> = Lazy::new(|| BitFloat {
-    m: vec![2, 5581709770980769792],
-    exp: 0,
-    sign: false,
-});
-
-pub static TEN: Lazy<BitFloat> = Lazy::new(|| BitFloat {
-    m: vec![10],
-    exp: 0,
-    sign: false,
-});
-
-impl fmt::Display for BitFloat {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let sz = self.ln() / &*LN10;
-        let exp: String;
-        if sz.exp >= 0 {
-            let mut exp_ubi_data = sz.m[..(sz.exp as usize + 1)].to_vec();
-            exp_ubi_data.reverse();
-            let mut exp_bi = BitInt {
-                val: UBitInt { data: exp_ubi_data },
-                sign: sz.sign,
-            };
-            if sz.sign {
-                exp_bi -= 1;
-            }
-            exp = format!(" E {}", exp_bi.to_string());
-        } else {
-            exp = "".to_string();
-        }
-
-        let mut val = self.clone();
-        val.exp = 0;
-
-        let mut out = val.m[0].to_string();
-        if let Some((index, _)) = out.bytes().enumerate().nth(1) {
-            out.insert(index, '.');
-        } else {
-            out.push('.');
-        }
-
-        let mut sub = val.m[0] as u128 * 10;
-        val *= 10.0;
-        val -= BitFloat::from(sub);
-
-        while !val.m.is_empty() {
-            if val.exp < 0 {
-                out = format!("{}{}", out, 0.to_string());
-                val *= &*TEN;
-            } else {
-                out = format!("{}{}", out, val.m[0].to_string());
-                sub = val.m[0] as u128 * 10;
-                val *= &*TEN;
-                val -= BitFloat::from(sub);
-            };
-        }
-
-        out = format!("{}{}", out, exp);
-
-        write!(f, "{}", out)?;
-        Ok(())
-    }
-}
-
-impl PartialEq<f64> for BitFloat {
-    #[inline]
-    fn eq(&self, other: &f64) -> bool {
-        return *self == BitFloat::from(*other);
-    }
-}
-
-impl PartialEq<f32> for BitFloat {
-    #[inline]
-    fn eq(&self, other: &f32) -> bool {
-        return *self == BitFloat::from(*other);
-    }
-}
-
-impl PartialOrd for BitFloat {
-    #[inline]
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        use Ordering::*;
-        if self.sign ^ other.sign {
-            if self.sign {
-                return Some(Less);
-            } else {
-                return Some(Greater);
-            }
-        }
-
-        let cmp_exp = self.exp.cmp(&other.exp);
-        if cmp_exp != Equal {
-            if self.sign {
-                return Some(cmp_exp.reverse());
-            } else {
-                return Some(cmp_exp);
-            }
-        }
-
-        let mut cmp_m = Equal;
-        for (l, r) in self.m.iter().zip(&other.m) {
-            if l > r {
-                cmp_m = Greater;
-            } else if r < l {
-                cmp_m = Less;
-            }
-        }
-
-        if self.sign {
-            return Some(cmp_m.reverse());
-        } else {
-            return Some(cmp_m);
-        }
-    }
-}
-
-impl PartialOrd<f64> for BitFloat {
-    #[inline]
-    fn partial_cmp(&self, other: &f64) -> Option<Ordering> {
-        self.partial_cmp(&BitFloat::from(*other))
-    }
-}
-
-impl PartialOrd<f32> for BitFloat {
-    #[inline]
-    fn partial_cmp(&self, other: &f32) -> Option<Ordering> {
-        self.partial_cmp(&BitFloat::from(*other))
-    }
-}
-
-impl Eq for BitFloat {}
-
-impl Ord for BitFloat {
-    #[inline]
-    fn cmp(&self, other: &Self) -> Ordering {
-        use Ordering::*;
-        if self.sign ^ other.sign {
-            if self.sign {
-                return Less;
-            } else {
-                return Greater;
-            }
-        }
-
-        let cmp_exp = self.exp.cmp(&other.exp);
-        if cmp_exp != Equal {
-            if self.sign {
-                return cmp_exp.reverse();
-            } else {
-                return cmp_exp;
-            }
-        }
-
-        let mut cmp_m = Equal;
-        for (l, r) in self.m.iter().zip(&other.m) {
-            if l > r {
-                cmp_m = Greater;
-            } else if r < l {
-                cmp_m = Less;
-            }
-        }
-
-        if self.sign {
-            return cmp_m.reverse();
-        } else {
-            return cmp_m;
-        }
-    }
-}
-
-impl Add for BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn add(self, rhs: Self) -> Self::Output {
-        use Ordering::*;
-        let sh = (self.exp - rhs.exp).unsigned_abs();
-
-        if self.m.is_empty() {
-            return rhs;
-        }
-        if rhs.m.is_empty() {
-            return self;
-        }
-
-        match self.abs_cmp(&rhs) {
-            Greater => {
-                let mut m = self.m;
-                let mut exp = self.exp;
-                if self.sign ^ rhs.sign {
-                    exp -= sub_bf(&mut m, &rhs.m, sh) as isize;
-                } else {
-                    exp += add_bf(&mut m, &rhs.m, sh) as isize;
-                }
-                BitFloat {
-                    exp,
-                    m,
-                    sign: self.sign,
-                }
-            }
-            Less => {
-                let mut m = rhs.m;
-                let mut exp = rhs.exp;
-                if self.sign ^ rhs.sign {
-                    exp -= sub_bf(&mut m, &self.m, sh) as isize;
-                } else {
-                    exp += add_bf(&mut m, &self.m, sh) as isize;
-                }
-                BitFloat {
-                    exp,
-                    m,
-                    sign: rhs.sign,
-                }
-            }
-            Equal => {
-                if self.sign ^ rhs.sign {
-                    return BitFloat {
-                        sign: false,
-                        exp: 0,
-                        m: vec![],
-                    };
-                } else {
-                    let mut m = self.m;
-                    let mut exp = self.exp;
-                    exp += add_bf(&mut m, &rhs.m, sh) as isize;
-                    BitFloat {
-                        exp,
-                        m,
-                        sign: self.sign,
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl Add for &BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn add(self, rhs: Self) -> Self::Output {
-        use Ordering::*;
-        let sh = (self.exp - rhs.exp).unsigned_abs();
-
-        if self.m.is_empty() {
-            return rhs.clone();
-        }
-        if rhs.m.is_empty() {
-            return self.clone();
-        }
-
-        match self.abs_cmp(&rhs) {
-            Greater => {
-                let mut m = self.m.clone();
-                let mut exp = self.exp;
-                if self.sign ^ rhs.sign {
-                    exp -= sub_bf(&mut m, &rhs.m, sh) as isize;
-                } else {
-                    exp += add_bf(&mut m, &rhs.m, sh) as isize;
-                }
-                BitFloat {
-                    exp,
-                    m,
-                    sign: self.sign,
-                }
-            }
-            Less => {
-                let mut m = rhs.m.clone();
-                let mut exp = rhs.exp;
-                if self.sign ^ rhs.sign {
-                    exp -= sub_bf(&mut m, &self.m, sh) as isize;
-                } else {
-                    exp += add_bf(&mut m, &self.m, sh) as isize;
-                }
-                BitFloat {
-                    exp,
-                    m,
-                    sign: rhs.sign,
-                }
-            }
-            Equal => {
-                if self.sign ^ rhs.sign {
-                    return BitFloat {
-                        sign: false,
-                        exp: 0,
-                        m: vec![],
-                    };
-                } else {
-                    let mut m = self.m.clone();
-                    let mut exp = self.exp;
-                    exp += add_bf(&mut m, &rhs.m, sh) as isize;
-                    BitFloat {
-                        exp,
-                        m,
-                        sign: self.sign,
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl Add<&BitFloat> for BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn add(self, rhs: &BitFloat) -> Self::Output {
-        use Ordering::*;
-        let sh = (self.exp - rhs.exp).unsigned_abs();
-
-        if self.m.is_empty() {
-            return rhs.clone();
-        }
-        if rhs.m.is_empty() {
-            return self;
-        }
-
-        match self.abs_cmp(&rhs) {
-            Greater => {
-                let mut m = self.m;
-                let mut exp = self.exp;
-                if self.sign ^ rhs.sign {
-                    exp -= sub_bf(&mut m, &rhs.m, sh) as isize;
-                } else {
-                    exp += add_bf(&mut m, &rhs.m, sh) as isize;
-                }
-                BitFloat {
-                    exp,
-                    m,
-                    sign: self.sign,
-                }
-            }
-            Less => {
-                let mut m = rhs.m.clone();
-                let mut exp = rhs.exp;
-                if self.sign ^ rhs.sign {
-                    exp -= sub_bf(&mut m, &self.m, sh) as isize;
-                } else {
-                    exp += add_bf(&mut m, &self.m, sh) as isize;
-                }
-                BitFloat {
-                    exp,
-                    m,
-                    sign: rhs.sign,
-                }
-            }
-            Equal => {
-                if self.sign ^ rhs.sign {
-                    return BitFloat {
-                        sign: false,
-                        exp: 0,
-                        m: vec![],
-                    };
-                } else {
-                    let mut m = self.m;
-                    let mut exp = self.exp;
-                    exp += add_bf(&mut m, &rhs.m, sh) as isize;
-                    BitFloat {
-                        exp,
-                        m,
-                        sign: self.sign,
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl Add<BitFloat> for &BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn add(self, rhs: BitFloat) -> Self::Output {
-        use Ordering::*;
-        let sh = (self.exp - rhs.exp).unsigned_abs();
-
-        if self.m.is_empty() {
-            return rhs;
-        }
-        if rhs.m.is_empty() {
-            return self.clone();
-        }
-
-        match self.abs_cmp(&rhs) {
-            Greater => {
-                let mut m = self.m.clone();
-                let mut exp = self.exp;
-                if self.sign ^ rhs.sign {
-                    exp -= sub_bf(&mut m, &rhs.m, sh) as isize;
-                } else {
-                    exp += add_bf(&mut m, &rhs.m, sh) as isize;
-                }
-                BitFloat {
-                    exp,
-                    m,
-                    sign: self.sign,
-                }
-            }
-            Less => {
-                let mut m = rhs.m;
-                let mut exp = rhs.exp;
-                if self.sign ^ rhs.sign {
-                    exp -= sub_bf(&mut m, &self.m, sh) as isize;
-                } else {
-                    exp += add_bf(&mut m, &self.m, sh) as isize;
-                }
-                BitFloat {
-                    exp,
-                    m,
-                    sign: rhs.sign,
-                }
-            }
-            Equal => {
-                if self.sign ^ rhs.sign {
-                    return BitFloat {
-                        sign: false,
-                        exp: 0,
-                        m: vec![],
-                    };
-                } else {
-                    let mut m = self.m.clone();
-                    let mut exp = self.exp;
-                    exp += add_bf(&mut m, &rhs.m, sh) as isize;
-                    BitFloat {
-                        exp,
-                        m,
-                        sign: self.sign,
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl Add<f64> for BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn add(self, rhs: f64) -> Self::Output {
-        self + BitFloat::from(rhs)
-    }
-}
-
-impl Add<f64> for &BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn add(self, rhs: f64) -> Self::Output {
-        self + BitFloat::from(rhs)
-    }
-}
-
-impl Add<BitFloat> for f64 {
-    type Output = BitFloat;
-
-    #[inline]
-    fn add(self, rhs: BitFloat) -> Self::Output {
-        BitFloat::from(self) + rhs
-    }
-}
-
-impl Add<&BitFloat> for f64 {
-    type Output = BitFloat;
-
-    #[inline]
-    fn add(self, rhs: &BitFloat) -> Self::Output {
-        BitFloat::from(self) + rhs
-    }
-}
-
-impl Add<f32> for BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn add(self, rhs: f32) -> Self::Output {
-        self + BitFloat::from(rhs)
-    }
-}
-
-impl Add<f32> for &BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn add(self, rhs: f32) -> Self::Output {
-        self + BitFloat::from(rhs)
-    }
-}
-
-impl Add<BitFloat> for f32 {
-    type Output = BitFloat;
-
-    #[inline]
-    fn add(self, rhs: BitFloat) -> Self::Output {
-        BitFloat::from(self) + rhs
-    }
-}
-
-impl Add<&BitFloat> for f32 {
-    type Output = BitFloat;
-
-    #[inline]
-    fn add(self, rhs: &BitFloat) -> Self::Output {
-        BitFloat::from(self) + rhs
-    }
-}
-
-impl AddAssign for BitFloat {
-    #[inline]
-    fn add_assign(&mut self, rhs: Self) {
-        use Ordering::*;
-        let sh = (self.exp - rhs.exp).unsigned_abs();
-
-        if self.m.is_empty() {
-            *self = rhs;
-            return;
-        }
-        if rhs.m.is_empty() {
-            return;
-        }
-
-        match self.abs_cmp(&rhs) {
-            Greater => {
-                if self.sign ^ rhs.sign {
-                    self.exp -= sub_bf(&mut self.m, &rhs.m, sh) as isize;
-                } else {
-                    self.exp += add_bf(&mut self.m, &rhs.m, sh) as isize;
-                }
-            }
-            Less => {
-                let mut m = rhs.m.clone();
-                let mut exp = rhs.exp;
-                if self.sign ^ rhs.sign {
-                    exp -= sub_bf(&mut m, &self.m, sh) as isize;
-                } else {
-                    exp += add_bf(&mut m, &self.m, sh) as isize;
-                }
-                *self = BitFloat {
-                    exp,
-                    m,
-                    sign: rhs.sign,
-                };
-            }
-            Equal => {
-                if self.sign ^ rhs.sign {
-                    self.sign = false;
-                    self.exp = 0;
-                    self.m.clear();
-                } else {
-                    self.exp += add_bf(&mut self.m, &rhs.m, sh) as isize;
-                }
-            }
-        }
-    }
-}
-
-impl AddAssign<&BitFloat> for BitFloat {
-    #[inline]
-    fn add_assign(&mut self, rhs: &BitFloat) {
-        use Ordering::*;
-        let sh = (self.exp - rhs.exp).unsigned_abs();
-
-        if self.m.is_empty() {
-            *self = rhs.clone();
-            return;
-        }
-        if rhs.m.is_empty() {
-            return;
-        }
-
-        match self.abs_cmp(&rhs) {
-            Greater => {
-                if self.sign ^ rhs.sign {
-                    self.exp -= sub_bf(&mut self.m, &rhs.m, sh) as isize;
-                } else {
-                    self.exp += add_bf(&mut self.m, &rhs.m, sh) as isize;
-                }
-            }
-            Less => {
-                let mut m = rhs.m.clone();
-                let mut exp = rhs.exp;
-                if self.sign ^ rhs.sign {
-                    exp -= sub_bf(&mut m, &self.m, sh) as isize;
-                } else {
-                    exp += add_bf(&mut m, &self.m, sh) as isize;
-                }
-                *self = BitFloat {
-                    exp,
-                    m,
-                    sign: rhs.sign,
-                };
-            }
-            Equal => {
-                if self.sign ^ rhs.sign {
-                    self.sign = false;
-                    self.exp = 0;
-                    self.m.clear();
-                } else {
-                    self.exp += add_bf(&mut self.m, &rhs.m, sh) as isize;
-                }
-            }
-        }
-    }
-}
-
-impl AddAssign<f64> for BitFloat {
-    #[inline]
-    fn add_assign(&mut self, rhs: f64) {
-        *self += BitFloat::from(rhs);
-    }
-}
-
-impl AddAssign<f32> for BitFloat {
-    #[inline]
-    fn add_assign(&mut self, rhs: f32) {
-        *self += BitFloat::from(rhs);
-    }
-}
-
-impl Neg for BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn neg(self) -> Self::Output {
-        BitFloat {
-            m: self.m,
-            exp: self.exp,
-            sign: !self.sign,
-        }
-    }
-}
-
-impl Neg for &BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn neg(self) -> Self::Output {
-        BitFloat {
-            m: self.m.clone(),
-            exp: self.exp,
-            sign: !self.sign,
-        }
-    }
-}
-
-impl Sub for BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn sub(self, rhs: Self) -> Self::Output {
-        use Ordering::*;
-        let sh = (self.exp - rhs.exp).unsigned_abs();
-
-        if self.m.is_empty() {
-            return -rhs;
-        }
-        if rhs.m.is_empty() {
-            return self;
-        }
-
-        match self.abs_cmp(&rhs) {
-            Greater => {
-                let mut m = self.m;
-                let mut exp = self.exp;
-                if self.sign == rhs.sign {
-                    exp -= sub_bf(&mut m, &rhs.m, sh) as isize;
-                } else {
-                    exp += add_bf(&mut m, &rhs.m, sh) as isize;
-                }
-                BitFloat {
-                    exp,
-                    m,
-                    sign: self.sign,
-                }
-            }
-            Less => {
-                let mut m = rhs.m;
-                let mut exp = rhs.exp;
-                if self.sign == rhs.sign {
-                    exp -= sub_bf(&mut m, &self.m, sh) as isize;
-                } else {
-                    exp += add_bf(&mut m, &self.m, sh) as isize;
-                }
-                BitFloat {
-                    exp,
-                    m,
-                    sign: !rhs.sign,
-                }
-            }
-            Equal => {
-                if self.sign == rhs.sign {
-                    return BitFloat {
-                        sign: false,
-                        exp: 0,
-                        m: vec![],
-                    };
-                } else {
-                    let mut m = self.m;
-                    let mut exp = self.exp;
-                    exp += add_bf(&mut m, &rhs.m, sh) as isize;
-                    BitFloat {
-                        exp,
-                        m,
-                        sign: self.sign,
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl Sub for &BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn sub(self, rhs: Self) -> Self::Output {
-        use Ordering::*;
-        let sh = (self.exp - rhs.exp).unsigned_abs();
-
-        if self.m.is_empty() {
-            return -rhs;
-        }
-        if rhs.m.is_empty() {
-            return self.clone();
-        }
-
-        match self.abs_cmp(&rhs) {
-            Greater => {
-                let mut m = self.m.clone();
-                let mut exp = self.exp;
-                if self.sign == rhs.sign {
-                    exp -= sub_bf(&mut m, &rhs.m, sh) as isize;
-                } else {
-                    exp += add_bf(&mut m, &rhs.m, sh) as isize;
-                }
-                BitFloat {
-                    exp,
-                    m,
-                    sign: self.sign,
-                }
-            }
-            Less => {
-                let mut m = rhs.m.clone();
-                let mut exp = rhs.exp;
-                if self.sign == rhs.sign {
-                    exp -= sub_bf(&mut m, &self.m, sh) as isize;
-                } else {
-                    exp += add_bf(&mut m, &self.m, sh) as isize;
-                }
-                BitFloat {
-                    exp,
-                    m,
-                    sign: !rhs.sign,
-                }
-            }
-            Equal => {
-                if self.sign == rhs.sign {
-                    return BitFloat {
-                        sign: false,
-                        exp: 0,
-                        m: vec![],
-                    };
-                } else {
-                    let mut m = self.m.clone();
-                    let mut exp = self.exp;
-                    exp += add_bf(&mut m, &rhs.m, sh) as isize;
-                    BitFloat {
-                        exp,
-                        m,
-                        sign: self.sign,
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl Sub<&BitFloat> for BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn sub(self, rhs: &BitFloat) -> Self::Output {
-        use Ordering::*;
-        let sh = (self.exp - rhs.exp).unsigned_abs();
-
-        if self.m.is_empty() {
-            return -rhs;
-        }
-        if rhs.m.is_empty() {
-            return self;
-        }
-
-        match self.abs_cmp(&rhs) {
-            Greater => {
-                let mut m = self.m;
-                let mut exp = self.exp;
-                if self.sign == rhs.sign {
-                    exp -= sub_bf(&mut m, &rhs.m, sh) as isize;
-                } else {
-                    exp += add_bf(&mut m, &rhs.m, sh) as isize;
-                }
-                BitFloat {
-                    exp,
-                    m,
-                    sign: self.sign,
-                }
-            }
-            Less => {
-                let mut m = rhs.m.clone();
-                let mut exp = rhs.exp;
-                if self.sign == rhs.sign {
-                    exp -= sub_bf(&mut m, &self.m, sh) as isize;
-                } else {
-                    exp += add_bf(&mut m, &self.m, sh) as isize;
-                }
-                BitFloat {
-                    exp,
-                    m,
-                    sign: !rhs.sign,
-                }
-            }
-            Equal => {
-                if self.sign == rhs.sign {
-                    return BitFloat {
-                        sign: false,
-                        exp: 0,
-                        m: vec![],
-                    };
-                } else {
-                    let mut m = self.m;
-                    let mut exp = self.exp;
-                    exp += add_bf(&mut m, &rhs.m, sh) as isize;
-                    BitFloat {
-                        exp,
-                        m,
-                        sign: self.sign,
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl Sub<BitFloat> for &BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn sub(self, rhs: BitFloat) -> Self::Output {
-        use Ordering::*;
-        let sh = (self.exp - rhs.exp).unsigned_abs();
-
-        if self.m.is_empty() {
-            return -rhs;
-        }
-        if rhs.m.is_empty() {
-            return self.clone();
-        }
-
-        match self.abs_cmp(&rhs) {
-            Greater => {
-                let mut m = self.m.clone();
-                let mut exp = self.exp;
-                if self.sign == rhs.sign {
-                    exp -= sub_bf(&mut m, &rhs.m, sh) as isize;
-                } else {
-                    exp += add_bf(&mut m, &rhs.m, sh) as isize;
-                }
-                BitFloat {
-                    exp,
-                    m,
-                    sign: self.sign,
-                }
-            }
-            Less => {
-                let mut m = rhs.m;
-                let mut exp = rhs.exp;
-                if self.sign == rhs.sign {
-                    exp -= sub_bf(&mut m, &self.m, sh) as isize;
-                } else {
-                    exp += add_bf(&mut m, &self.m, sh) as isize;
-                }
-                BitFloat {
-                    exp,
-                    m,
-                    sign: !rhs.sign,
-                }
-            }
-            Equal => {
-                if self.sign == rhs.sign {
-                    return BitFloat {
-                        sign: false,
-                        exp: 0,
-                        m: vec![],
-                    };
-                } else {
-                    let mut m = self.m.clone();
-                    let mut exp = self.exp;
-                    exp += add_bf(&mut m, &rhs.m, sh) as isize;
-                    BitFloat {
-                        exp,
-                        m,
-                        sign: self.sign,
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl Sub<f64> for BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn sub(self, rhs: f64) -> Self::Output {
-        self - BitFloat::from(rhs)
-    }
-}
-
-impl Sub<f64> for &BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn sub(self, rhs: f64) -> Self::Output {
-        self - BitFloat::from(rhs)
-    }
-}
-
-impl Sub<f32> for BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn sub(self, rhs: f32) -> Self::Output {
-        self - BitFloat::from(rhs)
-    }
-}
-
-impl Sub<f32> for &BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn sub(self, rhs: f32) -> Self::Output {
-        self - BitFloat::from(rhs)
-    }
-}
-
-impl SubAssign for BitFloat {
-    #[inline]
-    fn sub_assign(&mut self, rhs: Self) {
-        use Ordering::*;
-        let sh = (self.exp - rhs.exp).unsigned_abs();
-
-        if self.m.is_empty() {
-            *self = -rhs;
-            return;
-        }
-        if rhs.m.is_empty() {
-            return;
-        }
-
-        match self.abs_cmp(&rhs) {
-            Greater => {
-                if self.sign == rhs.sign {
-                    self.exp -= sub_bf(&mut self.m, &rhs.m, sh) as isize;
-                } else {
-                    self.exp += add_bf(&mut self.m, &rhs.m, sh) as isize;
-                }
-            }
-            Less => {
-                let mut m = rhs.m.clone();
-                let mut exp = rhs.exp;
-                if self.sign == rhs.sign {
-                    exp -= sub_bf(&mut m, &self.m, sh) as isize;
-                } else {
-                    exp += add_bf(&mut m, &self.m, sh) as isize;
-                }
-                *self = BitFloat {
-                    exp,
-                    m,
-                    sign: !rhs.sign,
-                };
-            }
-            Equal => {
-                if self.sign == rhs.sign {
-                    self.sign = false;
-                    self.exp = 0;
-                    self.m.clear();
-                } else {
-                    self.exp += add_bf(&mut self.m, &rhs.m, sh) as isize;
-                }
-            }
-        }
-    }
-}
-
-impl SubAssign<&BitFloat> for BitFloat {
-    #[inline]
-    fn sub_assign(&mut self, rhs: &BitFloat) {
-        use Ordering::*;
-        let sh = (self.exp - rhs.exp).unsigned_abs();
-
-        if self.m.is_empty() {
-            *self = -rhs;
-            return;
-        }
-        if rhs.m.is_empty() {
-            return;
-        }
-
-        match self.abs_cmp(&rhs) {
-            Greater => {
-                if self.sign == rhs.sign {
-                    self.exp -= sub_bf(&mut self.m, &rhs.m, sh) as isize;
-                } else {
-                    self.exp += add_bf(&mut self.m, &rhs.m, sh) as isize;
-                }
-            }
-            Less => {
-                let mut m = rhs.m.clone();
-                let mut exp = rhs.exp;
-                if self.sign == rhs.sign {
-                    exp -= sub_bf(&mut m, &self.m, sh) as isize;
-                } else {
-                    exp += add_bf(&mut m, &self.m, sh) as isize;
-                }
-                *self = BitFloat {
-                    exp,
-                    m,
-                    sign: !rhs.sign,
-                };
-            }
-            Equal => {
-                if self.sign == rhs.sign {
-                    self.sign = false;
-                    self.exp = 0;
-                    self.m.clear();
-                } else {
-                    self.exp += add_bf(&mut self.m, &rhs.m, sh) as isize;
-                }
-            }
-        }
-    }
-}
-
-impl SubAssign<f64> for BitFloat {
-    #[inline]
-    fn sub_assign(&mut self, rhs: f64) {
-        *self -= BitFloat::from(rhs);
-    }
-}
-
-impl SubAssign<f32> for BitFloat {
-    #[inline]
-    fn sub_assign(&mut self, rhs: f32) {
-        *self -= BitFloat::from(rhs);
-    }
-}
-
-impl Mul for BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn mul(self, rhs: Self) -> Self::Output {
-        let (m, carry) = mul_bf(&self.m, &rhs.m, 0);
-        let exp = self.exp + rhs.exp + carry as isize;
-
-        BitFloat {
-            exp,
-            m,
-            sign: self.sign ^ rhs.sign,
-        }
-    }
-}
-
-impl Mul for &BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn mul(self, rhs: Self) -> Self::Output {
-        let (m, carry) = mul_bf(&self.m, &rhs.m, 0);
-        let exp = self.exp + rhs.exp + carry as isize;
-
-        BitFloat {
-            exp,
-            m,
-            sign: self.sign ^ rhs.sign,
-        }
-    }
-}
-
-impl Mul<BitFloat> for &BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn mul(self, rhs: BitFloat) -> Self::Output {
-        let (m, carry) = mul_bf(&self.m, &rhs.m, 0);
-        let exp = self.exp + rhs.exp + carry as isize;
-
-        BitFloat {
-            exp,
-            m,
-            sign: self.sign ^ rhs.sign,
-        }
-    }
-}
-
-impl Mul<&BitFloat> for BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn mul(self, rhs: &BitFloat) -> Self::Output {
-        let (m, carry) = mul_bf(&self.m, &rhs.m, 0);
-        let exp = self.exp + rhs.exp + carry as isize;
-
-        BitFloat {
-            exp,
-            m,
-            sign: self.sign ^ rhs.sign,
-        }
-    }
-}
-
-impl Mul<f64> for BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn mul(self, rhs: f64) -> Self::Output {
-        self * BitFloat::from(rhs)
-    }
-}
-
-impl Mul<f64> for &BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn mul(self, rhs: f64) -> Self::Output {
-        self * BitFloat::from(rhs)
-    }
-}
-
-impl Mul<BitFloat> for f64 {
-    type Output = BitFloat;
-
-    #[inline]
-    fn mul(self, rhs: BitFloat) -> Self::Output {
-        rhs * BitFloat::from(self)
-    }
-}
-
-impl Mul<&BitFloat> for f64 {
-    type Output = BitFloat;
-
-    #[inline]
-    fn mul(self, rhs: &BitFloat) -> Self::Output {
-        rhs * BitFloat::from(self)
-    }
-}
-
-impl Mul<f32> for BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn mul(self, rhs: f32) -> Self::Output {
-        self * BitFloat::from(rhs)
-    }
-}
-
-impl Mul<f32> for &BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn mul(self, rhs: f32) -> Self::Output {
-        self * BitFloat::from(rhs)
-    }
-}
-
-impl Mul<BitFloat> for f32 {
-    type Output = BitFloat;
-
-    #[inline]
-    fn mul(self, rhs: BitFloat) -> Self::Output {
-        rhs * BitFloat::from(self)
-    }
-}
-
-impl Mul<&BitFloat> for f32 {
-    type Output = BitFloat;
-
-    #[inline]
-    fn mul(self, rhs: &BitFloat) -> Self::Output {
-        rhs * BitFloat::from(self)
-    }
-}
-
-impl MulAssign for BitFloat {
-    #[inline]
-    fn mul_assign(&mut self, rhs: Self) {
-        let carry: bool;
-        (self.m, carry) = mul_bf(&self.m, &rhs.m, 0);
-        self.exp += rhs.exp + carry as isize;
-        self.sign ^= rhs.sign;
-    }
-}
-
-impl MulAssign<&BitFloat> for BitFloat {
-    #[inline]
-    fn mul_assign(&mut self, rhs: &BitFloat) {
-        let carry: bool;
-        (self.m, carry) = mul_bf(&self.m, &rhs.m, 0);
-        self.exp += rhs.exp + carry as isize;
-        self.sign ^= rhs.sign;
-    }
-}
-
-impl MulAssign<f64> for BitFloat {
-    #[inline]
-    fn mul_assign(&mut self, rhs: f64) {
-        *self *= BitFloat::from(rhs);
-    }
-}
-
-impl MulAssign<f32> for BitFloat {
-    #[inline]
-    fn mul_assign(&mut self, rhs: f32) {
-        *self *= BitFloat::from(rhs);
-    }
-}
-
-pub trait StblMul<RHS = Self> {
-    type Output;
-    fn stbl_mul(self, rhs: RHS, acc: usize) -> Self::Output;
-}
-
-impl StblMul for BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn stbl_mul(self, rhs: Self, acc: usize) -> Self::Output {
-        let prod_len = (self.m.len() + rhs.m.len()).saturating_sub(1);
-        let (m, carry) = mul_bf(&self.m, &rhs.m, prod_len.saturating_sub(acc));
-        let exp = self.exp + rhs.exp + carry as isize;
-
-        BitFloat {
-            exp,
-            m,
-            sign: self.sign ^ rhs.sign,
-        }
-    }
-}
-
-impl StblMul for &BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn stbl_mul(self, rhs: Self, acc: usize) -> Self::Output {
-        let prod_len = (self.m.len() + rhs.m.len()).saturating_sub(1);
-        let (m, carry) = mul_bf(&self.m, &rhs.m, prod_len.saturating_sub(acc));
-        let exp = self.exp + rhs.exp + carry as isize;
-
-        BitFloat {
-            exp,
-            m,
-            sign: self.sign ^ rhs.sign,
-        }
-    }
-}
-
-impl StblMul<&BitFloat> for BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn stbl_mul(self, rhs: &BitFloat, acc: usize) -> Self::Output {
-        let prod_len = (self.m.len() + rhs.m.len()).saturating_sub(1);
-        let (m, carry) = mul_bf(&self.m, &rhs.m, prod_len.saturating_sub(acc));
-        let exp = self.exp + rhs.exp + carry as isize;
-
-        BitFloat {
-            exp,
-            m,
-            sign: self.sign ^ rhs.sign,
-        }
-    }
-}
-
-impl StblMul<BitFloat> for &BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn stbl_mul(self, rhs: BitFloat, acc: usize) -> Self::Output {
-        let prod_len = (self.m.len() + rhs.m.len()).saturating_sub(1);
-        let (m, carry) = mul_bf(&self.m, &rhs.m, prod_len.saturating_sub(acc));
-        let exp = self.exp + rhs.exp + carry as isize;
-
-        BitFloat {
-            exp,
-            m,
-            sign: self.sign ^ rhs.sign,
-        }
-    }
-}
-
-pub trait StblMulAssign<RHS = Self> {
-    fn stbl_mul_assign(&mut self, rhs: RHS, acc: usize);
-}
-
-impl StblMulAssign for BitFloat {
-    #[inline]
-    fn stbl_mul_assign(&mut self, rhs: Self, acc: usize) {
-        let prod_len = (self.m.len() + rhs.m.len()).saturating_sub(1);
-        let carry: bool;
-        (self.m, carry) = mul_bf(&self.m, &rhs.m, prod_len.saturating_sub(acc));
-        self.exp += rhs.exp + carry as isize;
-        self.sign ^= rhs.sign;
-    }
-}
-
-impl StblMulAssign<&BitFloat> for BitFloat {
-    #[inline]
-    fn stbl_mul_assign(&mut self, rhs: &BitFloat, acc: usize) {
-        let prod_len = (self.m.len() + rhs.m.len()).saturating_sub(1);
-        let carry: bool;
-        (self.m, carry) = mul_bf(&self.m, &rhs.m, prod_len.saturating_sub(acc));
-        self.exp += rhs.exp + carry as isize;
-        self.sign ^= rhs.sign;
-    }
-}
-
-impl Div for BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn div(self, rhs: Self) -> Self::Output {
-        let mut n = self;
-        let mut d = rhs;
-        div_bf_gs(&mut n, &mut d);
-        n
-    }
-}
-
-impl Div for &BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn div(self, rhs: Self) -> Self::Output {
-        let mut n = self.clone();
-        let mut d = rhs.clone();
-        div_bf_gs(&mut n, &mut d);
-        n
-    }
-}
-
-impl Div<&BitFloat> for BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn div(self, rhs: &BitFloat) -> Self::Output {
-        let mut n = self;
-        let mut d = rhs.clone();
-        div_bf_gs(&mut n, &mut d);
-        n
-    }
-}
-
-impl Div<BitFloat> for &BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn div(self, rhs: BitFloat) -> Self::Output {
-        let mut n = self.clone();
-        let mut d = rhs;
-        div_bf_gs(&mut n, &mut d);
-        n
-    }
-}
-
-impl Div<f64> for BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn div(self, rhs: f64) -> Self::Output {
-        self / BitFloat::from(rhs)
-    }
-}
-
-impl Div<f64> for &BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn div(self, rhs: f64) -> Self::Output {
-        self / BitFloat::from(rhs)
-    }
-}
-
-impl Div<BitFloat> for f64 {
-    type Output = BitFloat;
-
-    #[inline]
-    fn div(self, rhs: BitFloat) -> Self::Output {
-        BitFloat::from(self) / rhs
-    }
-}
-
-impl Div<&BitFloat> for f64 {
-    type Output = BitFloat;
-
-    #[inline]
-    fn div(self, rhs: &BitFloat) -> Self::Output {
-        BitFloat::from(self) / rhs
-    }
-}
-
-impl Div<f32> for BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn div(self, rhs: f32) -> Self::Output {
-        self / BitFloat::from(rhs)
-    }
-}
-
-impl Div<f32> for &BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn div(self, rhs: f32) -> Self::Output {
-        self / BitFloat::from(rhs)
-    }
-}
-
-impl Div<BitFloat> for f32 {
-    type Output = BitFloat;
-
-    #[inline]
-    fn div(self, rhs: BitFloat) -> Self::Output {
-        BitFloat::from(self) / rhs
-    }
-}
-
-impl Div<&BitFloat> for f32 {
-    type Output = BitFloat;
-
-    #[inline]
-    fn div(self, rhs: &BitFloat) -> Self::Output {
-        BitFloat::from(self) / rhs
-    }
-}
-
-impl DivAssign for BitFloat {
-    fn div_assign(&mut self, rhs: Self) {
-        let mut d = rhs;
-        div_bf_gs(self, &mut d);
-    }
-}
-
-impl DivAssign<&BitFloat> for BitFloat {
-    fn div_assign(&mut self, rhs: &BitFloat) {
-        let mut d = rhs.clone();
-        div_bf_gs(self, &mut d);
-    }
-}
-
-impl DivAssign<f64> for BitFloat {
-    fn div_assign(&mut self, rhs: f64) {
-        *self /= BitFloat::from(rhs);
-    }
-}
-
-impl DivAssign<f32> for BitFloat {
-    fn div_assign(&mut self, rhs: f32) {
-        *self /= BitFloat::from(rhs);
-    }
-}
-
-pub trait PowI<RHS = Self> {
-    type Output;
-    fn powi(self, n: RHS) -> Self::Output;
-}
-
-impl PowI<BitInt> for BitFloat {
-    type Output = BitFloat;
-    fn powi(self, n: BitInt) -> Self::Output {
-        if n.get_sign() {
-            &*ONE / powi_ubi(self, n.unsighned_abs())
-        } else {
-            powi_ubi(self, n.unsighned_abs())
-        }
-    }
-}
-
-impl PowI<BitInt> for &BitFloat {
-    type Output = BitFloat;
-    fn powi(self, n: BitInt) -> Self::Output {
-        if n.get_sign() {
-            &*ONE / powi_ubi(self.clone(), n.unsighned_abs())
-        } else {
-            powi_ubi(self.clone(), n.unsighned_abs())
-        }
-    }
-}
-
-impl PowI<&BitInt> for BitFloat {
-    type Output = BitFloat;
-    fn powi(self, n: &BitInt) -> Self::Output {
-        if n.get_sign() {
-            &*ONE / powi_ubi(self, n.clone().unsighned_abs())
-        } else {
-            powi_ubi(self, n.clone().unsighned_abs())
-        }
-    }
-}
-
-impl PowI<&BitInt> for &BitFloat {
-    type Output = BitFloat;
-    fn powi(self, n: &BitInt) -> Self::Output {
-        if n.get_sign() {
-            &*ONE / powi_ubi(self.clone(), n.clone().unsighned_abs())
-        } else {
-            powi_ubi(self.clone(), n.clone().unsighned_abs())
-        }
-    }
-}
-
-impl PowI<i128> for BitFloat {
-    type Output = BitFloat;
-
-    fn powi(self, n: i128) -> Self::Output {
-        if n < 0 {
-            &*ONE / powi_prim(self, n.unsigned_abs())
-        } else {
-            powi_prim(self, n.unsigned_abs())
-        }
-    }
-}
-
-impl PowI<i128> for &BitFloat {
-    type Output = BitFloat;
-
-    fn powi(self, n: i128) -> Self::Output {
-        if n < 0 {
-            &*ONE / powi_prim(self.clone(), n.unsigned_abs())
-        } else {
-            powi_prim(self.clone(), n.unsigned_abs())
-        }
-    }
 }
 
-macro_rules! impl_powi_bf_prim {
+macro_rules! impl_peq_bf_iprim {
     ($($t:ty),*) => {
         $(
-            impl PowI<$t> for BitFloat {
-                type Output = BitFloat;
-
-                fn powi(self, n: $t) -> Self::Output {
-                    if n < 0 {
-                        &*ONE / powi_prim(self, n.unsigned_abs() as u128)
-                    } else {
-                        powi_prim(self, n.unsigned_abs() as u128)
-                    }
-                }
-            }
-
-            impl PowI<$t> for &BitFloat {
-                type Output = BitFloat;
-
-                fn powi(self, n: $t) -> Self::Output {
-                    if n < 0 {
-                        &*ONE / powi_prim(self.clone(), n.unsigned_abs() as u128)
-                    } else {
-                        powi_prim(self.clone(), n.unsigned_abs() as u128)
-                    }
+            impl PartialEq<$t> for BitFloat{
+                fn eq(&self, other: &$t) -> bool {
+                    *self == BitFloat::from(*other)
                 }
             }
         )*
     };
 }
 
-impl_powi_bf_prim!(i64, isize, i32, i16, i8);
+impl_peq_bf_iprim!(f64, f32, i128, i64, isize, i32, i16, i8);
 
-pub trait Exp {
+impl PartialOrd for BitFloat {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        if self.sign ^ other.sign {
+            if self.sign {
+                return Some(std::cmp::Ordering::Less);
+            } else {
+                return Some(std::cmp::Ordering::Greater);
+            }
+        }
+
+        let exp_ord = self.exp.cmp(&other.exp);
+        if exp_ord != std::cmp::Ordering::Equal {
+            if self.sign {
+                return Some(exp_ord.reverse());
+            } else {
+                return Some(exp_ord);
+            }
+        }
+
+        let mut m_ord = std::cmp::Ordering::Equal;
+
+        for (&a, b) in self.m.iter().rev().zip(other.m.iter().rev()) {
+            m_ord = a.cmp(b);
+            if m_ord != std::cmp::Ordering::Equal {
+                break;
+            }
+        }
+
+        if self.sign {
+            return Some(m_ord.reverse());
+        } else {
+            return Some(m_ord);
+        }
+    }
+}
+
+macro_rules! impl_pord_bf_iprim {
+    ($($t:ty),*) => {
+        $(
+            impl PartialOrd<$t> for BitFloat{
+                fn partial_cmp(&self, other: &$t) -> Option<std::cmp::Ordering> {
+                    self.partial_cmp(&BitFloat::from(*other))
+                }
+            }
+        )*
+    };
+}
+
+impl_pord_bf_iprim!(f64, f32, i128, i64, isize, i32, i16, i8);
+
+impl Ord for BitFloat {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap()
+    }
+}
+
+impl Add for BitFloat {
+    type Output = BitFloat;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        use std::cmp::Ordering::*;
+
+        let (mut a, b, mut exp, sign) = match self.abs_cmp(&rhs) {
+            Greater => (self.m, rhs.m, self.exp, self.sign),
+            Less => (rhs.m, self.m, rhs.exp, rhs.sign),
+            Equal => (self.m, rhs.m, self.exp, self.sign),
+        };
+        let sh = (self.exp - rhs.exp).unsigned_abs();
+
+        let exp_adj = if self.sign ^ rhs.sign {
+            sub_bf(&mut a, &b, sh)
+        } else {
+            add_bf(&mut a, &b, sh)
+        };
+
+        exp += exp_adj;
+
+        BitFloat { m: a, exp, sign }
+    }
+}
+
+impl Add for &BitFloat {
+    type Output = BitFloat;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        use std::cmp::Ordering::*;
+
+        let (mut a, b, mut exp, sign) = match self.abs_cmp(&rhs) {
+            Greater => (self.m.clone(), &rhs.m, self.exp, self.sign),
+            Less => (rhs.m.clone(), &self.m, rhs.exp, rhs.sign),
+            Equal => (self.m.clone(), &rhs.m, self.exp, self.sign),
+        };
+        let sh = (self.exp - rhs.exp).unsigned_abs();
+
+        let exp_adj = if self.sign ^ rhs.sign {
+            sub_bf(&mut a, b, sh)
+        } else {
+            add_bf(&mut a, b, sh)
+        };
+
+        exp += exp_adj;
+
+        BitFloat { m: a, exp, sign }
+    }
+}
+
+impl Add<BitFloat> for &BitFloat {
+    type Output = BitFloat;
+
+    fn add(self, rhs: BitFloat) -> Self::Output {
+        use std::cmp::Ordering::*;
+
+        let (mut a, b, mut exp, sign) = match self.abs_cmp(&rhs) {
+            Greater => (self.m.clone(), &rhs.m, self.exp, self.sign),
+            Less => (rhs.m, &self.m, rhs.exp, rhs.sign),
+            Equal => (self.m.clone(), &rhs.m, self.exp, self.sign),
+        };
+        let sh = (self.exp - rhs.exp).unsigned_abs();
+
+        let exp_adj = if self.sign ^ rhs.sign {
+            sub_bf(&mut a, b, sh)
+        } else {
+            add_bf(&mut a, b, sh)
+        };
+
+        exp += exp_adj;
+
+        BitFloat { m: a, exp, sign }
+    }
+}
+
+impl Add<&BitFloat> for BitFloat {
+    type Output = BitFloat;
+
+    fn add(self, rhs: &BitFloat) -> Self::Output {
+        use std::cmp::Ordering::*;
+
+        let sh = (self.exp - rhs.exp).unsigned_abs();
+
+        let (mut a, b, mut exp, sign) = match self.abs_cmp(&rhs) {
+            Greater => (self.m, &rhs.m, self.exp, self.sign),
+            Less => (rhs.m.clone(), &self.m, rhs.exp, rhs.sign),
+            Equal => (self.m, &rhs.m, self.exp, self.sign),
+        };
+
+        let exp_adj = if self.sign ^ rhs.sign {
+            sub_bf(&mut a, b, sh)
+        } else {
+            add_bf(&mut a, b, sh)
+        };
+
+        exp += exp_adj;
+
+        BitFloat { m: a, exp, sign }
+    }
+}
+
+impl<T: MES> Add<T> for BitFloat {
+    type Output = BitFloat;
+
+    fn add(self, rhs: T) -> Self::Output {
+        self + BitFloat::from(rhs)
+    }
+}
+
+impl<T: MES> Add<T> for &BitFloat {
+    type Output = BitFloat;
+
+    fn add(self, rhs: T) -> Self::Output {
+        self + BitFloat::from(rhs)
+    }
+}
+
+macro_rules! impl_add_for_bitfloat {
+    ($($t:ty),*) => {
+        $(
+            impl Add<BitFloat> for $t {
+                type Output = BitFloat;
+
+                fn add(self, rhs: BitFloat) -> Self::Output {
+                    rhs + self
+                }
+            }
+
+            impl Add<&BitFloat> for $t {
+                type Output = BitFloat;
+
+                fn add(self, rhs: &BitFloat) -> Self::Output {
+                    rhs + self
+                }
+            }
+        )*
+    }
+}
+
+impl_add_for_bitfloat!(f64, f32, i128, i64, isize, i32, i16, i8);
+
+impl AddAssign for BitFloat{
+    fn add_assign(&mut self, rhs: Self) {
+        use std::cmp::Ordering::*;
+
+        let sh = (self.exp - rhs.exp).unsigned_abs();
+
+        match self.abs_cmp(&rhs) {
+            Greater => {
+                let exp_adj = if self.sign ^ rhs.sign {
+                    sub_bf(&mut self.m, &rhs.m, sh)
+                } else {
+                    add_bf(&mut self.m, &rhs.m, sh)
+                };
+
+                self.exp += exp_adj;
+            },
+            Less => {
+                let mut a = rhs.m;
+
+                let exp_adj = if self.sign ^ rhs.sign {
+                    sub_bf(&mut a, &self.m, sh)
+                } else {
+                    add_bf(&mut a, &self.m, sh)
+                };
+
+                self.m = a;
+                self.exp = rhs.exp + exp_adj;
+                self.sign = rhs.sign
+            },
+            Equal => {
+                if self.sign ^ rhs.sign {
+                    self.m = vec![];
+                    self.exp = 0;
+                    self.sign = false;
+                } else {
+                    let exp_adj = add_bf(&mut self.m, &rhs.m, sh);
+                    self.exp += exp_adj;
+                }
+            },
+        }
+    }
+}
+
+impl AddAssign<&BitFloat> for BitFloat{
+    fn add_assign(&mut self, rhs: &Self) {
+        use std::cmp::Ordering::*;
+
+        let sh = (self.exp - rhs.exp).unsigned_abs();
+        match self.abs_cmp(&rhs) {
+            Greater => {
+                let exp_adj = if self.sign ^ rhs.sign {
+                    sub_bf(&mut self.m, &rhs.m, sh)
+                } else {
+                    add_bf(&mut self.m, &rhs.m, sh)
+                };
+
+                self.exp += exp_adj;
+            },
+            Less => {
+                let mut a = rhs.m.clone();
+
+                let exp_adj = if self.sign ^ rhs.sign {
+                    sub_bf(&mut a, &self.m, sh)
+                } else {
+                    add_bf(&mut a, &self.m, sh)
+                };
+
+                self.m = a;
+                self.exp = rhs.exp + exp_adj;
+                self.sign = rhs.sign
+            },
+            Equal => {
+                if self.sign ^ rhs.sign {
+                    self.m = vec![];
+                    self.exp = 0;
+                    self.sign = false;
+                } else {
+                    let exp_adj = add_bf(&mut self.m, &rhs.m, sh);
+                    self.exp += exp_adj;
+                }
+            },
+        }
+    }
+}
+
+impl<T: MES> AddAssign<T> for BitFloat{
+    fn add_assign(&mut self, rhs: T) {
+        *self += BitFloat::from(rhs);
+    }
+}
+
+impl Sub for BitFloat {
+    type Output = BitFloat;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        use std::cmp::Ordering::*;
+
+        let (mut a, b, mut exp, sign) = match self.abs_cmp(&rhs) {
+            Greater => (self.m, &rhs.m, self.exp, self.sign),
+            Less => (rhs.m, &self.m, rhs.exp, rhs.sign),
+            Equal => (self.m, &rhs.m, self.exp, self.sign),
+        };
+        let sh = (self.exp - rhs.exp).unsigned_abs();
+
+        let exp_adj = if self.sign ^ rhs.sign {
+            add_bf(&mut a, b, sh)
+        } else {
+            sub_bf(&mut a, b, sh)
+        };
+
+        exp = exp.saturating_add(exp_adj);
+
+        BitFloat { m: a, exp, sign }
+    }
+}
+
+impl Sub for &BitFloat{
+    type Output = BitFloat;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        use std::cmp::Ordering::*;
+
+        let (mut a, b, mut exp, sign) = match self.abs_cmp(&rhs) {
+            Greater => (self.m.clone(), &rhs.m, self.exp, self.sign),
+            Less => (rhs.m.clone(), &self.m, rhs.exp, rhs.sign),
+            Equal => (self.m.clone(), &rhs.m, self.exp, self.sign),
+        };
+        let sh = (self.exp - rhs.exp).unsigned_abs();
+
+        let exp_adj = if self.sign ^ rhs.sign {
+            add_bf(&mut a, b, sh)
+        } else {
+            sub_bf(&mut a, b, sh)
+        };
+
+        exp = exp.saturating_add(exp_adj);
+
+        BitFloat { m: a, exp, sign }
+    }
+}
+
+impl Sub<&BitFloat> for BitFloat{
+    type Output = BitFloat;
+
+    fn sub(self, rhs: &Self) -> Self::Output {
+        use std::cmp::Ordering::*;
+
+        let (mut a, b, mut exp, sign) = match self.abs_cmp(&rhs) {
+            Greater => (self.m, &rhs.m, self.exp, self.sign),
+            Less => (rhs.m.clone(), &self.m, rhs.exp, rhs.sign),
+            Equal => (self.m, &rhs.m, self.exp, self.sign),
+        };
+        let sh = (self.exp - rhs.exp).unsigned_abs();
+
+        let exp_adj = if self.sign ^ rhs.sign {
+            add_bf(&mut a, b, sh)
+        } else {
+            sub_bf(&mut a, b, sh)
+        };
+
+        exp = exp.saturating_add(exp_adj);
+
+        BitFloat { m: a, exp, sign }
+    }
+}
+
+impl Sub<BitFloat> for &BitFloat{
+    type Output = BitFloat;
+
+    fn sub(self, rhs: BitFloat) -> Self::Output {
+        use std::cmp::Ordering::*;
+
+        let (mut a, b, mut exp, sign) = match self.abs_cmp(&rhs) {
+            Greater => (self.m.clone(), &rhs.m, self.exp, self.sign),
+            Less => (rhs.m, &self.m, rhs.exp, rhs.sign),
+            Equal => (self.m.clone(), &rhs.m, self.exp, self.sign),
+        };
+        let sh = (self.exp - rhs.exp).unsigned_abs();
+
+        println!("\nsh: {sh}, a: {:?}, b: {:?}", a, b);
+
+        let exp_adj = if self.sign ^ rhs.sign {
+            add_bf(&mut a, b, sh)
+        } else {
+            sub_bf(&mut a, b, sh)
+        };
+
+        exp = exp.saturating_add(exp_adj);
+
+        BitFloat { m: a, exp, sign }
+    }
+}
+
+impl<T: MES> Sub<T> for BitFloat{
+    type Output = BitFloat;
+
+    fn sub(self, rhs: T) -> Self::Output {
+        self + BitFloat::from(rhs)
+    }
+}
+
+impl<T: MES> Sub<T> for &BitFloat{
+    type Output = BitFloat;
+
+    fn sub(self, rhs: T) -> Self::Output {
+        self + BitFloat::from(rhs)
+    }
+}
+
+macro_rules! impl_sub_for_bitfloat {
+    ($($t:ty),*) => {
+        $(
+            impl Sub<BitFloat> for $t {
+                type Output = BitFloat;
+
+                fn sub(self, rhs: BitFloat) -> Self::Output {
+                    rhs + self
+                }
+            }
+
+            impl Sub<&BitFloat> for $t {
+                type Output = BitFloat;
+
+                fn sub(self, rhs: &BitFloat) -> Self::Output {
+                    rhs + self
+                }
+            }
+        )*
+    }
+}
+
+impl_sub_for_bitfloat!(f64, f32, i128, i64, isize, i32, i16, i8);
+
+impl SubAssign for BitFloat{
+    fn sub_assign(&mut self, rhs: Self) {
+        use std::cmp::Ordering::*;
+
+        let sh = (self.exp - rhs.exp).unsigned_abs();
+
+        match self.abs_cmp(&rhs) {
+            Greater => {
+                let exp_adj = if self.sign ^ !rhs.sign {
+                    sub_bf(&mut self.m, &rhs.m, sh)
+                } else {
+                    add_bf(&mut self.m, &rhs.m, sh)
+                };
+
+                self.exp += exp_adj;
+            },
+            Less => {
+                let mut a = rhs.m;
+
+                let exp_adj = if self.sign ^ !rhs.sign {
+                    sub_bf(&mut a, &self.m, sh)
+                } else {
+                    add_bf(&mut a, &self.m, sh)
+                };
+
+                self.m = a;
+                self.exp = rhs.exp + exp_adj;
+                self.sign = rhs.sign
+            },
+            Equal => {
+                if self.sign ^ !rhs.sign {
+                    self.m = vec![];
+                    self.exp = 0;
+                    self.sign = false;
+                } else {
+                    let exp_adj = add_bf(&mut self.m, &rhs.m, sh);
+                    self.exp += exp_adj;
+                }
+            },
+        }
+    }
+}
+
+impl SubAssign<&BitFloat> for BitFloat{
+    fn sub_assign(&mut self, rhs: &Self) {
+        use std::cmp::Ordering::*;
+
+        let sh = (self.exp - rhs.exp).unsigned_abs();
+        match self.abs_cmp(&rhs) {
+            Greater => {
+                let exp_adj = if self.sign ^ !rhs.sign {
+                    sub_bf(&mut self.m, &rhs.m, sh)
+                } else {
+                    add_bf(&mut self.m, &rhs.m, sh)
+                };
+
+                self.exp += exp_adj;
+            },
+            Less => {
+                let mut a = rhs.m.clone();
+
+                let exp_adj = if self.sign ^ !rhs.sign {
+                    sub_bf(&mut a, &self.m, sh)
+                } else {
+                    add_bf(&mut a, &self.m, sh)
+                };
+
+                self.m = a;
+                self.exp = rhs.exp + exp_adj;
+                self.sign = rhs.sign
+            },
+            Equal => {
+                if self.sign ^ !rhs.sign {
+                    self.m = vec![];
+                    self.exp = 0;
+                    self.sign = false;
+                } else {
+                    let exp_adj = add_bf(&mut self.m, &rhs.m, sh);
+                    self.exp += exp_adj;
+                }
+            },
+        }
+    }
+}
+
+impl<T: MES> SubAssign<T> for BitFloat{
+    fn sub_assign(&mut self, rhs: T) {
+        *self += BitFloat::from(rhs);
+    }
+}
+
+impl Mul for BitFloat {
+    type Output = BitFloat;
+
+    fn mul(self, rhs: Self) -> Self::Output {
+        let m = mul_ubi(&self.m, &rhs.m);
+        let mut exp = self.exp + rhs.exp;
+
+        if m.len() > self.m.len() + rhs.m.len() - 1 {
+            exp += 1;
+        }
+
+        BitFloat {
+            m,
+            exp,
+            sign: self.sign ^ rhs.sign,
+        }
+    }
+}
+
+impl Mul for &BitFloat{
+    type Output = BitFloat;
+
+    fn mul(self, rhs: Self) -> Self::Output {
+        let m = mul_ubi(&self.m, &rhs.m);
+        let mut exp = self.exp + rhs.exp;
+
+        if m.len() > self.m.len() + rhs.m.len() - 1 {
+            exp += 1;
+        }
+
+        BitFloat {
+            m,
+            exp,
+            sign: self.sign ^ rhs.sign,
+        }
+    }
+}
+
+impl Mul<&BitFloat> for BitFloat{
+    type Output = BitFloat;
+
+    fn mul(self, rhs: &Self) -> Self::Output {
+        let m = mul_ubi(&self.m, &rhs.m);
+        let mut exp = self.exp + rhs.exp;
+
+        if m.len() > self.m.len() + rhs.m.len() - 1 {
+            exp += 1;
+        }
+
+        BitFloat {
+            m,
+            exp,
+            sign: self.sign ^ rhs.sign,
+        }
+    }
+}
+
+impl Mul<BitFloat> for &BitFloat{
+    type Output = BitFloat;
+
+    fn mul(self, rhs: BitFloat) -> Self::Output {
+        let m = mul_ubi(&self.m, &rhs.m);
+        let mut exp = self.exp + rhs.exp;
+
+        if m.len() > self.m.len() + rhs.m.len() - 1 {
+            exp += 1;
+        }
+
+        BitFloat {
+            m,
+            exp,
+            sign: self.sign ^ rhs.sign,
+        }
+    }
+}
+
+impl<T: MES> Mul<T> for BitFloat{
+    type Output = BitFloat;
+
+    fn mul(self, rhs: T) -> Self::Output {
+        self * BitFloat::from(rhs)
+    }
+}
+
+impl<T: MES> Mul<T> for &BitFloat{
+    type Output = BitFloat;
+
+    fn mul(self, rhs: T) -> Self::Output {
+        self * BitFloat::from(rhs)
+    }
+}
+
+macro_rules! impl_mul_for_bitfloat {
+    ($($t:ty),*) => {
+        $(
+            impl Mul<BitFloat> for $t{
+                type Output = BitFloat;
+
+                fn mul(self, rhs: BitFloat) -> Self::Output{
+                    rhs * self
+                }
+            }
+
+            impl Mul<&BitFloat> for $t{
+                type Output = BitFloat;
+
+                fn mul(self, rhs: &BitFloat) -> Self::Output{
+                    rhs * self
+                }
+            }
+        )*
+    }
+}
+
+impl_mul_for_bitfloat!(f64, f32, i128, i64, isize, i32, i16, i8);
+
+pub trait MulStbl<RHS = Self> {
     type Output;
-    fn exp(self) -> Self::Output;
+    fn mul_stbl(self, rhs: RHS) -> Self::Output;
 }
 
-impl Exp for BitFloat {
+impl MulStbl for BitFloat {
     type Output = BitFloat;
 
-    fn exp(self) -> Self::Output {
-        exp_bf(&self)
+    fn mul_stbl(self, rhs: Self) -> Self::Output {
+        let mut m = mul_ubi(&self.m, &rhs.m);
+        let mut exp = self.exp + rhs.exp;
+
+        if m.len() > self.m.len() + rhs.m.len() - 1 {
+            exp += 1;
+        }
+
+        m.drain(..(std::cmp::min(rhs.m.len(),self.m.len())-1));
+
+        BitFloat {
+            m,
+            exp,
+            sign: self.sign ^ rhs.sign,
+        }
     }
 }
 
-impl Exp for &BitFloat {
+impl MulStbl for &BitFloat{
     type Output = BitFloat;
 
-    fn exp(self) -> Self::Output {
-        exp_bf(self)
+    fn mul_stbl(self, rhs: Self) -> Self::Output {
+        let mut m = mul_ubi(&self.m, &rhs.m);
+        let mut exp = self.exp + rhs.exp;
+
+        if m.len() > self.m.len() + rhs.m.len() - 1 {
+            exp += 1;
+        }
+
+        m.drain(..(std::cmp::min(rhs.m.len(),self.m.len())-1));
+
+        BitFloat {
+            m,
+            exp,
+            sign: self.sign ^ rhs.sign,
+        }
     }
 }
 
-pub trait Ln {
-    type Output;
-    fn ln(self) -> Self::Output;
-}
-
-impl Ln for BitFloat {
+impl MulStbl<&BitFloat> for BitFloat {
     type Output = BitFloat;
 
-    fn ln(self) -> Self::Output {
-        ln_bf(&self)
+    fn mul_stbl(self, rhs: &Self) -> Self::Output {
+        let mut m = mul_ubi(&self.m, &rhs.m);
+        let mut exp = self.exp + rhs.exp;
+
+        if m.len() > self.m.len() + rhs.m.len() - 1 {
+            exp += 1;
+        }
+
+        m.drain(..(std::cmp::min(rhs.m.len(),self.m.len())-1));
+
+        BitFloat {
+            m,
+            exp,
+            sign: self.sign ^ rhs.sign,
+        }
     }
 }
 
-impl Ln for &BitFloat {
+impl MulStbl<BitFloat> for &BitFloat{
     type Output = BitFloat;
 
-    fn ln(self) -> Self::Output {
-        ln_bf(self)
+    fn mul_stbl(self, rhs: BitFloat) -> Self::Output {
+        let mut m = mul_ubi(&self.m, &rhs.m);
+        let mut exp = self.exp + rhs.exp;
+
+        if m.len() > self.m.len() + rhs.m.len() - 1 {
+            exp += 1;
+        }
+
+        m.drain(..(std::cmp::min(rhs.m.len(),self.m.len())-1));
+
+        BitFloat {
+            m,
+            exp,
+            sign: self.sign ^ rhs.sign,
+        }
     }
 }
 
-pub trait PowF<RHS = Self> {
-    type Output;
-    fn powf(self, rhs: RHS) -> Self::Output;
-}
-
-impl PowF for BitFloat {
+impl Shl<i128> for BitFloat{
     type Output = BitFloat;
 
-    #[inline]
-    fn powf(self, rhs: Self) -> Self::Output {
-        (rhs * self.ln()).exp()
+    fn shl(self, rhs: i128) -> Self::Output {
+        let mut bf = self;
+
+        if rhs < 0{
+            shr_bf(&mut bf, rhs.unsigned_abs());
+        }else{
+            shl_bf(&mut bf, rhs.unsigned_abs())
+        }
+
+        return bf;
     }
 }
 
-impl PowF for &BitFloat {
+impl Shl<i128> for &BitFloat{
     type Output = BitFloat;
 
-    #[inline]
-    fn powf(self, rhs: Self) -> Self::Output {
-        (rhs * self.ln()).exp()
+    fn shl(self, rhs: i128) -> Self::Output {
+        let mut bf = self.clone();
+
+        if rhs < 0{
+            shr_bf(&mut bf, rhs.unsigned_abs());
+        }else{
+            shl_bf(&mut bf, rhs.unsigned_abs())
+        }
+
+        return bf;
     }
 }
 
-impl PowF<BitFloat> for &BitFloat {
-    type Output = BitFloat;
+macro_rules! impl_shl_for_bitfloat {
+    ($($t:ty),*) => {
+        $(
+            impl Shl<$t> for BitFloat{
+                type Output = BitFloat;
+            
+                fn shl(self, rhs: $t) -> Self::Output {
+                    let mut bf = self;
 
-    #[inline]
-    fn powf(self, rhs: BitFloat) -> Self::Output {
-        (rhs * self.ln()).exp()
+                    if rhs < 0{
+                        shr_bf(&mut bf, rhs.unsigned_abs() as u128);
+                    }else{
+                        shl_bf(&mut bf, rhs.unsigned_abs() as u128);
+                    }
+            
+                    return bf;
+                }
+            }
+            
+            impl Shl<$t> for &BitFloat{
+                type Output = BitFloat;
+            
+                fn shl(self, rhs: $t) -> Self::Output {
+                    let mut bf = self.clone();
+
+                    if rhs < 0{
+                        shr_bf(&mut bf, rhs.unsigned_abs() as u128);
+                    }else{
+                        shl_bf(&mut bf, rhs.unsigned_abs() as u128);
+                    }
+            
+                    return bf;
+                }
+            }
+        )*
     }
 }
 
-impl PowF<&BitFloat> for BitFloat {
-    type Output = BitFloat;
+impl_shl_for_bitfloat!(i64, isize, i32, i16, i8);
 
-    #[inline]
-    fn powf(self, rhs: &BitFloat) -> Self::Output {
-        (rhs * self.ln()).exp()
+impl ShlAssign<i128> for BitFloat{
+    fn shl_assign(&mut self, rhs: i128) {
+        if rhs < 0{
+            shr_bf(self, rhs.unsigned_abs());
+        }else{
+            shl_bf(self, rhs.unsigned_abs());
+        }
     }
 }
 
-impl PowF<f64> for &BitFloat {
-    type Output = BitFloat;
-
-    #[inline]
-    fn powf(self, rhs: f64) -> Self::Output {
-        (rhs * self.ln()).exp()
+macro_rules! impl_shl_assign_for_bitfloat {
+    ($($t:ty),*) => {
+        $(
+            impl ShlAssign<$t> for BitFloat{
+                fn shl_assign(&mut self, rhs: $t) {
+                    if rhs < 0{
+                        shr_bf(self, rhs.unsigned_abs() as u128);
+                    }else{
+                        shl_bf(self, rhs.unsigned_abs() as u128);
+                    }
+                }
+            }
+        )*
     }
 }
 
-impl PowF<f32> for &BitFloat {
+impl_shl_assign_for_bitfloat!(i64, isize, i32, i16, i8);
+
+impl Shr<i128> for BitFloat{
     type Output = BitFloat;
 
-    #[inline]
-    fn powf(self, rhs: f32) -> Self::Output {
-        (rhs * self.ln()).exp()
+    fn shr(self, rhs: i128) -> Self::Output {
+        let mut bf = self;
+
+        if rhs < 0{
+            shl_bf(&mut bf, rhs.unsigned_abs());
+        }else{
+            shr_bf(&mut bf, rhs.unsigned_abs());
+        }
+
+        return bf;
     }
 }
+
+impl Shr<i128> for &BitFloat{
+    type Output = BitFloat;
+
+    fn shr(self, rhs: i128) -> Self::Output {
+        let mut bf = self.clone();
+
+        if rhs < 0{
+            shl_bf(&mut bf, rhs.unsigned_abs());
+        }else{
+            shr_bf(&mut bf, rhs.unsigned_abs());
+        }
+
+        return bf;
+    }
+}
+
+macro_rules! impl_shr_for_bitfloat {
+    ($($t:ty),*) => {
+        $(
+            impl Shr<$t> for BitFloat{
+                type Output = BitFloat;
+            
+                fn shr(self, rhs: $t) -> Self::Output {
+                    let mut bf = self;
+
+                    if rhs < 0{
+                        shl_bf(&mut bf, rhs.unsigned_abs() as u128);
+                    }else{
+                        shr_bf(&mut bf, rhs.unsigned_abs() as u128);
+                    }
+            
+                    return bf;
+                }
+            }
+            
+            impl Shr<$t> for &BitFloat{
+                type Output = BitFloat;
+            
+                fn shr(self, rhs: $t) -> Self::Output {
+                    let mut bf = self.clone();
+
+                    if rhs < 0{
+                        shl_bf(&mut bf, rhs.unsigned_abs() as u128);
+                    }else{
+                        shr_bf(&mut bf, rhs.unsigned_abs() as u128);
+                    }
+            
+                    return bf;
+                }
+            }
+        )*
+    }
+}
+
+impl_shr_for_bitfloat!(i64, isize, i32, i16, i8);
+
+impl ShrAssign<i128> for BitFloat{
+    fn shr_assign(&mut self, rhs: i128) {
+        if rhs < 0{
+            shl_bf(self, rhs.unsigned_abs());
+        }else{
+            shr_bf(self, rhs.unsigned_abs());
+        }
+    }
+}
+
+macro_rules! impl_shr_assign_for_bitfloat {
+    ($($t:ty),*) => {
+        $(
+            impl ShrAssign<$t> for BitFloat{
+                fn shr_assign(&mut self, rhs: $t) {
+                    if rhs < 0{
+                        shl_bf(self, rhs.unsigned_abs() as u128);
+                    }else{
+                        shr_bf(self, rhs.unsigned_abs() as u128);
+                    }
+                }
+            }
+        )*
+    }
+}
+
+impl_shr_assign_for_bitfloat!(i64, isize, i32, i16, i8);
