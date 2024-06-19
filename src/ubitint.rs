@@ -664,6 +664,13 @@ impl UBitInt {
     pub fn mod2(&self) -> bool {
         (self.data[0] & 1) == 1
     }
+
+    #[inline]
+    pub fn div_rem(&self, other: &UBitInt) -> (UBitInt, UBitInt){
+        let mut rem = self.data.clone();
+        let div = div_ubi(&mut rem, &other.data);
+        (UBitInt::make(div), UBitInt::make(rem))
+    }
 }
 
 impl fmt::Display for UBitInt {

@@ -30,7 +30,7 @@ impl BitFrac {
     }
 
     #[inline]
-    pub fn from<T: SignVal>(n: T, d: T) -> Result<BitFrac, String> {
+    pub fn from<T: SignVal>(n: T, d: T) -> BitFrac {
         let (n_sign, mut n_data) = n.sign_and_val();
         let (d_sign, mut d_data) = d.sign_and_val();
 
@@ -43,14 +43,14 @@ impl BitFrac {
         if let Some(idx) = d_data.iter().rposition(|&x| x != 0) {
             d_data.truncate(idx + 1);
         } else {
-            return Err("the denominator cannot be zero".to_string());
+            panic!("the denominator cannot be zero");
         }
 
-        Ok(BitFrac {
+        BitFrac {
             n: UBitInt { data: n_data },
             d: UBitInt { data: d_data },
             sign: n_sign ^ d_sign,
-        })
+        }
     }
 
     #[inline]
@@ -68,8 +68,15 @@ impl BitFrac {
     }
 
     #[inline]
-    pub fn abs(&mut self) {
+    pub fn mut_abs(&mut self) {
         self.sign = false;
+    }
+
+    #[inline]
+    pub fn abs(&self) -> BitFrac{
+        let mut out = self.clone();
+        out.mut_abs();
+        out    
     }
 
     #[inline]
@@ -97,9 +104,9 @@ impl BitFrac {
 impl fmt::Display for BitFrac {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.sign {
-            write!(f, "-{}  //  {}", self.n.to_string(), self.d.to_string())?;
+            write!(f, "-{}//{}", self.n.to_string(), self.d.to_string())?;
         } else {
-            write!(f, "{}  //  {}", self.n.to_string(), self.d.to_string())?;
+            write!(f, "{}//{}", self.n.to_string(), self.d.to_string())?;
         }
         Ok(())
     }
@@ -474,7 +481,7 @@ impl AddAssign for BitFrac {
     #[inline]
     fn add_assign(&mut self, rhs: Self) {
         if self.sign ^ rhs.sign {
-            match (*self).cmp(&rhs) {
+            match (*self).abs_cmp(&rhs) {
                 Greater => {
                     self.n *= &rhs.d;
                     self.n -= rhs.n * &self.d;
@@ -853,7 +860,7 @@ impl SubAssign for BitFrac {
             self.n += rhs.n * &self.d;
             self.d *= rhs.d;
         } else {
-            match (*self).cmp(&rhs) {
+            match (*self).abs_cmp(&rhs) {
                 Greater => {
                     self.n *= &rhs.d;
                     self.n -= rhs.n * &self.d;
@@ -863,7 +870,7 @@ impl SubAssign for BitFrac {
                     self.n *= &rhs.d;
                     self.n = rhs.n * &self.d - &self.n;
                     self.d *= rhs.d;
-                    self.sign = rhs.sign;
+                    self.sign = !rhs.sign;
                 }
                 Equal => {
                     *self = BitFrac {
@@ -885,7 +892,7 @@ impl SubAssign<&BitFrac> for BitFrac {
             self.n += &rhs.n * &self.d;
             self.d *= &rhs.d;
         } else {
-            match (*self).cmp(&rhs) {
+            match (*self).abs_cmp(&rhs) {
                 Greater => {
                     self.n *= &rhs.d;
                     self.n -= &rhs.n * &self.d;
@@ -895,7 +902,7 @@ impl SubAssign<&BitFrac> for BitFrac {
                     self.n *= &rhs.d;
                     self.n = &rhs.n * &self.d - &self.n;
                     self.d *= &rhs.d;
-                    self.sign = rhs.sign;
+                    self.sign = !rhs.sign;
                 }
                 Equal => {
                     *self = BitFrac {

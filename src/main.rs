@@ -6,6 +6,7 @@ use bit_ops_2::{
 };
 use criterion::measurement::ValueFormatter;
 use rand::{rngs::OsRng, rngs::StdRng, Rng, RngCore, SeedableRng};
+use rayon::vec;
 use std::arch::asm;
 use std::f64::consts::*;
 use std::fs;
@@ -31,8 +32,5 @@ fn print_seed() {
 }
 
 fn main() {
-    let mut bf = BitFloat::from(PI);
-
-    recipricol(&mut bf);
-    println!("{:?}", bf);
+     
 }

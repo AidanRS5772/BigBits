@@ -72,9 +72,9 @@ impl BitInt {
     }
 
     #[inline]
-    pub fn from_ubi(ubi: UBitInt) -> BitInt {
+    pub fn from_ubi(ubi: &UBitInt) -> BitInt {
         BitInt {
-            val: ubi,
+            val: ubi.clone(),
             sign: false,
         }
     }
