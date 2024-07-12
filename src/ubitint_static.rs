@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(asm_sub_register)]
 
 use crate::ubitint::*;
 use std::arch::asm;
@@ -15,14 +16,14 @@ unsafe fn add4_with_carry_aarch64(lhs: &mut [usize], rhs: &[usize], c: &mut u8) 
         "adcs {l2}, {l2}, {r2}",
         "adcs {l3}, {l3}, {r3}",
         "cset {c}, cs",
-        l0 = inout(reg) *l0,
-        l1 = inout(reg) *l1,
-        l2 = inout(reg) *l2,
-        l3 = inout(reg) *l3,
-        r0 = in(reg) r0,
-        r1 = in(reg) r1,
-        r2 = in(reg) r2,
-        r3 = in(reg) r3,
+        l0 = inout(reg) lhs[0],
+        l1 = inout(reg) lhs[1],
+        l2 = inout(reg) lhs[2],
+        l3 = inout(reg) lhs[3],
+        r0 = in(reg) rhs[0],
+        r1 = in(reg) rhs[1],
+        r2 = in(reg) rhs[2],
+        r3 = in(reg) rhs[3],
         c = inout(reg) *c,
         options(nostack)
     );
@@ -148,10 +149,10 @@ pub fn mul_ubis_prim(a: &mut [usize], b: u128) {
 pub fn mul_ubis<const N: usize>(a: &[usize], b: &[usize]) -> [usize; N] {
     let mut out = [0; N];
 
-    let mask = (1u128 << 64) - 1;
+    let mask = 0xFFFFFFFFFFFFFFFF;
 
     let mut carry: u128 = 0;
-    for k in 0..N {
+    for k in 0..N{
         let mut term: u128 = carry;
         carry = 0;
         for j in 0..=k {

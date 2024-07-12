@@ -2,7 +2,9 @@ use crate::bitfrac::BitFrac;
 use crate::bitint::BitInt;
 use crate::ubitint::*;
 use once_cell::sync::Lazy;
+use std::f64::consts::{LN_2,LN_10};
 use std::ops::*;
+use std::fmt;
 
 fn add_bf(a: &mut Vec<usize>, b: &[usize], sh: usize) -> isize {
     let mut sstart = a.len() as isize - (b.len() + sh) as isize;
@@ -171,7 +173,7 @@ pub fn powi_prim(val: &BitFloat, exp: u128) -> BitFloat {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BitFloat {
     pub m: Vec<usize>,
     exp: isize,
@@ -1200,6 +1202,10 @@ pub static LN_COEF: [Lazy<BitFloat>; 4] = [
     Lazy::new(|| BitFloat { m: vec![9855433068824928256, 1], exp: 0, sign: true }),
 ];
 
+pub static HALF: Lazy<BitFloat> = Lazy::new(|| BitFloat{m: vec![9223372036854775808], exp: -1, sign: false});
+
+pub static TEN: Lazy<BitFloat> = Lazy::new(|| BitFloat{m: vec![10], exp: 0, sign: false});
+
 impl BitFloat {
     pub fn get_m(&self) -> Vec<usize> {
         self.m.clone()
@@ -1295,6 +1301,17 @@ impl BitFloat {
         } else {
             return Ok(out);
         }
+    }
+
+    pub fn to_bi(&self) -> BitInt{
+        let mut int = self.abs_floor();
+        if int.m.is_empty(){
+            return BitInt::default();
+        }
+        let mut zeros = vec![0_usize; int.m.len().saturating_sub(int.exp as usize + 1)];
+        zeros.append(&mut int.m);
+
+        BitInt::make(UBitInt::make(zeros), self.sign)
     }
 
     pub fn abs_cmp(&self, other: &BitFloat) -> std::cmp::Ordering {
@@ -1442,6 +1459,104 @@ impl BitFloat {
         }
 
         return out;
+    }
+
+    pub fn abs_floor(&self) -> BitFloat{
+        let mut out = self.clone();
+        if out.exp >= 0{
+            out.m.drain(..out.m.len().saturating_sub(out.exp as usize+1));
+        }else{
+            return BitFloat::default()
+        }
+
+        if let Some(idx) = out.m.iter().position(|&x| x != 0){
+            out.m.drain(..idx);
+            out.exp += idx as isize;
+        }else{
+            return BitFloat::default();
+        }
+        
+        out
+    }
+
+    pub fn floor(&self) -> BitFloat{
+        let mut out = self.abs_floor();
+        if out.sign{
+            out -= &*ONE;
+        }
+
+        out
+    }
+
+    pub fn ceil(&self) -> BitFloat{
+        let mut out = self.abs_floor();
+        if !out.sign{
+            out += &*ONE;
+        }
+
+        out
+    }
+
+    pub fn abs_fract(&self) -> BitFloat{
+        let mut out = self.clone();
+        if out.exp >= 0{
+            out.m.truncate(out.m.len().saturating_sub(out.exp as usize+1))
+        }
+        out.exp = -1;
+        out.sign = false;
+
+        if let Some(idx) = out.m.iter().rposition(|&x| x != 0){
+            out.m.truncate(idx+1);
+            out.exp -= (out.m.len() - idx - 1) as isize;
+        }else{
+            out.m.clear();
+            out.exp = 0;
+        }
+
+        out
+    }
+
+    pub fn fract(&self) -> BitFloat{
+        self - self.floor()
+    }
+
+    pub fn round(&self) -> BitFloat{
+        if self.abs_fract() > *HALF{
+            return self.ceil();
+        }else{
+            return self.floor();
+        }
+    }
+}
+
+impl fmt::Display for BitFloat{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let int = self.abs_floor().to_bi();
+        let mut fract = self.abs_fract();
+        println!("fract: {:?}", fract);
+
+        let max_iter = (((fract.m.len()*64) as f64)*LN_2/LN_10) as usize;
+        println!("max_iter: {max_iter}");
+        let mut fract_str:String = String::default();
+        for _ in 0..max_iter{
+            fract *= &*TEN;
+            if fract.exp == 0{
+                if let Some(digit) = fract.m.last(){
+                    fract_str.push_str(&digit.to_string());
+                }else{
+                    break
+                }
+            }else{
+                fract_str.push('0')
+            }
+            fract = fract.abs_fract();
+        }
+
+        println!("fract string len: {}", fract_str.len());
+
+        write!(f,"{}.{}", int.to_string(), fract_str)?;
+
+        Ok(())
     }
 }
 
@@ -2954,7 +3069,7 @@ impl PowF<BitFloat> for &BitFloat{
     }
 }
 
-macro_rules! impl_div_for_bitfloat {
+macro_rules! impl_powf_for_bitfloat {
     ($($t:ty),*) => {
         $(
             impl PowF<$t> for BitFloat{
@@ -2976,4 +3091,4 @@ macro_rules! impl_div_for_bitfloat {
     }
 }
 
-impl_div_for_bitfloat!(f64, f32);
+impl_powf_for_bitfloat!(f64, f32);

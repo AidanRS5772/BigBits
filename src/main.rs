@@ -2,7 +2,8 @@
 #![allow(dead_code)]
 
 use bit_ops_2::{
-    bitfloat::*, bitfrac::*, bitint::*, bitint_static::*, ubitint::*, ubitint_static::*,
+    bitfloat::*, bitfloat_static::*, bitfrac::*, bitint::*, bitint_static::*, ubitint::*,
+    ubitint_static::*,
 };
 use criterion::measurement::ValueFormatter;
 use rand::{rngs::OsRng, rngs::StdRng, Rng, RngCore, SeedableRng};
@@ -10,6 +11,7 @@ use rayon::vec;
 use std::arch::asm;
 use std::f64::consts::*;
 use std::fs;
+use std::ops::Mul;
 use std::ptr::copy_nonoverlapping;
 use std::result;
 use std::thread::sleep;
@@ -31,6 +33,4 @@ fn print_seed() {
     println!("];");
 }
 
-fn main() {
-     
-}
+fn main() {}

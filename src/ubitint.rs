@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(asm_sub_register)]
 
 use core::fmt;
 use std::arch::asm;
@@ -38,7 +39,7 @@ pub unsafe fn add_with_carry_x86_64(l: &mut usize, s: usize, c: &mut u8) {
 //propogates carry on aarch64
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub unsafe fn add_carry_aarch64(l: &mut usize, c: &mut usize) {
+pub unsafe fn add_carry_aarch64(l: &mut usize, c: &mut u8) {
     asm!(
         "adds {l}, {l}, {c}", // l + c -> l
         "cset {c}, cs",       // cf -> c
@@ -360,7 +361,7 @@ fn log2_ubi(ubi: &[usize]) -> u128 {
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub unsafe fn shr_carry_aarch64(e: &mut usize, c: &mut usize, rem: usize, mv_sz: usize) {
+pub unsafe fn shr_carry_aarch64(e: &mut usize, c: &mut usize, rem: u8, mv_sz: u8) {
     asm!(
         "lsl {tmp}, {e}, {ms}", // put the last bits of the e into tmp
         "lsr {e}, {e}, {r}", // shift e by rem

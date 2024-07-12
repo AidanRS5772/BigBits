@@ -1,5 +1,5 @@
 use crate::ubitint_static::Pow;
-use crate::ubitint::add_carry_x86_64;
+use crate::ubitint::*;
 use crate::ubitint_static::*;
 use std::ops::*;
 use std::fmt;

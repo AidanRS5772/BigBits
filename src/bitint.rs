@@ -5,7 +5,7 @@ use core::fmt;
 use std::cmp::Ordering::*;
 use std::ops::*;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BitInt {
     pub val: UBitInt,
     pub sign: bool,
@@ -69,6 +69,11 @@ impl BitInt {
             val: UBitInt { data },
             sign,
         }
+    }
+
+    #[inline]
+    pub fn make(val: UBitInt, sign: bool) -> BitInt{
+        BitInt{val,sign}
     }
 
     #[inline]
@@ -231,8 +236,6 @@ macro_rules! impl_pord_bi_prim {
 }
 
 impl_pord_bi_prim!(i128, i64, isize, i32, i16, i8);
-
-impl Eq for BitInt {}
 
 impl Ord for BitInt {
     #[inline]

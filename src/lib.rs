@@ -4,6 +4,7 @@ pub mod bitint;
 pub mod bitint_static;
 pub mod ubitint;
 pub mod ubitint_static;
+pub mod bitfloat_static;
 
 #[cfg(test)]
 mod tests {
