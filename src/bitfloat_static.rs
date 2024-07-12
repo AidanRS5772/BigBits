@@ -193,8 +193,5 @@ impl<const N:usize> Add for BitFloatStatic<N>{
 
         let sh = (self.exp - rhs.exp).unsigned_abs();
 
-
-
-
     }
 }
