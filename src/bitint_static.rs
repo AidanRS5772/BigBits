@@ -1,53 +1,21 @@
-use crate::ubitint_static::Pow;
-use crate::ubitint::add_carry_x86_64;
-use crate::ubitint_static::*;
-use std::ops::*;
+use crate::traits::{DivRem, FromErr, FromStrErr, Int, LogI, PowI, Prim, SmallBuf, Sqr, UPrim};
+use crate::ubitint_static::UBitIntStatic;
+use crate::{impl_commutative, impl_commutative_peq_pord};
+use crate::{impl_commutative_div_rem, utils::*};
+use std::f64::consts::{LN_10, LN_2};
 use std::fmt;
-
-fn twos_comp(bis: &mut [usize]) -> bool {
-    one_comp(bis);
-
-    unsafe {
-        let mut c: u8 = 1;
-        for l in bis {
-            #[cfg(target_arch = "aarch64")]
-            add_carry_aarch64(l, &mut c);
-
-            #[cfg(target_arch = "x86_64")]
-            add_carry_x86_64(l, &mut c);
-            if c == 0 {
-                return false;
-            }
-        }
-    }
-
-    return true;
-}
+use std::ops::*;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BitIntStatic<const N: usize> {
-    data: [usize; N],
+    data: [u64; N],
     sign: bool,
 }
 
-macro_rules! impl_to_usize_arr_iprim {
-    ($($t:ty),*) => {
-        $(
-            impl<const N: usize> ToUsizeArray<N> for $t{
-                #[inline]
-                fn to_usize_array(self) -> [usize;N]{
-                    self.unsigned_abs().to_usize_array()
-                }
-            }
-        )*
-    };
-}
-
-impl_to_usize_arr_iprim!(i128, i64, isize, i32, i16, i8);
-
 impl<const N: usize> BitIntStatic<N> {
     #[inline]
-    pub fn get_data(&self) -> [usize; N] {
+    pub fn get_data(&self) -> [u64; N] {
         self.data
     }
 
@@ -57,38 +25,26 @@ impl<const N: usize> BitIntStatic<N> {
     }
 
     #[inline]
-    pub fn make(data: [usize; N], sign: bool) -> BitIntStatic<N> {
-        BitIntStatic::<N> { data, sign }
+    pub fn make(data: [u64; N], sign: bool) -> Self {
+        BitIntStatic { data, sign }
     }
 
-    #[inline]
-    pub fn from<T: ToUsizeArray<N> + std::cmp::PartialOrd + Default + std::marker::Copy>(
-        val: T,
-    ) -> BitIntStatic<N> {
-        BitIntStatic::<N> {
-            data: val.to_usize_array(),
-            sign: val < T::default(),
-        }
-    }
+    const ZERO: Self = BitIntStatic {
+        data: [0; N],
+        sign: false,
+    };
 
-    #[inline]
-    pub fn from_str(num: &str) -> Result<BitIntStatic<N>, String>{
-        let sign:bool;
-        let unum:&str;
-        if let Some(first_char) = num.chars().next() {
-            if first_char == '-'{
-                sign = true;
-                unum = &num[1..];
-            }else{
-                sign = false;
-                unum = num;
-            }
-        } else {
-            return Err("malformed string input".to_string())
-        }
+    const ONE: Self = {
+        let mut data = [0; N];
+        data[0] = 1;
+        BitIntStatic { data, sign: false }
+    };
 
-        return Ok(BitIntStatic::<N> { data: UBitIntStatic::<N>::from_str(unum)?.get_data(), sign})
-    }
+    const NEG_ONE: Self = {
+        let mut data = [0; N];
+        data[0] = 1;
+        BitIntStatic { data, sign: true }
+    };
 
     #[inline]
     pub fn mut_neg(&mut self) {
@@ -96,43 +52,150 @@ impl<const N: usize> BitIntStatic<N> {
     }
 
     #[inline]
-    pub fn abs(&mut self) {
+    pub fn mut_abs(&mut self) {
         self.sign = false;
     }
 
     #[inline]
-    pub fn mod2_abs(&self) -> bool{
-        (self.data[0] & 1_usize) == 1
+    pub fn is_zero(&self) -> bool {
+        self.data.iter().all(|&x| x == 0)
     }
+}
 
-    #[inline]
-    pub fn unsigned_abs(&self) -> UBitIntStatic<N> {
-        UBitIntStatic::<N>::make(self.data)
-    }
-
-    #[inline]
-    pub fn to(&self) -> Result<i128, String> {
-        let uval: u128 = self.unsigned_abs().to()?;
-        let val_res: Result<i128, _> = uval.try_into();
-        match val_res {
-            Ok(val) => {
-                if self.sign {
-                    Ok(-val)
-                } else {
-                    Ok(val)
-                }
-            }
-            Err(_) => Err("Static BitInt cant be converted to a i128".to_string()),
+impl<const N: usize, T: Int> From<T> for BitIntStatic<N> {
+    fn from(value: T) -> Self {
+        let mut data = [0; N];
+        let buf = SmallBuf::from(value);
+        data[..buf.len()].copy_from_slice(&buf);
+        BitIntStatic {
+            data,
+            sign: value.sign(),
         }
+    }
+}
+
+impl<const N: usize> TryFrom<BitIntStatic<N>> for u128 {
+    type Error = FromErr;
+    fn try_from(value: BitIntStatic<N>) -> Result<Self, Self::Error> {
+        if value.sign {
+            return Err(FromErr::Sign);
+        }
+        let buf = SmallBuf::try_from(value.data.as_slice())?;
+        Ok(buf.into())
+    }
+}
+
+impl<const N: usize> TryFrom<BitIntStatic<N>> for i128 {
+    type Error = FromErr;
+    fn try_from(value: BitIntStatic<N>) -> Result<Self, Self::Error> {
+        let uval: u128 = SmallBuf::try_from(value.data.as_slice())?.into();
+        let ival: i128 = uval.try_into().map_err(|_| FromErr::Overflow)?;
+        Ok(if value.sign { -ival } else { ival })
+    }
+}
+
+macro_rules! impl_try_from_bi {
+    ($(($u:ty, $i:ty)), +) => {
+        $(
+        impl<const N: usize> TryFrom<BitIntStatic<N>> for $u{
+            type Error = FromErr;
+            fn try_from(value: BitIntStatic<N>) -> Result<Self, Self::Error> {
+                if value.sign {
+                    return Err(FromErr::Sign);
+                }
+                SmallBuf::try_from(value.data.as_slice())?.try_into()
+            }
+        }
+
+        impl<const N: usize> TryFrom<BitIntStatic<N>> for $i{
+            type Error = FromErr;
+            fn try_from(value: BitIntStatic<N>) -> Result<Self, Self::Error> {
+                let uval: $u = SmallBuf::try_from(value.data.as_slice())?.try_into()?;
+                let mut ival: $i = uval.try_into().map_err(|_| FromErr::Overflow)?;
+                Ok(if value.sign { -ival } else { ival })
+            }
+        }
+        )+
+    };
+}
+impl_try_from_bi!((u64, i64), (u32, i32), (u16, i16), (u8, i8));
+
+impl<const N: usize> FromStr for BitIntStatic<N> {
+    type Err = FromStrErr;
+    fn from_str(str: &str) -> Result<Self, FromStrErr> {
+        const CHUNK_SIZE: usize = 19;
+        const CHUNK_BASE: u64 = 10_000_000_000_000_000_000;
+
+        if (str.len() as f64) * LN_10 > (N as f64) * 64.0 * LN_2 {
+            return Err(FromStrErr::Overflow);
+        }
+
+        let neg = if let Some(last) = str.chars().next() {
+            if last == '-' {
+                true
+            } else {
+                false
+            }
+        } else {
+            return Err(FromStrErr::Empty);
+        };
+
+        if neg {
+            str.remove(0);
+        }
+
+        let mut result = BitIntStatic::zero();
+        let mut multiplier = BitIntStatic::one();
+        let mut end = str.len();
+        while end > 0 {
+            let mut start = end.saturating_sub(CHUNK_SIZE);
+            let chunk_str = &str[start..end];
+
+            if chunk_str.trim() != chunk_str {
+                return Err(FromStrErr::Whitespace);
+            }
+            let chunk_value = chunk_str
+                .parse::<usize>()
+                .map_err(|_| FromStrErr::MalformedExpression)?;
+
+            result += chunk_value * &multiplier;
+            multiplier *= CHUNK_BASE;
+            end = start;
+        }
+
+        result.sign = neg;
+        Ok(result)
     }
 }
 
 impl<const N: usize> fmt::Display for BitIntStatic<N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.sign{
-            write!(f, "{}{}", "-",(*self).unsigned_abs().to_string())?;
-        }else{
-            write!(f, "{}",(*self).unsigned_abs().to_string())?;
+        if self.is_zero() {
+            return write!(f, "0");
+        }
+
+        const CHUNK_DIVISOR: u64 = 10_000_000_000_000_000_000;
+        const CHUNK_DIGITS: usize = 19;
+
+        let mut chunks: Vec<u64> = Vec::new();
+        let mut ubi = self.unsigned_abs();
+
+        while !ubi.is_zero() {
+            let (div, rem) = ubi.div_rem(CHUNK_DIVISOR);
+            chunks.push(rem);
+            ubi = div;
+        }
+
+        if self.sign {
+            write!(f, "-")?;
+        }
+
+        if let Some(&first) = chunks.last() {
+            write!(f, "{}", first)?;
+        }
+
+        for &chunk in chunks.iter().rev().skip(1) {
+            write!(f, "{:0width$}", chunk, width = CHUNK_DIGITS)?;
         }
 
         Ok(())
@@ -141,456 +204,100 @@ impl<const N: usize> fmt::Display for BitIntStatic<N> {
 
 impl<const N: usize> PartialEq for BitIntStatic<N> {
     fn eq(&self, other: &Self) -> bool {
-        if self.sign != other.sign {
+        if self.sign ^ other.sign {
             return false;
         }
-
-        for (l, r) in self.data.iter().zip(&other.data) {
-            if l != r {
-                return false;
-            }
-        }
-
-        return true;
+        self.data == other.data
     }
 }
 
-impl<const N: usize> PartialEq<isize> for BitIntStatic<N> {
-    fn eq(&self, other: &isize) -> bool {
-        if self.sign ^ (*other < 0) {
+impl<const N: usize, T: Int> PartialEq<T> for BitIntStatic<N> {
+    fn eq(&self, other: &T) -> bool {
+        if self.sign ^ other.sign() {
             return false;
         }
-
-        if let Some(idx) = self.data.iter().rposition(|&x| x != 0) {
-            if idx > 0 {
-                return false;
-            } else {
-                return self.data[0] == (*other).unsigned_abs();
-            }
-        } else {
-            return *other == 0;
-        }
+        eq_buf(&self.data, &other.unsigned().into())
     }
 }
-
-#[cfg(target_pointer_width = "64")]
-impl<const N: usize> PartialEq<i64> for BitIntStatic<N> {
-    fn eq(&self, other: &i64) -> bool {
-        if self.sign ^ (*other < 0) {
-            return false;
-        }
-
-        if let Some(idx) = self.data.iter().rposition(|&x| x != 0) {
-            if idx > 0 {
-                return false;
-            } else {
-                return self.data[0] == (*other).unsigned_abs() as usize;
-            }
-        } else {
-            return *other == 0;
-        }
-    }
-}
-
-macro_rules! impl_partial_eq_bis_prim {
-    ($($t:ty),*) => {
-        $(
-            impl<const N:usize> PartialEq<$t> for BitIntStatic<N>{
-                fn eq(&self, other: &$t) -> bool {
-                    if self.sign ^ (*other < 0){
-                        return false
-                    }
-
-                    if let Some(idx) = self.data.iter().rposition(|&x| x != 0){
-                        if idx > 0{
-                            return false
-                        }else{
-                            return self.data[0] == (*other).unsigned_abs() as usize
-                        }
-                    }else{
-                        return *other == 0
-                    }
-                }
-            }
-        )*
-    };
-}
-
-impl_partial_eq_bis_prim!(i32, i16, i8);
-
 impl<const N: usize> PartialOrd for BitIntStatic<N> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         if self.sign ^ other.sign {
-            if self.sign {
-                return Some(std::cmp::Ordering::Less);
-            } else {
-                return Some(std::cmp::Ordering::Greater);
-            }
+            return Some(scmp(self.sign, std::cmp::Ordering::Greater));
         }
-
-        if self.sign {
-            return Some(
-                UBitIntStatic::make(self.data)
-                    .cmp(&UBitIntStatic::make(other.data))
-                    .reverse(),
-            );
-        } else {
-            return UBitIntStatic::make(self.data).partial_cmp(&UBitIntStatic::make(other.data));
-        }
+        Some(scmp(self.sign, cmp_buf(&self.data, &other.data)))
     }
 }
 
-impl<const N: usize> PartialOrd<isize> for BitIntStatic<N> {
-    fn partial_cmp(&self, other: &isize) -> Option<std::cmp::Ordering> {
-        if self.sign ^ (*other < 0) {
-            if self.sign {
-                return Some(std::cmp::Ordering::Less);
-            } else {
-                return Some(std::cmp::Ordering::Greater);
-            }
+impl<const N: usize, T: Int> PartialOrd<T> for BitIntStatic<N> {
+    fn partial_cmp(&self, other: &T) -> Option<std::cmp::Ordering> {
+        if self.sign ^ other.sign() {
+            return Some(scmp(self.sign, std::cmp::Ordering::Greater));
         }
-
-        if self.sign {
-            return Some(
-                UBitIntStatic::make(self.data)
-                    .partial_cmp(&(*other).unsigned_abs())
-                    .unwrap()
-                    .reverse(),
-            );
-        } else {
-            return UBitIntStatic::make(self.data).partial_cmp(&(*other).unsigned_abs());
-        }
+        Some(scmp(
+            self.sign,
+            cmp_buf(&self.data, &other.unsigned().into()),
+        ))
     }
 }
 
-#[cfg(target_pointer_width = "64")]
-impl<const N: usize> PartialOrd<i64> for BitIntStatic<N> {
-    fn partial_cmp(&self, other: &i64) -> Option<std::cmp::Ordering> {
-        if self.sign ^ (*other < 0) {
-            if self.sign {
-                return Some(std::cmp::Ordering::Less);
-            } else {
-                return Some(std::cmp::Ordering::Greater);
-            }
-        }
+impl_commutative_peq_pord!(const N, BitIntStatic, u128, i128, u64, i64, u32, i32, u16, i16, u8, i8);
 
-        if self.sign {
-            return Some(
-                UBitIntStatic::make(self.data)
-                    .partial_cmp(&(*other).unsigned_abs())
-                    .unwrap()
-                    .reverse(),
-            );
-        } else {
-            return UBitIntStatic::make(self.data).partial_cmp(&(*other).unsigned_abs());
-        }
+impl<const N: usize> Eq for BitIntStatic<N> {}
+
+impl<const N: usize> Ord for BitIntStatic<N> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap()
     }
 }
 
-macro_rules! impl_partial_ord_bis_prim {
-    ($($t:ty),*) => {
-        $(
-            impl<const N:usize> PartialOrd<$t> for BitIntStatic<N>{
-                fn partial_cmp(&self, other: &$t) -> Option<std::cmp::Ordering> {
-                    if self.sign ^ (*other < 0){
-                        if self.sign{
-                            return Some(std::cmp::Ordering::Less)
-                        }else{
-                            return Some(std::cmp::Ordering::Greater)
-                        }
-                    }
-
-                    if self.sign{
-                        return Some(UBitIntStatic::make(self.data).partial_cmp(&(*other).unsigned_abs()).unwrap().reverse())
-                    }else{
-                        return UBitIntStatic::make(self.data).partial_cmp(&(*other).unsigned_abs())
-                    }
-                }
-            }
-        )*
-    };
+fn add_sub<const N: usize>(lhs: &mut BitIntStatic<N>, rhs: &[u64], sub: bool) -> bool {
+    let comp = lhs.sign ^ sub;
+    let of = acc(&mut lhs.data, rhs, comp as u8);
+    lhs.sign ^= of && comp;
+    if of && comp {
+        twos_comp(&mut lhs.data);
+    }
+    return of && !comp;
 }
-
-impl_partial_ord_bis_prim!(i32, i16, i8);
 
 impl<const N: usize> Add for BitIntStatic<N> {
     type Output = BitIntStatic<N>;
-
     fn add(self, rhs: Self) -> Self::Output {
-        let (mut lhs_d, mut lhs_s) = (self.data, self.sign);
-        if lhs_s {
-            lhs_s ^= twos_comp(&mut lhs_d)
-        }
-
-        let (mut rhs_d, mut rhs_s) = (rhs.data, rhs.sign);
-        if rhs_s {
-            rhs_s ^= twos_comp(&mut rhs_d);
-        }
-
-        let mut sign = lhs_s ^ rhs_s ^ add_ubis::<N>(&mut lhs_d, &rhs_d, 0);
-
-        if sign {
-            sign ^= twos_comp(&mut lhs_d)
-        }
-
-        BitIntStatic::<N> { data: lhs_d, sign }
+        let mut lhs = self;
+        let of = add_sub(&mut lhs, &rhs.data, rhs.sign);
+        debug_assert!(!of, "attempt to add with overflow");
+        return lhs;
     }
 }
 
-impl<const N: usize> Add<isize> for BitIntStatic<N> {
+impl<const N: usize, T: Int> Add<T> for BitIntStatic<N> {
     type Output = BitIntStatic<N>;
-
-    fn add(self, rhs: isize) -> Self::Output {
-        if self.sign ^ (rhs < 0) {
-            match self.unsigned_abs()
-                .partial_cmp(&(rhs.unsigned_abs()))
-                .unwrap()
-            {
-                std::cmp::Ordering::Greater => {
-                    let mut lhs = self.data;
-                    sub_ubis_prim(&mut lhs, rhs.unsigned_abs());
-                    BitIntStatic::<N> {
-                        data: lhs,
-                        sign: self.sign,
-                    }
-                }
-                std::cmp::Ordering::Less => {
-                    let mut lhs: [usize; N] = [0; N];
-                    lhs[0] = rhs.unsigned_abs() - self.data[0];
-                    BitIntStatic::<N> {
-                        data: lhs,
-                        sign: !self.sign,
-                    }
-                }
-                std::cmp::Ordering::Equal => BitIntStatic::<N> {
-                    data: [0; N],
-                    sign: false,
-                },
-            }
-        } else {
-            let mut lhs = self.data;
-            add_ubis_prim(&mut lhs, rhs.unsigned_abs());
-            BitIntStatic::<N> {
-                data: lhs,
-                sign: self.sign,
-            }
-        }
+    fn add(self, rhs: T) -> Self::Output {
+        let mut lhs = self;
+        let of = add_sub(&mut lhs, &rhs.unsigned().into(), rhs.sign());
+        debug_assert!(!of, "attempt to add with overflow");
+        return lhs;
     }
 }
 
-impl<const N: usize> Add<BitIntStatic<N>> for isize {
-    type Output = BitIntStatic<N>;
-
-    #[inline]
-    fn add(self, rhs: BitIntStatic<N>) -> Self::Output {
-        rhs + self
-    }
-}
-
-#[cfg(target_pointer_width = "64")]
-impl<const N: usize> Add<i64> for BitIntStatic<N> {
-    type Output = BitIntStatic<N>;
-
-    fn add(self, rhs: i64) -> Self::Output {
-        if self.sign ^ (rhs < 0) {
-            match self.unsigned_abs()
-                .partial_cmp(&(rhs.unsigned_abs()))
-                .unwrap()
-            {
-                std::cmp::Ordering::Greater => {
-                    let mut lhs = self.data;
-                    sub_ubis_prim(&mut lhs, rhs.unsigned_abs() as usize);
-                    BitIntStatic::<N> {
-                        data: lhs,
-                        sign: self.sign,
-                    }
-                }
-                std::cmp::Ordering::Less => {
-                    let mut lhs: [usize; N] = [0; N];
-                    lhs[0] = rhs.unsigned_abs() as usize - self.data[0];
-                    BitIntStatic::<N> {
-                        data: lhs,
-                        sign: !self.sign,
-                    }
-                }
-                std::cmp::Ordering::Equal => BitIntStatic::<N> {
-                    data: [0; N],
-                    sign: false,
-                },
-            }
-        } else {
-            let mut lhs = self.data;
-            add_ubis_prim(&mut lhs, rhs.unsigned_abs() as usize);
-            BitIntStatic::<N> {
-                data: lhs,
-                sign: self.sign,
-            }
-        }
-    }
-}
-
-#[cfg(target_pointer_width = "64")]
-impl<const N: usize> Add<BitIntStatic<N>> for i64 {
-    type Output = BitIntStatic<N>;
-
-    fn add(self, rhs: BitIntStatic<N>) -> Self::Output {
-        rhs + self
-    }
-}
-
-macro_rules! impl_add_bis_prim {
-    ($($t:ty),*) => {
-        $(
-            impl<const N: usize> Add<$t> for BitIntStatic<N>{
-                type Output = BitIntStatic<N>;
-
-                fn add(self, rhs: $t) -> Self::Output {
-                    if self.sign ^ (rhs < 0){
-                        match self.unsigned_abs().partial_cmp(&(rhs.unsigned_abs())).unwrap(){
-                            std::cmp::Ordering::Greater => {
-                                let mut lhs = self.data;
-                                sub_ubis_prim(&mut lhs, rhs.unsigned_abs() as usize);
-                                BitIntStatic::<N> { data: lhs, sign: self.sign}
-                            },
-                            std::cmp::Ordering::Less => {
-                                let mut lhs: [usize; N] = [0;N];
-                                lhs[0] = rhs.unsigned_abs() as usize - self.data[0];
-                                BitIntStatic::<N> { data:lhs, sign: !self.sign }
-                            },
-                            std::cmp::Ordering::Equal =>{
-                                BitIntStatic::<N> { data: [0;N], sign: false}
-                            }
-                        }
-                    }else{
-                        let mut lhs = self.data;
-                        add_ubis_prim(&mut lhs, rhs.unsigned_abs() as usize);
-                        BitIntStatic::<N> { data: lhs, sign: self.sign}
-                    }
-                }
-            }
-
-            impl<const N:usize> Add<BitIntStatic<N>> for $t{
-                type Output = BitIntStatic<N>;
-
-                fn add(self, rhs: BitIntStatic<N>) -> Self::Output {
-                    rhs + self
-                }
-            }
-        )*
-    };
-}
-
-impl_add_bis_prim!(i32, i16, i8);
+impl_commutative!(const N, Add, add, BitIntStatic, |x| x, u128, i128, u64, i64, u32, i32, u16, i16, u8, i8);
 
 impl<const N: usize> AddAssign for BitIntStatic<N> {
     fn add_assign(&mut self, rhs: Self) {
-        if self.sign {
-            self.sign ^= twos_comp(&mut self.data)
-        }
-
-        let (mut rhs_d, mut rhs_s) = (rhs.data, rhs.sign);
-        if rhs_s {
-            rhs_s ^= twos_comp(&mut rhs_d);
-        }
-
-        self.sign ^= rhs_s ^ add_ubis::<N>(&mut self.data, &rhs_d, 0);
-
-        if self.sign {
-            self.sign ^= twos_comp(&mut self.data)
-        }
+        let of = add_sub(self, &rhs.data, rhs.sign);
+        debug_assert!(!of, "attempt to add with overflow");
     }
 }
 
-impl<const N: usize> AddAssign<isize> for BitIntStatic<N> {
-    fn add_assign(&mut self, rhs: isize) {
-        if self.sign ^ (rhs < 0) {
-            match self.unsigned_abs()
-                .partial_cmp(&(rhs.unsigned_abs()))
-                .unwrap()
-            {
-                std::cmp::Ordering::Greater => {
-                    sub_ubis_prim(&mut self.data, rhs.unsigned_abs());
-                }
-                std::cmp::Ordering::Less => {
-                    let mut lhs: [usize; N] = [0; N];
-                    lhs[0] = rhs.unsigned_abs() - self.data[0];
-                    self.data = lhs;
-                    self.sign ^= true;
-                }
-                std::cmp::Ordering::Equal => {
-                    self.data = [0; N];
-                    self.sign = false;
-                }
-            }
-        } else {
-            add_ubis_prim(&mut self.data, rhs.unsigned_abs());
-        }
+impl<const N: usize, T: Int> AddAssign<T> for BitIntStatic<N> {
+    fn add_assign(&mut self, rhs: T) {
+        let of = add_sub(self, &rhs.unsigned().into(), rhs.sign());
+        debug_assert!(!of, "attempt to add with overflow");
     }
 }
-
-#[cfg(target_pointer_width = "64")]
-impl<const N: usize> AddAssign<i64> for BitIntStatic<N> {
-    fn add_assign(&mut self, rhs: i64) {
-        if self.sign ^ (rhs < 0) {
-            match self.unsigned_abs()
-                .partial_cmp(&(rhs.unsigned_abs()))
-                .unwrap()
-            {
-                std::cmp::Ordering::Greater => {
-                    sub_ubis_prim(&mut self.data, rhs.unsigned_abs() as usize);
-                }
-                std::cmp::Ordering::Less => {
-                    let mut lhs: [usize; N] = [0; N];
-                    lhs[0] = rhs.unsigned_abs() as usize - self.data[0];
-                    self.data = lhs;
-                    self.sign ^= true;
-                }
-                std::cmp::Ordering::Equal => {
-                    self.data = [0; N];
-                    self.sign = false;
-                }
-            }
-        } else {
-            add_ubis_prim(&mut self.data, rhs.unsigned_abs() as usize);
-        }
-    }
-}
-
-macro_rules! impl_add_assign_bis_prim {
-    ($($t:ty),*) => {
-        $(
-            impl<const N:usize> AddAssign<$t> for BitIntStatic<N>{
-                fn add_assign(&mut self, rhs: $t) {
-                    if self.sign ^ (rhs < 0){
-                        match self.unsigned_abs().partial_cmp(&(rhs.unsigned_abs())).unwrap(){
-                            std::cmp::Ordering::Greater => {
-                                sub_ubis_prim(&mut self.data, rhs.unsigned_abs() as usize);
-                            },
-                            std::cmp::Ordering::Less => {
-                                let mut lhs: [usize; N] = [0;N];
-                                lhs[0] = rhs.unsigned_abs() as usize - self.data[0];
-                                self.data = lhs;
-                                self.sign ^= true;
-                            },
-                            std::cmp::Ordering::Equal =>{
-                                self.data = [0;N];
-                                self.sign = false;
-                            }
-                        }
-                    }else{
-                        add_ubis_prim(&mut self.data, rhs.unsigned_abs() as usize);
-                    }
-                }
-            }
-        )*
-    };
-}
-
-impl_add_assign_bis_prim!(i32, i16, i8);
 
 impl<const N: usize> Neg for BitIntStatic<N> {
     type Output = BitIntStatic<N>;
-
     fn neg(self) -> Self::Output {
         BitIntStatic::<N> {
             data: self.data,
@@ -601,638 +308,318 @@ impl<const N: usize> Neg for BitIntStatic<N> {
 
 impl<const N: usize> Sub for BitIntStatic<N> {
     type Output = BitIntStatic<N>;
-
     fn sub(self, rhs: Self) -> Self::Output {
-        let (mut lhs_d, mut lhs_s) = (self.data, self.sign);
-        if lhs_s {
-            lhs_s ^= twos_comp(&mut lhs_d)
-        }
-
-        let (mut rhs_d, mut rhs_s) = (rhs.data, !rhs.sign);
-        if rhs_s {
-            rhs_s ^= twos_comp(&mut rhs_d);
-        }
-
-        let mut sign = lhs_s ^ rhs_s ^ add_ubis::<N>(&mut lhs_d, &rhs_d, 0);
-
-        if sign {
-            sign ^= twos_comp(&mut lhs_d)
-        }
-
-        BitIntStatic::<N> { data: lhs_d, sign }
+        let mut lhs = self;
+        let of = add_sub(&mut lhs, &rhs.data, !rhs.sign);
+        debug_assert!(!of, "attempt to add with overflow");
+        return lhs;
     }
 }
 
-impl<const N: usize> Sub<isize> for BitIntStatic<N> {
+impl<const N: usize, T: Int> Sub<T> for BitIntStatic<N> {
     type Output = BitIntStatic<N>;
-
-    fn sub(self, rhs: isize) -> Self::Output {
-        if self.sign ^ (rhs >= 0) {
-            match self.unsigned_abs()
-                .partial_cmp(&(rhs.unsigned_abs()))
-                .unwrap()
-            {
-                std::cmp::Ordering::Greater => {
-                    let mut lhs = self.data;
-                    sub_ubis_prim(&mut lhs, rhs.unsigned_abs());
-                    BitIntStatic::<N> {
-                        data: lhs,
-                        sign: self.sign,
-                    }
-                }
-                std::cmp::Ordering::Less => {
-                    let mut lhs: [usize; N] = [0; N];
-                    lhs[0] = rhs.unsigned_abs() - self.data[0];
-                    BitIntStatic::<N> {
-                        data: lhs,
-                        sign: !self.sign,
-                    }
-                }
-                std::cmp::Ordering::Equal => BitIntStatic::<N> {
-                    data: [0; N],
-                    sign: false,
-                },
-            }
-        } else {
-            let mut lhs = self.data;
-            add_ubis_prim(&mut lhs, rhs.unsigned_abs());
-            BitIntStatic::<N> {
-                data: lhs,
-                sign: self.sign,
-            }
-        }
+    fn sub(self, rhs: T) -> Self::Output {
+        let mut lhs = self;
+        let of = add_sub(&mut lhs, &rhs.unsigned().into(), !rhs.sign());
+        debug_assert!(!of, "attempt to add with overflow");
+        return lhs;
     }
 }
 
-impl<const N: usize> Sub<BitIntStatic<N>> for isize {
-    type Output = BitIntStatic<N>;
-
-    fn sub(self, rhs: BitIntStatic<N>) -> Self::Output {
-        let mut out = rhs - self;
-        out.mut_neg();
-        out
-    }
-}
-
-#[cfg(target_pointer_width = "64")]
-impl<const N: usize> Sub<i64> for BitIntStatic<N> {
-    type Output = BitIntStatic<N>;
-
-    fn sub(self, rhs: i64) -> Self::Output {
-        if self.sign ^ (rhs >= 0) {
-            match self.unsigned_abs()
-                .partial_cmp(&(rhs.unsigned_abs()))
-                .unwrap()
-            {
-                std::cmp::Ordering::Greater => {
-                    let mut lhs = self.data;
-                    sub_ubis_prim(&mut lhs, rhs.unsigned_abs() as usize);
-                    BitIntStatic::<N> {
-                        data: lhs,
-                        sign: self.sign,
-                    }
-                }
-                std::cmp::Ordering::Less => {
-                    let mut lhs: [usize; N] = [0; N];
-                    lhs[0] = rhs.unsigned_abs() as usize - self.data[0];
-                    BitIntStatic::<N> {
-                        data: lhs,
-                        sign: !self.sign,
-                    }
-                }
-                std::cmp::Ordering::Equal => BitIntStatic::<N> {
-                    data: [0; N],
-                    sign: false,
-                },
-            }
-        } else {
-            let mut lhs = self.data;
-            add_ubis_prim(&mut lhs, rhs.unsigned_abs() as usize);
-            BitIntStatic::<N> {
-                data: lhs,
-                sign: self.sign,
-            }
-        }
-    }
-}
-
-#[cfg(target_pointer_width = "64")]
-impl<const N: usize> Sub<BitIntStatic<N>> for i64 {
-    type Output = BitIntStatic<N>;
-
-    fn sub(self, rhs: BitIntStatic<N>) -> Self::Output {
-        let mut out = rhs - self;
-        out.mut_neg();
-        out
-    }
-}
-
-macro_rules! impl_sub_bis_prim {
-    ($($t:ty),*) => {
-        $(
-            impl<const N:usize> Sub<$t> for BitIntStatic<N>{
-                type Output = BitIntStatic<N>;
-
-                fn sub(self, rhs: $t) -> Self::Output {
-                    if self.sign ^ (rhs >= 0){
-                        match self.unsigned_abs().partial_cmp(&(rhs.unsigned_abs())).unwrap(){
-                            std::cmp::Ordering::Greater => {
-                                let mut lhs = self.data;
-                                sub_ubis_prim(&mut lhs, rhs.unsigned_abs() as usize);
-                                BitIntStatic::<N> { data: lhs, sign: self.sign}
-                            },
-                            std::cmp::Ordering::Less => {
-                                let mut lhs: [usize; N] = [0;N];
-                                lhs[0] = rhs.unsigned_abs() as usize - self.data[0];
-                                BitIntStatic::<N> { data:lhs, sign: !self.sign }
-                            },
-                            std::cmp::Ordering::Equal =>{
-                                BitIntStatic::<N> { data: [0;N], sign: false}
-                            }
-                        }
-                    }else{
-                        let mut lhs = self.data;
-                        add_ubis_prim(&mut lhs, rhs.unsigned_abs() as usize);
-                        BitIntStatic::<N> { data: lhs, sign: self.sign}
-                    }
-                }
-            }
-
-            impl<const N:usize> Sub<BitIntStatic<N>> for $t {
-                type Output = BitIntStatic<N>;
-
-                fn sub(self, rhs: BitIntStatic<N>) -> Self::Output {
-                    let mut out = rhs - self;
-                    out.mut_neg();
-                    out
-                }
-            }
-        )*
-    };
-}
-
-impl_sub_bis_prim!(i32, i16, i8);
+impl_commutative!(const N, Sub, sub, BitIntStatic, |x| -x, u128, i128, u64, i64, u32, i32, u16, i16, u8, i8);
 
 impl<const N: usize> SubAssign for BitIntStatic<N> {
     fn sub_assign(&mut self, rhs: Self) {
-        if self.sign {
-            self.sign ^= twos_comp(&mut self.data)
-        }
-
-        let (mut rhs_d, mut rhs_s) = (rhs.data, !rhs.sign);
-        if rhs_s {
-            rhs_s ^= twos_comp(&mut rhs_d);
-        }
-
-        self.sign ^= rhs_s ^ add_ubis::<N>(&mut self.data, &rhs_d, 0);
-
-        if self.sign {
-            self.sign ^= twos_comp(&mut self.data)
-        }
+        let of = add_sub(self, &rhs.data, !rhs.sign);
+        debug_assert!(!of, "attempt to add with overflow");
     }
 }
 
-impl<const N:usize> SubAssign<isize> for BitIntStatic<N>{
-    fn sub_assign(&mut self, rhs: isize) {
-        if self.sign ^ (rhs >= 0) {
-            match self.unsigned_abs()
-                .partial_cmp(&(rhs.unsigned_abs()))
-                .unwrap()
-            {
-                std::cmp::Ordering::Greater => {
-                    sub_ubis_prim(&mut self.data, rhs.unsigned_abs());
-                }
-                std::cmp::Ordering::Less => {
-                    let mut lhs: [usize; N] = [0; N];
-                    lhs[0] = rhs.unsigned_abs() - self.data[0];
-                    self.data = lhs;
-                    self.sign ^= true;
-                }
-                std::cmp::Ordering::Equal => {
-                    self.data = [0; N];
-                    self.sign = false;
-                }
-            }
-        } else {
-            add_ubis_prim(&mut self.data, rhs.unsigned_abs());
-        }
+impl<const N: usize, T: Int> SubAssign<T> for BitIntStatic<N> {
+    fn sub_assign(&mut self, rhs: T) {
+        let of = add_sub(self, &rhs.unsigned().into(), !rhs.sign());
+        debug_assert!(!of, "attempt to add with overflow")
     }
 }
 
-#[cfg(target_pointer_width = "64")]
-impl<const N:usize> SubAssign<i64> for BitIntStatic<N>{
-    fn sub_assign(&mut self, rhs: i64) {
-        if self.sign ^ (rhs >= 0) {
-            match self.unsigned_abs()
-                .partial_cmp(&(rhs.unsigned_abs()))
-                .unwrap()
-            {
-                std::cmp::Ordering::Greater => {
-                    sub_ubis_prim(&mut self.data, rhs.unsigned_abs() as usize);
-                }
-                std::cmp::Ordering::Less => {
-                    let mut lhs: [usize; N] = [0; N];
-                    lhs[0] = rhs.unsigned_abs() as usize - self.data[0];
-                    self.data = lhs;
-                    self.sign ^= true;
-                }
-                std::cmp::Ordering::Equal => {
-                    self.data = [0; N];
-                    self.sign = false;
-                }
-            }
-        } else {
-            add_ubis_prim(&mut self.data, rhs.unsigned_abs() as usize);
-        }
-    }
-}
-
-macro_rules! impl_sub_assign_bis_prim {
-    ($($t:ty),*) => {
-        $(
-            impl<const N:usize> SubAssign<$t> for BitIntStatic<N>{
-                fn sub_assign(&mut self, rhs: $t) {
-                    if self.sign ^ (rhs >= 0) {
-                        match self.unsigned_abs()
-                            .partial_cmp(&(rhs.unsigned_abs()))
-                            .unwrap()
-                        {
-                            std::cmp::Ordering::Greater => {
-                                sub_ubis_prim(&mut self.data, rhs.unsigned_abs() as usize);
-                            }
-                            std::cmp::Ordering::Less => {
-                                let mut lhs: [usize; N] = [0; N];
-                                lhs[0] = rhs.unsigned_abs() as usize - self.data[0];
-                                self.data = lhs;
-                                self.sign ^= true;
-                            }
-                            std::cmp::Ordering::Equal => {
-                                self.data = [0; N];
-                                self.sign = false;
-                            }
-                        }
-                    } else {
-                        add_ubis_prim(&mut self.data, rhs.unsigned_abs() as usize);
-                    }
-                }
-            }
-        )*
-    };
-}
-
-impl_sub_assign_bis_prim!(i32, i16, i8);
-
-impl<const N:usize> Mul for BitIntStatic<N>{
+impl<const N: usize> Mul for BitIntStatic<N> {
     type Output = BitIntStatic<N>;
-
     fn mul(self, rhs: Self) -> Self::Output {
-        BitIntStatic::<N> { data: mul_ubis(&self.data, &rhs.data), sign: self.sign^rhs.sign}
+        let (data, c) = mul_arr(&self.data, &rhs.data).expect("attempt to multiply with overflow");
+        debug_assert!(c == 0, "attempt to multiply with overflow");
+        BitIntStatic {
+            data,
+            sign: self.sign ^ rhs.sign,
+        }
     }
 }
 
-impl<const N:usize> Mul<i128> for BitIntStatic<N>{
+impl<const N: usize> Mul<i128> for BitIntStatic<N> {
     type Output = BitIntStatic<N>;
-
     fn mul(self, rhs: i128) -> Self::Output {
-        let mut lhs = self.data;
-        mul_ubis_prim(&mut lhs, rhs.unsigned_abs());
-        BitIntStatic::<N> { data: lhs, sign: self.sign ^ (rhs < 0)}
+        let mut data = self.data;
+        let c = mul_prim2(&mut data, rhs.unsigned_abs());
+        debug_assert!(c != 0, "attempt to multiply with overflow");
+        BitIntStatic {
+            data,
+            sign: self.sign ^ (rhs < 0),
+        }
     }
 }
 
-impl<const N:usize> Mul<BitIntStatic<N>> for i128{
+impl<const N: usize> Mul<u128> for BitIntStatic<N> {
     type Output = BitIntStatic<N>;
-
-    fn mul(self, rhs: BitIntStatic<N>) -> Self::Output {
-        rhs * self
+    fn mul(self, rhs: u128) -> Self::Output {
+        let mut data = self.data;
+        let c = mul_prim2(&mut data, rhs);
+        debug_assert!(c != 0, "attempt to multiply with overflow");
+        BitIntStatic {
+            data,
+            sign: self.sign,
+        }
     }
 }
 
-macro_rules! impl_mul_bis_prim {
-    ($($t:ty),*) => {
-        $(
-            impl<const N:usize> Mul<$t> for BitIntStatic<N>{
-                type Output = BitIntStatic<N>;
-            
-                fn mul(self, rhs: $t) -> Self::Output {
-                    let mut lhs = self.data;
-                    mul_ubis_prim(&mut lhs, rhs.unsigned_abs() as u128);
-                    BitIntStatic::<N> { data: lhs, sign: self.sign ^ (rhs < 0)}
-                }
-            }
-
-            impl<const N:usize> Mul<BitIntStatic<N>> for $t{
-                type Output = BitIntStatic<N>;
-            
-                fn mul(self, rhs: BitIntStatic<N>) -> Self::Output {
-                    rhs * self
-                }
-            }
-        )*
-    };
+impl<const N: usize, T: Prim> Mul<T> for BitIntStatic<N> {
+    type Output = BitIntStatic<N>;
+    fn mul(self, rhs: T) -> Self::Output {
+        let mut data = self.data;
+        let c = mul_prim(&mut data, rhs.unsigned().into());
+        debug_assert!(c != 0, "attempt to multiply with overflow");
+        BitIntStatic {
+            data,
+            sign: self.sign ^ rhs.sign(),
+        }
+    }
 }
 
-impl_mul_bis_prim!(i64, isize, i32, i16, i8);
+impl_commutative!(const N, Mul, mul, BitIntStatic, |x| x, u128, i128, u64, i64, u32, i32, u16, i16, u8, i8);
 
-impl<const N:usize> MulAssign for BitIntStatic<N>{
+impl<const N: usize> MulAssign for BitIntStatic<N> {
     fn mul_assign(&mut self, rhs: Self) {
-        self.data = mul_ubis(&self.data, &rhs.data);
+        let (data, c) = mul_arr(&self.data, &rhs.data).expect("attempt to multiply with overflow");
+        debug_assert!(c == 0, "attempt to multiply with overflow");
+        self.data = data;
         self.sign ^= rhs.sign;
     }
 }
 
-impl<const N:usize> MulAssign<i128> for BitIntStatic<N>{
+impl<const N: usize> MulAssign<i128> for BitIntStatic<N> {
     fn mul_assign(&mut self, rhs: i128) {
-        mul_ubis_prim(&mut self.data, rhs.unsigned_abs());
+        let c = mul_prim2(&mut self.data, rhs.unsigned_abs());
+        debug_assert!(c != 0, "attempt to multiply with overflow");
         self.sign ^= rhs < 0;
     }
 }
 
-macro_rules! impl_mul_assign_bis_prim {
-    ($($t:ty),*) => {
-        $(
-            impl<const N:usize> MulAssign<$t> for BitIntStatic<N>{
-                fn mul_assign(&mut self, rhs: $t) {
-                    mul_ubis_prim(&mut self.data, rhs.unsigned_abs() as u128);
-                    self.sign ^= rhs < 0;
-                }
-            }
-        )*
-    };
-}
-
-impl_mul_assign_bis_prim!(i64, isize, i32, i16, i8);
-
-impl<const N:usize> Div for BitIntStatic<N>{
-    type Output = BitIntStatic<N>;
-
-    fn div(self, rhs: Self) -> Self::Output {
-        let mut ulhs = self.unsigned_abs();
-        let urhs = rhs.unsigned_abs();
-
-        BitIntStatic::<N>{ data: div_ubis(&mut ulhs, urhs).get_data(), sign: self.sign^rhs.sign}
+impl<const N: usize> MulAssign<u128> for BitIntStatic<N> {
+    fn mul_assign(&mut self, rhs: u128) {
+        let c = mul_prim2(&mut self.data, rhs);
+        debug_assert!(c != 0, "attempt to multiply with overflow");
     }
 }
 
-macro_rules! impl_div_bis_prim {
-    ($($t:ty),*) => {
-        $(
-            impl<const N:usize> Div<$t> for BitIntStatic<N>{
-                type Output = BitIntStatic<N>;
-            
-                fn div(self, rhs: $t) -> Self::Output {
-                    let mut ulhs = self.unsigned_abs();
-                    let urhs = UBitIntStatic::<N>::from(rhs.unsigned_abs());
-            
-                    BitIntStatic::<N>{ data: div_ubis(&mut ulhs, urhs).get_data(), sign: self.sign^(rhs < 0)}
-                }
-            }
-        )*
-    };
-}
-
-impl_div_bis_prim!(i128, i64, isize, i32, i16, i8);
-
-impl<const N:usize> DivAssign for BitIntStatic<N>{
-    fn div_assign(&mut self, rhs: Self) {
-        let mut ulhs = self.unsigned_abs();
-        let urhs = rhs.unsigned_abs();
-
-        self.data = div_ubis(&mut ulhs, urhs).get_data();
-        self.sign ^= rhs < 0;
+impl<const N: usize, T: Prim> MulAssign<T> for BitIntStatic<N> {
+    fn mul_assign(&mut self, rhs: T) {
+        let c = mul_prim(&mut self.data, rhs.unsigned().into());
+        debug_assert!(c != 0, "attempt to multiply with overflow");
     }
 }
 
-macro_rules! impl_div_assign_bis_prim {
-    ($($t:ty),*) => {
-        $(
-            impl<const N:usize> DivAssign<$t> for BitIntStatic<N>{
-                fn div_assign(&mut self, rhs: $t) {
-                    let mut ulhs = self.unsigned_abs();
-                    let urhs = UBitIntStatic::<N>::from(rhs.unsigned_abs());
-            
-                    self.data = div_ubis(&mut ulhs, urhs).get_data();
-                    self.sign ^= rhs < 0;
-                }
-            }
-        )*
-    };
+impl<const N: usize> Sqr for BitIntStatic<N> {
+    fn sqr(&self) -> Self {
+        let (data, c) = sqr_arr(&self.data).expect("attempt to multiply with overflow");
+        debug_assert!(c == 0, "attempt to multiply with overflow");
+        BitIntStatic { data, sign: false }
+    }
 }
 
-impl_div_assign_bis_prim!(i128, i64, isize, i32, i16, i8);
-
-impl<const N:usize> Rem for BitIntStatic<N>{
+impl<const N: usize, T: UPrim> Shl<T> for BitIntStatic<N> {
     type Output = BitIntStatic<N>;
+    fn shl(self, rhs: T) -> Self::Output {
+        let mut lhs = self;
+        shl_arr(&mut lhs.data, rhs.into());
+        return lhs;
+    }
+}
 
-    fn rem(self, rhs: Self) -> Self::Output {
-        let mut ulhs = self.unsigned_abs();
-        let urhs = rhs.unsigned_abs();
-        div_ubis(&mut ulhs, urhs);
+impl<const N: usize, T: UPrim> ShlAssign<T> for BitIntStatic<N> {
+    fn shl_assign(&mut self, rhs: T) {
+        shl_arr(&mut self.data, rhs.into());
+    }
+}
 
-        if rhs.sign ^ self.sign{
-            BitIntStatic::<N> { data: (urhs - ulhs).get_data(), sign: rhs.sign}
-        }else{
-            BitIntStatic::<N> { data: ulhs.get_data(), sign: rhs.sign}
+impl<const N: usize, T: UPrim> Shr<T> for BitIntStatic<N> {
+    type Output = BitIntStatic<N>;
+    fn shr(self, rhs: T) -> Self::Output {
+        let mut lhs = self;
+        shl_arr(&mut lhs.data, rhs.into());
+        return lhs;
+    }
+}
+
+impl<const N: usize, T: UPrim> ShrAssign<T> for BitIntStatic<N> {
+    fn shr_assign(&mut self, rhs: T) {
+        shl_arr(&mut self.data, rhs.into());
+    }
+}
+
+impl<const N: usize> DivRem for BitIntStatic<N> {
+    type Q = BitIntStatic<N>;
+    type R = UBitIntStatic<N>;
+    fn div_rem(self, rhs: Self) -> (Self::Q, Self::R) {
+        let n_len = buf_len(&self.data);
+        let mut n = self.data;
+        let d_len = buf_len(&rhs.data);
+        let mut d = rhs.data[..d_len];
+        let q = div_arr::<N>(&mut n[..n_len], &mut d);
+        (
+            BitIntStatic {
+                data: q,
+                sign: self.sign ^ rhs.sign,
+            },
+            UBitIntStatic::make(n),
+        )
+    }
+}
+
+impl<const N: usize> DivRem<i128> for BitIntStatic<N> {
+    type Q = BitIntStatic<N>;
+    type R = u128;
+    fn div_rem(self, rhs: i128) -> (Self::Q, Self::R) {
+        let n_len = buf_len(&self.data);
+        let mut n = self.data;
+        let mut d = SmallBuf::from(rhs.unsigned());
+        let q = div_arr::<N>(&mut n[..n_len], &mut d);
+        (
+            BitIntStatic {
+                data: q,
+                sign: self.sign ^ rhs.sign(),
+            },
+            SmallBuf::from(&n[..2]).into(),
+        )
+    }
+}
+
+impl<const N: usize> DivRem<u128> for BitIntStatic<N> {
+    type Q = BitIntStatic<N>;
+    type R = u128;
+    fn div_rem(self, rhs: u128) -> (Self::Q, Self::R) {
+        let n_len = buf_len(&self.data);
+        let mut n = self.data;
+        let mut d = SmallBuf::from(rhs);
+        let q = div_arr::<N>(&mut n[..n_len], &mut d);
+        (
+            BitIntStatic {
+                data: q,
+                sign: self.sign,
+            },
+            SmallBuf::try_from(&n[..2]).unwrap().into(),
+        )
+    }
+}
+
+impl<const N: usize, T: Prim> DivRem<T> for BitIntStatic<N>
+where
+    <T as Prim>::U: TryFrom<u64>,
+{
+    type Q = BitIntStatic<N>;
+    type R = <T as Prim>::U;
+    fn div_rem(self, rhs: T) -> (Self::Q, Self::R) {
+        let mut lhs = self;
+        let r = div_prim(&mut lhs.data, rhs.unsigned().into());
+        lhs.sign ^= rhs.sign();
+        (lhs, Self::R::try_from(r).unwrap())
+    }
+}
+
+fn divrem_bis_bwd<const N: usize, I, Q, R>(lhs: I, rhs: &BitIntStatic<N>) -> (Q, R)
+where
+    I: Into<R> + Div<Q, Output = Q> + Rem<Q, Output = R>,
+    Q: Default,
+    R: Into<Q>,
+{
+    let Ok(val) = rhs.to() else {
+        return (Q::default(), lhs.into());
+    };
+    (lhs / val, lhs % val)
+}
+
+impl<const N: usize, T: Int> DivRem<BitIntStatic<N>> for T {
+    type Q = <T as Int>::I;
+    type R = <T as Int>::U;
+    fn div_rem(self, rhs: BitIntStatic<N>) -> (Self::Q, Self::R) {
+        divrem_bis_bwd(self, &rhs)
+    }
+}
+
+impl<const N: usize, T> Div<T> for BitIntStatic<N>
+where
+    BitIntStatic<N>: DivRem<T>,
+{
+    type Output = <BitIntStatic<N> as DivRem<T>>::Q;
+    fn div(self, rhs: T) -> Self::Output {
+        self.div_rem(rhs).0
+    }
+}
+
+impl<const N: usize, T> Rem<T> for BitIntStatic<N>
+where
+    BitIntStatic<N>: DivRem<T>,
+{
+    type Output = <BitIntStatic<N> as DivRem<T>>::R;
+    fn rem(self, rhs: T) -> Self::Output {
+        self.div_rem(rhs).1
+    }
+}
+
+impl_commutative_div_rem!(const N, BitIntStatic, i128, u128, i64, u64, i32, u32, i16, u16, i8, u8);
+
+impl<const N: usize, T> DivAssign<T> for BitIntStatic<N>
+where
+    BitIntStatic<N>: DivRem<T, Q = BitIntStatic<N>>,
+{
+    fn div_assign(&mut self, rhs: T) {
+        *self = self.div_rem(rhs).0;
+    }
+}
+
+impl<const N: usize, T: UPrim> PowI<T> for BitIntStatic<N> {
+    type Output = BitIntStatic<N>;
+    fn powi(&self, rhs: T) -> Self::Output {
+        BitIntStatic {
+            data: powi_arr(&self.data, rhs.into())
+                .expect("attempt to take integer power with overflow"),
+            sign: self.sign && (rhs.into() & 1 == 1),
         }
     }
 }
 
-macro_rules! impl_rem_bis_prim {
-    ($($t:ty),*) => {
-        $(
-            impl<const N:usize> Rem<$t> for BitIntStatic<N>{
-                type Output = BitIntStatic<N>;
-            
-                fn rem(self, rhs: $t) -> Self::Output {
-                    let mut ulhs = self.unsigned_abs();
-                    let urhs = UBitIntStatic::<N>::from(rhs.unsigned_abs());
-                    div_ubis(&mut ulhs, urhs);
-            
-                    if (rhs < 0) ^ self.sign{
-                        BitIntStatic::<N> { data: (urhs - ulhs).get_data(), sign: rhs < 0}
-                    }else{
-                        BitIntStatic::<N> { data: ulhs.get_data(), sign: rhs < 0}
-                    }
-                }
-            }
-        )*
-    };
-}
+impl<const N: usize> LogI for BitIntStatic<N> {
+    type Output = u64;
 
-impl_rem_bis_prim!(i128, i64, isize, i32, i16, i8);
+    fn ilog2pow64(&self) -> Self::Output {
+        let len = buf_len(&self.data) as u64;
+        debug_assert!(len != 0, "attempt to calculate the logarithm of zero");
+        debug_assert!(!self.sign, "argument of integer logarithm must be positive");
 
-impl<const N:usize> RemAssign for BitIntStatic<N>{
-    fn rem_assign(&mut self, rhs: Self) {
-        let mut ulhs = self.unsigned_abs();
-        let urhs = rhs.unsigned_abs();
-        div_ubis(&mut ulhs, urhs);
+        return len - 1;
+    }
 
-        if rhs.sign ^ self.sign{
-            self.data = (urhs - ulhs).get_data();
-        }else{
-            self.data = ulhs.get_data();
+    fn ilog2(&self) -> Self::Output {
+        let l = self.ilog2pow64();
+        return l * 64 + self.data[l].ilog2();
+    }
+
+    fn ilog(&self, b: u128) -> Self::Output {
+        let mut log = self.ilog2() / (b.ilog2() as u64 + 1);
+        let mut b_ubis = UBitIntStatic::<N>::from(b).powi(log + 1);
+
+        while self >= &b_ubis {
+            log += 1;
+            b_ubis *= b;
         }
 
-        self.sign = rhs.sign;
+        return log;
     }
 }
-
-macro_rules! impl_rem_assign_bis_prim {
-    ($($t:ty),*) => {
-        $(
-            impl<const N:usize> RemAssign<$t> for BitIntStatic<N>{
-                fn rem_assign(&mut self, rhs: $t){
-                    let mut ulhs = self.unsigned_abs();
-                    let urhs = UBitIntStatic::<N>::from(rhs.unsigned_abs());
-                    div_ubis(&mut ulhs, urhs);
-            
-                    if (rhs < 0) ^ self.sign{
-                        self.data = (urhs - ulhs).get_data();
-                    }else{
-                        self.data = ulhs.get_data();
-                    }
-
-                    self.sign = rhs < 0;
-                }
-            }
-        )*
-    };
-}
-
-impl_rem_assign_bis_prim!(i128, i64, isize, i32, i16, i8);
-
-impl<const N:usize> Shl<u128> for BitIntStatic<N>{
-    type Output = BitIntStatic<N>;
-
-    fn shl(self, rhs: u128) -> Self::Output {
-        let mut lhs = self.data;
-        shl_ubis::<N>(&mut lhs, rhs);
-        BitIntStatic::<N> { data:lhs , sign: self.sign}
-    }
-}
-
-macro_rules! impl_shl_bis_prim {
-    ($($t:ty),*) => {
-        $(
-            impl<const N:usize> Shl<$t> for BitIntStatic<N>{
-                type Output = BitIntStatic<N>;
-            
-                fn shl(self, rhs: $t) -> Self::Output {
-                    let mut lhs = self.data;
-                    shl_ubis::<N>(&mut lhs, rhs as u128);
-                    BitIntStatic::<N> { data: lhs, sign: self.sign}
-                }
-            }
-        )*
-    };
-}
-
-impl_shl_bis_prim!(u64, usize, u32, u16, u8);
-
-impl<const N:usize> ShlAssign<u128> for BitIntStatic<N>{
-    fn shl_assign(&mut self, rhs: u128) {
-        shl_ubis::<N>(&mut self.data, rhs);
-    }
-}
-
-macro_rules! impl_shl_assign_bis_prim {
-    ($($t:ty),*) => {
-        $(
-            impl<const N:usize> ShlAssign<$t> for BitIntStatic<N>{
-                fn shl_assign(&mut self, rhs: $t) {
-                    shl_ubis::<N>(&mut self.data, rhs as u128);
-                }
-            }
-        )*
-    };
-}
-
-impl_shl_assign_bis_prim!(u64, usize, u32, u16, u8);
-
-impl<const N:usize> Shr<u128> for BitIntStatic<N>{
-    type Output = BitIntStatic<N>;
-
-    fn shr(self, rhs: u128) -> Self::Output {
-        let mut lhs = self.data;
-        shr_ubis::<N>(&mut lhs, rhs);
-        BitIntStatic::<N> { data: lhs, sign: self.sign}
-    }
-}
-
-macro_rules! impl_shr_bis_prim {
-    ($($t:ty),*) => {
-        $(
-            impl<const N:usize> Shr<$t> for BitIntStatic<N>{
-                type Output = BitIntStatic<N>;
-            
-                fn shr(self, rhs: $t) -> Self::Output {
-                    let mut lhs = self.data;
-                    shr_ubis::<N>(&mut lhs, rhs as u128);
-                    BitIntStatic::<N> { data: lhs, sign: self.sign}
-                }
-            }
-        )*
-    };
-}
-
-impl_shr_bis_prim!(u64, usize, u32, u16, u8);
-
-impl<const N:usize> ShrAssign<u128> for BitIntStatic<N>{
-    fn shr_assign(&mut self, rhs: u128) {
-        shr_ubis::<N>(&mut self.data, rhs);
-    }
-}
-
-macro_rules! impl_shr_assign_bis_prim {
-    ($($t:ty),*) => {
-        $(
-            impl<const N:usize> ShrAssign<$t> for BitIntStatic<N>{
-                fn shr_assign(&mut self, rhs: $t) {
-                    shr_ubis::<N>(&mut self.data, rhs as u128);
-                }
-            }
-        )*
-    };
-}
-
-impl_shr_assign_bis_prim!(u64, usize, u32, u16, u8);
-
-impl<const N:usize> Pow for BitIntStatic<N>{
-    type Output = BitIntStatic<N>;
-
-    fn pow(self, rhs: Self) -> Self::Output {
-        let b = self.unsigned_abs();
-        let exp = rhs.unsigned_abs();
-
-        let abs_pow_data = b.pow(exp).get_data();
-        if self.sign{
-            return BitIntStatic::<N> { data: abs_pow_data, sign: self.mod2_abs()};
-        }else{
-            return BitIntStatic::<N> { data: abs_pow_data, sign: false};
-        }
-    }
-}
-
-macro_rules! impl_pow_bis_prim {
-    ($($t:ty),*) => {
-        $(
-            impl<const N:usize> Pow<$t> for BitIntStatic<N>{
-                type Output = BitIntStatic<N>;
-            
-                fn pow(self, rhs: $t) -> Self::Output {
-                    let b = self.unsigned_abs();
-                    let exp = UBitIntStatic::<N>::from(rhs);
-            
-                    let abs_pow_data = b.pow(exp).get_data();
-                    if self.sign{
-                        return BitIntStatic::<N> { data: abs_pow_data, sign: self.mod2_abs()};
-                    }else{
-                        return BitIntStatic::<N> { data: abs_pow_data, sign: false};
-                    }
-                }
-            }
-        )*
-    };
-}
-
-impl_pow_bis_prim!(u128, u64, usize, u32, u16, u8);

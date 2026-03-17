@@ -1,0 +1,25 @@
+1. Implement transcendental functions for BitFloat
+2. Add specialized primitive float support
+	2) BitFloat
+3. Add symetric support for operations
+	6) BitFloat
+	7) BitFrac
+4. Remove costly u128/i128 supports for operations
+	4) BitFrac
+5. Change output types to theoretical minimum type of output
+	5) BitFloat
+	6) BitFrac
+6. Add validity checks for operations across all modules make non-checked versions
+	1) UBitIntStatic
+	2) UBitInt
+	3) BitIntStatic
+	4) BitInt
+	5) BitFloatStatic
+	6) BitFloat
+	7) BitFrac
+7. Write UBitIntStatic div_ubi to take a buffer
+8. Test different radixes for efficiency on integer divides
+9. Test Newton-Raphson 2nd and 3rd order against Goldshmit
+10. Make const versions of functions that is possible
+11. Set up comprehensive tests for all functionality (this is a lot make AI do it)
+12. Set up comprehensive benchmarking to compare against other libraries
