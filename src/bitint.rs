@@ -1,6 +1,4 @@
-use crate::traits::{
-    DivRem, FromErr, FromStrErr, Int, LogI, PowI, Prim, SmallBuf, Sqr, UPrim, UnsignedAbs,
-};
+use crate::traits::{Abs, DivRem, FromErr, FromStrErr, LogI, PowI, SmallBuf, Sqr, I};
 use crate::ubitint::UBitInt;
 use crate::utils::*;
 use crate::{impl_commutative, impl_commutative_div_rem, impl_commutative_peq_pord};
@@ -49,7 +47,7 @@ impl BitInt {
     }
 
     #[inline]
-    pub fn abs(&mut self) {
+    pub fn abs_mut(&mut self) {
         self.sign = false;
     }
 
@@ -59,52 +57,12 @@ impl BitInt {
     }
 }
 
-impl From<UBitInt> for BitInt {
-    fn from(value: UBitInt) -> Self {
-        BitInt {
-            data: value.get_data().to_vec(),
-            sign: false,
-        }
-    }
-}
-
-impl From<&UBitInt> for BitInt {
-    fn from(value: &UBitInt) -> Self {
-        BitInt {
-            data: value.get_data().to_vec(),
-            sign: false,
-        }
-    }
-}
-
-impl<T: Int> From<T> for BitInt {
+impl<T: I> From<T> for BitInt {
     fn from(value: T) -> Self {
         BitInt {
             data: value.unsigned().into().to_vec(),
             sign: value.sign(),
         }
-    }
-}
-
-impl TryFrom<BitInt> for u128 {
-    type Error = FromErr;
-    fn try_from(value: BitInt) -> Result<Self, Self::Error> {
-        if value.sign {
-            return Err(FromErr::Sign);
-        }
-        let buf = SmallBuf::try_from(value.data.as_slice())?;
-        Ok(buf.into())
-    }
-}
-
-impl TryFrom<&BitInt> for u128 {
-    type Error = FromErr;
-    fn try_from(value: &BitInt) -> Result<Self, Self::Error> {
-        if value.sign {
-            return Err(FromErr::Sign);
-        }
-        let buf = SmallBuf::try_from(value.data.as_slice())?;
-        Ok(buf.into())
     }
 }
 
@@ -126,71 +84,61 @@ impl TryFrom<&BitInt> for i128 {
     }
 }
 
-macro_rules! impl_try_from_bi {
-    ($(($u:ty, $i:ty)), +) => {
-        $(
-        impl TryFrom<BitInt> for $u{
-            type Error = FromErr;
-            fn try_from(value: BitInt) -> Result<Self, Self::Error> {
-                if value.sign {
-                    return Err(FromErr::Sign);
-                }
-                SmallBuf::try_from(value.data.as_slice())?.try_into()
-            }
-        }
-
-        impl TryFrom<&BitInt> for $u{
-            type Error = FromErr;
-            fn try_from(value: &BitInt) -> Result<Self, Self::Error> {
-                if value.sign {
-                    return Err(FromErr::Sign);
-                }
-                SmallBuf::try_from(value.data.as_slice())?.try_into()
-            }
-        }
-
-
-        impl TryFrom<BitInt> for $i{
-            type Error = FromErr;
-            fn try_from(value: BitInt) -> Result<Self, Self::Error> {
-                let uval: $u = SmallBuf::try_from(value.data.as_slice())?.try_into()?;
-                let ival: $i = uval.try_into().map_err(|_| FromErr::Overflow)?;
-                Ok(if value.sign { -ival } else { ival })
-            }
-        }
-
-        impl TryFrom<&BitInt> for $i{
-            type Error = FromErr;
-            fn try_from(value: &BitInt) -> Result<Self, Self::Error> {
-                let uval: $u = SmallBuf::try_from(value.data.as_slice())?.try_into()?;
-                let ival: $i = uval.try_into().map_err(|_| FromErr::Overflow)?;
-                Ok(if value.sign { -ival } else { ival })
-            }
-        }
-        )+
-    };
-}
-impl_try_from_bi!((u64, i64), (u32, i32), (u16, i16), (u8, i8));
-
-impl UnsignedAbs for BitInt {
-    type Output = UBitInt;
-    fn unsigned_abs(self) -> Self::Output {
-        UBitInt::make(self.data)
+impl TryFrom<BitInt> for i64 {
+    type Error = FromErr;
+    fn try_from(value: BitInt) -> Result<Self, Self::Error> {
+        let uval: u64 = SmallBuf::try_from(value.data.as_slice())?
+            .try_into()
+            .map_err(|_| FromErr::Overflow)?;
+        let ival: i64 = uval.try_into().map_err(|_| FromErr::Overflow)?;
+        Ok(if value.sign { -ival } else { ival })
     }
 }
 
-impl UnsignedAbs for &BitInt {
-    type Output = UBitInt;
-    fn unsigned_abs(self) -> Self::Output {
+impl TryFrom<&BitInt> for i64 {
+    type Error = FromErr;
+    fn try_from(value: &BitInt) -> Result<Self, Self::Error> {
+        let uval: u64 = SmallBuf::try_from(value.data.as_slice())?
+            .try_into()
+            .map_err(|_| FromErr::Overflow)?;
+        let ival: i64 = uval.try_into().map_err(|_| FromErr::Overflow)?;
+        Ok(if value.sign { -ival } else { ival })
+    }
+}
+
+impl Abs for BitInt {
+    type U = UBitInt;
+    type I = BitInt;
+    fn unsigned_abs(self) -> Self::U {
+        UBitInt::make(self.data)
+    }
+    fn abs(self) -> Self::I {
+        BitInt {
+            data: self.data,
+            sign: false,
+        }
+    }
+}
+
+impl Abs for &BitInt {
+    type U = UBitInt;
+    type I = BitInt;
+    fn unsigned_abs(self) -> Self::U {
         UBitInt::make(self.data.clone())
+    }
+    fn abs(self) -> Self::I {
+        BitInt {
+            data: self.data.clone(),
+            sign: false,
+        }
     }
 }
 
 impl FromStr for BitInt {
     type Err = FromStrErr;
     fn from_str(str: &str) -> Result<Self, FromStrErr> {
-        const CHUNK_SIZE: usize = 19;
-        const CHUNK_BASE: u64 = 10_000_000_000_000_000_000;
+        const CHUNK_SIZE: usize = 18;
+        const CHUNK_BASE: i64 = 1_000_000_000_000_000_000;
 
         let mut result = BitInt::zero();
         let mut multiplier = BitInt::one();
@@ -217,7 +165,7 @@ impl FromStr for BitInt {
                 return Err(FromStrErr::Whitespace);
             }
             let chunk_value = chunk_str
-                .parse::<u64>()
+                .parse::<i64>()
                 .map_err(|_| FromStrErr::MalformedExpression)?;
 
             result += chunk_value * &multiplier;
@@ -276,16 +224,7 @@ impl PartialEq for BitInt {
     }
 }
 
-impl PartialEq<UBitInt> for BitInt {
-    fn eq(&self, other: &UBitInt) -> bool {
-        if self.sign {
-            return false;
-        }
-        self.data == other.get_data()
-    }
-}
-
-impl<T: Int> PartialEq<T> for BitInt {
+impl<T: I> PartialEq<T> for BitInt {
     fn eq(&self, other: &T) -> bool {
         if self.sign ^ other.sign() {
             return false;
@@ -303,16 +242,7 @@ impl PartialOrd for BitInt {
     }
 }
 
-impl PartialOrd<UBitInt> for BitInt {
-    fn partial_cmp(&self, other: &UBitInt) -> Option<std::cmp::Ordering> {
-        if self.sign {
-            return Some(scmp(self.sign, std::cmp::Ordering::Greater));
-        }
-        Some(scmp(self.sign, cmp_buf(&self.data, other.get_data())))
-    }
-}
-
-impl<T: Int> PartialOrd<T> for BitInt {
+impl<T: I> PartialOrd<T> for BitInt {
     fn partial_cmp(&self, other: &T) -> Option<std::cmp::Ordering> {
         if self.sign ^ other.sign() {
             return Some(scmp(self.sign, std::cmp::Ordering::Greater));
@@ -324,7 +254,7 @@ impl<T: Int> PartialOrd<T> for BitInt {
     }
 }
 
-impl_commutative_peq_pord!(BitInt, UBitInt, u128, i128, u64, i64, u32, i32, u16, i16, u8, i8);
+impl_commutative_peq_pord!(BitInt, i128, i64);
 
 impl Eq for BitInt {}
 
@@ -389,43 +319,7 @@ impl Add<BitInt> for &BitInt {
     }
 }
 
-impl Add<UBitInt> for BitInt {
-    type Output = BitInt;
-    fn add(self, rhs: UBitInt) -> Self::Output {
-        let mut lhs = self;
-        add_sub(&mut lhs, &rhs.get_data(), false);
-        return lhs;
-    }
-}
-
-impl Add<UBitInt> for &BitInt {
-    type Output = BitInt;
-    fn add(self, rhs: UBitInt) -> Self::Output {
-        let mut lhs = self.clone();
-        add_sub(&mut lhs, &rhs.get_data(), false);
-        return lhs;
-    }
-}
-
-impl Add<&UBitInt> for BitInt {
-    type Output = BitInt;
-    fn add(self, rhs: &UBitInt) -> Self::Output {
-        let mut lhs = self;
-        add_sub(&mut lhs, &rhs.get_data(), false);
-        return lhs;
-    }
-}
-
-impl Add<&UBitInt> for &BitInt {
-    type Output = BitInt;
-    fn add(self, rhs: &UBitInt) -> Self::Output {
-        let mut lhs = self.clone();
-        add_sub(&mut lhs, &rhs.get_data(), false);
-        return lhs;
-    }
-}
-
-impl<T: Int> Add<T> for BitInt {
+impl<T: I> Add<T> for BitInt {
     type Output = BitInt;
     fn add(self, rhs: T) -> Self::Output {
         let mut lhs = self;
@@ -434,7 +328,7 @@ impl<T: Int> Add<T> for BitInt {
     }
 }
 
-impl<T: Int> Add<T> for &BitInt {
+impl<T: I> Add<T> for &BitInt {
     type Output = BitInt;
     fn add(self, rhs: T) -> Self::Output {
         let mut lhs = self.clone();
@@ -443,24 +337,7 @@ impl<T: Int> Add<T> for &BitInt {
     }
 }
 
-impl_commutative!(
-    Add,
-    add,
-    BitInt,
-    |x| x,
-    UBitInt,
-    &UBitInt,
-    i128,
-    u128,
-    i64,
-    u64,
-    i32,
-    u32,
-    i16,
-    u16,
-    i8,
-    u8
-);
+impl_commutative!(Add, add, BitInt, |x| x, i128, i64);
 
 impl AddAssign for BitInt {
     fn add_assign(&mut self, rhs: Self) {
@@ -486,7 +363,7 @@ impl AddAssign<&UBitInt> for BitInt {
     }
 }
 
-impl<T: Int> AddAssign<T> for BitInt {
+impl<T: I> AddAssign<T> for BitInt {
     fn add_assign(&mut self, rhs: T) {
         add_sub(self, &rhs.unsigned().into(), rhs.sign());
     }
@@ -550,43 +427,7 @@ impl Sub<BitInt> for &BitInt {
     }
 }
 
-impl Sub<UBitInt> for BitInt {
-    type Output = BitInt;
-    fn sub(self, rhs: UBitInt) -> Self::Output {
-        let mut lhs = self;
-        add_sub(&mut lhs, rhs.get_data(), true);
-        return lhs;
-    }
-}
-
-impl Sub<&UBitInt> for &BitInt {
-    type Output = BitInt;
-    fn sub(self, rhs: &UBitInt) -> Self::Output {
-        let mut lhs = self.clone();
-        add_sub(&mut lhs, rhs.get_data(), true);
-        return lhs;
-    }
-}
-
-impl Sub<&UBitInt> for BitInt {
-    type Output = BitInt;
-    fn sub(self, rhs: &UBitInt) -> Self::Output {
-        let mut lhs = self;
-        add_sub(&mut lhs, rhs.get_data(), true);
-        return lhs;
-    }
-}
-
-impl Sub<UBitInt> for &BitInt {
-    type Output = BitInt;
-    fn sub(self, rhs: UBitInt) -> Self::Output {
-        let mut lhs = self.clone();
-        add_sub(&mut lhs, rhs.get_data(), true);
-        return lhs;
-    }
-}
-
-impl<T: Int> Sub<T> for BitInt {
+impl<T: I> Sub<T> for BitInt {
     type Output = BitInt;
     fn sub(self, rhs: T) -> Self::Output {
         let mut lhs = self;
@@ -595,7 +436,7 @@ impl<T: Int> Sub<T> for BitInt {
     }
 }
 
-impl<T: Int> Sub<T> for &BitInt {
+impl<T: I> Sub<T> for &BitInt {
     type Output = BitInt;
     fn sub(self, rhs: T) -> Self::Output {
         let mut lhs = self.clone();
@@ -604,24 +445,7 @@ impl<T: Int> Sub<T> for &BitInt {
     }
 }
 
-impl_commutative!(
-    Sub,
-    sub,
-    BitInt,
-    |x| -x,
-    UBitInt,
-    &UBitInt,
-    i128,
-    u128,
-    i64,
-    u64,
-    i32,
-    u32,
-    i16,
-    u16,
-    i8,
-    u8
-);
+impl_commutative!(Sub, sub, BitInt, |x| -x, i128, i64);
 
 impl SubAssign for BitInt {
     fn sub_assign(&mut self, rhs: Self) {
@@ -635,19 +459,7 @@ impl SubAssign<&BitInt> for BitInt {
     }
 }
 
-impl SubAssign<UBitInt> for BitInt {
-    fn sub_assign(&mut self, rhs: UBitInt) {
-        add_sub(self, rhs.get_data(), true);
-    }
-}
-
-impl SubAssign<&UBitInt> for BitInt {
-    fn sub_assign(&mut self, rhs: &UBitInt) {
-        add_sub(self, rhs.get_data(), true);
-    }
-}
-
-impl<T: Int> SubAssign<T> for BitInt {
+impl<T: I> SubAssign<T> for BitInt {
     fn sub_assign(&mut self, rhs: T) {
         add_sub(self, &rhs.unsigned().into(), !rhs.sign());
     }
@@ -709,82 +521,6 @@ impl Mul<BitInt> for &BitInt {
     }
 }
 
-impl Mul<UBitInt> for BitInt {
-    type Output = BitInt;
-    fn mul(self, rhs: UBitInt) -> Self::Output {
-        let (mut data, c) = mul_vec(&self.data, rhs.get_data());
-        if c > 0 {
-            data.push(c);
-        }
-        BitInt {
-            data,
-            sign: self.sign,
-        }
-    }
-}
-
-impl Mul<UBitInt> for &BitInt {
-    type Output = BitInt;
-    fn mul(self, rhs: UBitInt) -> Self::Output {
-        let (mut data, c) = mul_vec(&self.data, rhs.get_data());
-        if c > 0 {
-            data.push(c);
-        }
-        BitInt {
-            data,
-            sign: self.sign,
-        }
-    }
-}
-
-impl Mul<&UBitInt> for BitInt {
-    type Output = BitInt;
-    fn mul(self, rhs: &UBitInt) -> Self::Output {
-        let (mut data, c) = mul_vec(&self.data, rhs.get_data());
-        if c > 0 {
-            data.push(c);
-        }
-        BitInt {
-            data,
-            sign: self.sign,
-        }
-    }
-}
-
-impl Mul<&UBitInt> for &BitInt {
-    type Output = BitInt;
-    fn mul(self, rhs: &UBitInt) -> Self::Output {
-        let (mut data, c) = mul_vec(&self.data, rhs.get_data());
-        if c > 0 {
-            data.push(c);
-        }
-        BitInt {
-            data,
-            sign: self.sign,
-        }
-    }
-}
-
-impl Mul<u128> for BitInt {
-    type Output = BitInt;
-    fn mul(self, rhs: u128) -> Self::Output {
-        let mut bi = self;
-        let c = mul_prim2(&mut bi.data, rhs);
-        push_prim2(&mut bi.data, c);
-        return bi;
-    }
-}
-
-impl Mul<u128> for &BitInt {
-    type Output = BitInt;
-    fn mul(self, rhs: u128) -> Self::Output {
-        let mut bi = self.clone();
-        let c = mul_prim2(&mut bi.data, rhs);
-        push_prim2(&mut bi.data, c);
-        return bi;
-    }
-}
-
 impl Mul<i128> for BitInt {
     type Output = BitInt;
     fn mul(self, rhs: i128) -> Self::Output {
@@ -807,11 +543,11 @@ impl Mul<i128> for &BitInt {
     }
 }
 
-impl<T: Prim> Mul<T> for BitInt {
+impl Mul<i64> for BitInt {
     type Output = BitInt;
-    fn mul(self, rhs: T) -> Self::Output {
+    fn mul(self, rhs: i64) -> Self::Output {
         let mut bi = self;
-        let c = mul_prim(&mut bi.data, rhs.unsigned().into());
+        let c = mul_prim(&mut bi.data, rhs.unsigned_abs().into());
         if c > 0 {
             bi.data.push(c);
         }
@@ -820,9 +556,9 @@ impl<T: Prim> Mul<T> for BitInt {
     }
 }
 
-impl<T: Prim> Mul<T> for &BitInt {
+impl Mul<i64> for &BitInt {
     type Output = BitInt;
-    fn mul(self, rhs: T) -> Self::Output {
+    fn mul(self, rhs: i64) -> Self::Output {
         let mut bi = self.clone();
         let c = mul_prim(&mut bi.data, rhs.unsigned().into());
         if c > 0 {
@@ -833,24 +569,7 @@ impl<T: Prim> Mul<T> for &BitInt {
     }
 }
 
-impl_commutative!(
-    Mul,
-    mul,
-    BitInt,
-    |x| x,
-    UBitInt,
-    &UBitInt,
-    u128,
-    i128,
-    u64,
-    i64,
-    u32,
-    i32,
-    u16,
-    i16,
-    u8,
-    i8
-);
+impl_commutative!(Mul, mul, BitInt, |x| x, i128, i64);
 
 impl MulAssign for BitInt {
     fn mul_assign(&mut self, rhs: Self) {
@@ -883,8 +602,8 @@ impl MulAssign<u128> for BitInt {
     }
 }
 
-impl<T: Prim> MulAssign<T> for BitInt {
-    fn mul_assign(&mut self, rhs: T) {
+impl MulAssign<i64> for BitInt {
+    fn mul_assign(&mut self, rhs: i64) {
         let c = mul_prim(&mut self.data, rhs.unsigned().into());
         if c > 0 {
             self.data.push(c);
@@ -902,51 +621,75 @@ impl Sqr for BitInt {
     }
 }
 
-impl<T: UPrim> Shl<T> for BitInt {
+impl Shl<usize> for BitInt {
     type Output = BitInt;
-    fn shl(self, rhs: T) -> Self::Output {
-        let mut bi = self;
-        shl_vec(&mut bi.data, rhs.into());
-        return bi;
+    fn shl(self, rhs: usize) -> Self::Output {
+        let mut lhs = self;
+        let div = rhs / 64;
+        lhs.data.resize(lhs.data.len() + div, 0);
+        lhs.data.rotate_right(div);
+        let c = shl_buf(&mut lhs.data, (rhs % 64) as u8);
+        if c > 0 {
+            lhs.data.push(c);
+        }
+        return lhs;
     }
 }
 
-impl<T: UPrim> Shl<T> for &BitInt {
+impl Shl<usize> for &BitInt {
     type Output = BitInt;
-    fn shl(self, rhs: T) -> Self::Output {
-        let mut bi = self.clone();
-        shl_vec(&mut bi.data, rhs.into());
-        return bi;
+    fn shl(self, rhs: usize) -> Self::Output {
+        let mut lhs = self.clone();
+        let div = rhs / 64;
+        lhs.data.resize(lhs.data.len() + div, 0);
+        lhs.data.rotate_right(div);
+        let c = shl_buf(&mut lhs.data, (rhs % 64) as u8);
+        if c > 0 {
+            lhs.data.push(c);
+        }
+        return lhs;
     }
 }
 
-impl<T: UPrim> ShlAssign<T> for BitInt {
-    fn shl_assign(&mut self, rhs: T) {
-        shl_vec(&mut self.data, rhs.into());
+impl ShlAssign<usize> for BitInt {
+    fn shl_assign(&mut self, rhs: usize) {
+        let div = rhs / 64;
+        self.data.resize(self.data.len() + div, 0);
+        self.data.rotate_right(div);
+        let c = shl_buf(&mut self.data, (rhs % 64) as u8);
+        if c > 0 {
+            self.data.push(c);
+        }
     }
 }
 
-impl<T: UPrim> Shr<T> for BitInt {
+impl Shr<usize> for BitInt {
     type Output = BitInt;
-    fn shr(self, rhs: T) -> Self::Output {
-        let mut bi = self;
-        shl_vec(&mut bi.data, rhs.into());
-        return bi;
+    fn shr(self, rhs: usize) -> Self::Output {
+        let mut lhs = self;
+        let div = rhs / 64;
+        lhs.data.drain(..div);
+        shr_buf(&mut lhs.data, (rhs % 64) as u8);
+        return lhs;
     }
 }
 
-impl<T: UPrim> Shr<T> for &BitInt {
+impl Shr<usize> for &BitInt {
     type Output = BitInt;
-    fn shr(self, rhs: T) -> Self::Output {
-        let mut bi = self.clone();
-        shl_vec(&mut bi.data, rhs.into());
-        return bi;
+    fn shr(self, rhs: usize) -> Self::Output {
+        let mut lhs = self.clone();
+        let div = rhs / 64;
+        lhs.data.drain(..div);
+        shr_buf(&mut lhs.data, (rhs % 64) as u8);
+        return lhs;
     }
 }
 
-impl<T: UPrim> ShrAssign<T> for BitInt {
-    fn shr_assign(&mut self, rhs: T) {
-        shl_vec(&mut self.data, rhs.into());
+impl ShrAssign<usize> for BitInt {
+    fn shr_assign(&mut self, rhs: usize) {
+        let div = rhs / 64;
+        self.data.drain(..div);
+        shr_buf(&mut self.data, (rhs % 64) as u8);
     }
 }
 
@@ -999,60 +742,6 @@ impl DivRem<BitInt> for &BitInt {
     }
 }
 
-impl DivRem<UBitInt> for BitInt {
-    type Q = BitInt;
-    type R = BitInt;
-    fn div_rem(self, rhs: UBitInt) -> (Self::Q, Self::R) {
-        let mut d = rhs.get_data().to_vec();
-        div_rem_bi(self, &mut d, false)
-    }
-}
-
-impl DivRem<UBitInt> for &BitInt {
-    type Q = BitInt;
-    type R = BitInt;
-    fn div_rem(self, rhs: UBitInt) -> (Self::Q, Self::R) {
-        let mut d = rhs.get_data().to_vec();
-        div_rem_bi(self.clone(), &mut d, false)
-    }
-}
-
-impl DivRem<&UBitInt> for BitInt {
-    type Q = BitInt;
-    type R = BitInt;
-    fn div_rem(self, rhs: &UBitInt) -> (Self::Q, Self::R) {
-        let mut d = rhs.get_data().to_vec();
-        div_rem_bi(self, &mut d, false)
-    }
-}
-
-impl DivRem<&UBitInt> for &BitInt {
-    type Q = BitInt;
-    type R = BitInt;
-    fn div_rem(self, rhs: &UBitInt) -> (Self::Q, Self::R) {
-        let mut d = rhs.get_data().to_vec();
-        div_rem_bi(self.clone(), &mut d, false)
-    }
-}
-
-impl DivRem<u128> for BitInt {
-    type Q = BitInt;
-    type R = BitInt;
-    fn div_rem(self, rhs: u128) -> (Self::Q, Self::R) {
-        let mut d = SmallBuf::from(rhs);
-        div_rem_bi(self, &mut d, false)
-    }
-}
-
-impl DivRem<u128> for &BitInt {
-    type Q = BitInt;
-    type R = BitInt;
-    fn div_rem(self, rhs: u128) -> (Self::Q, Self::R) {
-        let mut d = SmallBuf::from(rhs);
-        div_rem_bi(self.clone(), &mut d, false)
-    }
-}
-
 impl DivRem<i128> for BitInt {
     type Q = BitInt;
     type R = i128;
@@ -1073,107 +762,53 @@ impl DivRem<i128> for &BitInt {
     }
 }
 
-impl<T: Prim> DivRem<T> for BitInt
-where
-    <T as Prim>::BigI: TryFrom<u64>,
-{
+impl DivRem<i64> for BitInt {
     type Q = BitInt;
-    type R = <T as Prim>::MedI;
-    fn div_rem(self, rhs: T) -> (Self::Q, Self::R) {
+    type R = i64;
+    fn div_rem(self, rhs: i64) -> (Self::Q, Self::R) {
         let mut lhs = self;
-        let r = div_prim(&mut lhs.data, rhs.unsigned().into());
-        let mut rem = <T as Prim>::MedI::try_from(r).ok().unwrap();
-        lhs.sign ^= rhs.sign();
-        if rhs.sign() {
-            rem = rem.neg();
-        }
-        (lhs, rem)
+        let r = div_prim(&mut lhs.data, rhs.unsigned_abs());
+        lhs.sign ^= rhs.is_negative();
+        (lhs, r.try_into().unwrap())
     }
 }
 
-impl DivRem<BitInt> for u128 {
+impl DivRem<i64> for &BitInt {
     type Q = BitInt;
-    type R = u128;
-    fn div_rem(self, rhs: BitInt) -> (Self::Q, Self::R) {
-        let Ok(rem) = u128::try_from(&rhs) else {
-            return (BitInt::zero(), self);
-        };
-        let div = BitInt::from(self);
-        (div / rhs, self % rem)
+    type R = i64;
+    fn div_rem(self, rhs: i64) -> (Self::Q, Self::R) {
+        let mut lhs = self.clone();
+        let r = div_prim(&mut lhs.data, rhs.unsigned_abs());
+        lhs.sign ^= rhs.is_negative();
+        (lhs, r.try_into().unwrap())
     }
 }
 
-impl DivRem<&BitInt> for u128 {
-    type Q = BitInt;
-    type R = u128;
-    fn div_rem(self, rhs: &BitInt) -> (Self::Q, Self::R) {
-        let Ok(rem) = u128::try_from(rhs) else {
-            return (BitInt::zero(), self);
-        };
-        let div = BitInt::from(self);
-        (div / rhs, self % rem)
-    }
-}
-
-impl DivRem<BitInt> for i128 {
-    type Q = BitInt;
-    type R = i128;
-    fn div_rem(self, rhs: BitInt) -> (Self::Q, Self::R) {
-        let Ok(rem) = i128::try_from(&rhs) else {
-            return (BitInt::zero(), self);
-        };
-        let div = BitInt::from(self);
-        (div / rhs, self % rem)
-    }
-}
-
-impl DivRem<&BitInt> for i128 {
-    type Q = BitInt;
-    type R = i128;
-    fn div_rem(self, rhs: &BitInt) -> (Self::Q, Self::R) {
-        let Ok(rem) = i128::try_from(rhs) else {
-            return (BitInt::zero(), self);
-        };
-        let div = BitInt::from(self);
-        (div / rhs, self % rem)
-    }
-}
-
-impl<T: Prim> DivRem<BitInt> for T
+impl<T: I> DivRem<BitInt> for T
 where
-    T: TryFrom<BitInt> + Rem<T, Output = T> + for<'a> TryFrom<&'a BitInt>,
-    <T as Prim>::BigI:
-        Div<<T as Prim>::BigI, Output = <T as Prim>::BigI> + for<'a> TryFrom<&'a BitInt>,
+    T: for<'a> TryFrom<&'a BitInt>,
 {
-    type Q = <T as Prim>::BigI;
+    type Q = T;
     type R = T;
     fn div_rem(self, rhs: BitInt) -> (Self::Q, Self::R) {
-        let Ok(rem) = T::try_from(&rhs) else {
-            return (<T as Prim>::BigI::default(), self);
+        let Ok(prim) = T::try_from(&rhs) else {
+            return (T::default(), self);
         };
-        let Ok(div) = <T as Prim>::BigI::try_from(&rhs) else {
-            return (<T as Prim>::BigI::default(), self);
-        };
-        (self.into() / div, self % rem)
+        (self / prim, self % prim)
     }
 }
 
-impl<T: Prim> DivRem<&BitInt> for T
+impl<T: I> DivRem<&BitInt> for T
 where
-    T: TryFrom<BitInt> + Rem<T, Output = T> + for<'a> TryFrom<&'a BitInt>,
-    <T as Prim>::BigI:
-        Div<<T as Prim>::BigI, Output = <T as Prim>::BigI> + for<'a> TryFrom<&'a BitInt>,
+    T: for<'a> TryFrom<&'a BitInt>,
 {
-    type Q = <T as Prim>::BigI;
+    type Q = T;
     type R = T;
     fn div_rem(self, rhs: &BitInt) -> (Self::Q, Self::R) {
-        let Ok(rem) = T::try_from(rhs) else {
-            return (<T as Prim>::BigI::default(), self);
+        let Ok(prim) = T::try_from(rhs) else {
+            return (T::default(), self);
         };
-        let Ok(div) = <T as Prim>::BigI::try_from(rhs) else {
-            return (<T as Prim>::BigI::default(), self);
-        };
-        (self.into() / div, self % rem)
+        (self / prim, self % prim)
     }
 }
 
@@ -1217,7 +852,7 @@ where
     }
 }
 
-impl_commutative_div_rem!(BitInt, u128, i128, u64, i64, u32, i32, u16, i16, u8, i8);
+impl_commutative_div_rem!(BitInt, i128, i64);
 
 impl<T> DivAssign<T> for BitInt
 where
@@ -1237,18 +872,18 @@ where
     }
 }
 
-impl<T: UPrim> PowI<T> for BitInt {
+impl PowI<usize> for BitInt {
     type Output = BitInt;
-    fn powi(&self, rhs: T) -> Self::Output {
+    fn powi(&self, rhs: usize) -> Self::Output {
         BitInt {
-            data: powi_vec(&self.data, rhs.into()),
-            sign: self.sign ^ ((rhs.into() & 1) == 1),
+            data: powi_vec(&self.data, rhs),
+            sign: self.sign ^ (rhs % 2 == 1),
         }
     }
 }
 
 impl LogI for BitInt {
-    type Output = u64;
+    type Output = usize;
 
     fn ilog2pow64(&self) -> Self::Output {
         debug_assert!(
@@ -1257,18 +892,20 @@ impl LogI for BitInt {
         );
         debug_assert!(!self.sign, "argument of integer logarithm must be positive");
 
-        return (self.data.len() - 1) as u64;
+        return self.data.len() - 1;
     }
+
     fn ilog2(&self) -> Self::Output {
         let l = self.ilog2pow64();
-        return self.data[l as usize].ilog2() as u64 + 64 * l;
+        return self.data[l].ilog2() as usize + 64 * l;
     }
 
     fn ilog(&self, b: u128) -> Self::Output {
-        let mut log = self.ilog2() / (b.ilog2() as u64 + 1);
+        let mut log = self.ilog2() / (b.ilog2() as usize + 1);
+        let u_arg = self.unsigned_abs();
         let mut b_ubi = UBitInt::from(b).powi(log + 1);
 
-        while self >= &b_ubi {
+        while u_arg >= b_ubi {
             log += 1;
             b_ubi *= b;
         }

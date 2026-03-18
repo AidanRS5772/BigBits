@@ -1,4 +1,4 @@
-use crate::traits::{DivRem, FromErr, FromStrErr, LogI, PowI, SmallBuf, Sqr, UInt, UPrim};
+use crate::traits::{DivRem, FromErr, FromStrErr, LogI, PowI, SmallBuf, Sqr, U};
 use crate::{impl_commutative, impl_commutative_div_rem, impl_commutative_peq_pord, utils::*};
 use std::f64::consts::{LN_10, LN_2};
 use std::fmt;
@@ -43,19 +43,19 @@ impl<const N: usize, T: Into<SmallBuf>> From<T> for UBitIntStatic<N> {
     }
 }
 
-macro_rules! impl_try_from_prim {
-    ($($t:ty),+) => {
-        $(
-        impl<const N: usize> TryFrom<UBitIntStatic<N>> for $t{
-            type Error = FromErr;
-            fn try_from(value: UBitIntStatic<N>) -> Result<Self, Self::Error> {
-                value.data.try_into::<SmallBuf>()?.try_into::<$t>()
-            }
-        }
-        )+
-    };
+impl<const N: usize> TryFrom<UBitIntStatic<N>> for u128 {
+    type Error = FromErr;
+    fn try_from(value: UBitIntStatic<N>) -> Result<Self, Self::Error> {
+        Ok(SmallBuf::try_from(value.data.as_slice())?.into())
+    }
 }
-impl_try_from_prim!(u128, u64, usize, u32, u16, u8);
+
+impl<const N: usize> TryFrom<UBitIntStatic<N>> for u64 {
+    type Error = FromErr;
+    fn try_from(value: UBitIntStatic<N>) -> Result<Self, Self::Error> {
+        SmallBuf::try_from(value.data.as_slice())?.try_into()
+    }
+}
 
 impl<const N: usize> FromStr for UBitIntStatic<N> {
     type Err = FromStrErr;
@@ -130,9 +130,9 @@ impl<const N: usize> PartialEq for UBitIntStatic<N> {
     }
 }
 
-impl<const N: usize, T: Into<SmallBuf>> PartialEq<T> for UBitIntStatic<N> {
+impl<const N: usize, T: U> PartialEq<T> for UBitIntStatic<N> {
     fn eq(&self, other: &T) -> bool {
-        eq_buf(&self.data, &other.into())
+        eq_buf(&self.data, &(*other).into())
     }
 }
 
@@ -142,13 +142,13 @@ impl<const N: usize> PartialOrd for UBitIntStatic<N> {
     }
 }
 
-impl<const N: usize, T: Into<SmallBuf>> PartialOrd<T> for UBitIntStatic<N> {
+impl<const N: usize, T: U> PartialOrd<T> for UBitIntStatic<N> {
     fn partial_cmp(&self, other: &T) -> Option<std::cmp::Ordering> {
-        Some(cmp_buf(&self.data, &other.into()))
+        Some(cmp_buf(&self.data, &(*other).into()))
     }
 }
 
-impl_commutative_peq_pord!(const N, UBitIntStatic, u128, u64, u32, u16, u8);
+impl_commutative_peq_pord!(const N, UBitIntStatic, u128, u64);
 
 impl<const N: usize> Eq for UBitIntStatic<N> {}
 
@@ -178,7 +178,7 @@ impl<const N: usize, T: Into<SmallBuf>> Add<T> for UBitIntStatic<N> {
     }
 }
 
-impl_commutative!(const N, Add, add, UBitIntStatic, |x| x, u128, u64, u32, u16, u8);
+impl_commutative!(const N, Add, add, UBitIntStatic, |x| x, u128, u64);
 
 impl<const N: usize> AddAssign for UBitIntStatic<N> {
     fn add_assign(&mut self, rhs: Self) {
@@ -220,13 +220,13 @@ macro_rules! impl_sub_ubis_commute{
         impl<const N: usize> Sub<UBitIntStatic<N>> for $t {
             type Output = $t;
             fn sub(self, rhs: UBitIntStatic<N>) -> Self::Output {
-                self - rhs.try_into().expect("attempt to subtract with overflow")
+                self - <$t>::try_from(rhs).expect("attempt to subtract with overflow")
             }
         }
         )*
     };
 }
-impl_sub_ubis_commute!(u128, u64, u32, u16, u8);
+impl_sub_ubis_commute!(u128, u64);
 
 impl<const N: usize> SubAssign for UBitIntStatic<N> {
     fn sub_assign(&mut self, rhs: Self) {
@@ -261,17 +261,17 @@ impl<const N: usize> Mul<u128> for UBitIntStatic<N> {
     }
 }
 
-impl<const N: usize, T: UPrim> Mul<T> for UBitIntStatic<N> {
+impl<const N: usize> Mul<u64> for UBitIntStatic<N> {
     type Output = UBitIntStatic<N>;
-    fn mul(self, rhs: T) -> Self::Output {
+    fn mul(self, rhs: u64) -> Self::Output {
         let mut data = self.data;
-        let c = mul_prim(&mut data, rhs.into());
+        let c = mul_prim(&mut data, rhs);
         debug_assert!(c != 0, "attempt to multiply with overflow");
         UBitIntStatic::<N> { data }
     }
 }
 
-impl_commutative!(const N, Mul, mul, UBitIntStatic, |x| x, u128, u64, u32, u16, u8);
+impl_commutative!(const N, Mul, mul, UBitIntStatic, |x| x, u128, u64);
 
 impl<const N: usize> MulAssign for UBitIntStatic<N> {
     fn mul_assign(&mut self, rhs: Self) {
@@ -288,8 +288,8 @@ impl<const N: usize> MulAssign<u128> for UBitIntStatic<N> {
     }
 }
 
-impl<const N: usize, T: UPrim> MulAssign<T> for UBitIntStatic<N> {
-    fn mul_assign(&mut self, rhs: T) {
+impl<const N: usize> MulAssign<u64> for UBitIntStatic<N> {
+    fn mul_assign(&mut self, rhs: u64) {
         let c = mul_prim(&mut self.data, rhs.into());
         debug_assert!(c != 0, "attempt to multiply with overflow");
     }
@@ -303,33 +303,43 @@ impl<const N: usize> Sqr for UBitIntStatic<N> {
     }
 }
 
-impl<const N: usize, T: UPrim> Shl<T> for UBitIntStatic<N> {
+impl<const N: usize> Shl<usize> for UBitIntStatic<N> {
     type Output = UBitIntStatic<N>;
-    fn shl(self, rhs: T) -> Self::Output {
-        let mut data = self.data;
-        shl_arr(&mut data, rhs.into());
-        UBitIntStatic::<N> { data }
+    fn shl(self, rhs: usize) -> Self::Output {
+        let mut lhs = self;
+        let div = rhs / 64;
+        lhs.data.rotate_right(div);
+        shl_buf(&mut lhs.data, (rhs % 64) as u8);
+        return lhs;
     }
 }
 
-impl<const N: usize, T: UPrim> ShlAssign<T> for UBitIntStatic<N> {
-    fn shl_assign(&mut self, rhs: T) {
-        shl_arr(&mut self.data, rhs.into());
+impl<const N: usize> ShlAssign<usize> for UBitIntStatic<N> {
+    fn shl_assign(&mut self, rhs: usize) {
+        let div = rhs / 64;
+        self.data.rotate_right(div);
+        shl_buf(&mut self.data, (rhs % 64) as u8);
     }
 }
 
-impl<const N: usize, T: UPrim> Shr<T> for UBitIntStatic<N> {
+impl<const N: usize> Shr<usize> for UBitIntStatic<N> {
     type Output = UBitIntStatic<N>;
-    fn shr(self, rhs: T) -> Self::Output {
-        let mut data = self.data;
-        shr_arr(&mut data, rhs.into());
-        UBitIntStatic::<N> { data }
+    fn shr(self, rhs: usize) -> Self::Output {
+        let mut lhs = self;
+        let div = rhs / 64;
+        lhs.data[..div].fill(0);
+        lhs.data.rotate_left(div);
+        shr_buf(&mut lhs.data, (rhs % 64) as u8);
+        return lhs;
     }
 }
 
-impl<const N: usize, T: UPrim> ShrAssign<T> for UBitIntStatic<N> {
-    fn shr_assign(&mut self, rhs: T) {
-        shr_arr(&mut self.data, rhs.into());
+impl<const N: usize> ShrAssign<usize> for UBitIntStatic<N> {
+    fn shr_assign(&mut self, rhs: usize) {
+        let div = rhs / 64;
+        self.data[..div].fill(0);
+        self.data.rotate_left(div);
+        shr_buf(&mut self.data, (rhs % 64) as u8);
     }
 }
 
@@ -340,8 +350,8 @@ impl<const N: usize> DivRem for UBitIntStatic<N> {
         let n_len = buf_len(&self.data);
         let mut n = self.data;
         let d_len = buf_len(&rhs.data);
-        let mut d = rhs.data[..d_len];
-        let q = div_arr(&mut n[..n_len], &mut d);
+        let mut d = rhs.data;
+        let q = div_arr(&mut n[..n_len], &mut d[..d_len]);
         (UBitIntStatic { data: q }, UBitIntStatic { data: n })
     }
 }
@@ -351,38 +361,36 @@ impl<const N: usize> DivRem<u128> for UBitIntStatic<N> {
     type R = u128;
     fn div_rem(self, rhs: u128) -> (Self::Q, Self::R) {
         let n_len = buf_len(&self.data);
-        let mut n = self.data[..n_len];
-        let q = div_arr(&mut n, &mut SmallBuf::from(rhs));
-        (UBitIntStatic { data: q }, u128::try_from(n).unwrap())
+        let mut n = self.data;
+        let q = div_arr(&mut n[..n_len], &mut SmallBuf::from(rhs));
+        (
+            UBitIntStatic { data: q },
+            SmallBuf::try_from(&n[..2]).unwrap().into(),
+        )
     }
 }
 
-impl<const N: usize, T: UPrim> DivRem<T> for UBitIntStatic<N> {
+impl<const N: usize> DivRem<u64> for UBitIntStatic<N> {
     type Q = UBitIntStatic<N>;
-    type R = T;
-    fn div_rem(self, rhs: T) -> (Self::Q, Self::R) {
+    type R = u64;
+    fn div_rem(self, rhs: u64) -> (Self::Q, Self::R) {
         let mut data = self.data;
         let rem = div_prim(&mut data, rhs.into());
-        (UBitIntStatic { data }, rem.try_into().unwrap())
+        (UBitIntStatic { data }, rem)
     }
 }
 
-fn div_rem_ubis_bwd<const N: usize, I>(lhs: I, rhs: &UBitIntStatic<N>) -> (I, I)
+impl<const N: usize, T: U> DivRem<UBitIntStatic<N>> for T
 where
-    I: Default + Copy + Div<Output = I> + Rem<Output = I>,
-    UBitIntStatic<N>: TryInto<I>,
+    T: TryFrom<UBitIntStatic<N>>,
 {
-    let Ok(val) = rhs.try_into() else {
-        return (I::default(), lhs);
-    };
-    (lhs / val, lhs % val)
-}
-
-impl<const N: usize, T: UInt> DivRem<UBitIntStatic<N>> for T {
     type Q = T;
     type R = T;
     fn div_rem(self, rhs: UBitIntStatic<N>) -> (Self::Q, Self::R) {
-        div_rem_ubis_bwd(self, &rhs)
+        let Ok(prim) = T::try_from(rhs) else {
+            return (T::default(), self);
+        };
+        (self / prim, self % prim)
     }
 }
 
@@ -406,7 +414,7 @@ where
     }
 }
 
-impl_commutative_div_rem!(const N, UBitIntStatic, u128, u64, u32, u16, u8);
+impl_commutative_div_rem!(const N, UBitIntStatic, u128, u64);
 
 impl<const N: usize, T> DivAssign<T> for UBitIntStatic<N>
 where
@@ -421,39 +429,39 @@ impl<const N: usize> RemAssign for UBitIntStatic<N> {
     fn rem_assign(&mut self, rhs: Self) {
         let n_len = buf_len(&self.data);
         let d_len = buf_len(&rhs.data);
-        let mut d = rhs.data[..d_len];
-        div_arr(&mut self.data[..n_len], &mut d);
+        let mut d = rhs.data;
+        div_arr::<N>(&mut self.data[..n_len], &mut d[..d_len]);
     }
 }
 
-impl<const N: usize, T: UPrim> PowI<T> for UBitIntStatic<N> {
+impl<const N: usize> PowI<usize> for UBitIntStatic<N> {
     type Output = UBitIntStatic<N>;
-    fn powi(&self, rhs: T) -> Self::Output {
-        let data =
-            powi_arr(&self.data, rhs.into()).expect("attempt to take integer power with overflow");
-        UBitIntStatic { data }
+    fn powi(&self, rhs: usize) -> Self::Output {
+        UBitIntStatic {
+            data: powi_arr(&self.data, rhs).expect("attempt to take integer power with overflow"),
+        }
     }
 }
 
 impl<const N: usize> LogI for UBitIntStatic<N> {
-    type Output = u64;
+    type Output = usize;
 
     fn ilog2pow64(&self) -> Self::Output {
-        let len = buf_len(&self.data) as u64;
+        let len = buf_len(&self.data);
         debug_assert!(len != 0, "attempt to calculate the logarithm of zero");
         return len - 1;
     }
 
     fn ilog2(&self) -> Self::Output {
         let l = self.ilog2pow64();
-        return l * 64 + self.data[l].ilog2();
+        return l * 64 + self.data[l].ilog2() as usize;
     }
 
     fn ilog(&self, b: u128) -> Self::Output {
-        let mut log = self.ilog2() / (b.ilog2() as u64 + 1);
+        let mut log = self.ilog2() / (b.ilog2() as usize + 1);
         let mut b_ubis = UBitIntStatic::<N>::from(b).powi(log + 1);
 
-        while self >= *b_ubis {
+        while *self >= b_ubis {
             log += 1;
             b_ubis *= b;
         }

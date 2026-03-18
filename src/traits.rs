@@ -1,121 +1,7 @@
-use std::ops::{Deref, DerefMut, Neg};
+#![allow(dead_code)]
+use std::ops::{Deref, DerefMut, Div, Neg, Rem};
 
 use crate::utils::{lsb, signed_shl, signed_shr};
-
-pub(crate) trait UInt: Into<SmallBuf> + Copy {}
-macro_rules! impl_uint{
-    ($($t:ty),+) => {
-        $(
-        impl UInt for $t {}
-        )+
-    };
-}
-impl_uint!(u128, u64, u32, u16, u8);
-
-pub(crate) trait UPrim: Into<u64> + Copy {}
-macro_rules! impl_uprim {
-    ($($t:ty),+) => {
-        $(
-        impl UPrim for $t {}
-        )+
-    };
-}
-impl_uprim!(u64, u32, u16, u8);
-
-pub(crate) trait Int: Copy {
-    type U: Int + Into<SmallBuf>;
-    type I: Int;
-
-    #[inline]
-    fn unsigned(self) -> Self::U;
-
-    #[inline]
-    fn sign(self) -> bool;
-}
-
-macro_rules! impl_int {
-    ($(($u:ty, $i:ty)), +) => {
-        $(
-        impl Int  for $u{
-            type U = Self;
-            type I = $i;
-            fn unsigned(self) -> Self::U{
-                self
-            }
-            fn sign(self) -> bool{
-                false
-            }
-        }
-
-        impl Int for $i{
-            type U = $u;
-            type I = Self;
-            fn unsigned(self) -> Self::U{
-                self.unsigned_abs()
-            }
-            fn sign(self) -> bool{
-                self < 0
-            }
-        }
-        )+
-    };
-}
-impl_int!((u128, i128), (u64, i64), (u32, i32), (u16, i16), (u8, i8));
-
-pub(crate) trait Prim: Copy + Default + Into<Self::BigI> {
-    type U: Into<u64>;
-    type BigI: Default;
-    type MedI: Default + TryFrom<u64> + Neg<Output = Self::MedI>;
-
-    fn unsigned(self) -> Self::U;
-
-    fn sign(self) -> bool;
-}
-
-macro_rules! impl_int {
-    ($(($u:ty, $i:ty, $big:ty)), +) => {
-        $(
-        impl Prim  for $u{
-            type U = Self;
-            type BigI = $big;
-            type MedI = $big;
-
-            fn unsigned(self) -> Self::U{
-                self
-            }
-            fn sign(self) -> bool{
-                false
-            }
-        }
-
-        impl Prim for $i{
-            type U = $u;
-            type BigI = $big;
-            type MedI = Self;
-
-            fn unsigned(self) -> Self::U{
-                self.unsigned_abs()
-            }
-            fn sign(self) -> bool{
-                self < 0
-            }
-        }
-        )+
-    };
-}
-impl_int!(
-    (u64, i64, i128),
-    (u32, i32, i64),
-    (u16, i16, i32),
-    (u8, i8, i16)
-);
-
-#[derive(Debug)]
-pub enum FromErr {
-    Overflow,
-    Underflow,
-    Sign,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SmallBuf {
@@ -147,6 +33,12 @@ impl DerefMut for SmallBuf {
     }
 }
 
+#[derive(Debug)]
+pub enum FromErr {
+    Overflow,
+    Underflow,
+}
+
 impl TryFrom<&[u64]> for SmallBuf {
     type Error = FromErr;
     fn try_from(buf: &[u64]) -> Result<Self, Self::Error> {
@@ -159,12 +51,6 @@ impl TryFrom<&[u64]> for SmallBuf {
             limbs,
             len: buf.len(),
         });
-    }
-}
-
-impl From<SmallBuf> for u128 {
-    fn from(buf: SmallBuf) -> Self {
-        *buf.get(0).unwrap_or(&0) as u128 | (*buf.get(1).unwrap_or(&0) as u128) << 64
     }
 }
 
@@ -184,35 +70,72 @@ impl From<u128> for SmallBuf {
     }
 }
 
-impl<T: UPrim + Default + Eq> From<T> for SmallBuf {
-    fn from(value: T) -> Self {
-        if value == T::default() {
-            SmallBuf::ZERO
-        } else {
-            SmallBuf {
-                limbs: [value.into(), 0],
-                len: 1,
-            }
-        }
+impl From<SmallBuf> for u128 {
+    fn from(buf: SmallBuf) -> Self {
+        *buf.get(0).unwrap_or(&0) as u128 | (*buf.get(1).unwrap_or(&0) as u128) << 64
     }
 }
 
-macro_rules! impl_try_from_small_buf_{
-    ($($t:ty),+) => {
-        $(
-        impl TryFrom<SmallBuf> for $t{
-            type Error = FromErr;
-            fn try_from(buf: SmallBuf) -> Result<Self, Self::Error>{
-                if buf.len() > 1{
-                    return Err(FromErr::Overflow);
-                }
-                <$t>::try_from(buf[0]).map_err(|_| FromErr::Overflow)
+impl From<u64> for SmallBuf {
+    fn from(value: u64) -> Self {
+        return if value == 0 {
+            SmallBuf::ZERO
+        } else {
+            SmallBuf {
+                limbs: [value, 0],
+                len: 1,
             }
-        }
-        )+
-    };
+        };
+    }
 }
-impl_try_from_small_buf_!(u64, u32, u16, u8);
+
+impl TryFrom<SmallBuf> for u64 {
+    type Error = FromErr;
+    fn try_from(value: SmallBuf) -> Result<Self, Self::Error> {
+        return if value.len > 1 {
+            Err(FromErr::Overflow)
+        } else if value.len == 0 {
+            Ok(0)
+        } else {
+            Ok(value.limbs[0])
+        };
+    }
+}
+
+pub(crate) trait U:
+    Default + Copy + Into<SmallBuf> + Div<Self, Output = Self> + Rem<Self, Output = Self>
+{
+}
+impl U for u128 {}
+impl U for u64 {}
+
+pub(crate) trait I:
+    Default + Copy + Div<Self, Output = Self> + Rem<Self, Output = Self>
+{
+    type U: Into<SmallBuf>;
+    fn unsigned(self) -> Self::U;
+    fn sign(self) -> bool;
+}
+
+impl I for i128 {
+    type U = u128;
+    fn unsigned(self) -> Self::U {
+        self.unsigned_abs()
+    }
+    fn sign(self) -> bool {
+        self.is_negative()
+    }
+}
+
+impl I for i64 {
+    type U = u64;
+    fn unsigned(self) -> Self::U {
+        self.unsigned_abs()
+    }
+    fn sign(self) -> bool {
+        self.is_negative()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SEM {
@@ -248,7 +171,7 @@ impl From<f64> for SEM {
         let exp_bits = ((bits >> 52) & 0x7FF) as i128;
         let mantissa_bits = bits & 0xFFFFFFFFFFFFF;
 
-        let (mut sig, exp) = match (exp_bits, mantissa_bits) {
+        let (sig, exp) = match (exp_bits, mantissa_bits) {
             (0x7FF, _) => return if s { SEM::NEG_INF } else { SEM::POS_INF },
             (0, 0) => return SEM::ZERO,
             (0, _) => {
@@ -325,10 +248,11 @@ impl From<f32> for SEM {
     }
 }
 
-impl From<u128> for SEM {
-    fn from(value: u128) -> Self {
-        let m1 = (value >> 64) as u64;
-        let m0 = value as u64;
+impl From<i128> for SEM {
+    fn from(value: i128) -> Self {
+        let uval = value.unsigned_abs();
+        let m1 = (uval >> 64) as u64;
+        let m0 = uval as u64;
         let limbs = match (m1, m0) {
             (0, 0) => return SEM::ZERO,
             (m1, 0) => [m1, 0],
@@ -336,31 +260,23 @@ impl From<u128> for SEM {
             (m1, m0) => [m0, m1],
         };
         return SEM {
-            s: false,
+            s: value.is_negative(),
             e: if m1 != 0 { 1 } else { 0 },
             m: SmallBuf {
                 limbs,
-                len: if m1 != 0 && m0 != 0 { 1 } else { 0 },
+                len: if m1 != 0 && m0 != 0 { 2 } else { 1 },
             },
         };
     }
 }
 
-impl From<i128> for SEM {
-    fn from(value: i128) -> Self {
-        let mut usem = SEM::from(value.unsigned_abs());
-        usem.s = value.is_negative();
-        return usem;
-    }
-}
-
-impl<T: Prim> From<T> for SEM {
-    fn from(value: T) -> Self {
+impl From<i64> for SEM {
+    fn from(value: i64) -> Self {
         return SEM {
-            s: value.sign(),
+            s: value.is_negative(),
             e: 0,
             m: SmallBuf {
-                limbs: [value.unsigned().into(), 0],
+                limbs: [value.unsigned_abs(), 0],
                 len: 1,
             },
         };
@@ -456,26 +372,6 @@ impl TryFrom<SEM> for f32 {
     }
 }
 
-impl TryFrom<SEM> for u128 {
-    type Error = FromErr;
-    fn try_from(value: SEM) -> Result<Self, Self::Error> {
-        if value.s {
-            return Err(FromErr::Sign);
-        }
-        if value.e >= 2 {
-            return Err(FromErr::Overflow);
-        }
-
-        return if value.e == 0 {
-            Ok(*value.m.last().unwrap() as u128)
-        } else if value.e == 1 {
-            Ok(value.m.into())
-        } else {
-            Ok(0)
-        };
-    }
-}
-
 impl TryFrom<SEM> for i128 {
     type Error = FromErr;
     fn try_from(value: SEM) -> Result<Self, Self::Error> {
@@ -483,7 +379,7 @@ impl TryFrom<SEM> for i128 {
             return Err(FromErr::Overflow);
         }
 
-        let uval: u128 = if value.e == 0 {
+        let uval = if value.e == 0 {
             *value.m.last().unwrap() as u128
         } else if value.e == 1 {
             value.m.into()
@@ -491,7 +387,7 @@ impl TryFrom<SEM> for i128 {
             0
         };
 
-        let mut val = uval as i128;
+        let mut val: i128 = uval.try_into().map_err(|_| FromErr::Overflow)?;
         if value.s {
             val = val.neg();
         }
@@ -499,51 +395,21 @@ impl TryFrom<SEM> for i128 {
     }
 }
 
-macro_rules! impl_try_from_sem_uprim {
-    ($($t: ty), +) => {
-        $(
-        impl TryFrom<SEM> for $t{
-            type Error = FromErr;
-            fn try_from(value: SEM) -> Result<$t, Self::Error>{
-                return if value.s {
-                    Err(FromErr::Overflow)
-                } else if value.e > 0{
-                    Err(FromErr::Overflow)
-                } else if value.e < 0 {
-                    Ok(0)
-                } else{
-                    (*value.m.last().unwrap()).try_into().map_err(|_| FromErr::Overflow)
-                };
-            }
+impl TryFrom<SEM> for i64 {
+    type Error = FromErr;
+    fn try_from(value: SEM) -> Result<Self, Self::Error> {
+        if value.e >= 1 {
+            return Err(FromErr::Overflow);
         }
-        )+
-    };
-}
-impl_try_from_sem_uprim!(u64, u32, u16, u8);
 
-macro_rules! impl_try_from_sem_iprim {
-    ($($t: ty), +) => {
-        $(
-        impl TryFrom<SEM> for $t{
-            type Error = FromErr;
-            fn try_from(value: SEM) -> Result<$t, Self::Error>{
-                return if value.e > 0{
-                    Err(FromErr::Overflow)
-                } else if value.e < 0 {
-                    Ok(0)
-                } else{
-                    let mut val: $t = (*value.m.last().unwrap()).try_into().map_err(|_| FromErr::Overflow)?;
-                    if value.s{
-                        val = val.neg();
-                    }
-                    return Ok(val);
-                };
-            }
+        let uval = *value.m.last().unwrap();
+        let mut val: i64 = uval.try_into().map_err(|_| FromErr::Overflow)?;
+        if value.s {
+            val = val.neg();
         }
-        )+
-    };
+        return Ok(val);
+    }
 }
-impl_try_from_sem_iprim!(i64, i32, i16, i8);
 
 #[derive(Debug)]
 pub enum FromStrErr {
@@ -553,9 +419,11 @@ pub enum FromStrErr {
     MalformedExpression,
 }
 
-pub trait UnsignedAbs {
-    type Output;
-    fn unsigned_abs(self) -> Self::Output;
+pub trait Abs {
+    type I;
+    type U;
+    fn unsigned_abs(self) -> Self::U;
+    fn abs(self) -> Self::I;
 }
 
 pub trait PowI<RHS = Self> {
@@ -725,11 +593,11 @@ macro_rules! impl_commutative {
         $(
             impl<const $G: usize> $Trait<$big<$G>> for $prim
             where
-                $big<$G>: $Trait<$prim>,
+                $big<$G>: $Trait<$prim, Output = $big<$G>>,
             {
-                type Output = <$big<$G> as $Trait<$prim>>::Output;
+                type Output = $big<$G>;
                 fn $method(self, rhs: $big<$G>) -> Self::Output {
-                    let $x = rhs.$method(self);
+                    let $x: $big<$G> = rhs.$method(self);
                     $transform
                 }
             }

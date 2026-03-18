@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::arch::asm;
 
 #[inline(always)]
@@ -40,6 +41,8 @@ fn combine_u64(x0: u64, x1: u64) -> u128 {
 }
 
 pub(crate) fn eq_buf(lhs: &[u64], rhs: &[u64]) -> bool {
+    use std::cmp::Ordering::*;
+
     match lhs.len().cmp(&rhs.len()) {
         Greater => {
             return lhs[rhs.len()..].iter().any(|&x| x != 0);
@@ -59,6 +62,8 @@ pub(crate) fn eq_buf(lhs: &[u64], rhs: &[u64]) -> bool {
 }
 
 pub(crate) fn cmp_buf(lhs: &[u64], rhs: &[u64]) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+
     match lhs.len().cmp(&rhs.len()) {
         Greater => {
             if lhs[rhs.len()..].iter().any(|&x| x != 0) {
@@ -75,12 +80,12 @@ pub(crate) fn cmp_buf(lhs: &[u64], rhs: &[u64]) -> std::cmp::Ordering {
 
     for (l, r) in lhs.iter().zip(rhs).rev() {
         let cmp = l.cmp(r);
-        if cmp != std::cmp::Ordering::Equal {
+        if cmp != Equal {
             return cmp;
         }
     }
 
-    return std::cmp::Ordering::Equal;
+    return Equal;
 }
 
 #[inline]
@@ -263,7 +268,7 @@ pub(crate) fn dec(lhs: &mut [u64]) -> bool {
     }
 }
 pub(crate) fn twos_comp(buf: &mut [u64]) {
-    for l in buf {
+    for l in buf.iter_mut() {
         *l = !*l;
     }
     inc(buf);
@@ -496,9 +501,6 @@ fn find_karatsuba_scratch_size(l: usize, s: usize) -> usize {
 }
 
 pub(crate) fn mul_vec(a: &[u64], b: &[u64]) -> (Vec<u64>, u64) {
-    let a_len = a.len();
-    let b_len = b.len();
-
     let mut out = vec![0_u64; a.len() + b.len() - 1];
     let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
     let c = match karatsuba_dispatch(long.len(), short.len()) {
@@ -646,7 +648,7 @@ fn karatsuba_sqr_alg(buf: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
     }
     let half = (buf.len() + 1) / 2;
     let (cross, rest) = scratch.split_at_mut(2 * half + 1);
-    karatsuba_sqr_core(buf, half, out, cross, scratch)
+    karatsuba_sqr_core(buf, half, out, cross, rest)
 }
 
 fn find_karatsuba_sqr_scratch_size(mut n: usize) -> usize {
@@ -751,7 +753,7 @@ pub(crate) fn shr_buf(buf: &mut [u64], sh: u8) -> u64 {
     unsafe {
         let mut c = 0;
         for e in buf.iter_mut().rev() {
-            shr_carry_aarch64(e, &mut c, sh, mv_sz);
+            shr_carry(e, &mut c, sh, mv_sz);
         }
         return c;
     }
@@ -819,76 +821,11 @@ pub(crate) fn shl_buf(buf: &mut [u64], sh: u8) -> u64 {
     }
 }
 
-pub(crate) fn shl_vec(vec: &mut Vec<u64>, sh: u64) {
-    let div = (sh / 64) as usize;
-    if div > 0 {
-        let len = vec.len();
-        vec.resize(len + div, 0);
-        vec.copy_within(0..len, div as usize);
-        vec[..div].fill(0);
-    }
-
-    let rem = (sh % 64) as u8;
-    let c = shl_buf(vec, rem);
-    if c > 0 {
-        vec.push(c);
-    }
-}
-
-pub(crate) fn shr_vec(vec: &mut Vec<u64>, sh: u64) {
-    let div = (sh / 64) as usize;
-    if div > 0 {
-        if div < vec.len() {
-            vec.drain(0..div);
-        } else {
-            vec.clear();
-            return;
-        }
-    }
-
-    let rem = (sh % 64) as u8;
-    shr_buf(vec, rem);
-    if *vec.last().unwrap() == 0 {
-        vec.pop();
-    }
-}
-
-pub(crate) fn shl_arr(buf: &mut [u64], sh: u64) {
-    let div = (sh / 64) as usize;
-    if div >= buf.len() {
-        buf.fill(0);
-        return;
-    }
-    if div > 0 {
-        buf.copy_within(0..(buf.len() - div), div);
-        buf[..div].fill(0);
-    }
-
-    let rem = (sh % 64) as u8;
-    shl_buf(&mut buf[div..], rem);
-}
-
-pub(crate) fn shr_arr(buf: &mut [u64], sh: u64) {
-    let div = (sh / 64) as usize;
-    if div >= buf.len() {
-        buf.fill(0);
-        return;
-    }
-    if div > 0 {
-        buf.copy_within(div..buf.len(), 0);
-        buf[(buf.len() - div)..].fill(0);
-    }
-
-    let rem = (sh % 64) as u8;
-    shl_buf(&mut buf[..(buf.len() - div)], rem);
-}
-
 pub(crate) fn div_prim(buf: &mut [u64], prim: u64) -> u64 {
     let prim_u128 = prim as u128;
     let mut rem: u128 = 0;
-    let mut val: u128 = 0;
     for e in buf.iter_mut().rev() {
-        val = (rem << 64) | (*e as u128);
+        let val = (rem << 64) | (*e as u128);
         rem = val % prim_u128;
         *e = (val / prim_u128) as u64;
     }
@@ -960,7 +897,8 @@ pub(crate) fn div_buf_of(n: &mut [u64], of: &mut u64, d: &[u64], out: &mut [u64]
 
     out[q_len] = knuth_est(&mut n[q_len..], of, d, d1, d0, dfull);
     for i in (0..q_len).rev() {
-        out[i] = knuth_est(&mut n[i..i + d_len], &mut n[i + d_len], d, d1, d0, dfull)
+        let (win, of) = n[i..].split_at_mut(d_len);
+        out[i] = knuth_est(win, &mut of[0], d, d1, d0, dfull)
     }
 }
 
@@ -1044,8 +982,8 @@ fn div_2_1_static<const N: usize>(
 
     let half_len = (dlen + 1) / 2;
     let (q_lo, q_hi) = q.split_at_mut(half_len);
-    div_3_2_static(&mut n[half_len..], d, half_len, q_hi, m, scratch);
-    div_3_2_static(&mut n[0..3 * half_len], d, half_len, q_lo, m, scratch);
+    div_3_2_static::<N>(&mut n[half_len..], d, half_len, q_hi, m, scratch);
+    div_3_2_static::<N>(&mut n[0..3 * half_len], d, half_len, q_lo, m, scratch);
 }
 
 fn find_bz_scratch_size(d: usize) -> usize {
@@ -1121,7 +1059,7 @@ pub(crate) fn div_arr<const N: usize>(n: &mut [u64], d: &mut [u64]) -> [u64; N] 
             if size > N {
                 let mut m = [0_u64; N];
                 bz_div_alg(n, d, &mut out, t, |n, d, q| {
-                    div_2_1_static(n, d, q, &mut m, &mut scratch)
+                    div_2_1_static::<N>(n, d, q, &mut m, &mut scratch)
                 });
             } else {
                 bz_div_alg(n, d, &mut out, t, |n, d, q| div_2_1(n, d, q, &mut scratch));
@@ -1133,14 +1071,14 @@ pub(crate) fn div_arr<const N: usize>(n: &mut [u64], d: &mut [u64]) -> [u64; N] 
     return out;
 }
 
-pub(crate) fn powi_vec(buf: &[u64], mut pow: u64) -> Vec<u64> {
+pub(crate) fn powi_vec(buf: &[u64], pow: usize) -> Vec<u64> {
     if pow == 0 {
         return vec![1];
     }
 
     let l = buf_len(buf);
     let log2 = (l - 1) * 64 + buf[l - 1].ilog2() as usize;
-    let tmp_sz = 1 + (log2 * pow as usize) / 64;
+    let tmp_sz = 1 + (log2 * pow) / 64;
     let scratch_sz = std::cmp::max(
         find_karatsuba_sqr_scratch_size(tmp_sz / 2),
         find_karatsuba_scratch_size(tmp_sz, l),
@@ -1155,7 +1093,7 @@ pub(crate) fn powi_vec(buf: &[u64], mut pow: u64) -> Vec<u64> {
 
     let log = pow.ilog2() as usize;
     for i in (0..log).rev() {
-        let mut sqr_len = 2 * len - 1;
+        let sqr_len = 2 * len - 1;
         let (src, dst): (&[u64], &mut [u64]) = if io {
             (&out, &mut tmp)
         } else {
@@ -1194,10 +1132,10 @@ pub(crate) fn powi_vec(buf: &[u64], mut pow: u64) -> Vec<u64> {
     return out;
 }
 
-pub(crate) fn powi_arr<const N: usize>(buf: &[u64], pow: u64) -> Result<[u64; N], ()> {
+pub(crate) fn powi_arr<const N: usize>(buf: &[u64], pow: usize) -> Result<[u64; N], ()> {
     let l = buf_len(buf);
     let log2 = (l - 1) * 64 + buf[l - 1].ilog2() as usize;
-    let tmp_sz = (log2 * pow as usize) / 64;
+    let tmp_sz = (log2 * pow) / 64;
     if tmp_sz > N {
         return Err(());
     }
@@ -1321,7 +1259,6 @@ pub(crate) fn powi_arr<const N: usize>(buf: &[u64], pow: u64) -> Result<[u64; N]
                 return Err(());
             }
             dst[len] = mul_c;
-            len += 1
         }
         io = !io;
     }
