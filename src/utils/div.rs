@@ -64,6 +64,7 @@ fn knuth_est(win: &mut [u64], of: &mut u64, d: &[u64], d1: u128, d0: u128, dfull
     return qhat;
 }
 
+//assumes normalized d and handles overflow of normalized n
 pub fn div_buf_of(n: &mut [u64], of: &mut u64, d: &[u64], out: &mut [u64]) {
     let d_len = d.len();
     let n_len = n.len();
@@ -73,8 +74,9 @@ pub fn div_buf_of(n: &mut [u64], of: &mut u64, d: &[u64], out: &mut [u64]) {
     let dfull = ((d1 as u128) << 64) | (d0 as u128);
 
     let q_len = n_len - d_len;
-
-    out[q_len] = knuth_est(&mut n[q_len..], of, d, d1, d0, dfull);
+    if out.len() > q_len {
+        out[q_len] = knuth_est(&mut n[q_len..], of, d, d1, d0, dfull);
+    }
     for i in (0..q_len).rev() {
         let (win, of) = n[i..].split_at_mut(d_len);
         out[i] = knuth_est(win, &mut of[0], d, d1, d0, dfull)
@@ -103,34 +105,6 @@ fn div_3_2(n: &mut [u64], d: &[u64], half_len: usize, q: &mut [u64], scratch: &m
     }
 }
 
-fn div_3_2_static<const N: usize>(
-    n: &mut [u64],
-    d: &[u64],
-    half_len: usize,
-    q: &mut [u64],
-    m: &mut [u64],
-    scratch: &mut [u64],
-) {
-    let (d_lo, d_hi) = d.split_at(half_len);
-    if cmp_buf(&n[2 * half_len..], d_hi) == std::cmp::Ordering::Less {
-        div_2_1(&mut n[half_len..], d_hi, q, scratch);
-    } else {
-        q.fill(u64::MAX);
-        acc(&mut n[2 * half_len..], d_hi, 1);
-        acc(&mut n[half_len..], d_hi, 0);
-    }
-
-    karatsuba_alg(q, d_lo, m, scratch);
-
-    if acc(n, &m, 1) {
-        dec(q);
-        if !acc(n, d, 0) {
-            dec(q);
-            acc(n, d, 0);
-        }
-    }
-}
-
 const BZ_CUTOFF: usize = 64;
 
 fn div_2_1(n: &mut [u64], d: &[u64], q: &mut [u64], scratch: &mut [u64]) {
@@ -146,23 +120,18 @@ fn div_2_1(n: &mut [u64], d: &[u64], q: &mut [u64], scratch: &mut [u64]) {
     div_3_2(&mut n[0..3 * half_len], d, half_len, q_lo, scratch);
 }
 
-fn div_2_1_static<const N: usize>(
+fn bz_div_alg(
     n: &mut [u64],
-    d: &[u64],
-    q: &mut [u64],
-    m: &mut [u64],
-    scratch: &mut [u64],
+    d: &mut [u64],
+    out: &mut [u64],
+    t: usize,
+    mut div_fn: impl FnMut(&mut [u64], &[u64], &mut [u64]),
 ) {
     let dlen = d.len();
-    if dlen <= BZ_CUTOFF {
-        div_buf_of(n, &mut 0, d, q);
-        return;
+    for i in (0..t).rev() {
+        let idx = dlen * i;
+        div_fn(&mut n[idx..idx + 2 * dlen], d, &mut out[idx..idx + dlen]);
     }
-
-    let half_len = (dlen + 1) / 2;
-    let (q_lo, q_hi) = q.split_at_mut(half_len);
-    div_3_2_static::<N>(&mut n[half_len..], d, half_len, q_hi, m, scratch);
-    div_3_2_static::<N>(&mut n[0..3 * half_len], d, half_len, q_lo, m, scratch);
 }
 
 fn find_bz_scratch_size(d: usize) -> usize {
@@ -195,20 +164,6 @@ fn bz_div_init(n: &mut [u64], d: &mut [u64], out: &mut [u64]) -> Option<(usize, 
     return Some((t, last_lz));
 }
 
-fn bz_div_alg(
-    n: &mut [u64],
-    d: &mut [u64],
-    out: &mut [u64],
-    t: usize,
-    mut div_fn: impl FnMut(&mut [u64], &[u64], &mut [u64]),
-) {
-    let dlen = d.len();
-    for i in (0..t).rev() {
-        let idx = dlen * i;
-        div_fn(&mut n[idx..idx + 2 * dlen], d, &mut out[idx..idx + dlen]);
-    }
-}
-
 pub fn div_vec(n: &mut [u64], d: &mut [u64]) -> Vec<u64> {
     if d.len() == 0 {
         panic!("division by zero");
@@ -227,6 +182,53 @@ pub fn div_vec(n: &mut [u64], d: &mut [u64]) -> Vec<u64> {
         shr_buf(d, sh);
     }
     return out;
+}
+
+fn div_3_2_static<const N: usize>(
+    n: &mut [u64],
+    d: &[u64],
+    half_len: usize,
+    q: &mut [u64],
+    m: &mut [u64],
+    scratch: &mut [u64],
+) {
+    let (d_lo, d_hi) = d.split_at(half_len);
+    if cmp_buf(&n[2 * half_len..], d_hi) == std::cmp::Ordering::Less {
+        div_2_1(&mut n[half_len..], d_hi, q, scratch);
+    } else {
+        q.fill(u64::MAX);
+        acc(&mut n[2 * half_len..], d_hi, 1);
+        acc(&mut n[half_len..], d_hi, 0);
+    }
+
+    karatsuba_alg(q, d_lo, m, scratch);
+
+    if acc(n, &m, 1) {
+        dec(q);
+        if !acc(n, d, 0) {
+            dec(q);
+            acc(n, d, 0);
+        }
+    }
+}
+
+fn div_2_1_static<const N: usize>(
+    n: &mut [u64],
+    d: &[u64],
+    q: &mut [u64],
+    m: &mut [u64],
+    scratch: &mut [u64],
+) {
+    let dlen = d.len();
+    if dlen <= BZ_CUTOFF {
+        div_buf_of(n, &mut 0, d, q);
+        return;
+    }
+
+    let half_len = (dlen + 1) / 2;
+    let (q_lo, q_hi) = q.split_at_mut(half_len);
+    div_3_2_static::<N>(&mut n[half_len..], d, half_len, q_hi, m, scratch);
+    div_3_2_static::<N>(&mut n[0..3 * half_len], d, half_len, q_lo, m, scratch);
 }
 
 pub fn div_arr<const N: usize>(n: &mut [u64], d: &mut [u64]) -> [u64; N] {
