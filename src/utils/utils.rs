@@ -45,10 +45,14 @@ pub fn eq_buf(lhs: &[u64], rhs: &[u64]) -> bool {
 
     match lhs.len().cmp(&rhs.len()) {
         Greater => {
-            return lhs[rhs.len()..].iter().any(|&x| x != 0);
+            if lhs[rhs.len()..].iter().any(|&x| x != 0) {
+                return false;
+            }
         }
         Less => {
-            return rhs[lhs.len()..].iter().any(|&x| x != 0);
+            if rhs[lhs.len()..].iter().any(|&x| x != 0) {
+                return false;
+            }
         }
         Equal => {}
     }
@@ -267,6 +271,7 @@ pub fn dec(lhs: &mut [u64]) -> bool {
         true
     }
 }
+
 pub fn twos_comp(buf: &mut [u64]) {
     for l in buf.iter_mut() {
         *l = !*l;

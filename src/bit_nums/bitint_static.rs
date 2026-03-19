@@ -131,7 +131,7 @@ impl<const N: usize> FromStr for BitIntStatic<N> {
         let mut result = BitIntStatic::ZERO;
         let mut multiplier = BitIntStatic::ONE;
         let mut end = str.len();
-        while end > 0 {
+        while end > neg as usize {
             let mut start = end.saturating_sub(CHUNK_SIZE);
             if neg && start == 0 {
                 start += 1;
@@ -346,7 +346,7 @@ impl<const N: usize> Mul<i128> for BitIntStatic<N> {
     fn mul(self, rhs: i128) -> Self::Output {
         let mut data = self.data;
         let c = mul_prim2(&mut data, rhs.unsigned_abs());
-        debug_assert!(c != 0, "attempt to multiply with overflow");
+        debug_assert!(c == 0, "attempt to multiply with overflow");
         BitIntStatic {
             data,
             sign: self.sign ^ (rhs < 0),
@@ -359,7 +359,7 @@ impl<const N: usize> Mul<u128> for BitIntStatic<N> {
     fn mul(self, rhs: u128) -> Self::Output {
         let mut data = self.data;
         let c = mul_prim2(&mut data, rhs);
-        debug_assert!(c != 0, "attempt to multiply with overflow");
+        debug_assert!(c == 0, "attempt to multiply with overflow");
         BitIntStatic {
             data,
             sign: self.sign,
@@ -372,7 +372,7 @@ impl<const N: usize> Mul<i64> for BitIntStatic<N> {
     fn mul(self, rhs: i64) -> Self::Output {
         let mut data = self.data;
         let c = mul_prim(&mut data, rhs.unsigned_abs());
-        debug_assert!(c != 0, "attempt to multiply with overflow");
+        debug_assert!(c == 0, "attempt to multiply with overflow");
         BitIntStatic {
             data,
             sign: self.sign ^ rhs.sign(),
@@ -394,7 +394,7 @@ impl<const N: usize> MulAssign for BitIntStatic<N> {
 impl<const N: usize> MulAssign<i128> for BitIntStatic<N> {
     fn mul_assign(&mut self, rhs: i128) {
         let c = mul_prim2(&mut self.data, rhs.unsigned_abs());
-        debug_assert!(c != 0, "attempt to multiply with overflow");
+        debug_assert!(c == 0, "attempt to multiply with overflow");
         self.sign ^= rhs < 0;
     }
 }
@@ -402,14 +402,14 @@ impl<const N: usize> MulAssign<i128> for BitIntStatic<N> {
 impl<const N: usize> MulAssign<u128> for BitIntStatic<N> {
     fn mul_assign(&mut self, rhs: u128) {
         let c = mul_prim2(&mut self.data, rhs);
-        debug_assert!(c != 0, "attempt to multiply with overflow");
+        debug_assert!(c == 0, "attempt to multiply with overflow");
     }
 }
 
 impl<const N: usize> MulAssign<i64> for BitIntStatic<N> {
     fn mul_assign(&mut self, rhs: i64) {
         let c = mul_prim(&mut self.data, rhs.unsigned_abs());
-        debug_assert!(c != 0, "attempt to multiply with overflow");
+        debug_assert!(c == 0, "attempt to multiply with overflow");
     }
 }
 

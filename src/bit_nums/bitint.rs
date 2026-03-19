@@ -154,7 +154,7 @@ impl FromStr for BitInt {
         };
 
         let mut end = str.len();
-        while end > 0 {
+        while end > neg as usize {
             let mut start = end.saturating_sub(CHUNK_SIZE);
             if neg && start == 0 {
                 start += 1;
@@ -846,9 +846,9 @@ impl<'a, T> Rem<T> for &'a BitInt
 where
     &'a BitInt: DivRem<T>,
 {
-    type Output = <&'a BitInt as DivRem<T>>::Q;
+    type Output = <&'a BitInt as DivRem<T>>::R;
     fn rem(self, rhs: T) -> Self::Output {
-        self.div_rem(rhs).0
+        self.div_rem(rhs).1
     }
 }
 
@@ -877,7 +877,7 @@ impl PowI<usize> for BitInt {
     fn powi(&self, rhs: usize) -> Self::Output {
         BitInt {
             data: powi_vec(&self.data, rhs),
-            sign: self.sign ^ (rhs % 2 == 1),
+            sign: self.sign && (rhs % 2 == 1),
         }
     }
 }
