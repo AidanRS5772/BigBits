@@ -1,10 +1,9 @@
 #![allow(dead_code)]
+use crate::utils::utils::{lsb, signed_shl, signed_shr};
 use std::ops::{Deref, DerefMut, Div, Neg, Rem};
 
-use crate::utils::{lsb, signed_shl, signed_shr};
-
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct SmallBuf {
+pub(super) struct SmallBuf {
     limbs: [u64; 2],
     len: usize,
 }
@@ -102,14 +101,14 @@ impl TryFrom<SmallBuf> for u64 {
     }
 }
 
-pub(crate) trait U:
+pub(super) trait U:
     Default + Copy + Into<SmallBuf> + Div<Self, Output = Self> + Rem<Self, Output = Self>
 {
 }
 impl U for u128 {}
 impl U for u64 {}
 
-pub(crate) trait I:
+pub(super) trait I:
     Default + Copy + Div<Self, Output = Self> + Rem<Self, Output = Self>
 {
     type U: Into<SmallBuf>;
@@ -138,7 +137,7 @@ impl I for i64 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct SEM {
+pub(super) struct SEM {
     pub(crate) s: bool,
     pub(crate) e: i128,
     pub(crate) m: SmallBuf,

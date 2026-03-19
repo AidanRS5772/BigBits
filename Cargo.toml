@@ -1,12 +1,21 @@
 [package]
-name = "BigBits"
+name = "big_bits"
 version = "0.1.0"
 edition = "2021"
 
-[dependencies]
+[dev-dependencies]
 criterion = "0.5.1"
+
+[dependencies]
 itertools = "0.12.1"
 rand = "0.8.5"
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+
+[features]
+_bench_internals = []
 
 [[bench]]
 name = "utils_bench"

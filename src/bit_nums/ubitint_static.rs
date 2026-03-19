@@ -1,5 +1,6 @@
-use crate::traits::{DivRem, FromErr, FromStrErr, LogI, PowI, SmallBuf, Sqr, U};
-use crate::{impl_commutative, impl_commutative_div_rem, impl_commutative_peq_pord, utils::*};
+use super::traits::{DivRem, FromErr, FromStrErr, LogI, PowI, SmallBuf, Sqr, U};
+use crate::utils::{div::*, mul::*, utils::*};
+use crate::{impl_commutative, impl_commutative_div_rem, impl_commutative_peq_pord};
 use std::f64::consts::{LN_10, LN_2};
 use std::fmt;
 use std::ops::*;

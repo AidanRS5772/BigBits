@@ -1,6 +1,6 @@
-use crate::traits::{Abs, DivRem, FromErr, FromStrErr, LogI, PowI, SmallBuf, Sqr, I};
-use crate::ubitint::UBitInt;
-use crate::utils::*;
+use super::traits::{Abs, DivRem, FromErr, FromStrErr, LogI, PowI, SmallBuf, Sqr, I};
+use crate::bit_nums::ubitint::UBitInt;
+use crate::utils::{div::*, mul::*, utils::*};
 use crate::{impl_commutative, impl_commutative_div_rem, impl_commutative_peq_pord};
 use core::fmt;
 use std::ops::*;

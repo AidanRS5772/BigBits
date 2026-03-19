@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-
 use crate::bitint::*;
 use crate::ubitint::*;
 use core::fmt;

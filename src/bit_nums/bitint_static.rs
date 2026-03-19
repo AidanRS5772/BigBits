@@ -1,7 +1,8 @@
-use crate::traits::{Abs, DivRem, FromErr, FromStrErr, LogI, PowI, SmallBuf, Sqr, I};
-use crate::ubitint_static::UBitIntStatic;
-use crate::{impl_commutative, impl_commutative_peq_pord};
-use crate::{impl_commutative_div_rem, utils::*};
+#![allow(dead_code)]
+use super::traits::{Abs, DivRem, FromErr, FromStrErr, LogI, PowI, SmallBuf, Sqr, I};
+use crate::bit_nums::ubitint_static::UBitIntStatic;
+use crate::utils::{div::*, mul::*, utils::*};
+use crate::{impl_commutative, impl_commutative_div_rem, impl_commutative_peq_pord};
 use std::f64::consts::{LN_10, LN_2};
 use std::fmt;
 use std::ops::*;
