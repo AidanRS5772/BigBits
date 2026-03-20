@@ -218,7 +218,13 @@ fn test_mul_vec_commutativity() {
 /// At the Karatsuba boundary: mul_vec and mul_buf should agree.
 #[test]
 fn test_mul_vec_karatsuba_boundary() {
-    for len in [30usize, 31, 32, 33, 34] {
+    for len in [
+        KARATSUBA_CUTOFF - 2,
+        KARATSUBA_CUTOFF - 1,
+        KARATSUBA_CUTOFF,
+        KARATSUBA_CUTOFF + 1,
+        KARATSUBA_CUTOFF + 2,
+    ] {
         let a = rand_nonzero_vec(len, len as u64);
         let b = rand_nonzero_vec(len, len as u64 + 1000);
         let (mut vec_result, c_vec) = mul_vec(&a, &b);
@@ -366,10 +372,15 @@ fn test_sqr_equals_mul_random() {
     }
 }
 
-/// At the Karatsuba squaring boundary (32 limbs).
+/// At the Karatsuba squaring boundary.
 #[test]
 fn test_sqr_vec_karatsuba_boundary() {
-    for len in [31usize, 32, 33, 34] {
+    for len in [
+        KARATSUBA_SQR_CUTOFF - 1,
+        KARATSUBA_SQR_CUTOFF,
+        KARATSUBA_SQR_CUTOFF + 1,
+        KARATSUBA_SQR_CUTOFF + 2,
+    ] {
         let v = rand_nonzero_vec(len, len as u64 + 500);
         let (mut sv, sc) = sqr_vec(&v);
         let (mut mv, mc) = mul_vec(&v, &v);
@@ -411,10 +422,8 @@ fn test_sqr_arr_matches_sqr_vec() {
     trim_lz(&mut expected);
 
     let (arr, ac) = sqr_arr::<16>(&v).expect("sqr_arr failed");
-    let mut got: Vec<u64> = arr[..2 * v.len() - 1].to_vec();
-    if ac > 0 {
-        got.push(ac);
-    }
+    assert_eq!(ac, 0, "oveflow from sqr of 4 buffer into 16 buffer should be zero");
+    let mut got: Vec<u64> = arr[..2 * v.len()].to_vec();
     trim_lz(&mut got);
     assert_eq!(got, expected);
 }
@@ -545,9 +554,9 @@ fn test_short_mul_vec_top_one_limb() {
 
 #[test]
 fn test_short_mul_vec_matches_full_top() {
-    // Only test p > SHORT_CUTOFF (32): that path uses mul_vec and gives exact top-p limbs.
-    // The short_mul_buf path (p <= 32) is an intentional approximation — it omits carry
-    // propagation from below the computed window and may not match the exact top limb.
+    // Only test p > SHORT_CUTOFF: that path uses mul_vec and gives exact top-p limbs.
+    // The short_mul_buf path (p <= SHORT_CUTOFF) is an intentional approximation — it omits
+    // carry propagation from below the computed window and may not match the exact top limb.
     for seed in 0u64..10 {
         let a = rand_nonzero_vec(20, seed);
         let b = rand_nonzero_vec(20, seed + 50);
@@ -555,14 +564,14 @@ fn test_short_mul_vec_matches_full_top() {
         let (mut full, _) = mul_vec(&a, &b);
         full.resize(full_len, 0);
 
-        for p in 33..=full_len {
+        for p in (SHORT_CUTOFF + 1)..=full_len {
             let (short, _) = short_mul_vec(&a, &b, p);
             assert_eq!(short, full[full_len - p..], "seed={seed}, p={p}");
         }
     }
 }
 
-/// Boundary: test at SHORT_CUTOFF (32) — only the p > 32 path gives exact top-p limbs.
+/// Boundary: test at SHORT_CUTOFF — only the p > SHORT_CUTOFF path gives exact top-p limbs.
 #[test]
 fn test_short_mul_vec_cutoff_boundary() {
     let a = rand_nonzero_vec(20, 999);
@@ -571,23 +580,23 @@ fn test_short_mul_vec_cutoff_boundary() {
     let (mut full, _) = mul_vec(&a, &b);
     full.resize(full_len, 0);
 
-    // p=33 uses the mul_vec path (p > SHORT_CUTOFF=32), giving exact top-p limbs.
-    let (short, _) = short_mul_vec(&a, &b, 33);
-    assert_eq!(short, full[full_len - 33..], "p=33");
+    // p = SHORT_CUTOFF+1 uses the mul_vec path (p > SHORT_CUTOFF), giving exact top-p limbs.
+    let (short, _) = short_mul_vec(&a, &b, SHORT_CUTOFF + 1);
+    assert_eq!(short, full[full_len - (SHORT_CUTOFF + 1)..], "p=SHORT_CUTOFF+1");
 }
 
 // ─── short_sqr_vec ──────────────────────────────────────────────────────────
 
 #[test]
 fn test_short_sqr_vec_matches_sqr_top() {
-    // Only test p > SHORT_SQR_CUTOFF (32): that path uses sqr_vec and gives exact top-p limbs.
+    // Only test p > SHORT_SQR_CUTOFF: that path uses sqr_vec and gives exact top-p limbs.
     for seed in 0u64..8 {
         let v = rand_nonzero_vec(20, seed + 200);
         let full_len = 2 * v.len() - 1;
         let (mut full, _) = sqr_vec(&v);
         full.resize(full_len, 0);
 
-        for p in 33..=full_len {
+        for p in (SHORT_SQR_CUTOFF + 1)..=full_len {
             let (short, _) = short_sqr_vec(&v, p);
             assert_eq!(short, full[full_len - p..], "seed={seed}, p={p}");
         }
@@ -608,7 +617,7 @@ fn test_short_sqr_vec_equals_short_mul_self() {
     }
 }
 
-/// Boundary at SHORT_SQR_CUTOFF (32) — only p > 32 gives exact top-p limbs.
+/// Boundary at SHORT_SQR_CUTOFF — only p > SHORT_SQR_CUTOFF gives exact top-p limbs.
 #[test]
 fn test_short_sqr_vec_cutoff_boundary() {
     let v = rand_nonzero_vec(20, 777);
@@ -616,7 +625,7 @@ fn test_short_sqr_vec_cutoff_boundary() {
     let (mut full, _) = sqr_vec(&v);
     full.resize(full_len, 0);
 
-    // p=33 uses the sqr_vec path (p > SHORT_SQR_CUTOFF=32), giving exact top-p limbs.
-    let (short, _) = short_sqr_vec(&v, 33);
-    assert_eq!(short, full[full_len - 33..], "p=33");
+    // p = SHORT_SQR_CUTOFF+1 uses the sqr_vec path (p > SHORT_SQR_CUTOFF), giving exact top-p limbs.
+    let (short, _) = short_sqr_vec(&v, SHORT_SQR_CUTOFF + 1);
+    assert_eq!(short, full[full_len - (SHORT_SQR_CUTOFF + 1)..], "p=SHORT_SQR_CUTOFF+1");
 }

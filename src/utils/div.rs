@@ -83,20 +83,27 @@ pub fn div_buf_of(n: &mut [u64], of: &mut u64, d: &[u64], out: &mut [u64]) {
     }
 }
 
-fn div_3_2(n: &mut [u64], d: &[u64], half_len: usize, q: &mut [u64], scratch: &mut [u64]) {
-    let (d_lo, d_hi) = d.split_at(half_len);
-    if cmp_buf(&n[2 * half_len..], d_hi) == std::cmp::Ordering::Less {
-        div_2_1(&mut n[half_len..], d_hi, q, scratch);
+fn div_3_2(n: &mut [u64], d: &[u64], d_lo_len: usize, q: &mut [u64], scratch: &mut [u64]) {
+    let q_len = q.len();
+    let (d_lo, d_hi) = d.split_at(d_lo_len);
+
+    if cmp_buf(&n[d.len()..], d_hi) == std::cmp::Ordering::Less {
+        div_2_1(&mut n[d_lo_len..], d_hi, q, scratch);
     } else {
         q.fill(u64::MAX);
-        acc(&mut n[2 * half_len..], d_hi, 1);
-        acc(&mut n[half_len..], d_hi, 0);
+        acc(&mut n[d.len()..], d_hi, 1);
+        acc(&mut n[d_lo_len..], d_hi, 0);
     }
 
-    let (m, k_scratch) = scratch.split_at_mut(q.len() + half_len);
-    karatsuba_alg(q, d_lo, m, k_scratch);
+    let prod_len = q_len + d_lo_len;
+    let (m, k_scratch) = scratch.split_at_mut(prod_len);
+    if q_len >= d_lo_len {
+        karatsuba_alg(q, d_lo, m, k_scratch);
+    } else {
+        karatsuba_alg(d_lo, q, m, k_scratch);
+    }
 
-    if acc(n, &m, 1) {
+    if acc(n, &m[..prod_len], 1) {
         dec(q);
         if !acc(n, d, 0) {
             dec(q);
@@ -105,7 +112,7 @@ fn div_3_2(n: &mut [u64], d: &[u64], half_len: usize, q: &mut [u64], scratch: &m
     }
 }
 
-const BZ_CUTOFF: usize = 64;
+pub(crate) const BZ_CUTOFF: usize = 64;
 
 fn div_2_1(n: &mut [u64], d: &[u64], q: &mut [u64], scratch: &mut [u64]) {
     let dlen = d.len();
@@ -114,10 +121,12 @@ fn div_2_1(n: &mut [u64], d: &[u64], q: &mut [u64], scratch: &mut [u64]) {
         return;
     }
 
-    let half_len = (dlen + 1) / 2;
-    let (q_lo, q_hi) = q.split_at_mut(half_len);
-    div_3_2(&mut n[half_len..], d, half_len, q_hi, scratch);
-    div_3_2(&mut n[0..3 * half_len], d, half_len, q_lo, scratch);
+    let lo = dlen / 2;
+    let hi = dlen - lo;
+    let (q_lo, q_hi) = q.split_at_mut(lo);
+
+    div_3_2(&mut n[lo..], d, lo, q_hi, scratch);
+    div_3_2(&mut n[..dlen + lo], d, hi, q_lo, scratch);
 }
 
 fn bz_div_alg(
@@ -139,7 +148,7 @@ fn find_bz_scratch_size(d: usize) -> usize {
         return 0;
     }
     let half = (d + 1) / 2;
-    2 * half - 1 + find_karatsuba_scratch_size(half, half)
+    2 * half + find_karatsuba_scratch_size(half, half)
 }
 
 fn bz_div_init(n: &mut [u64], d: &mut [u64], out: &mut [u64]) -> Option<(usize, u8)> {
@@ -158,7 +167,7 @@ fn bz_div_init(n: &mut [u64], d: &mut [u64], out: &mut [u64]) -> Option<(usize, 
     shl_buf(d, last_lz);
     let mut last_n = shl_buf(n, last_lz);
 
-    let t = (nlen + 1) / dlen - 1;
+    let t = (nlen - dlen) / dlen;
     let init_idx = dlen * t;
     div_buf_of(&mut n[init_idx..], &mut last_n, d, &mut out[init_idx..]);
     return Some((t, last_lz));

@@ -1,6 +1,9 @@
 #![allow(dead_code)]
 use big_bits::*;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{
+    black_box, criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId,
+    Criterion, Throughput,
+};
 use rand::Rng;
 
 fn random_limbs(n: usize) -> Vec<u64> {
@@ -15,8 +18,15 @@ fn random_sh() -> u8 {
 
 const ARCH: &'static str = std::env::consts::ARCH;
 
-fn bench_acc_buf(c: &mut Criterion) {
+fn set_up_group(group: &mut BenchmarkGroup<'_, WallTime>) {
+    group.sample_size(250); // default is 100
+    group.measurement_time(std::time::Duration::from_secs(20)); // default is 5s
+    group.warm_up_time(std::time::Duration::from_secs(5)); // default is 3s
+}
+
+fn bench_acc(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("add_buf/{ARCH}"));
+    set_up_group(&mut group);
     let sizes: Vec<usize> = vec![4, 16, 64, 256, 1024, 4096];
     for &n in &sizes {
         group.throughput(Throughput::Elements(n as u64));
@@ -29,8 +39,9 @@ fn bench_acc_buf(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_shl_buf(c: &mut Criterion) {
+fn bench_shl(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("shl_buf/{ARCH}"));
+    set_up_group(&mut group);
     let sizes: Vec<usize> = vec![4, 16, 64, 256, 1024, 4096];
     for &n in &sizes {
         group.throughput(Throughput::Elements(n as u64));
@@ -43,8 +54,9 @@ fn bench_shl_buf(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_shr_buf(c: &mut Criterion) {
+fn bench_shr(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("shr_buf/{ARCH}"));
+    set_up_group(&mut group);
     let sizes: Vec<usize> = vec![4, 16, 64, 256, 1024, 4096];
     for &n in &sizes {
         group.throughput(Throughput::Elements(n as u64));
@@ -57,8 +69,9 @@ fn bench_shr_buf(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_school_mul_buf(c: &mut Criterion) {
+fn bench_school_mul(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("school_mul_buf/{ARCH}"));
+    set_up_group(&mut group);
     let sizes: Vec<usize> = vec![4, 16, 64, 256, 1024, 4096];
     for &n in &sizes {
         group.throughput(Throughput::Elements(n as u64));
@@ -72,5 +85,20 @@ fn bench_school_mul_buf(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_acc_buf);
+fn bench_mul(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("mul_buf/{ARCH}"));
+    set_up_group(&mut group);
+    let sizes: Vec<usize> = vec![4, 16, 64, 256, 1024, 4096];
+    for &n in &sizes {
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
+            let a = random_limbs(n);
+            let b = random_limbs(n);
+            bench.iter(|| mul_vec(black_box(&a), black_box(&b)));
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_mul);
 criterion_main!(benches);

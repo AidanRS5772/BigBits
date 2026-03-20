@@ -211,13 +211,11 @@ fn test_div_vec_invariant_small_random() {
     }
 }
 
-/// Test near the BZ_CUTOFF (64 limbs) to exercise the recursive Burnikel-Ziegler path.
+/// Test near the BZ_CUTOFF to exercise the recursive Burnikel-Ziegler path.
 #[test]
-fn test_div_vec_invariant_bz_cutoff() {
+fn test_div_vec_invariant_bz_cutoff_even() {
     for seed in 0u64..5 {
-        // Divisor just above BZ_CUTOFF so the BZ recursion kicks in.
-        // Use even d_len=66 — the recursive BZ algorithm requires even-length divisors.
-        let d_len = 66usize;
+        let d_len = BZ_CUTOFF + (seed % 2 + 1) as usize;
         let n_len = d_len * 2 + (seed as usize % 10);
         let n = rand_nonzero_vec(n_len, seed + 5000);
         let d = rand_nonzero_vec(d_len, seed + 6000);
@@ -232,6 +230,33 @@ fn test_div_vec_invariant_bz_cutoff() {
             verify_divmod(&n_orig, &d, &q, &r),
             "BZ invariant failed for seed={seed}"
         );
+    }
+}
+
+/// Deep BZ recursion: divisor large enough that div_2_1 recurses into itself.
+/// Tests both even (2*BZ_CUTOFF+2) and odd (2*BZ_CUTOFF+1) at this depth.
+#[test]
+fn test_div_vec_invariant_bz_deep_recursive() {
+    for (d_len, seed_base) in [
+        (BZ_CUTOFF * 2 + 2, 10000u64),
+        (BZ_CUTOFF * 2 + 1, 11000u64),
+    ] {
+        for seed in 0u64..3 {
+            let n_len = d_len * 2 + 4;
+            let n = rand_nonzero_vec(n_len, seed + seed_base);
+            let d = rand_nonzero_vec(d_len, seed + seed_base + 100);
+
+            let n_orig = n.clone();
+            let mut n_work = n.clone();
+            let mut d_work = d.clone();
+            let q = div_vec(&mut n_work, &mut d_work);
+            let r = n_work.clone();
+
+            assert!(
+                verify_divmod(&n_orig, &d, &q, &r),
+                "BZ deep invariant failed: d_len={d_len}, seed={seed}"
+            );
+        }
     }
 }
 

@@ -111,7 +111,7 @@ enum KDispatch {
     Recurse,
 }
 
-const KARATSUBA_CUTOFF: usize = 32;
+pub(crate) const KARATSUBA_CUTOFF: usize = 24;
 
 fn karatsuba_dispatch(long: usize, short: usize) -> KDispatch {
     return if short == 1 {
@@ -175,12 +175,8 @@ fn karatsuba_core(
     return c + acc(&mut out[half_len..], &cross, 0) as u64;
 }
 
-pub(super) fn karatsuba_alg(
-    long: &[u64],
-    short: &[u64],
-    out: &mut [u64],
-    scratch: &mut [u64],
-) -> u64 {
+pub(super) fn karatsuba_alg(a: &[u64], b: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
+    let (long, short) = if a.len() >= b.len() { (a, b) } else { (b, a) };
     match karatsuba_dispatch(long.len(), short.len()) {
         KDispatch::Prim => {
             out[..long.len()].copy_from_slice(long);
@@ -319,7 +315,7 @@ pub fn sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
             carry += val >> 63;
         }
 
-        if n % 2 == 0 {
+        if n % 2 == 0 && n / 2 <= len {
             let half_val = buf[n / 2] as u128;
             let val = half_val * half_val;
             term += val & mask;
@@ -333,7 +329,7 @@ pub fn sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
     return carry as u64;
 }
 
-const KARATSUBA_SQR_CUTOFF: usize = 32;
+pub(crate) const KARATSUBA_SQR_CUTOFF: usize = 32;
 
 fn karatsuba_sqr_core(
     buf: &[u64],
@@ -456,7 +452,7 @@ fn short_mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     return carry as u64;
 }
 
-const SHORT_CUTOFF: usize = 32;
+pub(crate) const SHORT_CUTOFF: usize = 32;
 
 pub fn short_mul_vec(a: &[u64], b: &[u64], prec: usize) -> (Vec<u64>, u64) {
     let p = prec.min(a.len() + b.len() - 1);
@@ -514,7 +510,7 @@ fn short_sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
     return carry as u64;
 }
 
-const SHORT_SQR_CUTOFF: usize = 32;
+pub(crate) const SHORT_SQR_CUTOFF: usize = 32;
 
 pub fn short_sqr_vec(buf: &[u64], prec: usize) -> (Vec<u64>, u64) {
     let p = prec.min(2 * buf.len() - 1);
