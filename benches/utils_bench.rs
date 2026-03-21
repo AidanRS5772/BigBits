@@ -48,7 +48,7 @@ fn bench_sub_buf(c: &mut Criterion) {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
             let short = random_limbs(n);
-            let mut long = random_limbs(n+1);
+            let mut long = random_limbs(n + 1);
             bench.iter(|| sub_buf(black_box(&mut long), black_box(&short)));
         });
     }
@@ -116,5 +116,5 @@ fn bench_mul(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_shr);
+criterion_group!(benches, bench_shr, bench_school_mul, bench_mul);
 criterion_main!(benches);
