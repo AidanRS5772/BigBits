@@ -265,21 +265,19 @@ impl Ord for BitInt {
 }
 
 fn add_sub(lhs: &mut BitInt, rhs: &[u64], sub: bool) {
-    let comp = lhs.sign ^ sub;
     if lhs.data.len() < rhs.len() {
         lhs.data.resize(rhs.len(), 0);
     }
 
-    if acc(&mut lhs.data, &rhs, comp as u8) {
-        if comp {
+    if lhs.sign ^ sub {
+        if sub_buf(&mut lhs.data, rhs) {
             twos_comp(&mut lhs.data);
-        } else {
+        }
+        trim_lz(&mut lhs.data);
+    } else {
+        if add_buf(&mut lhs.data, rhs) {
             lhs.data.push(1);
         }
-        lhs.sign ^= comp;
-    }
-    if comp {
-        trim_lz(&mut lhs.data);
     }
 }
 

@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+
 use big_bits::*;
 use criterion::{
     black_box, criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId,
@@ -24,7 +25,7 @@ fn set_up_group(group: &mut BenchmarkGroup<'_, WallTime>) {
     group.warm_up_time(std::time::Duration::from_secs(5)); // default is 3s
 }
 
-fn bench_acc(c: &mut Criterion) {
+fn bench_add_buf(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("add_buf/{ARCH}"));
     set_up_group(&mut group);
     let sizes: Vec<usize> = vec![4, 16, 64, 256, 1024, 4096];
@@ -33,7 +34,23 @@ fn bench_acc(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
             let short = random_limbs(n);
             let mut long = random_limbs(n + 1);
-            bench.iter(|| acc(black_box(&mut long), black_box(&short), 0));
+            bench.iter(|| add_buf(black_box(&mut long), black_box(&short)));
+        });
+    }
+    group.finish();
+}
+
+fn bench_sub_buf(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("sub_buf/{ARCH}"));
+    set_up_group(&mut group);
+    let sizes: Vec<usize> = vec![4, 16, 64, 256, 1024, 4096];
+    for &n in &sizes {
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
+            let short = random_limbs(n);
+            let mut long = random_limbs(n);
+            long.push(u64::MAX);
+            bench.iter(|| sub_buf(black_box(&mut long), black_box(&short)));
         });
     }
     group.finish();
@@ -100,5 +117,5 @@ fn bench_mul(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_mul);
+criterion_group!(benches, bench_add_buf, bench_sub_buf);
 criterion_main!(benches);

@@ -239,7 +239,11 @@ impl<const N: usize> Ord for BitIntStatic<N> {
 
 fn add_sub<const N: usize>(lhs: &mut BitIntStatic<N>, rhs: &[u64], sub: bool) -> bool {
     let comp = lhs.sign ^ sub;
-    let of = acc(&mut lhs.data, rhs, comp as u8);
+    let of = if comp {
+        add_buf(&mut lhs.data, rhs)
+    } else {
+        sub_buf(&mut lhs.data, rhs)
+    };
     lhs.sign ^= of && comp;
     if of && comp {
         twos_comp(&mut lhs.data);

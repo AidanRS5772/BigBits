@@ -14,29 +14,25 @@ pub fn div_prim(buf: &mut [u64], prim: u64) -> u64 {
 
 fn sub_mul_of(win: &mut [u64], of: &mut u64, d: &[u64], q: u64) -> bool {
     let q_u128 = q as u128;
-    let mut carry = 0_u128;
+    let mut mul_carry: u64 = 0;
+    let mut borrow: u64 = 0;
 
-    unsafe {
-        let mut c = 1_u8;
-        for (w, &d) in win.iter_mut().zip(d) {
-            let val = q_u128 * (d as u128) + carry;
-            carry = val >> 64;
+    for (w, &d) in win.iter_mut().zip(d) {
+        let prod = q_u128 * (d as u128) + mul_carry as u128;
+        mul_carry = (prod >> 64) as u64;
+        let prod_lo = prod as u64;
 
-            add_with_carry(w, !(val as u64), &mut c);
-        }
-        add_with_carry(of, !(carry as u64), &mut c);
-        return c == 0;
+        let (s1, b1) = w.overflowing_sub(prod_lo);
+        let (s2, b2) = s1.overflowing_sub(borrow);
+        *w = s2;
+        borrow = b1 as u64 + b2 as u64;
     }
-}
 
-fn add_of(win: &mut [u64], of: &mut u64, d: &[u64]) {
-    unsafe {
-        let mut c = 0_u8;
-        for (w, &d) in win.iter_mut().zip(d) {
-            add_with_carry(w, d, &mut c);
-        }
-        *of = of.wrapping_add(c as u64);
-    }
+    let (s1, b1) = of.overflowing_sub(mul_carry);
+    let (s2, b2) = s1.overflowing_sub(borrow);
+    *of = s2;
+
+    (b1 as u64 + b2 as u64) != 0
 }
 
 fn knuth_est(win: &mut [u64], of: &mut u64, d: &[u64], d1: u128, d0: u128, dfull: u128) -> u64 {
@@ -59,7 +55,9 @@ fn knuth_est(win: &mut [u64], of: &mut u64, d: &[u64], d1: u128, d0: u128, dfull
 
     if sub_mul_of(win, of, d, qhat) {
         qhat -= 1;
-        add_of(win, of, d);
+        if add_buf(win, d) {
+            *of = of.wrapping_add(1);
+        }
     }
     return qhat;
 }
@@ -91,8 +89,8 @@ fn div_3_2(n: &mut [u64], d: &[u64], d_lo_len: usize, q: &mut [u64], scratch: &m
         div_2_1(&mut n[d_lo_len..], d_hi, q, scratch);
     } else {
         q.fill(u64::MAX);
-        acc(&mut n[d.len()..], d_hi, 1);
-        acc(&mut n[d_lo_len..], d_hi, 0);
+        sub_buf(&mut n[d.len()..], d_hi);
+        sub_buf(&mut n[d_lo_len..], d_hi);
     }
 
     let prod_len = q_len + d_lo_len;
@@ -103,11 +101,11 @@ fn div_3_2(n: &mut [u64], d: &[u64], d_lo_len: usize, q: &mut [u64], scratch: &m
         karatsuba_alg(d_lo, q, m, k_scratch);
     }
 
-    if acc(n, &m[..prod_len], 1) {
-        dec(q);
-        if !acc(n, d, 0) {
-            dec(q);
-            acc(n, d, 0);
+    if sub_buf(n, &m[..prod_len]) {
+        dec_buf(q);
+        if !add_buf(n, d) {
+            dec_buf(q);
+            add_buf(n, d);
         }
     }
 }
@@ -206,17 +204,17 @@ fn div_3_2_static<const N: usize>(
         div_2_1(&mut n[half_len..], d_hi, q, scratch);
     } else {
         q.fill(u64::MAX);
-        acc(&mut n[2 * half_len..], d_hi, 1);
-        acc(&mut n[half_len..], d_hi, 0);
+        sub_buf(&mut n[2 * half_len..], d_hi);
+        sub_buf(&mut n[half_len..], d_hi);
     }
 
     karatsuba_alg(q, d_lo, m, scratch);
 
-    if acc(n, &m, 1) {
-        dec(q);
-        if !acc(n, d, 0) {
-            dec(q);
-            acc(n, d, 0);
+    if add_buf(n, &m) {
+        dec_buf(q);
+        if !add_buf(n, d) {
+            dec_buf(q);
+            add_buf(n, d);
         }
     }
 }

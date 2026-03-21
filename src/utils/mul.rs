@@ -89,14 +89,14 @@ fn chunking_karatsuba(long: &[u64], short: &[u64], out: &mut [u64], scratch: &mu
         let (val, rest) = scratch.split_at_mut(2 * s);
         let of = i * s;
         karatsuba_alg(&long[of..of + s], short, val, rest);
-        acc(&mut out[of..], val, 0) as u64;
+        add_buf(&mut out[of..], val);
     }
 
     let of = n_chunks * s;
     let chunk = &long[of..];
     let (val, rest) = scratch.split_at_mut(chunk.len() + s - 1);
     overflow += karatsuba_alg(short, chunk, val, rest);
-    if acc(&mut out[of..], val, 0) {
+    if add_buf(&mut out[of..], val) {
         overflow += 1;
     }
 
@@ -148,13 +148,13 @@ fn karatsuba_core(
         let mut s_len = half_len;
 
         l_sum[..l_len].copy_from_slice(l0);
-        if acc(&mut l_sum[..l_len], l1, 0) {
+        if add_buf(&mut l_sum[..l_len], l1) {
             l_sum[l_len] = 1;
             l_len += 1;
         }
 
         s_sum[..s_len].copy_from_slice(s0);
-        if acc(&mut s_sum[..s_len], s1, 0) {
+        if add_buf(&mut s_sum[..s_len], s1) {
             s_sum[s_len] = 1;
             s_len += 1;
         }
@@ -164,15 +164,18 @@ fn karatsuba_core(
 
     let (z0, z2) = out.split_at_mut(2 * half_len);
     karatsuba_alg(l0, s0, z0, scratch);
-    let c = karatsuba_alg(l1, s1, z2, scratch);
+    let mut c = karatsuba_alg(l1, s1, z2, scratch);
 
-    acc(cross, z0, 1);
-    acc(cross, z2, 1);
+    sub_buf(cross, z0);
+    sub_buf(cross, z2);
     if c > 0 {
-        acc(&mut cross[z2.len()..], &[c], 1);
+        sub_buf(&mut cross[z2.len()..], &[c]);
+    }
+    if add_buf(&mut out[half_len..], &cross) {
+        c += 1;
     }
 
-    return c + acc(&mut out[half_len..], &cross, 0) as u64;
+    return c;
 }
 
 pub(super) fn karatsuba_alg(a: &[u64], b: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
@@ -344,7 +347,7 @@ fn karatsuba_sqr_core(
         let sum = &mut out[..=half_len];
         sum[..half_len].copy_from_slice(x0);
         let mut sum_len = half_len;
-        if acc(&mut sum[..half_len], x1, 0) {
+        if add_buf(&mut sum[..half_len], x1) {
             sum[half_len] = 1;
             sum_len += 1;
         }
@@ -358,12 +361,12 @@ fn karatsuba_sqr_core(
     karatsuba_sqr_alg(x0, z0, scratch);
     let mut c = karatsuba_sqr_alg(x1, z2, scratch);
 
-    acc(cross, z0, 1);
-    acc(cross, z2, 1);
+    sub_buf(cross, z0);
+    sub_buf(cross, z2);
     if c > 0 {
-        acc(&mut cross[z2.len()..], &[c], 1);
+        sub_buf(&mut cross[z2.len()..], &[c]);
     }
-    if acc(&mut out[half_len..], &cross, 0) {
+    if add_buf(&mut out[half_len..], &cross) {
         c += 1;
     }
 

@@ -1,9 +1,9 @@
-mod test_utils;
-mod test_mul;
 mod test_div;
+mod test_mul;
+mod test_utils;
 
 use crate::utils::mul::mul_vec;
-use crate::utils::utils::{acc, eq_buf, trim_lz};
+use crate::utils::utils::{add_buf, eq_buf, sub_buf, trim_lz};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -41,7 +41,7 @@ pub(super) fn verify_divmod(n_orig: &[u64], d: &[u64], q: &[u64], r: &[u64]) -> 
         result.resize(r.len(), 0);
     }
     // Ignore the overflow bool — if q*d+r > n, the equality check below will catch it.
-    acc(&mut result, r, 0);
+    add_buf(&mut result, r);
 
     trim_lz(&mut result);
     let mut n = n_orig.to_vec();

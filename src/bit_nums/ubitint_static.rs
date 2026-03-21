@@ -163,7 +163,7 @@ impl<const N: usize> Add for UBitIntStatic<N> {
     type Output = UBitIntStatic<N>;
     fn add(self, rhs: UBitIntStatic<N>) -> Self::Output {
         let mut lhs = self.data;
-        let of = acc(&mut lhs, &rhs.data, 0);
+        let of = add_buf(&mut lhs, &rhs.data);
         debug_assert!(!of, "attempt to add with overflow");
         UBitIntStatic::<N> { data: lhs }
     }
@@ -173,7 +173,7 @@ impl<const N: usize, T: Into<SmallBuf>> Add<T> for UBitIntStatic<N> {
     type Output = UBitIntStatic<N>;
     fn add(self, rhs: T) -> Self::Output {
         let mut lhs = self.data;
-        let of = acc(&mut lhs, &rhs.into(), 0);
+        let of = add_buf(&mut lhs, &rhs.into());
         debug_assert!(!of, "attempt to add with overflow");
         UBitIntStatic::<N> { data: lhs }
     }
@@ -183,14 +183,14 @@ impl_commutative!(const N, Add, add, UBitIntStatic, |x| x, u128, u64);
 
 impl<const N: usize> AddAssign for UBitIntStatic<N> {
     fn add_assign(&mut self, rhs: Self) {
-        let of = acc(&mut self.data, &rhs.data, 0);
+        let of = add_buf(&mut self.data, &rhs.data);
         debug_assert!(!of, "attempt to add with overflow");
     }
 }
 
 impl<const N: usize, T: Into<SmallBuf>> AddAssign<T> for UBitIntStatic<N> {
     fn add_assign(&mut self, rhs: T) {
-        let of = acc(&mut self.data, &rhs.into(), 0);
+        let of = add_buf(&mut self.data, &rhs.into());
         debug_assert!(!of, "attempt to add with overflow");
     }
 }
@@ -199,7 +199,7 @@ impl<const N: usize> Sub for UBitIntStatic<N> {
     type Output = UBitIntStatic<N>;
     fn sub(self, rhs: Self) -> Self::Output {
         let mut lhs = self.data;
-        let of = acc(&mut lhs, &rhs.data, 1);
+        let of = sub_buf(&mut lhs, &rhs.data);
         debug_assert!(!of, "attempt to subtract with overflow");
         UBitIntStatic::<N> { data: lhs }
     }
@@ -209,7 +209,7 @@ impl<const N: usize, T: Into<SmallBuf>> Sub<T> for UBitIntStatic<N> {
     type Output = UBitIntStatic<N>;
     fn sub(self, rhs: T) -> Self::Output {
         let mut lhs = self.data;
-        let of = acc(&mut lhs, &rhs.into(), 1);
+        let of = sub_buf(&mut lhs, &rhs.into());
         debug_assert!(!of, "attempt to subtract with overflow");
         UBitIntStatic { data: lhs }
     }
@@ -231,14 +231,14 @@ impl_sub_ubis_commute!(u128, u64);
 
 impl<const N: usize> SubAssign for UBitIntStatic<N> {
     fn sub_assign(&mut self, rhs: Self) {
-        let of = acc(&mut self.data, &rhs.data, 1);
+        let of = sub_buf(&mut self.data, &rhs.data);
         debug_assert!(!of, "attempt to subtract with overflow");
     }
 }
 
 impl<const N: usize, T: Into<SmallBuf>> SubAssign<T> for UBitIntStatic<N> {
     fn sub_assign(&mut self, rhs: T) {
-        let of = acc(&mut self.data, &rhs.into(), 1);
+        let of = sub_buf(&mut self.data, &rhs.into());
         debug_assert!(!of, "attempt to subtract with overflow");
     }
 }
