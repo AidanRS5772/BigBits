@@ -2,7 +2,7 @@
 extern crate core;
 
 pub mod bit_nums;
-pub(crate) mod utils;
+pub mod utils;
 
 #[cfg(test)]
 mod tests;

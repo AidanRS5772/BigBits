@@ -116,5 +116,5 @@ fn bench_mul(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_add_buf, bench_sub_buf);
+criterion_group!(benches, bench_shr);
 criterion_main!(benches);

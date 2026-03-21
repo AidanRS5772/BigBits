@@ -443,7 +443,7 @@ unsafe fn shr_asm_x86(dst: &mut u64, src: u64, sh: u8) {
         dst = inout(reg) *dst,
         src = in(reg) src,
         in("cl") sh,
-        options(nostack)
+        options(nostack, nomem)
     );
 }
 
@@ -481,7 +481,7 @@ unsafe fn shl_asm_x86(dst: &mut u64, src: u64, sh: u8) {
         dst = inout(reg) *dst,
         src = in(reg) src,
         in("cl") sh,
-        options(nostack)
+        options(nostack, nomem)
     );
 }
 

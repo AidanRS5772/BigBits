@@ -1,50 +1,156 @@
 #![allow(dead_code)]
 use crate::utils::utils::*;
+use std::arch::asm;
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn mul_prim_asm_x86(val: u64, prim: u64, carry: u64) -> (u64, u64) {
+    let lo: u64;
+    let hi: u64;
+    asm!(
+        "mul {prim}",
+        "add rax, {carry}",
+        "adc rdx, 0",
+        prim = in(reg) prim,
+        carry = in(reg) carry,
+        inout("rax") val => lo,
+        out("rdx") hi,
+        options(nostack, nomem),
+    );
+    (lo, hi)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn mul_prim_asm_aarch(val: u64, prim: u64, carry: u64) -> (u64, u64) {
+    let lo: u64;
+    let hi: u64;
+    asm!(
+        "mul {lo}, {a_val}, {prim}",
+        "umulh {hi}, {a_val}, {prim}",
+        "adds {lo}, {lo}, {carry}",
+        "adc {hi}, {hi}, xzr",
+        a_val = in(reg) val,
+        prim = in(reg) prim,
+        carry = in(reg) carry,
+        lo = out(reg) lo,
+        hi = out(reg) hi,
+        options(nostack, nomem),
+    );
+    (lo, hi)
+}
+
+#[inline(always)]
+unsafe fn mul_prim_asm(val: u64, prim: u64, carry: u64) -> (u64, u64) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        mul_prim_asm_aarch(val, prim, carry)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        mul_prim_asm_x86(val, prim, carry)
+    }
+}
 
 pub fn mul_prim(buf: &mut [u64], prim: u64) -> u64 {
-    let prim_u128 = prim as u128;
-    let mut carry: u128 = 0;
-
+    let mut carry: u64 = 0;
     for e in buf {
-        let val = (*e as u128) * prim_u128 + carry;
-        *e = val as u64;
-        carry = val >> 64;
+        let (lo, hi) = unsafe { mul_prim_asm(*e, prim, carry) };
+        *e = lo;
+        carry = hi;
     }
+    carry
+}
 
-    return carry as u64;
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn mul_asm_x86(a_val: u64, b_val: u64, acc0: &mut u64, acc1: &mut u64, acc2: &mut u64) {
+    asm!(
+        "mul {b_val}",
+        "add {acc0}, rax",
+        "adc {acc1}, rdx",
+        "adc {acc2}, 0",
+        b_val = in(reg) b_val,
+        inout("rax") a_val => _,
+        out("rdx") _,
+        acc0 = inout(reg) *acc0,
+        acc1 = inout(reg) *acc1,
+        acc2 = inout(reg) *acc2,
+        options(nostack, nomem),
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn mul_asm_aarch(a_val: u64, b_val: u64, acc0: &mut u64, acc1: &mut u64, acc2: &mut u64) {
+    asm!(
+        "mul {lo}, {a_val}, {b_val}",
+        "umulh {hi}, {a_val}, {b_val}",
+        "adds {acc0}, {acc0}, {lo}",
+        "adcs {acc1}, {acc1}, {hi}",
+        "adc {acc2}, {acc2}, xzr",
+        a_val = in(reg) a_val,
+        b_val = in(reg) b_val,
+        lo = out(reg) _,
+        hi = out(reg) _,
+        acc0 = inout(reg) *acc0,
+        acc1 = inout(reg) *acc1,
+        acc2 = inout(reg) *acc2,
+        options(nostack, nomem),
+    );
+}
+
+#[inline(always)]
+unsafe fn mul_asm(a_val: u64, b_val: u64, acc0: &mut u64, acc1: &mut u64, acc2: &mut u64) {
+    #[cfg(target_arch = "aarch64")]
+    mul_asm_aarch(a_val, b_val, acc0, acc1, acc2);
+
+    #[cfg(target_arch = "x86_64")]
+    mul_asm_x86(a_val, b_val, acc0, acc1, acc2);
 }
 
 pub fn mul_prim2(buf: &mut [u64], prim: u128) -> u128 {
-    let mask = u64::MAX as u128;
-
-    let p0 = prim & mask;
-    let p1 = prim >> 64;
-
-    let last = *buf.last().unwrap() as u128;
-
-    let val_u128 = (buf[0] as u128) * p0;
-    let mut carry = val_u128 >> 64;
-    let mut val = val_u128 as u64;
-
-    for i in 1..buf.len() {
-        let mut term = carry;
-        carry = 0;
-
-        let val0 = (buf[i - 1] as u128) * p1;
-        term += val0 & mask;
-        carry += val0 >> 64;
-
-        let val1 = (buf[i] as u128) * p0;
-        term += val1 & mask;
-        carry += val1 >> 64;
-
-        carry += term >> 64;
-        buf[i - 1] = val;
-        val = term as u64;
+    if buf.is_empty() {
+        return 0;
     }
-    buf[buf.len() - 1] = val;
+    let p0 = prim as u64;
+    let p1 = (prim >> 64) as u64;
+    let len = buf.len();
 
-    return last * p1 + carry;
+    let mut acc0: u64 = 0;
+    let mut acc1: u64 = 0;
+    let mut acc2: u64 = 0;
+
+    let mut prev = buf[0];
+    unsafe {
+        mul_asm(prev, p0, &mut acc0, &mut acc1, &mut acc2);
+    }
+
+    for i in 1..len {
+        let cur = unsafe { *buf.get_unchecked(i) };
+        unsafe {
+            *buf.get_unchecked_mut(i - 1) = acc0;
+        }
+        acc0 = acc1;
+        acc1 = acc2;
+        acc2 = 0;
+        unsafe {
+            mul_asm(prev, p1, &mut acc0, &mut acc1, &mut acc2);
+            mul_asm(cur, p0, &mut acc0, &mut acc1, &mut acc2);
+        }
+        prev = cur;
+    }
+
+    buf[len - 1] = acc0;
+    acc0 = acc1;
+    acc1 = acc2;
+    acc2 = 0;
+
+    unsafe {
+        mul_asm(prev, p1, &mut acc0, &mut acc1, &mut acc2);
+    }
+
+    (acc1 as u128) << 64 | acc0 as u128
 }
 
 pub fn mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
@@ -54,23 +160,26 @@ pub fn mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     let a_len = a.len() - 1;
     let b_len = b.len() - 1;
 
-    let mask = u64::MAX as u128;
-    let mut carry: u128 = 0;
+    let mut acc0: u64 = 0;
+    let mut acc1: u64 = 0;
+    let mut acc2: u64 = 0;
     for n in 0..out.len() {
-        let mut term: u128 = carry;
-        carry = 0;
         let mi = n.saturating_sub(b_len);
         let mf = n.min(a_len);
-        for m in mi..=mf {
-            let val = (a[m] as u128) * (b[n - m] as u128);
-            term += val & mask;
-            carry += val >> 64;
+        unsafe {
+            for m in mi..=mf {
+                let a_val = *a.get_unchecked(m);
+                let b_val = *b.get_unchecked(n - m);
+                mul_asm(a_val, b_val, &mut acc0, &mut acc1, &mut acc2);
+            }
+            *out.get_unchecked_mut(n) = acc0;
         }
-        carry += term >> 64;
-        out[n] = term as u64;
+        acc0 = acc1;
+        acc1 = acc2;
+        acc2 = 0;
     }
 
-    return carry as u64;
+    return acc0;
 }
 
 fn chunking_karatsuba(long: &[u64], short: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {

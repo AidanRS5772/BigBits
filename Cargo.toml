@@ -10,6 +10,9 @@ criterion = "0.5.1"
 itertools = "0.12.1"
 rand = "0.8.5"
 
+[profile.release]
+debug = true
+
 [profile.bench]
 lto = "thin"
 codegen-units = 1
