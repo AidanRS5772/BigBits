@@ -220,7 +220,7 @@ enum KDispatch {
     Recurse,
 }
 
-pub(crate) const KARATSUBA_CUTOFF: usize = 24;
+pub(crate) const KARATSUBA_CUTOFF: usize = 27;
 
 fn karatsuba_dispatch(long: usize, short: usize) -> KDispatch {
     return if short == 1 {
@@ -408,40 +408,119 @@ pub fn mul_arr<const N: usize>(a: &[u64], b: &[u64]) -> Result<([u64; N], u64), 
     return Ok((out, c));
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn mul_double_asm_x86(
+    a_val: u64,
+    b_val: u64,
+    acc0: &mut u64,
+    acc1: &mut u64,
+    acc2: &mut u64,
+) {
+    asm!(
+        "mul {b_val}",
+        "add rax, rax",
+        "adc rdx, rdx",
+        "adc {acc2}, 0",
+        "add {acc0}, rax",
+        "adc {acc1}, rdx",
+        "adc {acc2}, 0",
+        b_val = in(reg) b_val,
+        inout("rax") a_val => _,
+        out("rdx") _,
+        acc0 = inout(reg) *acc0,
+        acc1 = inout(reg) *acc1,
+        acc2 = inout(reg) *acc2,
+        options(nostack, nomem),
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn mul_double_asm_aarch(
+    a_val: u64,
+    b_val: u64,
+    acc0: &mut u64,
+    acc1: &mut u64,
+    acc2: &mut u64,
+) {
+    asm!(
+        "mul {lo}, {a_val}, {b_val}",
+        "umulh {hi}, {a_val}, {b_val}",
+        "adds {lo}, {lo}, {lo}",
+        "adcs {hi}, {hi}, {hi}",
+        "adc {acc2}, {acc2}, xzr",
+        "adds {acc0}, {acc0}, {lo}",
+        "adcs {acc1}, {acc1}, {hi}",
+        "adc {acc2}, {acc2}, xzr",
+        a_val = in(reg) a_val,
+        b_val = in(reg) b_val,
+        lo = out(reg) _,
+        hi = out(reg) _,
+        acc0 = inout(reg) *acc0,
+        acc1 = inout(reg) *acc1,
+        acc2 = inout(reg) *acc2,
+        options(nostack, nomem),
+    );
+}
+
+#[inline(always)]
+unsafe fn mul_double_asm(a_val: u64, b_val: u64, acc0: &mut u64, acc1: &mut u64, acc2: &mut u64) {
+    #[cfg(target_arch = "aarch64")]
+    mul_double_asm_aarch(a_val, b_val, acc0, acc1, acc2);
+
+    #[cfg(target_arch = "x86_64")]
+    mul_double_asm_x86(a_val, b_val, acc0, acc1, acc2);
+}
+
 pub fn sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
+    if buf.is_empty() {
+        return 0;
+    }
     let len = buf.len() - 1;
-    let mask = u64::MAX as u128;
 
-    let init_term = (buf[0] as u128) * (buf[0] as u128);
-    out[0] = init_term as u64;
-    let mut carry = init_term >> 64;
+    let mut acc0: u64 = 0;
+    let mut acc1: u64 = 0;
+    let mut acc2: u64 = 0;
+
+    unsafe {
+        mul_asm(buf[0], buf[0], &mut acc0, &mut acc1, &mut acc2);
+        *out.get_unchecked_mut(0) = acc0;
+    }
+    acc0 = acc1;
+    acc1 = acc2;
+    acc2 = 0;
+
     for n in 1..out.len() {
-        let mut term = carry;
-        carry = 0;
-
         let mi = n.saturating_sub(len);
         let mf = ((n - 1) / 2).min(len);
-        for m in mi..=mf {
-            let val = (buf[m] as u128) * (buf[n - m] as u128);
-            term += (val << 1) & mask;
-            carry += val >> 63;
+
+        unsafe {
+            for m in mi..=mf {
+                let a_val = *buf.get_unchecked(m);
+                let b_val = *buf.get_unchecked(n - m);
+                mul_double_asm(a_val, b_val, &mut acc0, &mut acc1, &mut acc2);
+            }
         }
 
         if n % 2 == 0 && n / 2 <= len {
-            let half_val = buf[n / 2] as u128;
-            let val = half_val * half_val;
-            term += val & mask;
-            carry += val >> 64;
+            unsafe {
+                let d = *buf.get_unchecked(n / 2);
+                mul_asm(d, d, &mut acc0, &mut acc1, &mut acc2);
+            }
         }
 
-        out[n] = term as u64;
-        carry += term >> 64;
+        out[n] = acc0;
+        acc0 = acc1;
+        acc1 = acc2;
+        acc2 = 0;
     }
 
-    return carry as u64;
+    acc0
 }
 
-pub(crate) const KARATSUBA_SQR_CUTOFF: usize = 32;
+// tune parameter would expect to be larger then mul
+pub(crate) const KARATSUBA_SQR_CUTOFF: usize = 24;
 
 fn karatsuba_sqr_core(
     buf: &[u64],
