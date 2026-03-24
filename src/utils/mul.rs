@@ -1,6 +1,10 @@
 #![allow(dead_code)]
 use crate::utils::utils::*;
+use rustfft::{num_complex::Complex, Fft, FftDirection, FftPlanner};
 use std::arch::asm;
+use std::cell::RefCell;
+use std::f64::consts::PI;
+use std::sync::Arc;
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
@@ -340,6 +344,178 @@ pub(super) fn find_karatsuba_scratch_size(l: usize, s: usize) -> usize {
     total
 }
 
+thread_local! {
+    static FFT_PLANNER: RefCell<FftPlanner<f64>> = RefCell::new(FftPlanner::new());
+}
+
+const LENGTH_PRIMES: [usize; 4] = [2, 3, 5, 7];
+
+const fn log_prim_search(init: usize, target: usize, idx: usize) -> usize {
+    if init >= target {
+        return init;
+    }
+
+    if idx == 0 {
+        let sh = target.ilog2().saturating_sub(init.ilog2());
+        let mut result = init << sh;
+        if result < target {
+            result <<= 1;
+        }
+        return result;
+    }
+
+    let p = LENGTH_PRIMES[idx];
+    let mut val = init;
+    let mut best = log_prim_search(val, target, idx - 1);
+    if best == target {
+        return best;
+    }
+    val *= p;
+    while val < best {
+        let cur = log_prim_search(val, target, idx - 1);
+        if cur < best {
+            best = cur;
+            if best == target {
+                return best;
+            }
+        }
+        val *= p;
+    }
+    return best;
+}
+
+const fn find_fft_size(n: usize) -> usize {
+    const INIT: usize = 4; // guarantee that size is a multiple of INIT
+    return log_prim_search(INIT, n, LENGTH_PRIMES.len() - 1);
+}
+
+fn u16_buf_len(buf: &[u64]) -> usize {
+    let buf_len = buf_len(buf);
+    let mut buf_u16_len = 4 * buf_len;
+    let last = buf[buf_len];
+    let mask = 0xFFFF;
+    if (last >> 48) & mask == 0 {
+        buf_u16_len -= 1;
+        if (last >> 32) & mask == 0 {
+            buf_u16_len -= 1;
+            if (last >> 16) & mask == 0 {
+                buf_u16_len -= 1;
+            }
+        }
+    }
+    return buf_u16_len;
+}
+
+#[inline(always)]
+fn separate_mul(xk: Complex<f64>, xnk: Complex<f64>) -> Complex<f64> {
+    let a = (xk + xnk.conj()).scale(0.5);
+    let b = (xk - xnk.conj()).scale(0.5) * -Complex::i();
+    a * b
+}
+
+#[inline(always)]
+fn butterfly(e: Complex<f64>, d: Complex<f64>, w: Complex<f64>) -> Complex<f64> {
+    e + Complex::<f64>::i() * (d * w)
+}
+
+fn recombine(x: &mut [Complex<f64>], m: usize) {
+    let n = x.len();
+    let t = Complex::cis(2.0 * PI / n as f64);
+
+    {
+        let pk = separate_mul(x[0], x[0]);
+        let pj = separate_mul(x[m], x[m]);
+        x[0] = butterfly(pk + pj, pk - pj, Complex::new(1.0, 0.0));
+    }
+
+    let mut w = t;
+    for k in 1..=(m - 1) / 2 {
+        let mk = m - k;
+
+        let xk = x[k];
+        let xnk = x[n - k];
+        let xkm = x[k + m];
+        let xmk = x[mk];
+
+        let pk = separate_mul(xk, xnk);
+        let pj = separate_mul(xkm, xmk);
+        x[k] = butterfly(pk + pj, pk - pj, w);
+
+        let pmk = separate_mul(xmk, xkm);
+        let pnk = separate_mul(xnk, xk);
+        x[mk] = butterfly(pmk + pnk, pmk - pnk, -w.conj());
+
+        w *= t;
+    }
+
+    let k = m / 2;
+    let wk = Complex::cis(PI * k as f64 / n as f64);
+
+    let xk = x[k];
+    let xnk = x[n - k];
+    let xkm = x[k + m];
+
+    let pk = separate_mul(xk, xnk);
+    let pj = separate_mul(xkm, xk);
+    x[k] = butterfly(pk + pj, pk - pj, wk);
+}
+
+fn fft_mul_vec(a: &[u64], b: &[u64]) -> (Vec<u64>, u64) {
+    let a_u16_len = u16_buf_len(a);
+    let b_u16_len = u16_buf_len(b);
+    let unpadded_sz = a_u16_len + b_u16_len - 1;
+
+    let n = find_fft_size(unpadded_sz);
+    let m = n / 2;
+
+    let mut x = vec![Complex::new(0.0, 0.0); n];
+    let mask = 0xFFFF;
+    for i in 0..a_u16_len {
+        x[i].re = ((a[i / 4] >> ((i % 4) * 16)) & mask) as f64;
+    }
+    for i in 0..b_u16_len {
+        x[i].im = ((b[i / 4] >> ((i % 4) * 16)) & mask) as f64;
+    }
+
+    FFT_PLANNER.with(|cell| {
+        let planner = &mut *cell.borrow_mut();
+
+        let fwd = planner.plan_fft_forward(n);
+
+        let scratch_size = fwd.get_inplace_scratch_len();
+        let mut scratch = vec![Complex::new(0.0, 0.0); scratch_size];
+
+        fwd.process_with_scratch(&mut x, &mut scratch);
+
+        recombine(&mut x, m);
+
+        let bwd = planner.plan_fft_inverse(m);
+        bwd.process_with_scratch(&mut x[..m], &mut scratch);
+
+        let scale = 1.0 / n as f64;
+        for v in &mut x[..m] {
+            *v = v.scale(scale)
+        }
+    });
+
+    let out_len = a.len() + b.len() - 1;
+    let mut out = vec![0_u64; out_len];
+    let mut carry: u128 = 0;
+    for i in 0..out_len {
+        let idx = i * 2;
+        let a = x[idx].re.round_ties_even() as u128;
+        let b = x[idx].im.round_ties_even() as u128;
+        let c = x[idx + 1].re.round_ties_even() as u128;
+        let d = x[idx + 1].im.round_ties_even() as u128;
+
+        let val = carry + a + (b << 16) + (c << 32) + (d << 48);
+        out[i] = val as u64;
+        carry = val >> 64;
+    }
+
+    return (out, carry as u64);
+}
+
 pub fn mul_vec(a: &[u64], b: &[u64]) -> (Vec<u64>, u64) {
     let mut out = vec![0_u64; a.len() + b.len() - 1];
     let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
@@ -519,8 +695,7 @@ pub fn sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
     acc0
 }
 
-// tune parameter would expect to be larger then mul
-pub(crate) const KARATSUBA_SQR_CUTOFF: usize = 24;
+pub(crate) const KARATSUBA_SQR_CUTOFF: usize = 26;
 
 fn karatsuba_sqr_core(
     buf: &[u64],

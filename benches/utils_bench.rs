@@ -121,13 +121,15 @@ fn bench_mul(c: &mut Criterion) {
 fn bench_school_sqr(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("school_sqr_buf/{ARCH}"));
     set_up_group(&mut group);
-    let sizes: Vec<usize> = vec![4, 16, 64, 256, 1024, 4096];
+    let sizes: Vec<usize> = vec![24, 25, 26, 27, 28];
     for &n in &sizes {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
             let a = random_limbs(n);
-            let mut out = vec![0; 2 * n - 1];
-            bench.iter(|| sqr_buf(black_box(&a), black_box(&mut out)));
+            bench.iter(|| {
+                let mut out = vec![0; 2 * n - 1];
+                sqr_buf(black_box(&a), black_box(&mut out));
+            });
         });
     }
     group.finish();
@@ -136,7 +138,7 @@ fn bench_school_sqr(c: &mut Criterion) {
 fn bench_sqr(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("sqr_buf/{ARCH}"));
     set_up_group(&mut group);
-    let sizes: Vec<usize> = vec![4, 16, 64, 256, 1024, 4096];
+    let sizes: Vec<usize> = vec![24, 25, 26, 27, 28];
     for &n in &sizes {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
@@ -147,5 +149,5 @@ fn bench_sqr(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_school_sqr);
+criterion_group!(benches, bench_sqr, bench_school_sqr);
 criterion_main!(benches);

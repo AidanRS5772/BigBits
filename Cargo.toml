@@ -9,6 +9,7 @@ criterion = "0.5.1"
 [dependencies]
 itertools = "0.12.1"
 rand = "0.8.5"
+rustfft = "6.4.1"
 
 [profile.release]
 debug = true
