@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 use crate::utils::utils::*;
+use rustfft::num_traits::{One, Zero};
 use rustfft::{num_complex::Complex, Fft, FftDirection, FftPlanner};
 use std::arch::asm;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::sync::Arc;
 
@@ -344,13 +346,126 @@ pub(super) fn find_karatsuba_scratch_size(l: usize, s: usize) -> usize {
     total
 }
 
-thread_local! {
-    static FFT_PLANNER: RefCell<FftPlanner<f64>> = RefCell::new(FftPlanner::new());
+struct TwidleTower {
+    table: Vec<Complex<f64>>,
+    veiw: Vec<Complex<f64>>,
+    res: usize,
+    gen: u8,
+    base: usize,
 }
 
-const LENGTH_PRIMES: [usize; 4] = [2, 3, 5, 7];
+impl TwidleTower {
+    const MAX_GEN: u8 = 3;
 
-const fn log_prim_search(init: usize, target: usize, idx: usize) -> usize {
+    fn build(n: usize) -> Self {
+        let len = n / 4 + 1;
+        let th = 2.0 * PI / (n as f64);
+        let mut table = Vec::<Complex<f64>>::with_capacity(len);
+        table.push(Complex::new(1.0, 0.0));
+        for k in 1..len {
+            table.push(Complex::cis(th * k as f64));
+        }
+
+        TwidleTower {
+            table,
+            veiw: Vec::new(),
+            res: n,
+            gen: 0,
+            base: 1,
+        }
+    }
+
+    fn refine(&mut self, new_res: usize) {
+        debug_assert!(new_res > self.res);
+        debug_assert!(new_res % self.res == 0);
+
+        let new_len = new_res / 4 + 1;
+        let mut new_table = Vec::<Complex<f64>>::with_capacity(new_len);
+
+        let growth = new_res / self.res;
+        let mut steps = Vec::<Complex<f64>>::with_capacity(growth - 1);
+        let th = 2.0 * PI / (new_res as f64);
+        for i in 1..growth {
+            steps.push(Complex::cis(th * i as f64));
+        }
+
+        for &v in &self.table[..self.table.len() - 1] {
+            new_table.push(v);
+            for &s in steps.iter() {
+                new_table.push(v * s);
+            }
+        }
+        new_table.push(self.table[self.table.len() - 1]);
+
+        self.table = new_table;
+        self.res = new_res;
+        self.gen += 1;
+        self.base *= growth;
+    }
+
+    fn rebuild(&mut self, new_res: usize) {
+        debug_assert!(new_res > self.res);
+        debug_assert!(new_res % self.res == 0);
+
+        let new_len = new_res / 4 + 1;
+        let growth = new_res / self.res;
+        let new_base = self.base * growth;
+        let mut new_table = Vec::<Complex<f64>>::with_capacity(new_len);
+        new_table.push(Complex::one());
+        let th = 2.0 * PI / (new_res as f64);
+        for i in 1..new_len {
+            if i % new_base != 0 {
+                new_table.push(Complex::cis(th * i as f64));
+            } else {
+                new_table.push(self.table[i / growth]);
+            }
+        }
+
+        self.table = new_table;
+        self.res = new_res;
+        self.gen = 0;
+        self.base = 1;
+    }
+
+    fn get(&mut self, res: usize) -> &[Complex<f64>] {
+        return match res.cmp(&self.res) {
+            std::cmp::Ordering::Equal => &self.table,
+            std::cmp::Ordering::Greater => {
+                debug_assert!(res % self.res == 0);
+                if self.gen >= Self::MAX_GEN {
+                    self.rebuild(res);
+                } else {
+                    self.refine(res);
+                }
+                &self.table
+            }
+            std::cmp::Ordering::Less => {
+                debug_assert!(self.res % res == 0);
+                let len = res / 4 + 1;
+                let stride = self.res / res;
+                self.veiw.clear();
+                for i in 0..len {
+                    self.veiw.push(self.table[i * stride]);
+                }
+                &self.veiw
+            }
+        };
+    }
+}
+
+struct FFTCache {
+    planner: FftPlanner<f64>,
+    twidles: HashMap<usize, TwidleTower>,
+    scratch: Vec<Complex<f64>>,
+}
+
+thread_local! {
+    static FFT_CACHE: RefCell<FFTCache> = RefCell::new(FFTCache { planner: FftPlanner::new(), twidles: HashMap::new(), scratch: Vec::new() });
+}
+
+const LENGTH_PRIMES: [usize; 3] = [3, 5, 7];
+
+const fn log_prim_search(init: usize, target: usize, mut idx: usize) -> usize {
     if init >= target {
         return init;
     }
@@ -364,15 +479,16 @@ const fn log_prim_search(init: usize, target: usize, idx: usize) -> usize {
         return result;
     }
 
+    idx -= 1;
     let p = LENGTH_PRIMES[idx];
     let mut val = init;
-    let mut best = log_prim_search(val, target, idx - 1);
+    let mut best = log_prim_search(val, target, idx);
     if best == target {
         return best;
     }
     val *= p;
     while val < best {
-        let cur = log_prim_search(val, target, idx - 1);
+        let cur = log_prim_search(val, target, idx);
         if cur < best {
             best = cur;
             if best == target {
@@ -385,8 +501,8 @@ const fn log_prim_search(init: usize, target: usize, idx: usize) -> usize {
 }
 
 const fn find_fft_size(n: usize) -> usize {
-    const INIT: usize = 4; // guarantee that size is a multiple of INIT
-    return log_prim_search(INIT, n, LENGTH_PRIMES.len() - 1);
+    const INIT: usize = 4; // guarantee that size is a multiple of 4
+    return log_prim_search(INIT, n, LENGTH_PRIMES.len());
 }
 
 fn u16_buf_len(buf: &[u64]) -> usize {
@@ -407,101 +523,42 @@ fn u16_buf_len(buf: &[u64]) -> usize {
 }
 
 #[inline(always)]
-fn separate_mul(xk: Complex<f64>, xnk: Complex<f64>) -> Complex<f64> {
-    let a = (xk + xnk.conj()).scale(0.5);
-    let b = (xk - xnk.conj()).scale(0.5) * -Complex::i();
-    a * b
+fn separate_mul(x: Complex<f64>, y: Complex<f64>) -> Complex<f64> {
+    let ar = x.re + y.re;
+    let ai = x.im - y.im;
+    let br = x.im + y.im;
+    let bi = y.re - x.re;
+    Complex::new((ar * br - ai * bi) * 0.25, (ar * bi + ai * br) * 0.25)
 }
 
-#[inline(always)]
-fn butterfly(e: Complex<f64>, d: Complex<f64>, w: Complex<f64>) -> Complex<f64> {
-    e + Complex::<f64>::i() * (d * w)
-}
+fn recombine(x: &mut [Complex<f64>], m: usize, n: usize, tw: &[Complex<f64>]) {
+    let pk = x[0].re * x[0].im;
+    let pj = x[m].re * x[m].im;
+    x[0] = Complex::new(pk + pj, pk - pj);
 
-fn recombine(x: &mut [Complex<f64>], m: usize) {
-    let n = x.len();
-    let t = Complex::cis(2.0 * PI / n as f64);
+    for k in 1..m / 2 {
+        let pk = separate_mul(x[k], x[n - k]);
+        let pj = separate_mul(x[m + k], x[m - k]);
+        let s = pk + pj;
+        let d = pk - pj;
+        let dw = d * tw[k];
 
-    {
-        let pk = separate_mul(x[0], x[0]);
-        let pj = separate_mul(x[m], x[m]);
-        x[0] = butterfly(pk + pj, pk - pj, Complex::new(1.0, 0.0));
-    }
-
-    let mut w = t;
-    for k in 1..=(m - 1) / 2 {
-        let mk = m - k;
-
-        let xk = x[k];
-        let xnk = x[n - k];
-        let xkm = x[k + m];
-        let xmk = x[mk];
-
-        let pk = separate_mul(xk, xnk);
-        let pj = separate_mul(xkm, xmk);
-        x[k] = butterfly(pk + pj, pk - pj, w);
-
-        let pmk = separate_mul(xmk, xkm);
-        let pnk = separate_mul(xnk, xk);
-        x[mk] = butterfly(pmk + pnk, pmk - pnk, -w.conj());
-
-        w *= t;
+        x[k] = s + Complex::<f64>::i() * dw;
+        x[m - k] = s.conj() + Complex::<f64>::i() * dw.conj();
     }
 
     let k = m / 2;
     let wk = Complex::cis(PI * k as f64 / n as f64);
-
-    let xk = x[k];
-    let xnk = x[n - k];
-    let xkm = x[k + m];
-
-    let pk = separate_mul(xk, xnk);
-    let pj = separate_mul(xkm, xk);
-    x[k] = butterfly(pk + pj, pk - pj, wk);
+    let pk = separate_mul(x[k], x[n - k]);
+    let s_re = 2.0 * pk.re;
+    let d_im = 2.0 * pk.im;
+    x[k] = Complex::new(s_re - d_im * wk.re, -d_im * wk.im);
 }
 
-fn fft_mul_vec(a: &[u64], b: &[u64]) -> (Vec<u64>, u64) {
-    let a_u16_len = u16_buf_len(a);
-    let b_u16_len = u16_buf_len(b);
-    let unpadded_sz = a_u16_len + b_u16_len - 1;
-
-    let n = find_fft_size(unpadded_sz);
-    let m = n / 2;
-
-    let mut x = vec![Complex::new(0.0, 0.0); n];
-    let mask = 0xFFFF;
-    for i in 0..a_u16_len {
-        x[i].re = ((a[i / 4] >> ((i % 4) * 16)) & mask) as f64;
-    }
-    for i in 0..b_u16_len {
-        x[i].im = ((b[i / 4] >> ((i % 4) * 16)) & mask) as f64;
-    }
-
-    FFT_PLANNER.with(|cell| {
-        let planner = &mut *cell.borrow_mut();
-
-        let fwd = planner.plan_fft_forward(n);
-
-        let scratch_size = fwd.get_inplace_scratch_len();
-        let mut scratch = vec![Complex::new(0.0, 0.0); scratch_size];
-
-        fwd.process_with_scratch(&mut x, &mut scratch);
-
-        recombine(&mut x, m);
-
-        let bwd = planner.plan_fft_inverse(m);
-        bwd.process_with_scratch(&mut x[..m], &mut scratch);
-
-        let scale = 1.0 / n as f64;
-        for v in &mut x[..m] {
-            *v = v.scale(scale)
-        }
-    });
-
-    let out_len = a.len() + b.len() - 1;
-    let mut out = vec![0_u64; out_len];
-    let mut carry: u128 = 0;
-    for i in 0..out_len {
+fn accumulate(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
+    debug_assert!(2 * x.len() > out.len());
+    let mut carry = 0;
+    for i in 0..out.len() {
         let idx = i * 2;
         let a = x[idx].re.round_ties_even() as u128;
         let b = x[idx].im.round_ties_even() as u128;
@@ -512,8 +569,70 @@ fn fft_mul_vec(a: &[u64], b: &[u64]) -> (Vec<u64>, u64) {
         out[i] = val as u64;
         carry = val >> 64;
     }
+    return carry as u64;
+}
 
-    return (out, carry as u64);
+fn fft_mul_vec(a: &[u64], b: &[u64]) -> (Vec<u64>, u64) {
+    let a_u16_len = u16_buf_len(a);
+    let b_u16_len = u16_buf_len(b);
+    let unpadded_sz = a_u16_len + b_u16_len - 1;
+
+    let n = find_fft_size(unpadded_sz);
+    let m = n / 2;
+
+    let mut out = vec![0_u64; a.len() + b.len() - 1];
+    let carry = FFT_CACHE.with(|cell| {
+        let cache = &mut *cell.borrow_mut();
+
+        let FFTCache {
+            planner,
+            twidles,
+            scratch,
+        } = cache;
+
+        let fwd = planner.plan_fft_forward(n);
+        let bwd = planner.plan_fft_inverse(m);
+        let scratch_len = fwd
+            .get_inplace_scratch_len()
+            .max(bwd.get_inplace_scratch_len())
+            + n;
+
+        if scratch_len > scratch.len() {
+            scratch.resize(scratch_len, Complex::zero());
+        }
+
+        let (x, fft_scratch) = scratch.split_at_mut(n);
+
+        let mask = 0xFFFF;
+        for i in 0..a_u16_len {
+            x[i].re = ((a[i / 4] >> ((i % 4) * 16)) & mask) as f64;
+        }
+        for i in 0..b_u16_len {
+            x[i].im = ((b[i / 4] >> ((i % 4) * 16)) & mask) as f64;
+        }
+
+        let fwd = planner.plan_fft_forward(n);
+        let bwd = planner.plan_fft_inverse(m);
+
+        fwd.process_with_scratch(x, fft_scratch);
+
+        let tw = twidles
+            .entry(n >> n.trailing_zeros())
+            .or_insert_with(|| TwidleTower::build(n))
+            .get(n);
+
+        recombine(x, m, n, tw);
+
+        bwd.process_with_scratch(&mut x[..m], fft_scratch);
+
+        let scale = 1.0 / n as f64;
+        for v in &mut x[..m] {
+            *v = v.scale(scale)
+        }
+        accumulate(&x[..m], &mut out)
+    });
+
+    return (out, carry);
 }
 
 pub fn mul_vec(a: &[u64], b: &[u64]) -> (Vec<u64>, u64) {
