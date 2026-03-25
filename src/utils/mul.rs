@@ -1,5 +1,7 @@
 #![allow(dead_code)]
-use crate::utils::utils::*;
+use super::SCRATCH;
+use crate::utils::{utils::*, SCRATCH_POOL};
+use rustfft::num_traits::ops::overflowing;
 use rustfft::num_traits::{One, Zero};
 use rustfft::{num_complex::Complex, Fft, FftDirection, FftPlanner};
 use std::arch::asm;
@@ -188,79 +190,21 @@ pub fn mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     return acc0;
 }
 
-fn chunking_karatsuba(long: &[u64], short: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
-    out.fill(0);
-    let s = short.len();
-    let mut overflow = 0;
-
-    let n_chunks = long.len() / s;
-    let len = if long.len() % s == 0 {
-        n_chunks - 1
-    } else {
-        n_chunks
-    };
-
-    for i in 0..len {
-        let (val, rest) = scratch.split_at_mut(2 * s);
-        let of = i * s;
-        karatsuba_alg(&long[of..of + s], short, val, rest);
-        add_buf(&mut out[of..], val);
-    }
-
-    let of = n_chunks * s;
-    let chunk = &long[of..];
-    let (val, rest) = scratch.split_at_mut(chunk.len() + s - 1);
-    overflow += karatsuba_alg(short, chunk, val, rest);
-    if add_buf(&mut out[of..], val) {
-        overflow += 1;
-    }
-
-    return overflow;
-}
-
-enum KDispatch {
-    Prim,
-    Prim2,
-    Base,
-    Chunking,
-    Recurse,
-}
-
-pub(crate) const KARATSUBA_CUTOFF: usize = 27;
-
-fn karatsuba_dispatch(long: usize, short: usize) -> KDispatch {
-    return if short == 1 {
-        KDispatch::Prim
-    } else if short == 2 {
-        KDispatch::Prim2
-    } else if long <= KARATSUBA_CUTOFF {
-        KDispatch::Base
-    } else if short < (long + 1) / 2 {
-        if short <= KARATSUBA_CUTOFF {
-            KDispatch::Base
-        } else {
-            KDispatch::Chunking
-        }
-    } else {
-        KDispatch::Recurse
-    };
-}
-
 fn karatsuba_core(
     long: &[u64],
     short: &[u64],
-    half_len: usize,   // (long + 1) / 2
+    half: usize,       // (long + 1) / 2
     out: &mut [u64],   // >= long + short - 1
     cross: &mut [u64], // >= 2*half + 1
     scratch: &mut [u64],
 ) -> u64 {
-    let (l0, l1) = long.split_at(half_len);
-    let (s0, s1) = short.split_at(half_len);
+    let (l0, l1) = long.split_at(half);
+    let (s0, s1) = short.split_at(half);
 
     {
-        let (l_sum, s_sum) = out[..2 * half_len + 2].split_at_mut(half_len + 1);
-        let mut l_len = half_len;
-        let mut s_len = half_len;
+        let (l_sum, s_sum) = out[..2 * half + 2].split_at_mut(half + 1);
+        let mut l_len = half;
+        let mut s_len = half;
 
         l_sum[..l_len].copy_from_slice(l0);
         if add_buf(&mut l_sum[..l_len], l1) {
@@ -274,76 +218,29 @@ fn karatsuba_core(
             s_len += 1;
         }
 
-        karatsuba_alg(&l_sum[..l_len], &s_sum[..s_len], cross, scratch);
+        mul_core(&l_sum[..l_len], &s_sum[..s_len], cross, scratch);
     }
 
-    let (z0, z2) = out.split_at_mut(2 * half_len);
-    karatsuba_alg(l0, s0, z0, scratch);
-    let mut c = karatsuba_alg(l1, s1, z2, scratch);
+    let (z0, z2) = out.split_at_mut(2 * half);
+    mul_core(l0, s0, z0, scratch);
+    let mut c = mul_core(l1, s1, z2, scratch);
 
     sub_buf(cross, z0);
     sub_buf(cross, z2);
     if c > 0 {
         sub_buf(&mut cross[z2.len()..], &[c]);
     }
-    if add_buf(&mut out[half_len..], &cross) {
+    if add_buf(&mut out[half..], &cross) {
         c += 1;
     }
 
     return c;
 }
 
-pub(super) fn karatsuba_alg(a: &[u64], b: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
-    let (long, short) = if a.len() >= b.len() { (a, b) } else { (b, a) };
-    match karatsuba_dispatch(long.len(), short.len()) {
-        KDispatch::Prim => {
-            out[..long.len()].copy_from_slice(long);
-            return mul_prim(out, short[0]);
-        }
-        KDispatch::Prim2 => {
-            out[..long.len()].copy_from_slice(long);
-            out[out.len() - 1] = 0;
-            return mul_prim2(out, short[0] as u128 | (short[0] as u128) << 64) as u64;
-        }
-        KDispatch::Base => {
-            return mul_buf(long, short, out);
-        }
-        KDispatch::Chunking => {
-            return chunking_karatsuba(long, short, out, scratch);
-        }
-        KDispatch::Recurse => {}
-    }
-
-    let half_len = (long.len() + 1) / 2;
-    let (cross, rest) = scratch.split_at_mut(2 * half_len + 1);
-    cross.fill(0);
-
-    karatsuba_core(long, short, half_len, out, cross, rest)
-}
-
-pub(super) fn find_karatsuba_scratch_size(l: usize, s: usize) -> usize {
-    if l <= KARATSUBA_CUTOFF || s <= 2 {
-        return 0;
-    }
-
-    let init_half = (l + 1) / 2;
-
-    let (mut n, mut total) = if s < init_half {
-        if s <= KARATSUBA_CUTOFF {
-            return 0;
-        }
-        (s, 2 * s)
-    } else {
-        (init_half + 1, 2 * init_half + 1)
-    };
-
-    while n > KARATSUBA_CUTOFF {
-        let half = (n + 1) / 2;
-        total += 2 * half + 1;
-        n = half + 1;
-    }
-
-    total
+fn karatsuba_mul(long: &[u64], short: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
+    let half = (long.len() + 1) / 2;
+    let (cross, rest) = scratch.split_at_mut(2 * half + 1);
+    karatsuba_core(long, short, half, out, cross, rest)
 }
 
 struct TwidleTower {
@@ -572,7 +469,7 @@ fn accumulate(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
     return carry as u64;
 }
 
-fn fft_mul_vec(a: &[u64], b: &[u64]) -> (Vec<u64>, u64) {
+fn fft_mul(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     let a_u16_len = u16_buf_len(a);
     let b_u16_len = u16_buf_len(b);
     let unpadded_sz = a_u16_len + b_u16_len - 1;
@@ -580,8 +477,7 @@ fn fft_mul_vec(a: &[u64], b: &[u64]) -> (Vec<u64>, u64) {
     let n = find_fft_size(unpadded_sz);
     let m = n / 2;
 
-    let mut out = vec![0_u64; a.len() + b.len() - 1];
-    let carry = FFT_CACHE.with(|cell| {
+    FFT_CACHE.with(|cell| {
         let cache = &mut *cell.borrow_mut();
 
         let FFTCache {
@@ -629,78 +525,145 @@ fn fft_mul_vec(a: &[u64], b: &[u64]) -> (Vec<u64>, u64) {
         for v in &mut x[..m] {
             *v = v.scale(scale)
         }
-        accumulate(&x[..m], &mut out)
-    });
-
-    return (out, carry);
+        accumulate(&x[..m], out)
+    })
 }
 
-pub fn mul_vec(a: &[u64], b: &[u64]) -> (Vec<u64>, u64) {
-    let mut out = vec![0_u64; a.len() + b.len() - 1];
-    let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
-    let c = match karatsuba_dispatch(long.len(), short.len()) {
-        KDispatch::Prim => {
-            out[..long.len()].copy_from_slice(long);
-            mul_prim(&mut out, short[0])
-        }
-        KDispatch::Prim2 => {
-            out[..long.len()].copy_from_slice(long);
-            mul_prim2(&mut out, combine_u64(short[0], short[1])) as u64
-        }
-        KDispatch::Base => mul_buf(long, short, &mut out),
-        KDispatch::Chunking => {
-            let mut scratch = vec![0_u64; find_karatsuba_scratch_size(long.len(), short.len())];
-            chunking_karatsuba(long, short, &mut out, &mut scratch)
-        }
-        KDispatch::Recurse => {
-            let mut cross_scratch =
-                vec![0_u64; find_karatsuba_scratch_size(long.len(), short.len())];
-            let half = (long.len() + 1) / 2;
-            let (cross, scratch) = cross_scratch.split_at_mut(2 * half + 1);
-            karatsuba_core(long, short, half, &mut out, cross, scratch)
-        }
-    };
+pub(crate) const KARATSUBA_CUTOFF: usize = 27;
+pub(crate) const FFT_CUTOFF: usize = 1024;
+pub(crate) const FFT_CHUNKING: f64 = 2.5;
 
-    return (out, c);
+enum Tier {
+    School,
+    Karatsuba,
+    FFT,
 }
 
-pub fn mul_arr<const N: usize>(a: &[u64], b: &[u64]) -> Result<([u64; N], u64), ()> {
-    let a_len = buf_len(a);
-    let b_len = buf_len(b);
-    if a_len + b_len - 1 > N {
-        return Err(());
+fn select_tier(s: usize) -> Tier {
+    if s <= KARATSUBA_CUTOFF {
+        Tier::School
+    } else if s <= FFT_CUTOFF {
+        Tier::Karatsuba
+    } else {
+        Tier::FFT
+    }
+}
+
+fn is_balanced(l: usize, s: usize, tier: &Tier) -> bool {
+    match tier {
+        Tier::School => true,
+        Tier::Karatsuba => s > (l + 1) / 2,
+        Tier::FFT => l <= (s as f64 * FFT_CHUNKING) as usize,
+    }
+}
+
+fn balanced_mul(long: &[u64], short: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
+    match select_tier(short.len()) {
+        Tier::School => mul_buf(long, short, out),
+        Tier::Karatsuba => karatsuba_mul(long, short, out, scratch),
+        Tier::FFT => fft_mul(long, short, out),
+    }
+}
+
+fn chunked_mul(long: &[u64], short: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
+    out.fill(0);
+    let s = short.len();
+
+    let n_chunks = long.len() / s;
+    let mut end = n_chunks;
+    if long.len() % s == 0 {
+        end -= 1;
     }
 
-    let mut out = [0_u64; N];
-    let (long, short) = if a_len > b_len { (a, b) } else { (b, a) };
-    let c = match karatsuba_dispatch(long.len(), short.len()) {
-        KDispatch::Prim => {
-            out[..long.len()].copy_from_slice(long);
-            mul_prim(&mut out, short[0])
-        }
-        KDispatch::Prim2 => {
-            out[..long.len()].copy_from_slice(long);
-            mul_prim2(&mut out, combine_u64(short[0], short[1])) as u64
-        }
-        KDispatch::Base => mul_buf(long, short, &mut out),
-        KDispatch::Chunking => {
-            let mut scratch = [0; N];
-            chunking_karatsuba(long, short, &mut out, &mut scratch)
-        }
-        KDispatch::Recurse => {
-            let mut scratch = [0; N];
-            let scratch_sz = find_karatsuba_scratch_size(long.len(), short.len());
-            let half_len = (long.len() + 1) / 2;
-            if scratch_sz > N {
-                let mut cross = [0; N];
-                karatsuba_core(long, short, half_len, &mut out, &mut cross, &mut scratch)
-            } else {
-                let (cross, rest) = scratch.split_at_mut(2 * half_len + 1);
-                karatsuba_core(long, short, half_len, &mut out, cross, rest)
+    let (val, rest) = scratch.split_at_mut(2 * s);
+    for i in 0..end {
+        let offset = i * s;
+        balanced_mul(&long[offset..offset + s], short, val, rest);
+        add_buf(&mut out[offset..], val);
+    }
+
+    let offset = end * s;
+    let chunk = &long[offset..];
+    let (val, rest) = scratch.split_at_mut(chunk.len() + s - 1);
+    let mut overflow = mul_core(short, chunk, val, rest);
+    if add_buf(&mut out[offset..], val) {
+        overflow += 1;
+    }
+
+    overflow
+}
+
+fn mul_core(a: &[u64], b: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
+    let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
+    let s = short.len();
+
+    if s == 1 {
+        out[..long.len()].copy_from_slice(long);
+        return mul_prim(out, short[0]);
+    }
+    if s == 2 {
+        out[..long.len()].copy_from_slice(long);
+        return mul_prim2(out, combine_u64(short[0], short[1])) as u64;
+    }
+
+    if is_balanced(long.len(), s, &select_tier(s)) {
+        balanced_mul(long, short, out, scratch)
+    } else {
+        chunked_mul(long, short, out, scratch)
+    }
+}
+
+fn find_mul_scratch_size(a: usize, b: usize) -> usize {
+    let (s, l) = (a.min(b), a.max(b));
+    let tier = select_tier(s);
+    if is_balanced(l, s, &tier) {
+        find_balanced_scratch(l, &tier)
+    } else {
+        2 * s + find_balanced_scratch(s, &tier)
+    }
+}
+
+fn find_balanced_scratch(n: usize, tier: &Tier) -> usize {
+    match tier {
+        Tier::School => 0,
+        Tier::Karatsuba => {
+            let mut total = 0;
+            let mut n = n;
+            while n > KARATSUBA_CUTOFF {
+                let half = (n + 1) / 2;
+                total += 2 * half + 1;
+                n = half + 1;
             }
+            total
         }
+        Tier::FFT => 0,
+    }
+}
+
+fn mul_vec(a: &[u64], b: &[u64]) -> (Vec<u64>, u64) {
+    let mut out = vec![0; a.len() + b.len() - 1];
+    let scratch_sz = find_mul_scratch_size(a.len(), b.len());
+    SCRATCH_POOL.with(|cell| {
+        let scratch_pool = &mut *cell.borrow_mut();
+        let scratch = scratch_pool.get(scratch_sz);
+        let overflow = mul_core(a, b, &mut out, scratch);
+        (out, overflow)
+    })
+}
+
+fn mul_arr<const N: usize>(a: &[u64], b: &[u64]) -> ([u64; N], u64) {
+    let mut out = [0; N];
+    let scratch_sz = find_mul_scratch_size(a.len(), b.len());
+    let mut scratch = [0; N];
+    let overflow = if scratch_sz < N {
+        mul_core(a, b, &mut out, &mut scratch)
+    } else {
+        let mut cross = [0; N];
+        let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
+        let half = (long.len() + 1) / 2;
+        karatsuba_core(long, short, half, &mut out, &mut cross, &mut scratch)
     };
-    return Ok((out, c));
+    (out, overflow)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -713,21 +676,21 @@ unsafe fn mul_double_asm_x86(
     acc2: &mut u64,
 ) {
     asm!(
-        "mul {b_val}",
-        "add rax, rax",
-        "adc rdx, rdx",
-        "adc {acc2}, 0",
-        "add {acc0}, rax",
-        "adc {acc1}, rdx",
-        "adc {acc2}, 0",
-        b_val = in(reg) b_val,
-        inout("rax") a_val => _,
-        out("rdx") _,
-        acc0 = inout(reg) *acc0,
-        acc1 = inout(reg) *acc1,
-        acc2 = inout(reg) *acc2,
-        options(nostack, nomem),
-    );
+            "mul {b_val}",
+            "add rax, rax",
+            "adc rdx, rdx",
+            "adc {acc2}, 0",
+            "add {acc0}, rax",
+            "adc {acc1}, rdx",
+            "adc {acc2}, 0",
+            b_val = in(reg) b_val,
+            inout("rax") a_val => _,
+    out("rdx") _,
+            acc0 = inout(reg) *acc0,
+            acc1 = inout(reg) *acc1,
+            acc2 = inout(reg) *acc2,
+            options(nostack, nomem),
+        );
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -904,6 +867,7 @@ pub fn sqr_arr<const N: usize>(buf: &[u64]) -> Result<([u64; N], u64), ()> {
             karatsuba_sqr_core(buf, half_len, &mut out, &mut cross, &mut scratch)
         } else {
             let (cross, rest) = scratch.split_at_mut(2 * half_len + 1);
+
             karatsuba_sqr_core(buf, half_len, &mut out, cross, rest)
         }
     };
