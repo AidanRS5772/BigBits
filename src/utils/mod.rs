@@ -18,8 +18,18 @@ impl Scratch {
         }
         return &mut self.buf[..n];
     }
+
+    fn ensure(&mut self, n: usize) {
+        if self.buf.len() < n {
+            self.buf.resize(n, 0);
+        }
+    }
 }
 
 thread_local! {
      pub(crate) static SCRATCH_POOL: RefCell<Scratch> = RefCell::new(Scratch { buf: Vec::new() })
 }
+
+pub const KARATSUBA_CUTOFF: usize = 27;
+pub const FFT_CUTOFF: usize = 1024;
+pub const FFT_CHUNKING: f64 = 2.5;
