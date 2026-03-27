@@ -1,13 +1,11 @@
 #![allow(dead_code)]
-use crate::utils::{utils::*, Scratch, KARATSUBA_CUTOFF, SCRATCH_POOL};
-use rustfft::num_traits::ops::overflowing;
+use crate::utils::{FFT_CHUNKING, FFT_CUTOFF, KARATSUBA_CUTOFF, SCRATCH_POOL, Scratch, utils::*};
 use rustfft::num_traits::{One, Zero};
 use rustfft::{num_complex::Complex, Fft, FftDirection, FftPlanner};
 use std::arch::asm;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::f64::consts::PI;
-use std::iter::zip;
 use std::sync::Arc;
 
 #[cfg(target_arch = "x86_64")]
@@ -162,9 +160,6 @@ pub fn mul_prim2(buf: &mut [u64], prim: u128) -> u128 {
 }
 
 pub fn mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
-    if a.is_empty() || b.is_empty() {
-        return 0;
-    }
     let a_len = a.len() - 1;
     let b_len = b.len() - 1;
 
@@ -218,12 +213,12 @@ fn karatsuba_core(
             s_len += 1;
         }
 
-        mul_core(&a_sum[..l_len], &b_sum[..s_len], cross, scratch);
+        karatsuba_mul(&a_sum[..l_len], &b_sum[..s_len], cross, scratch);
     }
 
     let (z0, z2) = out.split_at_mut(2 * half);
-    mul_core(a0, b0, z0, scratch);
-    let mut overflow = mul_core(a1, b1, z2, scratch);
+    karatsuba_mul(a0, b0, z0, scratch);
+    let mut overflow = karatsuba_mul(a1, b1, z2, scratch);
 
     sub_buf(cross, z0);
     sub_buf(cross, z2);
@@ -237,20 +232,20 @@ fn karatsuba_core(
     return overflow;
 }
 
-fn chunking_karatsuba(a: &[u64], b: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64{
+fn chunking_karatsuba(long: &[u64], short: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64{
     out.fill(0);
-    let (long, short) = if a.len() > b.len() {(a,b)} else {(b,a)};
     let s = short.len();
     let l = long.len();
-    let chunks = l / s;
-    let mut end = chunks;
+    let half = (s + 1) / 2;
+    let mut chunks = l / s;
     if l % s == 0{
-        end -= 1;
+        chunks -= 1;
     }
-    let (val, rest) = scratch.split_at_mut(2*s);
-    for i in 0..end{
+    for i in 0..chunks{
         let of = s*i;
-        karatsuba_mul(&long[of..of+s], short, val, rest);
+        let (val_cross, rest) = scratch.split_at_mut(2*s + 2*half + 1);
+        let (cross, val) = val_cross.split_at_mut(2*half + 1);
+        karatsuba_core(&long[of..of+s], short, half, val, cross, rest);
         add_buf(&mut out[of..], &val);
     }
     let of = chunks*s;
@@ -312,8 +307,7 @@ fn karatsuba_mul(a: &[u64], b: &[u64], out: &mut [u64], scratch: &mut [u64]) -> 
     karatsuba_core(long, short, half, out, cross, rest)
 }
 
-fn find_karatsuab_scratch(a: usize, b: usize) -> usize{
-    let (l, s) = (a.max(b), b.min(a));
+fn find_karatsuab_scratch(l: usize, s: usize) -> usize{
     match kdispatch(l, s){
         KDispatch::Prim | KDispatch::Prim2 | KDispatch::School => 0,
         KDispatch::Chunking => 2*s + find_karatsuab_scratch(s,s),
@@ -324,23 +318,23 @@ fn find_karatsuab_scratch(a: usize, b: usize) -> usize{
     }
 }
 
-pub fn karatsuba_entry_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64{
-    let scratch_sz = find_karatsuab_scratch(a.len(), b.len());
+pub fn karatsuba_entry_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> u64{
+    let scratch_sz = find_karatsuab_scratch(long.len(), short.len());
     SCRATCH_POOL.with(|cell|{
         let scratch = &mut *cell.borrow_mut();
-        karatsuba_mul(a, b, out, scratch.get(scratch_sz))
+        karatsuba_mul(long, short, out, scratch.get(scratch_sz))
     })
 }
 
-pub fn karatsuba_entry_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u64{
-    let scratch_sz = find_karatsuab_scratch(a.len(), b.len());
+pub fn karatsuba_entry_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> u64{
+    let scratch_sz = find_karatsuab_scratch(long.len(), short.len());
     let mut scratch = [0; N];
     if scratch_sz < N{
-        karatsuba_mul(a, b, out, &mut scratch)
+        karatsuba_mul(long, short, out, &mut scratch)
     }else{
         let mut cross = [0; N];
-        let half = (a.len().min(b.len()) + 1) / 2;
-        karatsuba_core(a, b, half, out, &mut cross, &mut scratch)
+        let half = (long.len() + 1) / 2;
+        karatsuba_core(long, short, half, out, &mut cross, &mut scratch)
     }
 }
 
@@ -454,11 +448,11 @@ impl TwidleTower {
 struct FFTCache {
     planner: FftPlanner<f64>,
     twidles: HashMap<usize, TwidleTower>,
-    scratch: Vec<Complex<f64>>,
+    scratch_pool: Scratch<Complex<f64>>,
 }
 
 thread_local! {
-    static FFT_CACHE: RefCell<FFTCache> = RefCell::new(FFTCache { planner: FftPlanner::new(), twidles: HashMap::new(), scratch: Vec::new() });
+    static FFT_CACHE: RefCell<FFTCache> = RefCell::new(FFTCache { planner: FftPlanner::new(), twidles: HashMap::new(), scratch_pool: Scratch::new()});
 }
 
 const LENGTH_PRIMES: [usize; 3] = [3, 5, 7];
@@ -467,7 +461,6 @@ const fn log_prim_search(init: usize, target: usize, mut idx: usize) -> usize {
     if init >= target {
         return init;
     }
-
     if idx == 0 {
         let sh = target.ilog2().saturating_sub(init.ilog2());
         let mut result = init << sh;
@@ -476,7 +469,6 @@ const fn log_prim_search(init: usize, target: usize, mut idx: usize) -> usize {
         }
         return result;
     }
-
     idx -= 1;
     let p = LENGTH_PRIMES[idx];
     let mut val = init;
@@ -503,23 +495,6 @@ const fn find_fft_size(n: usize) -> usize {
     return log_prim_search(INIT, n, LENGTH_PRIMES.len());
 }
 
-fn u16_buf_len(buf: &[u64]) -> usize {
-    let buf_len = buf_len(buf);
-    let mut buf_u16_len = 4 * buf_len;
-    let last = buf[buf_len];
-    let mask = 0xFFFF;
-    if (last >> 48) & mask == 0 {
-        buf_u16_len -= 1;
-        if (last >> 32) & mask == 0 {
-            buf_u16_len -= 1;
-            if (last >> 16) & mask == 0 {
-                buf_u16_len -= 1;
-            }
-        }
-    }
-    return buf_u16_len;
-}
-
 #[inline(always)]
 fn separate_mul(x: Complex<f64>, y: Complex<f64>) -> Complex<f64> {
     let ar = x.re + y.re;
@@ -527,6 +502,20 @@ fn separate_mul(x: Complex<f64>, y: Complex<f64>) -> Complex<f64> {
     let br = x.im + y.im;
     let bi = y.re - x.re;
     Complex::new((ar * br - ai * bi) * 0.25, (ar * bi + ai * br) * 0.25)
+}
+
+fn decompose(x: &mut [Complex<f64>], a: &[u64], b: &[u64]){
+    let max_len = x.len() / 4;
+    let mask = 0xFFFF;
+    for i in 0..max_len {
+        let a_val = a.get(i).copied().unwrap_or(0);
+        let b_val = b.get(i).copied().unwrap_or(0);
+        let idx = i * 4;
+        x[idx] = Complex { re: (a_val & mask) as f64, im: (b_val & mask) as f64 };
+        x[idx+1] = Complex { re: (a_val >> 16 & mask) as f64, im: (b_val >> 16 & mask) as f64 };
+        x[idx+2] = Complex { re: (a_val >> 32 & mask) as f64, im: (b_val >> 32 & mask) as f64 };
+        x[idx+3] = Complex { re: (a_val >> 48) as f64, im: (b_val >> 48) as f64 };
+    }
 }
 
 fn recombine(x: &mut [Complex<f64>], m: usize, n: usize, tw: &[Complex<f64>]) {
@@ -553,29 +542,9 @@ fn recombine(x: &mut [Complex<f64>], m: usize, n: usize, tw: &[Complex<f64>]) {
     x[k] = Complex::new(s_re - d_im * wk.re, -d_im * wk.im);
 }
 
-fn decompose(x: &mut [Complex<f64>], a: &[u64], b: &[u64]){
-    let max_len = a.len().max(b.len());
-    debug_assert!(x.len() == 4*max_len);
-
-    let a_iter = a.iter().copied().chain(std::iter::repeat(0u64));
-    let b_iter = b.iter().copied().chain(std::iter::repeat(0u64));
-
-    let mut idx = 0;
-    let mask = 0xFFFF;
-    for (a, b) in a_iter.zip(b_iter){
-        x[idx] = Complex { re: (a & mask) as f64 , im: (b & mask) as f64 };
-        x[idx+1] = Complex { re: (a >> 16 & mask) as f64 , im: (b >> 16 & mask) as f64 };
-        x[idx+2] = Complex { re: (a >> 32 & mask) as f64 , im: (b >> 32 & mask) as f64 };
-        x[idx+3] = Complex { re: (a >> 48 & mask) as f64 , im: (b >> 48 & mask) as f64 };
-        idx += 1
-    }
-
-}
-
 fn accumulate(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
-    debug_assert!(2 * x.len() > out.len());
     let mut carry = 0;
-    for i in 0..out.len() {
+    for i in 0..out.len().min(2*x.len()) {
         let idx = i * 2;
         let a = x[idx].re.round_ties_even() as u128;
         let b = x[idx].im.round_ties_even() as u128;
@@ -589,157 +558,228 @@ fn accumulate(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
     return carry as u64;
 }
 
-fn fft_mul(a: &[u64], b: &[u64], out: &mut [u64], n: usize, fwd: &dyn Fft<f64>, bwd: &dyn Fft<f64>, tw: &[Complex<f64>], scratch: &mut [Complex<f64>]) -> u64 {
-    let m = n / 2;
-    let (x, fft_scratch) = scratch.split_at_mut(n);
+fn fft_core(a: &[u64], b: &[u64], out: &mut [u64], n: usize, fwd: &dyn Fft<f64>, bwd: &dyn Fft<f64>, tw: &[Complex<f64>], x: &mut [Complex<f64>], fft_scratch: &mut [Complex<f64>]) -> u64 {
     decompose(x, a, b);
     fwd.process_with_scratch(x, fft_scratch);
-    recombine(x, m, n, tw);
-    bwd.process_with_scratch(&mut x[..m], fft_scratch);
+    recombine(x, n/2, n, tw);
+    bwd.process_with_scratch(&mut x[..n/2], fft_scratch);
     let scale = 1.0 / n as f64;
-    for v in &mut x[..m] {
+    for v in &mut x[..n/2] {
         *v = v.scale(scale)
     }
-    accumulate(&x[..m], out)
+    accumulate(&x[..n/2], out)
 }
 
-fn fft_chunking()
+fn fft_final_dispatch(long: &[u64], short: &[u64], out: &mut [u64], fft_cache: &mut FFTCache, buf_scratch: &mut [u64]) -> u64{
+    let (val, scratch) = buf_scratch.split_at_mut(long.len() + short.len() - 1);
+    let mut overflow = match dyn_dispatch(short.len()){
+        DynDispatch::Prim => {
+            val[..long.len()].copy_from_slice(long);
+            mul_prim(val, short[0])
+        }
+        DynDispatch::Prim2 => {
+            val[..long.len()].copy_from_slice(long);
+            mul_prim2(val, combine_u64(short[0], short[1])) as u64
+        }
+        DynDispatch::School => {
+            mul_buf(long, short, val)
+        }
+        DynDispatch::Karatsuba => {
+            karatsuba_mul(long, short, val, scratch)
+        }
+        DynDispatch::FFT => {
+            if long.len() as f64 > FFT_CHUNKING * short.len() as f64{
+                fft_chunking(long, short, val, fft_cache, scratch)
+            }else{
+                fft_mul(long, short, val, fft_cache)
+            }
+        }
+    };
+    if add_buf(out, val){
+        overflow += 1;
+    }
+    overflow
+}
 
-enum Tier {
+fn fft_chunking(long: &[u64], short: &[u64], out: &mut [u64], fft_cache: &mut FFTCache, buf_scratch: &mut [u64]) -> u64{
+    out.fill(0);
+    let l = long.len();
+    let s = short.len();
+    let n = find_fft_size(8*s);
+    let l_chunk_sz= n / 4;
+    let mut chunk_cnt = l / l_chunk_sz;
+    if l % l_chunk_sz == 0 {
+        chunk_cnt -= 1;
+    }
+    {
+        let FFTCache { planner, twidles, fft_scratch_pool } = fft_cache;
+        let fwd = planner.plan_fft_forward(n);
+        let bwd = planner.plan_fft_inverse(n/2);
+        let tw = twidles.entry(n >> n.trailing_zeros()).or_insert_with(|| TwidleTower::build(n)).get(n);
+        let (x, fft_scratch) = fft_scratch_pool.get(n + fwd.get_inplace_scratch_len().max(bwd.get_inplace_scratch_len())).split_at_mut(n);
+        let val = &mut buf_scratch[..(l_chunk_sz + s)];
+        for i in 0..chunk_cnt{
+            let of = l_chunk_sz*i;
+            fft_core(&long[of..of+l_chunk_sz], short, val, n, fwd.as_ref(), bwd.as_ref(), tw, x, fft_scratch);
+            add_buf(&mut out[of..], val);
+        }
+    }
+    let of = chunk_cnt*l_chunk_sz;
+    let last_chunk = &long[of..];
+    let (last_long, last_short) = if last_chunk.len() > short.len() {(last_chunk, short)} else {(short, last_chunk)};
+    fft_final_dispatch(last_long, last_short, &mut out[of..], fft_cache, buf_scratch)
+}
+
+fn u16_buf_len(buf: &[u64]) -> usize{
+    let mut len = 4*buf.len();
+    let last = buf.last().copied().unwrap();
+    if last >> 48 == 0{
+        len -= 1;
+        if last >> 32 == 0{
+            len -= 1;
+            if last >> 16 == 0{
+                len -= 1;
+            }
+        }
+    }
+    return len;
+}
+
+fn fft_mul(long: &[u64], short: &[u64], out: &mut [u64], fft_cache: &mut FFTCache) -> u64{
+    let u16_long_len = u16_buf_len(long);
+    let u16_short_len = u16_buf_len(short);
+    let n = find_fft_size(u16_long_len + u16_short_len - 1);
+    let FFTCache { planner, twidles, fft_scratch_pool } = fft_cache;
+    let fwd = planner.plan_fft_forward(n);
+    let bwd = planner.plan_fft_inverse(n/2);
+    let tw = twidles.entry(n >> n.trailing_zeros()).or_insert_with(|| TwidleTower::build(n)).get(n);
+    let (x, fft_scratch) = fft_scratch_pool.get(n + fwd.get_inplace_scratch_len().max(bwd.get_inplace_scratch_len())).split_at_mut(n);
+    fft_core(long, short, out, n, fwd.as_ref(), bwd.as_ref(), tw, x, fft_scratch)
+}
+
+fn find_fft_chunking_buf_scratch(l: usize, s: usize) -> usize{
+    let n = find_fft_size(8*s);
+    let l_chunk_sz= n / 4;
+    let chunk_scratch_size = l_chunk_sz + s;
+
+    let mut chunk_cnt = l / l_chunk_sz;
+    if l % l_chunk_sz == 0 {
+        chunk_cnt -= 1;
+    }
+    let l_last = l - chunk_cnt*l_chunk_sz;
+    let mut last_chunk_scratch_size = l_last + s - 1;
+    match dyn_dispatch(l_last.min(s)){
+        DynDispatch::Prim | DynDispatch::Prim2 | DynDispatch::School => {},
+        DynDispatch::Karatsuba => {
+            last_chunk_scratch_size += find_karatsuab_scratch(l_last, s);
+        },
+        DynDispatch::FFT => {
+            if l_last as f64 > FFT_CHUNKING * s as f64{
+                last_chunk_scratch_size += find_fft_chunking_buf_scratch(l_last, s);
+            }
+        }
+    };
+
+    return chunk_scratch_size.max(last_chunk_scratch_size)
+}
+
+fn fft_entry(long: &[u64], short: &[u64], out: &mut [u64]) -> u64{
+    FFT_CACHE.with(|cell| {
+        let fft_cache = &mut *cell.borrow_mut();
+        if long.len() as f64 > FFT_CHUNKING * short.len() as f64{
+            let scratch_sz = find_fft_chunking_buf_scratch(long.len(), short.len());
+            SCRATCH_POOL.with(|cell| {
+                let scratch = &mut *cell.borrow_mut();
+                fft_chunking(long, short, out, fft_cache, scratch.get(scratch_sz))
+            })
+        }else{
+            fft_mul(long, short, out, fft_cache)
+        }
+    })
+}
+
+enum DynDispatch {
+    Prim,
+    Prim2,
     School,
     Karatsuba,
     FFT,
 }
 
-
-fn select_mul_tier(s: usize) -> Tier {
-    if s <= KARATSUBA_CUTOFF {
-        Tier::School
-    } else if s <= FFT_CUTOFF {
-        Tier::Karatsuba
+fn dyn_dispatch(s: usize) -> DynDispatch {
+    if s == 1{
+        DynDispatch::Prim
+    } else if s == 2{
+        DynDispatch::Prim2
+    }else if s <= KARATSUBA_CUTOFF {
+        DynDispatch::School
+    } else if s <= FFT_CUTOFF{
+        DynDispatch::Karatsuba
     } else {
-        Tier::FFT
-    }
-}
-
-fn is_balanced(l: usize, s: usize, tier: &Tier) -> bool {
-    match tier {
-        Tier::School => true,
-        Tier::Karatsuba => s > (l + 1) / 2,
-        Tier::FFT => l <= (s as f64 * FFT_CHUNKING) as usize,
-    }
-}
-
-fn balanced_mul(long: &[u64], short: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
-    match select_mul_tier(short.len()) {
-        Tier::School => mul_buf(long, short, out),
-        Tier::Karatsuba => karatsuba_mul(long, short, out, scratch),
-        Tier::FFT => fft_mul(long, short, out),
-    }
-}
-
-fn chunked_mul(long: &[u64], short: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
-    out.fill(0);
-    let s = short.len();
-
-    let n_chunks = long.len() / s;
-    let mut end = n_chunks;
-    if long.len() % s == 0 {
-        end -= 1;
-    }
-
-    let (val, rest) = scratch.split_at_mut(2 * s);
-    for i in 0..end {
-        let offset = i * s;
-        balanced_mul(&long[offset..offset + s], short, val, rest);
-        add_buf(&mut out[offset..], val);
-    }
-
-    let offset = end * s;
-    let chunk = &long[offset..];
-    let (val, rest) = scratch.split_at_mut(chunk.len() + s - 1);
-    let mut overflow = mul_core(short, chunk, val, rest);
-    if add_buf(&mut out[offset..], val) {
-        overflow += 1;
-    }
-
-    overflow
-}
-
-fn mul_core(a: &[u64], b: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
-    let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
-    let s = short.len();
-
-    if s == 1 {
-        out[..long.len()].copy_from_slice(long);
-        return mul_prim(out, short[0]);
-    }
-    if s == 2 {
-        out[..long.len()].copy_from_slice(long);
-        return mul_prim2(out, combine_u64(short[0], short[1])) as u64;
-    }
-
-    if is_balanced(long.len(), s, &select_mul_tier(s)) {
-        balanced_mul(long, short, out, scratch)
-    } else {
-        chunked_mul(long, short, out, scratch)
-    }
-}
-
-fn find_mul_scratch_size(a: usize, b: usize) -> usize {
-    let (s, l) = (a.min(b), a.max(b));
-    let tier = select_mul_tier(s);
-    if is_balanced(l, s, &tier) {
-        find_balanced_scratch(l, &tier)
-    } else {
-        2 * s + find_balanced_scratch(s, &tier)
-    }
-}
-
-fn find_balanced_scratch(n: usize, tier: &Tier) -> usize {
-    match tier {
-        Tier::School => 0,
-        Tier::Karatsuba => {
-            let mut total = 0;
-            let mut n = n;
-            while n > KARATSUBA_CUTOFF {
-                let half = (n + 1) / 2;
-                total += 2 * half + 1;
-                n = half + 1;
-            }
-            total
-        }
-        Tier::FFT => 0,
+        DynDispatch::FFT
     }
 }
 
 fn mul_vec(a: &[u64], b: &[u64]) -> (Vec<u64>, u64) {
-    let mut out = vec![0; a.len() + b.len() - 1];
-    let scratch_sz = find_mul_scratch_size(a.len(), b.len());
-    SCRATCH_POOL.with(|cell: RefCell<Scratch>| {
-        let scratch_pool = &mut *cell.borrow_mut();
-        let overflow = mul_core(a, b, &mut out, scratch_pool.get(scratch_sz));
-        (out, overflow)
-    })
+    if a.len() == 0 || b.len() == 0{
+        return (Vec::new(), 0);
+    }
+    let mut out = vec![0_u64; a.len() + b.len() -1];
+    let (long, short) = if a.len() > b.len() {(a,b)} else {(b,a)};
+    let of = match dyn_dispatch(short.len()){
+        DynDispatch::Prim => {
+            out[..long.len()].copy_from_slice(long);
+            mul_prim(&mut out, short[0])
+        }
+        DynDispatch::Prim2 => {
+            out[..long.len()].copy_from_slice(long);
+            mul_prim2(&mut out, combine_u64(short[0], short[1])) as u64
+        }
+        DynDispatch::School => mul_buf(long, short, &mut out),
+        DynDispatch::Karatsuba => karatsuba_entry_dyn(long, short, &mut out),
+        DynDispatch::FFT => fft_entry(long, short, &mut out),
+    };
+    (out, of)
+}
+
+enum StaticDispatch{
+    Prim,
+    Prim2,
+    School,
+    Karatsuba,
+}
+
+fn static_dispatch(s: usize) -> StaticDispatch{
+    if s == 1{
+        StaticDispatch::Prim
+    }else if s == 2{
+        StaticDispatch::Prim2
+    }else if s <= KARATSUBA_CUTOFF{
+        StaticDispatch::School
+    }else{
+        StaticDispatch::Karatsuba
+    }
 }
 
 fn mul_arr<const N: usize>(a: &[u64], b: &[u64]) -> Result<([u64; N], u64), ()> {
     if a.len() + b.len() - 1 > N {
         return Err(());
     }
-
-    let mut out = [0; N];
-    let scratch_sz = find_mul_scratch_size(a.len(), b.len());
-    let mut scratch = [0; N];
-    let overflow = if scratch_sz < N {
-        mul_core(a, b, &mut out, &mut scratch)
-    } else {
-        let mut cross = [0; N];
-        let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
-        let half = (long.len() + 1) / 2;
-        karatsuba_core(long, short, half, &mut out, &mut cross, &mut scratch)
+    let (long, short) = if a.len() > b.len() {(a,b)} else {(b,a)};
+    let mut out = [0;N];
+    let of = match static_dispatch(short.len()) {
+        StaticDispatch::Prim => {
+            out[..long.len()].copy_from_slice(long);
+            mul_prim(&mut out, short[0])
+        }
+        StaticDispatch::Prim2 => {
+            out[..long.len()].copy_from_slice(long);
+            mul_prim2(&mut out, combine_u64(short[0], short[1])) as u64
+        }
+        StaticDispatch::School => mul_buf(long, short, &mut out),
+        StaticDispatch::Karatsuba => karatsuba_entry_static::<N>(long, short, &mut out)
     };
-    Ok((out, overflow))
+    Ok((out, of))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -903,26 +943,26 @@ fn karatsuba_sqr_mul(buf: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
 
 pub(crate) const KARATSUBA_SQR_CUTOFF: usize = 26;
 
-fn select_sqr_tier(len: usize) -> Tier {
+fn select_sqr_tier(len: usize) -> DynDispatch {
     if len <= KARATSUBA_SQR_CUTOFF {
-        Tier::School
+        DynDispatch::School
     } else {
-        Tier::Karatsuba
+        DynDispatch::Karatsuba
     }
 }
 
 fn sqr_core(buf: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
     match select_sqr_tier(buf.len()) {
-        Tier::School => sqr_buf(buf, out),
-        Tier::Karatsuba => karatsuba_sqr_mul(buf, out, scratch),
-        Tier::FFT => unreachable!(),
+        DynDispatch::School => sqr_buf(buf, out),
+        DynDispatch::Karatsuba => karatsuba_sqr_mul(buf, out, scratch),
+        DynDispatch::FFT => unreachable!(),
     }
 }
 
 fn find_sqr_scratch_size(mut n: usize) -> usize {
     match select_sqr_tier(n) {
-        Tier::School => 0,
-        Tier::Karatsuba => {
+        DynDispatch::School => 0,
+        DynDispatch::Karatsuba => {
             let mut total = 0;
             while n > KARATSUBA_SQR_CUTOFF {
                 let half = (n + 1) / 2;
@@ -931,7 +971,7 @@ fn find_sqr_scratch_size(mut n: usize) -> usize {
             }
             total
         }
-        Tier::FFT => unreachable!(),
+        DynDispatch::FFT => unreachable!(),
     }
 }
 

@@ -4,30 +4,31 @@ pub mod div;
 pub mod mul;
 pub mod utils;
 
-pub(crate) struct Scratch {
-    buf: Vec<u64>,
+pub(crate) struct Scratch<T> {
+    buf: Vec<T>,
 }
 
-impl Scratch {
-    fn get(&mut self, n: usize) -> &mut [u64] {
+impl<T: Default + Copy> Scratch<T> {
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    pub fn get(&mut self, n: usize) -> &mut [T] {
         if self.buf.len() < n {
-            self.buf.fill(0);
-            self.buf.resize(n, 0);
-        } else {
-            self.buf[..n].fill(0);
+            self.buf.resize(n, T::default());
         }
-        return &mut self.buf[..n];
+        &mut self.buf[..n]
     }
 
     fn ensure(&mut self, n: usize) {
         if self.buf.len() < n {
-            self.buf.resize(n, 0);
+            self.buf.resize(n, T::default());
         }
     }
 }
 
 thread_local! {
-     pub(crate) static SCRATCH_POOL: RefCell<Scratch> = RefCell::new(Scratch { buf: Vec::new() })
+     pub(crate) static SCRATCH_POOL: RefCell<Scratch<u64>> = RefCell::new(Scratch::new())
 }
 
 pub const KARATSUBA_CUTOFF: usize = 27;
