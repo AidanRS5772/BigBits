@@ -20,6 +20,21 @@ impl<T: Default + Copy> Scratch<T> {
         &mut self.buf[..n]
     }
 
+    pub fn get_splits<const N: usize>(&mut self, sizes: [usize; N]) -> [&mut [T]; N] {
+        let tot = sizes.iter().sum();
+        if self.buf.len() < tot {
+            self.buf.resize(tot, T::default());
+        }
+        let base = self.buf.as_mut_ptr();
+        let mut offset = 0usize;
+        std::array::from_fn(|i| {
+            let size = sizes[i];
+            let s = unsafe { std::slice::from_raw_parts_mut(base.add(offset), size) };
+            offset += size;
+            s
+        })
+    }
+
     fn ensure(&mut self, n: usize) {
         if self.buf.len() < n {
             self.buf.resize(n, T::default());
@@ -30,7 +45,3 @@ impl<T: Default + Copy> Scratch<T> {
 thread_local! {
      pub(crate) static SCRATCH_POOL: RefCell<Scratch<u64>> = RefCell::new(Scratch::new())
 }
-
-pub const KARATSUBA_CUTOFF: usize = 27;
-pub const FFT_CUTOFF: usize = 1024;
-pub const FFT_CHUNKING: f64 = 2.5;
