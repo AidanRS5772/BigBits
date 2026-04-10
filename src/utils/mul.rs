@@ -1,12 +1,17 @@
 #![allow(dead_code)]
-use crate::utils::{utils::*, Scratch, SCRATCH_POOL};
+use crate::utils::{utils::*, *};
 use rustfft::num_traits::{One, Zero};
 use rustfft::{num_complex::Complex, Fft, FftDirection, FftPlanner};
 use std::arch::asm;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::f64::consts::PI;
-use std::sync::Arc;
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 
 // SCHOOL BOOK MULTIPLICATION
 // Worst complexity lowest overhead optimized for small inputs. Base tier algorithm.
@@ -64,6 +69,13 @@ unsafe fn mul_prim_asm(val: u64, prim: u64, carry: u64) -> (u64, u64) {
 }
 
 pub fn mul_prim(buf: &mut [u64], prim: u64) -> u64 {
+    if buf.is_empty() {
+        return 0;
+    }
+    if prim == 0 {
+        buf.fill(0);
+        return 0;
+    }
     let mut carry: u64 = 0;
     for e in buf {
         let (lo, hi) = unsafe { mul_prim_asm(*e, prim, carry) };
@@ -124,6 +136,10 @@ pub fn mul_prim2(buf: &mut [u64], prim: u128) -> u128 {
     if buf.is_empty() {
         return 0;
     }
+    if prim == 0 {
+        buf.fill(0);
+        return 0;
+    }
     let p0 = prim as u64;
     let p1 = (prim >> 64) as u64;
     let len = buf.len();
@@ -165,6 +181,9 @@ pub fn mul_prim2(buf: &mut [u64], prim: u128) -> u128 {
 }
 
 pub fn mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
     let a_len = a.len() - 1;
     let b_len = b.len() - 1;
 
@@ -191,7 +210,7 @@ pub fn mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
 }
 
 //KARATSUBA MULTIPLICATION
-// Mid tier complexity overhead is still reletively small, Mid tier algorithm. It handles unbalanced inputs through a
+// Mid tier complexity overhead is still relatively small, Mid tier algorithm. It handles unbalanced inputs through a
 // chunking and non-chunking version. The chunking boundary happens at 2s = l this is given to us
 // by the nature of algorithm and doesn't need to be determined through testing.
 // Time:
@@ -236,11 +255,12 @@ fn karatsuba_core(
     let (z0, z2) = out.split_at_mut(2 * half);
     karatsuba_mul(a0, b0, z0, scratch);
     let mut overflow = karatsuba_mul(a1, b1, z2, scratch);
+    let z2_len = buf_len(z2);
 
     sub_buf(cross, z0);
-    sub_buf(cross, z2);
+    sub_buf(cross, &z2[..z2_len]);
     if overflow > 0 {
-        sub_buf(&mut cross[z2.len()..], &[overflow]);
+        sub_prim(&mut cross[z2_len..], overflow);
     }
     if add_buf(&mut out[half..], &cross) {
         overflow += 1;
@@ -258,16 +278,19 @@ fn chunking_karatsuba(long: &[u64], short: &[u64], out: &mut [u64], scratch: &mu
     if l % s == 0 {
         chunks -= 1;
     }
-    for i in 0..chunks {
-        let of = s * i;
+    {
         let (val_cross, rest) = scratch.split_at_mut(2 * s + 2 * half + 1);
         let (cross, val) = val_cross.split_at_mut(2 * half + 1);
-        karatsuba_core(&long[of..of + s], short, half, val, cross, rest);
-        add_buf(&mut out[of..], &val);
+        for i in 0..chunks {
+            let of = s * i;
+            karatsuba_core(&long[of..of + s], short, half, val, cross, rest);
+            add_buf(&mut out[of..], &val);
+        }
     }
     let of = chunks * s;
-    let (val, rest) = scratch.split_at_mut(s + l - of - 1);
-    let mut overflow = karatsuba_mul(&long[of..], short, val, rest);
+    let last_chunk = &long[of..];
+    let (val, rest) = scratch.split_at_mut(last_chunk.len() + s - 1);
+    let mut overflow = karatsuba_mul(last_chunk, short, val, rest);
     if add_buf(&mut out[of..], val) {
         overflow += 1;
     }
@@ -282,15 +305,12 @@ enum KDispatch {
     Recurse,
 }
 
-const CHUNKING_KARATSUBA_CUTOFF: usize = 32;
-const BALENCED_KARATSUBA_CUTOFF: usize = 32;
-
-fn is_school(l: usize, s: usize) -> bool {
+pub fn is_school(l: usize, s: usize) -> bool {
     let half = (l + 1) / 2;
     if s <= half {
         s <= CHUNKING_KARATSUBA_CUTOFF
     } else {
-        let c = BALENCED_KARATSUBA_CUTOFF as f64;
+        let c = KARATSUBA_CUTOFF as f64;
         let val = l as f64 - 1.5 * c;
         let boundary = (1.125 * c - val * val / (2.0 * c)).ceil() as usize;
         s <= boundary
@@ -304,7 +324,7 @@ fn kdispatch(l: usize, s: usize) -> KDispatch {
         KDispatch::Prim2
     } else if is_school(l, s) {
         KDispatch::School
-    } else if s < (l + 1) / 2 {
+    } else if s <= (l + 1) / 2 {
         KDispatch::Chunking
     } else {
         KDispatch::Recurse
@@ -333,34 +353,42 @@ fn karatsuba_mul(a: &[u64], b: &[u64], out: &mut [u64], scratch: &mut [u64]) -> 
     karatsuba_core(long, short, half, out, cross, rest)
 }
 
-fn find_karatsuab_scratch(l: usize, s: usize) -> usize {
+pub fn find_karatsuba_scratch(l: usize, s: usize) -> usize {
     match kdispatch(l, s) {
         KDispatch::Prim | KDispatch::Prim2 | KDispatch::School => 0,
-        KDispatch::Chunking => 2 * s + find_karatsuab_scratch(s, s),
+        KDispatch::Chunking => {
+            let half = (s + 1) / 2;
+            2 * s + 2 * half + 1 + find_karatsuba_scratch(s, s)
+        }
         KDispatch::Recurse => {
             let half = (l + 1) / 2;
-            2 * half + 1 + find_karatsuab_scratch(half + 1, half + 1)
+            2 * half + 1 + find_karatsuba_scratch(half + 1, half + 1)
         }
     }
 }
 
 pub fn karatsuba_entry_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
-    let scratch_sz = find_karatsuab_scratch(long.len(), short.len());
-    SCRATCH_POOL.with(|cell| {
-        let scratch = &mut *cell.borrow_mut();
-        karatsuba_mul(long, short, out, scratch.get(scratch_sz))
-    })
+    let mut scratch_guard = ScratchGuard::acquire();
+    let scratch_sz = find_karatsuba_scratch(long.len(), short.len());
+    karatsuba_mul(long, short, out, scratch_guard.get(scratch_sz))
 }
 
 pub fn karatsuba_entry_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
-    let scratch_sz = find_karatsuab_scratch(long.len(), short.len());
+    let scratch_sz = find_karatsuba_scratch(long.len(), short.len());
     let mut scratch = [0; N];
     if scratch_sz < N {
         karatsuba_mul(long, short, out, &mut scratch)
     } else {
         let mut cross = [0; N];
         let half = (long.len() + 1) / 2;
-        karatsuba_core(long, short, half, out, &mut cross, &mut scratch)
+        karatsuba_core(
+            long,
+            short,
+            half,
+            out,
+            &mut cross[..2 * half + 1],
+            &mut scratch,
+        )
     }
 }
 
@@ -444,7 +472,7 @@ impl TwidleTower {
         let growth = new_res / self.res;
         let new_base = self.base * growth;
         let mut new_table = Vec::<Complex<f64>>::with_capacity(new_len);
-        new_table.push(Complex::one());
+        new_table.push(Complex { re: 1.0, im: 0.0 });
         let th = 2.0 * PI / (new_res as f64);
         for i in 1..new_len {
             if i % new_base != 0 {
@@ -489,11 +517,11 @@ impl TwidleTower {
 struct FFTCache {
     planner: FftPlanner<f64>,
     twidles: HashMap<usize, TwidleTower>,
-    scratch_pool: Scratch<Complex<f64>>,
+    scratch: Vec<Complex<f64>>,
 }
 
 thread_local! {
-    static FFT_CACHE: RefCell<FFTCache> = RefCell::new(FFTCache { planner: FftPlanner::new(), twidles: HashMap::new(), scratch_pool: Scratch::new()});
+    static FFT_CACHE: RefCell<FFTCache> = RefCell::new(FFTCache { planner: FftPlanner::new(), twidles: HashMap::new(), scratch: Vec::new()});
 }
 
 const LENGTH_PRIMES: [usize; 3] = [3, 5, 7];
@@ -536,29 +564,67 @@ const fn find_fft_size(n: usize) -> usize {
     return log_prim_search(INIT, n, LENGTH_PRIMES.len());
 }
 
-fn decompose(a: &[u64], b: &[u64], x: &mut [Complex<f64>]) {
-    let max_len = x.len() / 4;
-    let mask = 0xFFFF;
-    for i in 0..max_len {
-        let a_val = a.get(i).copied().unwrap_or(0);
-        let b_val = b.get(i).copied().unwrap_or(0);
-        let idx = i * 4;
-        x[idx] = Complex {
-            re: (a_val & mask) as f64,
-            im: (b_val & mask) as f64,
-        };
-        x[idx + 1] = Complex {
-            re: (a_val >> 16 & mask) as f64,
-            im: (b_val >> 16 & mask) as f64,
-        };
-        x[idx + 2] = Complex {
-            re: (a_val >> 32 & mask) as f64,
-            im: (b_val >> 32 & mask) as f64,
-        };
-        x[idx + 3] = Complex {
-            re: (a_val >> 48) as f64,
-            im: (b_val >> 48) as f64,
-        };
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scale_and_round_x86(x: &mut [Complex<f64>], scale: f64) {
+    let coefs = std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut f64, x.len() * 2);
+    let divisor = _mm256_set1_pd(scale);
+    const ROUND: i32 = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
+    let chunks = coefs.len() / 4;
+    let ptr = coefs.as_mut_ptr();
+    for i in 0..chunks {
+        let offset = i * 4;
+        // Load 4 f64s
+        let v = _mm256_loadu_pd(ptr.add(offset));
+        // Divide by scale
+        let scaled = _mm256_div_pd(v, divisor);
+        // Round
+        let rounded = _mm256_round_pd::<ROUND>(scaled);
+        // Store
+        _mm256_storeu_pd(ptr.add(offset), rounded);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn scale_and_round_aarch(x: &mut [Complex<f64>], scale: f64) {
+    let coefs = std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut f64, x.len() * 2);
+    let divisor = vdupq_n_f64(scale);
+    let chunks = coefs.len() / 2;
+    let ptr = coefs.as_mut_ptr();
+    for i in 0..chunks {
+        let offset = i * 2;
+        // Load 2 f64s
+        let v = vld1q_f64(ptr.add(offset));
+        // Divide by scale
+        let scaled = vdivq_f64(v, divisor);
+        // Round
+        let rounded = vrndnq_f64(scaled);
+        vst1q_f64(ptr.add(offset), rounded);
+    }
+}
+
+fn scale_and_round_standard(x: &mut [Complex<f64>], scale: f64) {
+    let coefs = unsafe { std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut f64, x.len() * 2) };
+    for c in coefs {
+        *c /= scale;
+        *c = c.round_ties_even();
+    }
+}
+
+fn scale_and_round(x: &mut [Complex<f64>], scale: f64) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        unsafe {
+            scale_and_round_x86(x, scale);
+        }
+    } else {
+        scale_and_round_standard(x, scale);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        scale_and_round_aarch(x, scale);
     }
 }
 
@@ -575,164 +641,465 @@ fn recombine(x: &mut [Complex<f64>], m: usize, n: usize, tw: &[Complex<f64>]) {
     let pk = x[0].re * x[0].im;
     let pj = x[m].re * x[m].im;
     x[0] = Complex::new(pk + pj, pk - pj);
-
     for k in 1..m / 2 {
         let pk = separate_mul(x[k], x[n - k]);
         let pj = separate_mul(x[m + k], x[m - k]);
         let s = pk + pj;
         let d = pk - pj;
         let dw = d * tw[k];
-
-        x[k] = (s + Complex::<f64>::i() * dw).scale(0.25);
-        x[m - k] = (s.conj() + Complex::<f64>::i() * dw.conj()).scale(0.25);
+        x[k] = Complex::new(s.re - dw.im, s.im + dw.re).scale(0.25);
+        x[m - k] = Complex::new(s.re + dw.im, dw.re - s.im).scale(0.25);
     }
-
     let k = m / 2;
-    x[k] = separate_mul(x[k], x[n - k]).conj().scale(2.0);
+    x[k] = separate_mul(x[k], x[n - k]).conj().scale(0.5);
 }
 
-fn accumulate(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
-    let mut carry = 0;
-    for i in 0..out.len().min(x.len() / 2) {
-        let idx = i * 2;
-        let a = x[idx].re.round_ties_even() as u128;
-        let b = x[idx].im.round_ties_even() as u128;
-        let c = x[idx + 1].re.round_ties_even() as u128;
-        let d = x[idx + 1].im.round_ties_even() as u128;
+fn fft_core(
+    x: &mut [Complex<f64>],
+    fwd: &dyn Fft<f64>,
+    bwd: &dyn Fft<f64>,
+    tw: &[Complex<f64>],
+    fft_scratch: &mut [Complex<f64>],
+) {
+    let n = x.len();
+    fwd.process_with_scratch(x, fft_scratch);
+    recombine(x, n / 2, n, tw);
+    bwd.process_with_scratch(&mut x[..n / 2], fft_scratch);
+    scale_and_round(x, n as f64);
+}
 
-        let val = carry + a + (b << 16) + (c << 32) + (d << 48);
-        out[i] = val as u64;
-        carry = val >> 64;
+enum BitSize {
+    Bit16,
+    Bit8,
+}
+
+fn bit_sz_dispatch(s: usize) -> BitSize {
+    if s < FFT_BIT_CUTOFF {
+        return BitSize::Bit16;
+    } else {
+        return BitSize::Bit8;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn decompose_16_x86(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
+    let out = x.as_mut_ptr() as *mut f64;
+    let mut idx = 0usize;
+
+    for (&l, &s) in long.iter().zip(short) {
+        // Broadcast into both 64-bit lanes of a 128-bit register
+        // [u16_0, u16_1, u16_2, u16_3] → [u32_0, u32_1, u32_2, u32_3]
+        // [u32_0, u32_1, u32_2, u32_3] → [f64_0, f64_1, f64_2, f64_3]
+        let l_broadcast = _mm_set1_epi64x(l as i64);
+        let l_as_u32s = _mm_cvtepu16_epi32(l_broadcast);
+        let l_f64s = _mm256_cvtepi32_pd(l_as_u32s);
+        let s_broadcast = _mm_set1_epi64x(s as i64);
+        let s_as_u32s = _mm_cvtepu16_epi32(s_broadcast);
+        let s_f64s = _mm256_cvtepi32_pd(s_as_u32s);
+        // result: [l0, s0, l2, s2]
+        let lo = _mm256_unpacklo_pd(l_f64s, s_f64s);
+        // result: [l1, s1, l3, s3]
+        let hi = _mm256_unpackhi_pd(l_f64s, s_f64s);
+        // result: [l0, s0, l1, s1]
+        let first_four = _mm256_permute2f128_pd(lo, hi, 0x20);
+        // result: [l2, s2, l3, s3]
+        let second_four = _mm256_permute2f128_pd(lo, hi, 0x31);
+        // Store 8 f64s = 4 Complex<f64> values
+        _mm256_storeu_pd(out.add(idx), first_four);
+        _mm256_storeu_pd(out.add(idx + 4), second_four);
+        idx += 8;
+    }
+    let zero = _mm256_setzero_pd();
+    for &l in &long[short.len()..] {
+        let l_broadcast = _mm_set1_epi64x(l as i64);
+        let l_as_u32s = _mm_cvtepu16_epi32(l_broadcast);
+        let l_f64s = _mm256_cvtepi32_pd(l_as_u32s);
+        // Interleave with zeros: same logic but s_f64s is replaced by zero
+        let lo = _mm256_unpacklo_pd(l_f64s, zero);
+        let hi = _mm256_unpackhi_pd(l_f64s, zero);
+        let first_four = _mm256_permute2f128_pd(lo, hi, 0x20);
+        let second_four = _mm256_permute2f128_pd(lo, hi, 0x31);
+        _mm256_storeu_pd(out.add(idx), first_four);
+        _mm256_storeu_pd(out.add(idx + 4), second_four);
+        idx += 8;
+    }
+
+    // Zero any remaining output
+    let total = x.len() * 2;
+    if idx < total {
+        std::ptr::write_bytes(out.add(idx), 0, total - idx);
+    }
+}
+
+//converts u64 to f64 in 16 bit chunks
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn u64_into_2x2f64s_aarch(x: u64) -> (float64x2_t, float64x2_t) {
+    // Load into a 64-bit NEON register
+    let x_raw = vdup_n_u64(x);
+    // Reinterpret the same 64 bits as 4 × u16
+    let x_u16x4 = vreinterpret_u16_u64(x_raw);
+    // Zero Extend: 4 x u16 -> 4 x u32
+    let x_u32x4 = vmovl_u16(x_u16x4);
+    // Split: 4 x u32 -> 2 x u32 + 2 x u32
+    let (x_u32_lo, x_u32_hi) = (vget_low_u32(x_u32x4), vget_high_u32(x_u32x4));
+    // Zero Extend: 2 x u32 -> 2 x u64
+    let x_u64_lo = vmovl_u32(x_u32_lo);
+    let x_u64_hi = vmovl_u32(x_u32_hi);
+    // Float Cast: 2 x u64 -> 2 x f64
+    let x_f0 = vcvtq_f64_u64(x_u64_lo);
+    let x_f1 = vcvtq_f64_u64(x_u64_hi);
+    (x_f0, x_f1)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn decompose_16_aarch(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
+    let out = x.as_mut_ptr() as *mut f64;
+    let mut idx = 0usize;
+
+    for (&l, &s) in long.iter().zip(short) {
+        let (l_f0, l_f1) = u64_into_2x2f64s_aarch(l);
+        let (s_f0, s_f1) = u64_into_2x2f64s_aarch(s);
+        // [l0, l1] × [s0, s1] → [l0, s0]
+        let pair0 = vzip1q_f64(l_f0, s_f0);
+        // [l0, l1] × [s0, s1] → [l1, s1]
+        let pair1 = vzip2q_f64(l_f0, s_f0);
+        // [l2, l3] × [s2, s3] → [l2, s2]
+        let pair2 = vzip1q_f64(l_f1, s_f1);
+        // [l2, l3] × [s2, s3] → [l3, s3]
+        let pair3 = vzip2q_f64(l_f1, s_f1);
+        // Store 8 f64s = 4 Complex<f64> values
+        vst1q_f64(out.add(idx), pair0);
+        vst1q_f64(out.add(idx + 2), pair1);
+        vst1q_f64(out.add(idx + 4), pair2);
+        vst1q_f64(out.add(idx + 6), pair3);
+        idx += 8;
+    }
+
+    let zero = vdupq_n_f64(0.0);
+    for &l in &long[short.len()..] {
+        let (l_f0, l_f1) = u64_into_2x2f64s_aarch(l);
+        // zip with zero register for im = 0.0
+        vst1q_f64(out.add(idx), vzip1q_f64(l_f0, zero));
+        vst1q_f64(out.add(idx + 2), vzip2q_f64(l_f0, zero));
+        vst1q_f64(out.add(idx + 4), vzip1q_f64(l_f1, zero));
+        vst1q_f64(out.add(idx + 6), vzip2q_f64(l_f1, zero));
+        idx += 8;
+    }
+
+    let total = x.len() * 2;
+    if idx < total {
+        std::ptr::write_bytes(out.add(idx), 0, total - idx);
+    }
+}
+
+fn decompose_16_standard(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
+    const MASK: u64 = u16::MAX as u64;
+    let mut idx = 0;
+    for (&l, &s) in long.iter().zip(short) {
+        x[idx].re = (l & MASK) as f64;
+        x[idx].im = (s & MASK) as f64;
+        x[idx + 1].re = (l >> 16 & MASK) as f64;
+        x[idx + 1].im = (s >> 16 & MASK) as f64;
+        x[idx + 2].re = (l >> 32 & MASK) as f64;
+        x[idx + 2].im = (s >> 32 & MASK) as f64;
+        x[idx + 3].re = (l >> 48) as f64;
+        x[idx + 3].im = (s >> 48) as f64;
+        idx += 4;
+    }
+    for &l in &long[short.len()..] {
+        x[idx].re = (l & MASK) as f64;
+        x[idx].im = 0.0;
+        x[idx + 1].re = (l >> 16 & MASK) as f64;
+        x[idx + 1].im = 0.0;
+        x[idx + 2].re = (l >> 32 & MASK) as f64;
+        x[idx + 2].im = 0.0;
+        x[idx + 3].re = (l >> 48) as f64;
+        x[idx + 3].im = 0.0;
+        idx += 4;
+    }
+    if idx < x.len() {
+        x[idx..].fill(Complex::zero());
+    }
+}
+
+fn decompose_16(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        unsafe {
+            decompose_16_x86(long, short, x);
+        }
+    } else {
+        decompose_16_standard(long, short, x);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        decompose_16_aarch(long, short, x);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn decompose_8_x86(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
+    let out = x.as_mut_ptr() as *mut f64;
+    let mut idx = 0usize;
+
+    for (&l, &s) in long.iter().zip(short) {
+        let lv = _mm_set1_epi64x(l as i64);
+        let l_lo_u32 = _mm_cvtepu8_epi32(lv);
+        let l_lo_f64 = _mm256_cvtepi32_pd(l_lo_u32);
+        let lv_shifted = _mm_bsrli_si128(lv, 4);
+        let l_hi_u32 = _mm_cvtepu8_epi32(lv_shifted);
+        let l_hi_f64 = _mm256_cvtepi32_pd(l_hi_u32);
+
+        let sv = _mm_set1_epi64x(s as i64);
+        let s_lo_u32 = _mm_cvtepu8_epi32(sv);
+        let s_lo_f64 = _mm256_cvtepi32_pd(s_lo_u32);
+        let sv_shifted = _mm_bsrli_si128(sv, 4);
+        let s_hi_u32 = _mm_cvtepu8_epi32(sv_shifted);
+        let s_hi_f64 = _mm256_cvtepi32_pd(s_hi_u32);
+
+        // [l0, s0, l2, s2]
+        let lo_lo = _mm256_unpacklo_pd(l_lo_f64, s_lo_f64);
+        // [l1, s1, l3, s3]
+        let lo_hi = _mm256_unpackhi_pd(l_lo_f64, s_lo_f64);
+        // low lanes of both → [l0, s0, l1, s1]
+        let lo_first = _mm256_permute2f128_pd(lo_lo, lo_hi, 0x20);
+        // high lanes of both → [l2, s2, l3, s3]
+        let lo_second = _mm256_permute2f128_pd(lo_lo, lo_hi, 0x31);
+
+        _mm256_storeu_pd(out.add(idx), lo_first);
+        _mm256_storeu_pd(out.add(idx + 4), lo_second);
+
+        // ---- Interleave high group (bytes 4-7 from each) ----
+
+        let hi_lo = _mm256_unpacklo_pd(l_hi_f64, s_hi_f64);
+        let hi_hi = _mm256_unpackhi_pd(l_hi_f64, s_hi_f64);
+        let hi_first = _mm256_permute2f128_pd(hi_lo, hi_hi, 0x20);
+        let hi_second = _mm256_permute2f128_pd(hi_lo, hi_hi, 0x31);
+
+        _mm256_storeu_pd(out.add(idx + 8), hi_first);
+        _mm256_storeu_pd(out.add(idx + 12), hi_second);
+
+        idx += 16;
+    }
+
+    // ---- Overhang ----
+
+    let zero = _mm256_setzero_pd();
+    for &l in &long[short.len()..] {
+        let lv = _mm_set1_epi64x(l as i64);
+
+        let l_lo_f64 = _mm256_cvtepi32_pd(_mm_cvtepu8_epi32(lv));
+        let l_hi_f64 = _mm256_cvtepi32_pd(_mm_cvtepu8_epi32(_mm_bsrli_si128(lv, 4)));
+
+        let lo_lo = _mm256_unpacklo_pd(l_lo_f64, zero);
+        let lo_hi = _mm256_unpackhi_pd(l_lo_f64, zero);
+        _mm256_storeu_pd(out.add(idx), _mm256_permute2f128_pd(lo_lo, lo_hi, 0x20));
+        _mm256_storeu_pd(out.add(idx + 4), _mm256_permute2f128_pd(lo_lo, lo_hi, 0x31));
+
+        let hi_lo = _mm256_unpacklo_pd(l_hi_f64, zero);
+        let hi_hi = _mm256_unpackhi_pd(l_hi_f64, zero);
+        _mm256_storeu_pd(out.add(idx + 8), _mm256_permute2f128_pd(hi_lo, hi_hi, 0x20));
+        _mm256_storeu_pd(
+            out.add(idx + 12),
+            _mm256_permute2f128_pd(hi_lo, hi_hi, 0x31),
+        );
+
+        idx += 16;
+    }
+
+    let total = x.len() * 2;
+    if idx < total {
+        std::ptr::write_bytes(out.add(idx), 0, total - idx);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn u64_into_2x4f64_aarch(l: u64) -> (float64x2_t, float64x2_t, float64x2_t, float64x2_t) {
+    let l_raw = vdup_n_u64(l);
+    let l_u8x8 = vreinterpret_u8_u64(l_raw);
+    let l_u16x8 = vmovl_u8(l_u8x8);
+    let (l_u16_lo, l_u16_hi) = (vget_low_u16(l_u16x8), vget_high_u16(l_u16x8));
+    let l_u32_lo = vmovl_u16(l_u16_lo);
+    let l_u32_hi = vmovl_u16(l_u16_hi);
+    let (l_u32_lo_lo, l_u32_lo_hi) = (vget_low_u32(l_u32_lo), vget_high_u32(l_u32_lo));
+    let (l_u32_hi_lo, l_u32_hi_hi) = (vget_low_u32(l_u32_hi), vget_high_u32(l_u32_hi));
+    let l_u64_lo_lo = vmovl_u32(l_u32_lo_lo);
+    let l_u64_lo_hi = vmovl_u32(l_u32_lo_hi);
+    let l_u64_hi_lo = vmovl_u32(l_u32_hi_lo);
+    let l_u64_hi_hi = vmovl_u32(l_u32_hi_hi);
+    (
+        vcvtq_f64_u64(l_u64_lo_lo),
+        vcvtq_f64_u64(l_u64_lo_hi),
+        vcvtq_f64_u64(l_u64_hi_lo),
+        vcvtq_f64_u64(l_u64_hi_hi),
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn decompose_8_aarch(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
+    let out = x.as_mut_ptr() as *mut f64;
+    let mut idx = 0usize;
+
+    for (&l, &s) in long.iter().zip(short) {
+        let (l_f0, l_f1, l_f2, l_f3) = u64_into_2x4f64_aarch(l);
+        let (s_f0, s_f1, s_f2, s_f3) = u64_into_2x4f64_aarch(s);
+        vst1q_f64(out.add(idx), vzip1q_f64(l_f0, s_f0)); // [l0, s0]
+        vst1q_f64(out.add(idx + 2), vzip2q_f64(l_f0, s_f0)); // [l1, s1]
+        vst1q_f64(out.add(idx + 4), vzip1q_f64(l_f1, s_f1)); // [l2, s2]
+        vst1q_f64(out.add(idx + 6), vzip2q_f64(l_f1, s_f1)); // [l3, s3]
+        vst1q_f64(out.add(idx + 8), vzip1q_f64(l_f2, s_f2)); // [l4, s4]
+        vst1q_f64(out.add(idx + 10), vzip2q_f64(l_f2, s_f2)); // [l5, s5]
+        vst1q_f64(out.add(idx + 12), vzip1q_f64(l_f3, s_f3)); // [l6, s6]
+        vst1q_f64(out.add(idx + 14), vzip2q_f64(l_f3, s_f3)); // [l7, s7]
+        idx += 16;
+    }
+
+    let zero = vdupq_n_f64(0.0);
+    for &l in &long[short.len()..] {
+        let (l_f0, l_f1, l_f2, l_f3) = u64_into_2x4f64_aarch(l);
+        vst1q_f64(out.add(idx), vzip1q_f64(l_f0, zero));
+        vst1q_f64(out.add(idx + 2), vzip2q_f64(l_f0, zero));
+        vst1q_f64(out.add(idx + 4), vzip1q_f64(l_f1, zero));
+        vst1q_f64(out.add(idx + 6), vzip2q_f64(l_f1, zero));
+        vst1q_f64(out.add(idx + 8), vzip1q_f64(l_f2, zero));
+        vst1q_f64(out.add(idx + 10), vzip2q_f64(l_f2, zero));
+        vst1q_f64(out.add(idx + 12), vzip1q_f64(l_f3, zero));
+        vst1q_f64(out.add(idx + 14), vzip2q_f64(l_f3, zero));
+        idx += 16;
+    }
+
+    let total = x.len() * 2;
+    if idx < total {
+        std::ptr::write_bytes(out.add(idx), 0, total - idx);
+    }
+}
+
+fn decompose_8_standard(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
+    const MASK: u64 = u8::MAX as u64;
+    let mut idx = 0;
+    for (&l, &s) in long.iter().zip(short) {
+        x[idx].re = (l & MASK) as f64;
+        x[idx].im = (s & MASK) as f64;
+        x[idx + 1].re = (l >> 8 & MASK) as f64;
+        x[idx + 1].im = (s >> 8 & MASK) as f64;
+        x[idx + 2].re = (l >> 16 & MASK) as f64;
+        x[idx + 2].im = (s >> 16 & MASK) as f64;
+        x[idx + 3].re = (l >> 24 & MASK) as f64;
+        x[idx + 3].im = (s >> 24 & MASK) as f64;
+        x[idx + 4].re = (l >> 32 & MASK) as f64;
+        x[idx + 4].im = (s >> 32 & MASK) as f64;
+        x[idx + 5].re = (l >> 40 & MASK) as f64;
+        x[idx + 5].im = (s >> 40 & MASK) as f64;
+        x[idx + 6].re = (l >> 48 & MASK) as f64;
+        x[idx + 6].im = (s >> 48 & MASK) as f64;
+        x[idx + 7].re = (l >> 56 & MASK) as f64;
+        x[idx + 7].im = (s >> 56 & MASK) as f64;
+        idx += 8;
+    }
+    for &l in &long[short.len()..] {
+        x[idx].re = (l & MASK) as f64;
+        x[idx].im = 0.0;
+        x[idx + 1].re = (l >> 8 & MASK) as f64;
+        x[idx + 1].im = 0.0;
+        x[idx + 2].re = (l >> 16 & MASK) as f64;
+        x[idx + 2].im = 0.0;
+        x[idx + 3].re = (l >> 24 & MASK) as f64;
+        x[idx + 3].im = 0.0;
+        x[idx + 4].re = (l >> 32 & MASK) as f64;
+        x[idx + 4].im = 0.0;
+        x[idx + 5].re = (l >> 40 & MASK) as f64;
+        x[idx + 5].im = 0.0;
+        x[idx + 6].re = (l >> 48 & MASK) as f64;
+        x[idx + 6].im = 0.0;
+        x[idx + 7].re = (l >> 56 & MASK) as f64;
+        x[idx + 7].im = 0.0;
+        idx += 8;
+    }
+    if idx < x.len() {
+        x[idx..].fill(Complex::zero());
+    }
+}
+
+fn decompose_8(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        unsafe { decompose_8_x86(long, short, x) }
+    } else {
+        decompose_8_standard(long, short, x);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        decompose_8_aarch(long, short, x);
+    }
+}
+
+fn accumulate_16(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
+    let coefs = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const f64, x.len() * 2) };
+    let mut carry = 0;
+    for (chunk, elem) in coefs.chunks(4).zip(out.iter_mut()) {
+        let mut tot = carry;
+        for (i, c) in chunk.iter().enumerate() {
+            let val = unsafe { c.to_int_unchecked::<u64>() } as u128;
+            tot += val << (i * 16)
+        }
+        *elem = tot as u64;
+        carry = tot >> 64;
     }
     return carry as u64;
 }
 
-fn fft_core(
-    a: &[u64],
-    b: &[u64],
-    out: &mut [u64],
-    n: usize,
-    fwd: &dyn Fft<f64>,
-    bwd: &dyn Fft<f64>,
-    tw: &[Complex<f64>],
-    x: &mut [Complex<f64>],
-    fft_scratch: &mut [Complex<f64>],
-) -> u64 {
-    decompose(a, b, x);
-    fwd.process_with_scratch(x, fft_scratch);
-    recombine(x, n / 2, n, tw);
-    bwd.process_with_scratch(&mut x[..n / 2], fft_scratch);
-    let scale = 1.0 / n as f64;
-    for v in &mut x[..n / 2] {
-        *v = v.scale(scale)
+fn accumulate_8(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
+    let coefs = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const f64, x.len() * 2) };
+    let mut carry = 0;
+    for (chunk, elem) in coefs.chunks(8).zip(out.iter_mut()) {
+        let mut tot = carry;
+        for (i, c) in chunk.iter().enumerate() {
+            let val = unsafe { c.to_int_unchecked::<u64>() };
+            tot += (val as u128) << (i * 8)
+        }
+        *elem = tot as u64;
+        carry = tot >> 64;
     }
-    accumulate(&x[..n / 2], out)
+    return carry as u64;
 }
 
-const CHUNKING_FFT_PROP: f64 = 4.0;
-
-fn fft_chunk_boundary(s: usize) -> usize {
-    (CHUNKING_FFT_PROP * (s * s) as f64).ceil() as usize
+#[inline(always)]
+fn bit16_length(sz: usize, last: u64) -> usize {
+    (sz - 1) * 4 + (last.ilog2() as usize + 1) / 16
 }
 
-const CHUNKING_FFT_CHUNKING_KARATSUBA_CUTOFF: usize = 500;
-const FFT_CHUNKING_KARATSUBA_CUTOFF: usize = 500;
-const FFT_KARATSUBA_CUTOFF: usize = 500;
-
-enum FFTDispatch {
-    Prim,
-    Prim2,
-    School,
-    Karatsuba,
-    FFT,
-    ChunkingFFT,
+#[inline(always)]
+fn bit8_length(sz: usize, last: u64) -> usize {
+    (sz - 1) * 8 + (last.ilog2() as usize + 1) / 8
 }
 
-fn is_karatsuba(l: usize, s: usize) -> bool {
-    const LOG_2_3: f64 = 1.584962501;
-    if fft_chunk_boundary(s) <= l {
-        s < CHUNKING_FFT_CHUNKING_KARATSUBA_CUTOFF
-    } else {
-        let half = (l + 1) / 2;
-        let fft_cost = (l + s) * ((l + s).ilog2() as usize + 1);
-        if s <= half {
-            let k_chunk_cost = l * ((s as f64).powf(LOG_2_3).ceil() as usize);
-            k_chunk_cost < FFT_CHUNKING_KARATSUBA_CUTOFF * fft_cost
-        } else {
-            let k_cost = (l as f64).powf(LOG_2_3).ceil() as usize
-                - ((l - s) as f64).powf(LOG_2_3).ceil() as usize;
-            k_cost < FFT_KARATSUBA_CUTOFF * fft_cost
-        }
-    }
-}
-
-fn fft_dispatch(l: usize, s: usize) -> FFTDispatch {
-    if s == 1 {
-        FFTDispatch::Prim
-    } else if s == 2 {
-        FFTDispatch::Prim2
-    } else if is_school(l, s) {
-        FFTDispatch::School
-    } else if is_karatsuba(l, s) {
-        FFTDispatch::Karatsuba
-    } else {
-        if fft_chunk_boundary(s) <= l {
-            FFTDispatch::ChunkingFFT
-        } else {
-            FFTDispatch::FFT
-        }
-    }
-}
-
-fn fft_final(
-    long: &[u64],
-    short: &[u64],
-    out: &mut [u64],
-    fft_cache: &mut FFTCache,
-    buf_scratch: &mut [u64],
-) -> u64 {
-    let (val, scratch) = buf_scratch.split_at_mut(long.len() + short.len() - 1);
-    let mut overflow = match fft_dispatch(long.len(), short.len()) {
-        FFTDispatch::Prim => {
-            val[..long.len()].copy_from_slice(long);
-            mul_prim(val, short[0])
-        }
-        FFTDispatch::Prim2 => {
-            val[..long.len()].copy_from_slice(long);
-            mul_prim2(val, combine_u64(short[0], short[1])) as u64
-        }
-        FFTDispatch::School => mul_buf(long, short, val),
-        FFTDispatch::Karatsuba => karatsuba_mul(long, short, val, scratch),
-        FFTDispatch::FFT => fft_mul(long, short, val, fft_cache),
-        FFTDispatch::ChunkingFFT => fft_chunking(long, short, val, fft_cache, scratch),
+pub fn fft_entry(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+    let bit_size = bit_sz_dispatch(short.len());
+    let (l_len, s_len) = match bit_size {
+        BitSize::Bit16 => (
+            bit16_length(long.len(), long.last().copied().unwrap()),
+            bit16_length(short.len(), short.last().copied().unwrap()),
+        ),
+        BitSize::Bit8 => (
+            bit8_length(long.len(), long.last().copied().unwrap()),
+            bit8_length(short.len(), short.last().copied().unwrap()),
+        ),
     };
-    if add_buf(out, val) {
-        overflow += 1;
-    }
-    overflow
-}
-
-fn fft_chunking(
-    long: &[u64],
-    short: &[u64],
-    out: &mut [u64],
-    fft_cache: &mut FFTCache,
-    buf_scratch: &mut [u64],
-) -> u64 {
-    out.fill(0);
-    let l = long.len();
-    let s = short.len();
-    let n = find_fft_size(8 * s);
-    let l_chunk_sz = n / 8;
-    let mut chunk_cnt = l / l_chunk_sz;
-    if l % l_chunk_sz == 0 {
-        chunk_cnt -= 1;
-    }
-    {
+    let n = find_fft_size(l_len + s_len - 1);
+    FFT_CACHE.with(|cell| {
+        let fft_cache = &mut *cell.borrow_mut();
         let FFTCache {
             planner,
             twidles,
-            scratch_pool,
+            scratch,
         } = fft_cache;
         let fwd = planner.plan_fft_forward(n);
         let bwd = planner.plan_fft_inverse(n / 2);
@@ -740,133 +1107,57 @@ fn fft_chunking(
             .entry(n >> n.trailing_zeros())
             .or_insert_with(|| TwidleTower::build(n))
             .get(n);
-        let [x, fft_scratch] = scratch_pool.get_splits([
-            n,
-            fwd.get_inplace_scratch_len()
-                .max(bwd.get_inplace_scratch_len()),
-        ]);
-
-        let val = &mut buf_scratch[..(l_chunk_sz + s)];
-        for i in 0..chunk_cnt {
-            let of = l_chunk_sz * i;
-            fft_core(
-                &long[of..of + l_chunk_sz],
-                short,
-                val,
-                n,
-                fwd.as_ref(),
-                bwd.as_ref(),
-                tw,
-                x,
-                fft_scratch,
-            );
-            add_buf(&mut out[of..], val);
+        let scratch_sz = n + fwd
+            .get_inplace_scratch_len()
+            .max(bwd.get_inplace_scratch_len());
+        if scratch_sz > scratch.len() {
+            scratch.resize(scratch_sz, Complex::zero());
         }
-    }
-    let of = chunk_cnt * l_chunk_sz;
-    let last_chunk = &long[of..];
-    let (last_long, last_short) = if last_chunk.len() > short.len() {
-        (last_chunk, short)
-    } else {
-        (short, last_chunk)
-    };
-    fft_final(
-        last_long,
-        last_short,
-        &mut out[of..],
-        fft_cache,
-        buf_scratch,
-    )
-}
+        let (x, fft_scratch) = scratch.split_at_mut(n);
 
-fn u16_buf_len(buf: &[u64]) -> usize {
-    let mut len = 4 * buf.len();
-    let last = buf.last().copied().unwrap();
-    if last >> 48 == 0 {
-        len -= 1;
-        if last >> 32 == 0 {
-            len -= 1;
-            if last >> 16 == 0 {
-                len -= 1;
-            }
+        match bit_size {
+            BitSize::Bit16 => decompose_16(long, short, x),
+            BitSize::Bit8 => decompose_8(long, short, x),
         }
-    }
-    return len;
-}
 
-fn fft_mul(long: &[u64], short: &[u64], out: &mut [u64], fft_cache: &mut FFTCache) -> u64 {
-    let u16_long_len = u16_buf_len(long);
-    let u16_short_len = u16_buf_len(short);
-    let n = find_fft_size(u16_long_len + u16_short_len - 1);
-    let FFTCache {
-        planner,
-        twidles,
-        scratch_pool,
-    } = fft_cache;
-    let fwd = planner.plan_fft_forward(n);
-    let bwd = planner.plan_fft_inverse(n / 2);
-    let tw = twidles
-        .entry(n >> n.trailing_zeros())
-        .or_insert_with(|| TwidleTower::build(n))
-        .get(n);
-    let [x, fft_scratch] = scratch_pool.get_splits([
-        n,
-        fwd.get_inplace_scratch_len()
-            .max(bwd.get_inplace_scratch_len()),
-    ]);
-    fft_core(
-        long,
-        short,
-        out,
-        n,
-        fwd.as_ref(),
-        bwd.as_ref(),
-        tw,
-        x,
-        fft_scratch,
-    )
-}
+        fft_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
 
-fn find_fft_chunking_buf_scratch(l: usize, s: usize) -> usize {
-    let n = find_fft_size(8 * s);
-    let l_chunk_sz = n / 8;
-    let chunk_scratch_size = l_chunk_sz + s;
-
-    let mut chunk_cnt = l / l_chunk_sz;
-    if l % l_chunk_sz == 0 {
-        chunk_cnt -= 1;
-    }
-    let l_last = l - chunk_cnt * l_chunk_sz;
-    let mut last_chunk_scratch_size = l_last + s - 1;
-    match fft_dispatch(l, s) {
-        FFTDispatch::Prim | FFTDispatch::Prim2 | FFTDispatch::School | FFTDispatch::FFT => {}
-        FFTDispatch::Karatsuba => {
-            last_chunk_scratch_size += find_karatsuab_scratch(l_last, s);
-        }
-        FFTDispatch::ChunkingFFT => {
-            last_chunk_scratch_size += find_fft_chunking_buf_scratch(l_last, s);
-        }
-    };
-
-    return chunk_scratch_size.max(last_chunk_scratch_size);
-}
-
-fn fft_entry(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
-    FFT_CACHE.with(|cell| {
-        let fft_cache = &mut *cell.borrow_mut();
-        if fft_chunk_boundary(short.len()) < long.len() {
-            let scratch_sz = find_fft_chunking_buf_scratch(long.len(), short.len());
-            SCRATCH_POOL.with(|cell| {
-                let scratch = &mut *cell.borrow_mut();
-                fft_chunking(long, short, out, fft_cache, scratch.get(scratch_sz))
-            })
-        } else {
-            fft_mul(long, short, out, fft_cache)
+        match bit_size {
+            BitSize::Bit16 => accumulate_16(x, out),
+            BitSize::Bit8 => accumulate_8(x, out),
         }
     })
 }
 
 //END FFT MULTIPLICATION
+
+pub fn fft_cost(l: usize, s: usize) -> f64 {
+    let sum = (l + s) as f64;
+    sum * sum.ln()
+}
+
+pub fn chunking_karatsuba_cost(l: usize, s: usize) -> f64 {
+    const LOG_2_3: f64 = 1.584962501;
+    let s_pow = (s as f64).powf(LOG_2_3 - 1.0);
+    (l as f64) * s_pow
+}
+
+pub fn karatsuba_cost(l: usize, s: usize) -> f64 {
+    const LOG_2_3: f64 = 1.584962501;
+    let l_pow = (l as f64).powf(LOG_2_3);
+    let sum_pow = ((l - s) as f64).powf(LOG_2_3);
+    l_pow - sum_pow
+}
+
+pub fn is_karatsuba(l: usize, s: usize) -> bool {
+    let fft_cost = fft_cost(l, s);
+    let half = (l + 1) / 2;
+    if s <= half {
+        chunking_karatsuba_cost(l, s) < FFT_CHUNKING_KARATSUBA_CUTOFF * fft_cost
+    } else {
+        karatsuba_cost(l, s) < FFT_KARATSUBA_CUTOFF * fft_cost
+    }
+}
 
 enum DynDispatch {
     Prim,
@@ -892,10 +1183,10 @@ fn dyn_dispatch(l: usize, s: usize) -> DynDispatch {
 
 pub fn mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     debug_assert!(
-        out.len() > a.len() + b.len() - 1,
+        out.len() >= a.len() + b.len() - 1,
         "out is not large enough for multiplication"
     );
-    if a.len() == 0 || b.len() == 0 {
+    if a.is_empty() || b.is_empty() {
         return 0;
     }
     let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
@@ -914,27 +1205,10 @@ pub fn mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     }
 }
 
-pub fn ensure_mul(a: usize, b: usize) {
-    let (l, s) = (a.max(b), a.min(b));
-    match dyn_dispatch(l, s) {
-        DynDispatch::Prim | DynDispatch::Prim2 | DynDispatch::School => {}
-        DynDispatch::Karatsuba => SCRATCH_POOL.with(|cell| {
-            let scratch_pool = &mut *cell.borrow_mut();
-            scratch_pool.ensure(find_karatsuab_scratch(l, s));
-        }),
-        DynDispatch::FFT => {
-            FFT_CACHE.with(|cell| {
-                let fft_cache = &mut *cell.borrow_mut();
-                fft_cache.scratch_pool.ensure(4 * (a + b));
-            });
-            if fft_chunk_boundary(s) < l {
-                SCRATCH_POOL.with(|cell| {
-                    let scratch = &mut *cell.borrow_mut();
-                    scratch.ensure(find_fft_chunking_buf_scratch(l, s));
-                });
-            }
-        }
-    }
+pub fn mul_vec(a: &[u64], b: &[u64]) -> (Vec<u64>, u64) {
+    let mut out = vec![0; a.len() + b.len() - 1];
+    let of = mul_dyn(a, b, &mut out);
+    (out, of)
 }
 
 enum StaticDispatch {
@@ -956,7 +1230,7 @@ fn static_dispatch(l: usize, s: usize) -> StaticDispatch {
     }
 }
 
-fn mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> Result<u64, ()> {
+pub fn mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> Result<u64, ()> {
     if a.len() + b.len() - 1 > N {
         return Err(());
     }
@@ -975,7 +1249,14 @@ fn mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> Result<u
     })
 }
 
-//SQUARE multiplication simple hierarchy School < Karatsuba < FFT
+pub fn mul_arr<const N: usize>(a: &[u64], b: &[u64]) -> Result<([u64; N], u64), ()> {
+    let mut out = [0; N];
+    let of = mul_static::<N>(a, b, &mut out)?;
+    Ok((out, of))
+}
+
+//SQUARE MULTIPLICATION
+//simple hierarchy School < Karatsuba < FFT
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
@@ -1096,7 +1377,6 @@ fn karatsuba_sqr_core(
     scratch: &mut [u64],
 ) -> u64 {
     let (x0, x1) = buf.split_at(half);
-
     {
         let sum = &mut out[..=half];
         sum[..half].copy_from_slice(x0);
@@ -1108,15 +1388,13 @@ fn karatsuba_sqr_core(
 
         karatsuba_sqr_mul(&sum[..sum_len], cross, scratch);
     }
-
     out.fill(0);
     let (z0, z2) = out.split_at_mut(2 * half);
-
     karatsuba_sqr_mul(x0, z0, scratch);
     let mut overflow = karatsuba_sqr_mul(x1, z2, scratch);
-
+    let z2_len = buf_len(z2);
     sub_buf(cross, z0);
-    sub_buf(cross, z2);
+    sub_buf(cross, &z2[..z2_len]);
     if overflow > 0 {
         sub_buf(&mut cross[z2.len()..], &[overflow]);
     }
@@ -1127,8 +1405,6 @@ fn karatsuba_sqr_core(
     return overflow;
 }
 
-const KARATSUBA_SQR_CUTOFF: usize = 26;
-
 fn karatsuba_sqr_mul(buf: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
     if buf.len() <= KARATSUBA_SQR_CUTOFF {
         return sqr_buf(buf, out);
@@ -1138,53 +1414,33 @@ fn karatsuba_sqr_mul(buf: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
     karatsuba_sqr_core(buf, half, out, cross, rest)
 }
 
-fn find_karatsuba_sqr_scratch_sz(mut n: usize) -> usize {
-    let mut tot = 0;
-    while n > KARATSUBA_SQR_CUTOFF {
+pub fn find_karatsuba_sqr_scratch_sz(n: usize) -> usize {
+    return if n > KARATSUBA_SQR_CUTOFF {
         let half = (n + 1) / 2;
-        tot += 2 * half + 1;
-        n = half + 1;
-    }
-    return tot;
+        2 * half + 1 + find_karatsuba_sqr_scratch_sz(half + 1)
+    } else {
+        0
+    };
 }
 
-fn karatsuba_sqr_entry_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
+pub fn karatsuba_sqr_entry_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
+    let mut scratch_gaurd = ScratchGuard::acquire();
     let scratch_sz = find_karatsuba_sqr_scratch_sz(buf.len());
-    SCRATCH_POOL.with(|cell| {
-        let scratch = &mut *cell.borrow_mut();
-        let half = (buf.len() + 1) / 2;
-        let (cross, rest) = scratch.get(scratch_sz).split_at_mut(2 * half + 1);
-        karatsuba_sqr_core(buf, half, out, cross, rest)
-    })
+    let half = (buf.len() + 1) / 2;
+    let (cross, rest) = scratch_gaurd.get(scratch_sz).split_at_mut(2 * half + 1);
+    karatsuba_sqr_core(buf, half, out, cross, rest)
 }
 
-fn karatsuba_sqr_entry_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
+pub fn karatsuba_sqr_entry_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
     let scratch_sz = find_karatsuba_sqr_scratch_sz(buf.len());
     let half = (buf.len() + 1) / 2;
     let mut scratch = [0; N];
     if scratch_sz > N {
         let mut cross = [0; N];
-        karatsuba_sqr_core(buf, half, out, &mut cross, &mut scratch)
+        karatsuba_sqr_core(buf, half, out, &mut cross[..2 * half + 1], &mut scratch)
     } else {
         let (cross, rest) = scratch.split_at_mut(2 * half + 1);
         karatsuba_sqr_core(buf, half, out, cross, rest)
-    }
-}
-
-fn sqr_decompose(buf: &[u64], x: &mut [Complex<f64>]) {
-    let max_len = x.len() / 2;
-    let mask = 0xFFFF;
-    for i in 0..max_len {
-        let val = buf.get(i).copied().unwrap();
-        let idx = 2 * i;
-        x[idx] = Complex {
-            re: (val & mask) as f64,
-            im: (val >> 16 & mask) as f64,
-        };
-        x[idx + 1] = Complex {
-            re: (val >> 32 & mask) as f64,
-            im: (val >> 48) as f64,
-        };
     }
 }
 
@@ -1210,54 +1466,213 @@ fn sqr_recombine(x: &mut [Complex<f64>], m: usize, tw: &[Complex<f64>]) {
         let (a, b) = seperate(e, tw[k] * o.conj());
         let s = c_sqr(a) - c_sqr(b);
         let t = e * o;
-        x[k] = (s + Complex::<f64>::i() * t).scale(2.0);
-        x[m - k] = (s.conj() + Complex::<f64>::i() * t.conj()).scale(2.0);
+        x[k] = Complex::new(s.re - t.im, s.im + t.re).scale(2.0);
+        x[m - k] = Complex::new(s.re + t.im, t.re - s.im).scale(2.0)
     }
     x[m / 2] = c_sqr(x[m / 2]);
 }
 
 fn fft_sqr_core(
-    buf: &[u64],
-    out: &mut [u64],
-    m: usize,
+    x: &mut [Complex<f64>],
     fwd: &dyn Fft<f64>,
     bwd: &dyn Fft<f64>,
     tw: &[Complex<f64>],
-    x: &mut [Complex<f64>],
     fft_scratch: &mut [Complex<f64>],
-) -> u64 {
-    sqr_decompose(buf, x);
+) {
+    let m = x.len();
     fwd.process_with_scratch(x, fft_scratch);
     sqr_recombine(x, m, tw);
     bwd.process_with_scratch(x, fft_scratch);
-    let scale = 1.0 / m as f64;
-    for v in x.into_iter() {
-        *v = v.scale(scale)
-    }
-    accumulate(x, out)
+    scale_and_round(x, m as f64);
 }
 
-fn fft_sqr_entry(buf: &[u64], out: &mut [u64]) -> u64 {
-    let u16_len = u16_buf_len(buf);
-    let m = find_fft_size(2 * u16_len - 1) / 2;
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sqr_decompose_16_x86(buf: &[u64], x: &mut [Complex<f64>]) {
+    let out = x.as_mut_ptr() as *mut f64;
+    let mut idx = 0usize;
+    for &b in buf {
+        // loadl loads 64 bits into the low half of a 128-bit register
+        let v = _mm_set1_epi64x(b as i64);
+        // pmovzxwd: zero-extend 4 u16s → 4 u32s
+        let u32s = _mm_cvtepu16_epi32(v);
+        // cvtepi32_pd: 4 i32 → 4 f64
+        let f = _mm256_cvtepi32_pd(u32s);
+        _mm256_storeu_pd(out.add(idx), f);
+        idx += 4;
+    }
+    let written = buf.len() * 4;
+    if written < x.len() * 2 {
+        std::ptr::write_bytes(out.add(written), 0, x.len() * 2 - written);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn sqr_decompose_16_aarch64(buf: &[u64], x: &mut [Complex<f64>]) {
+    let out = x.as_mut_ptr() as *mut f64;
+    let mut idx = 0usize;
+    for &b in buf {
+        let (f0, f1) = u64_into_2x2f64s_aarch(b);
+        vst1q_f64(out.add(idx), f0);
+        vst1q_f64(out.add(idx + 2), f1);
+        idx += 4;
+    }
+    let written = buf.len() * 4;
+    if written < x.len() * 2 {
+        std::ptr::write_bytes(out.add(written), 0, x.len() * 2 - written);
+    }
+}
+
+fn sqr_decompose_16_standard(buf: &[u64], x: &mut [Complex<f64>]) {
+    let coefs = unsafe { std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut f64, x.len() * 2) };
+    const MASK: u64 = u16::MAX as u64;
+    let mut idx = 0;
+    for &b in buf {
+        coefs[idx] = (b & MASK) as f64;
+        coefs[idx + 1] = (b >> 16 & MASK) as f64;
+        coefs[idx + 2] = (b >> 32 & MASK) as f64;
+        coefs[idx + 3] = (b >> 48) as f64;
+        idx += 4;
+    }
+    if idx < x.len() {
+        x[idx..].fill(Complex::zero());
+    }
+}
+
+fn sqr_decompose_16(buf: &[u64], x: &mut [Complex<f64>]) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        unsafe { sqr_decompose_16_x86(buf, x) }
+    } else {
+        sqr_decompose_16(buf, x);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        sqr_decompose_16_aarch64(buf, x);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sqr_decompose_8_x86(buf: &[u64], x: &mut [Complex<f64>]) {
+    let out = x.as_mut_ptr() as *mut f64;
+    let mut idx = 0usize;
+    for &b in buf {
+        let v = _mm_set1_epi64x(b as i64);
+        // pmovzxbd: zero-extend low 4 bytes → 4 u32s
+        let lo4 = _mm_cvtepu8_epi32(v);
+        // shift right 4 bytes, then same widening for bytes 4-7
+        let hi4 = _mm_cvtepu8_epi32(_mm_bsrli_si128(v, 4));
+        _mm256_storeu_pd(out.add(idx), _mm256_cvtepi32_pd(lo4));
+        _mm256_storeu_pd(out.add(idx + 4), _mm256_cvtepi32_pd(hi4));
+        idx += 8;
+    }
+    let written = buf.len() * 8;
+    if written < x.len() * 2 {
+        std::ptr::write_bytes(out.add(written), 0, x.len() * 2 - written);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn sqr_decompose_8_aarch64(buf: &[u64], x: &mut [Complex<f64>]) {
+    let out = x.as_mut_ptr() as *mut f64;
+    let mut idx = 0usize;
+    for &b in buf {
+        let (f0, f1, f2, f3) = u64_into_2x4f64_aarch(b);
+        vst1q_f64(out.add(idx), f0);
+        vst1q_f64(out.add(idx + 2), f1);
+        vst1q_f64(out.add(idx + 4), f2);
+        vst1q_f64(out.add(idx + 6), f3);
+        idx += 8;
+    }
+    let written = buf.len() * 8;
+    if written < x.len() * 2 {
+        std::ptr::write_bytes(out.add(written), 0, x.len() * 2 - written);
+    }
+}
+
+fn sqr_decompose_8_standard(buf: &[u64], x: &mut [Complex<f64>]) {
+    let coefs = unsafe { std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut f64, x.len() * 2) };
+    const MASK: u64 = u8::MAX as u64;
+    let mut idx = 0;
+    for &b in buf {
+        coefs[idx] = (b & MASK) as f64;
+        coefs[idx + 1] = (b >> 8 & MASK) as f64;
+        coefs[idx + 2] = (b >> 16 & MASK) as f64;
+        coefs[idx + 3] = (b >> 24 & MASK) as f64;
+        coefs[idx + 4] = (b >> 32 & MASK) as f64;
+        coefs[idx + 5] = (b >> 40 & MASK) as f64;
+        coefs[idx + 6] = (b >> 48 & MASK) as f64;
+        coefs[idx + 7] = (b >> 56 & MASK) as f64;
+        idx += 8;
+    }
+    if idx < x.len() {
+        x[idx..].fill(Complex::zero());
+    }
+}
+
+fn sqr_decompose_8(buf: &[u64], x: &mut [Complex<f64>]) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        unsafe { sqr_decompose_8_x86(buf, x) }
+    } else {
+        sqr_decompose_8(buf, x);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        sqr_decompose_8_aarch64(buf, x);
+    }
+}
+
+fn bit_size_sqr_dispatch(n: usize) -> BitSize {
+    return if n <= FFT_SQR_BIT_CUTOFF {
+        BitSize::Bit16
+    } else {
+        BitSize::Bit8
+    };
+}
+
+pub fn fft_sqr_entry(buf: &[u64], out: &mut [u64]) -> u64 {
+    let bit_size = bit_size_sqr_dispatch(buf.len());
+    let bit_len = match bit_size {
+        BitSize::Bit16 => bit16_length(buf.len(), buf.last().copied().unwrap()),
+        BitSize::Bit8 => bit8_length(buf.len(), buf.last().copied().unwrap()),
+    };
+    let n = find_fft_size(2 * bit_len - 1);
+    let m = n / 2;
     FFT_CACHE.with(|cell| {
         let FFTCache {
             planner,
             twidles,
-            scratch_pool,
+            scratch,
         } = &mut *cell.borrow_mut();
         let fwd = planner.plan_fft_forward(m);
         let bwd = planner.plan_fft_inverse(m);
-        let [x, fft_scratch] = scratch_pool.get_splits([
-            m,
-            fwd.get_inplace_scratch_len()
-                .max(bwd.get_inplace_scratch_len()),
-        ]);
         let tw = twidles
-            .entry(m >> m.trailing_zeros())
-            .or_insert_with(|| TwidleTower::build(m))
-            .get(m);
-        fft_sqr_core(buf, out, m, fwd.as_ref(), bwd.as_ref(), tw, x, fft_scratch)
+            .entry(n >> n.trailing_zeros())
+            .or_insert_with(|| TwidleTower::build(n))
+            .get(n);
+        let scratch_sz = m + fwd
+            .get_inplace_scratch_len()
+            .max(bwd.get_inplace_scratch_len());
+        if scratch_sz > scratch.len() {
+            scratch.resize(scratch_sz, Complex::zero());
+        }
+        let (x, fft_scratch) = scratch.split_at_mut(m);
+
+        match bit_size {
+            BitSize::Bit16 => sqr_decompose_16(buf, x),
+            BitSize::Bit8 => sqr_decompose_8(buf, x),
+        }
+        fft_sqr_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
+        match bit_size {
+            BitSize::Bit16 => accumulate_16(x, out),
+            BitSize::Bit8 => accumulate_8(x, out),
+        }
     })
 }
 
@@ -1266,8 +1681,6 @@ enum DynSqrDispatch {
     Karatsuba,
     FFT,
 }
-
-const FFT_SQR_CUTOFF: usize = 500;
 
 fn dyn_sqr_dispatch(n: usize) -> DynSqrDispatch {
     if n <= KARATSUBA_SQR_CUTOFF {
@@ -1279,7 +1692,7 @@ fn dyn_sqr_dispatch(n: usize) -> DynSqrDispatch {
     }
 }
 
-fn sqr_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
+pub fn sqr_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
     debug_assert!(
         2 * buf.len() - 1 <= out.len(),
         "out is not large enough for multiplication"
@@ -1291,18 +1704,10 @@ fn sqr_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
     }
 }
 
-fn ensure_sqr(n: usize) {
-    match dyn_sqr_dispatch(n) {
-        DynSqrDispatch::School => {}
-        DynSqrDispatch::Karatsuba => SCRATCH_POOL.with(|cell| {
-            let scratch_pool = &mut *cell.borrow_mut();
-            scratch_pool.ensure(find_karatsuba_sqr_scratch_sz(n));
-        }),
-        DynSqrDispatch::FFT => FFT_CACHE.with(|cell| {
-            let fft_cache = &mut *cell.borrow_mut();
-            fft_cache.scratch_pool.ensure(8 * n);
-        }),
-    }
+pub fn sqr_vec(buf: &[u64]) -> (Vec<u64>, u64) {
+    let mut out = vec![0; 2 * buf.len() - 1];
+    let of = sqr_dyn(buf, &mut out);
+    (out, of)
 }
 
 enum StaticSqrDispatch {
@@ -1318,7 +1723,7 @@ fn static_sqr_dispatch(n: usize) -> StaticSqrDispatch {
     }
 }
 
-fn sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> Result<u64, ()> {
+pub fn sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> Result<u64, ()> {
     if 2 * buf.len() - 1 > N {
         return Err(());
     }
@@ -1328,123 +1733,314 @@ fn sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> Result<u64, ()> {
     })
 }
 
-pub fn get_powi_size(n: usize, last: u64, pow: usize) -> usize {
-    let log2 = 1 + last.ilog2() as usize + (n - 1) << 6;
-    (log2 * pow + 63) >> 6
+pub fn sqr_arr<const N: usize>(buf: &[u64]) -> Result<([u64; N], u64), ()> {
+    let mut out = [0; N];
+    let of = sqr_static::<N>(buf, &mut out)?;
+    Ok((out, of))
+}
+
+//SHORT MULTIPLICATION
+// Gets only the top part of a multiplication, only optimized for small inputs asymptotically same
+// computation as a full product other then truncating inputs dynamically.
+
+pub fn short_mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
+    let a_len = a.len() - 1;
+    let b_len = b.len() - 1;
+    let d = (a_len + b_len).saturating_sub(out.len());
+
+    let mut acc0: u64 = 0;
+    let mut acc1: u64 = 0;
+    let mut acc2: u64 = 0;
+    for n in d..d + out.len() {
+        let mi = n.saturating_sub(b_len);
+        let mf = n.min(a_len);
+        unsafe {
+            for m in mi..=mf {
+                let a_val = *a.get_unchecked(m);
+                let b_val = *b.get_unchecked(n - m);
+                mul_asm(a_val, b_val, &mut acc0, &mut acc1, &mut acc2);
+            }
+            *out.get_unchecked_mut(n - d) = acc0;
+        }
+        acc0 = acc1;
+        acc1 = acc2;
+        acc2 = 0;
+    }
+
+    return acc0;
+}
+
+pub fn short_mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+    if a.len() + b.len() - 1 < out.len() {
+        return mul_dyn(a, b, out);
+    }
+    if out.len() <= SHORT_MUL_CUTOFF {
+        return short_mul_buf(a, b, out);
+    }
+    let trunc_a = &a[a.len().saturating_sub(out.len())..];
+    let trunc_b = &b[b.len().saturating_sub(out.len())..];
+    let mut scratch = ScratchGuard::acquire();
+    let val = scratch.get(trunc_a.len() + trunc_b.len() - 1);
+    let of = mul_dyn(trunc_a, trunc_b, val);
+    out.copy_from_slice(&val[val.len() - out.len()..]);
+    return of;
+}
+
+pub fn short_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+    debug_assert!(
+        out.len() <= N,
+        "out is to large for static parameter N: {N}"
+    );
+    if a.len() + b.len() - 1 < out.len() {
+        return mul_static::<N>(a, b, out).unwrap();
+    }
+    if out.len() <= SHORT_MUL_CUTOFF {
+        return short_mul_buf(a, b, out);
+    }
+    let trunc_a = &a[a.len().saturating_sub(out.len())..];
+    let trunc_b = &b[b.len().saturating_sub(out.len())..];
+    let mut scratch = [0; N];
+    let val = &mut scratch[..trunc_a.len() + trunc_b.len() - 1];
+    let of = mul_dyn(trunc_a, trunc_b, val);
+    out.copy_from_slice(&val[val.len() - out.len()..]);
+    return of;
+}
+
+
+//MIDDLE MULTIPLICATION
+// gets the middle part n limbs of a n x 2n product
+// n: [0..n-1] x 2n: [0..2n-1] -> 3n-1: [0..3n-2] -> [n .. 2n-1]
+
+fn mid_mul_buf(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+    // long (2n-1) , short (n)
+    let n = short.len();
+    let mut acc0: u64 = 0;
+    let mut acc1: u64 = 0;
+    let mut acc2: u64 = 0;
+    for i in 0..n {
+        unsafe {
+            for j in 0..n{
+                let a_val = *long.get_unchecked(j + i);
+                let b_val = *short.get_unchecked(n - j - 1);
+                mul_asm(a_val, b_val, &mut acc0, &mut acc1, &mut acc2);
+            }
+            *out.get_unchecked_mut(i) = acc0;
+        }
+        acc0 = acc1;
+        acc1 = acc2;
+        acc2 = 0;
+    }
+    return acc0;
+}
+
+fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> u64{
+    let sz = short.len();
+    let bit_size = bit_sz_dispatch(sz);
+    let (l_len, s_len, w) = match bit_size {
+        BitSize::Bit16 => (
+            bit16_length(long.len(), long.last().copied().unwrap()),
+            bit16_length(short.len(), short.last().copied().unwrap()),
+            4,
+        ),
+        BitSize::Bit8 => (
+            bit8_length(long.len(), long.last().copied().unwrap()),
+            bit8_length(short.len(), short.last().copied().unwrap()),
+            8,
+        ),
+    };
+    let n = find_fft_size(l_len + s_len - (sz - 1)*w - 1);
+    FFT_CACHE.with(|cell| {
+        let fft_cache = &mut *cell.borrow_mut();
+        let FFTCache {
+            planner,
+            twidles,
+            scratch,
+        } = fft_cache;
+        let fwd = planner.plan_fft_forward(n);
+        let bwd = planner.plan_fft_inverse(n / 2);
+        let tw = twidles
+            .entry(n >> n.trailing_zeros())
+            .or_insert_with(|| TwidleTower::build(n))
+            .get(n);
+        let scratch_sz = n + fwd
+            .get_inplace_scratch_len()
+            .max(bwd.get_inplace_scratch_len());
+        if scratch_sz > scratch.len() {
+            scratch.resize(scratch_sz, Complex::zero());
+        }
+        let (x, fft_scratch) = scratch.split_at_mut(n);
+
+        match bit_size {
+            BitSize::Bit16 => decompose_16(long, short, x),
+            BitSize::Bit8 => decompose_8(long, short, x),
+        }
+
+        fft_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
+
+        match bit_size {
+            BitSize::Bit16 => accumulate_16(&x[(sz-1)*w .. (2*sz-1)*w], out),
+            BitSize::Bit8 => accumulate_8(&x[(sz-1)*w .. (2*sz-1)*w], out),
+        }
+    })
+}
+
+enum DynMidDispatch{
+    School,
+    Karatsuba,
+    FFT
+}
+
+fn dyn_mid_dispatch(n: usize) -> DynMidDispatch{
+    return if n < KARATSUBA_MID_CUTOFF{
+        DynMidDispatch::School
+    }else if n < FFT_MID_CUTOFF{
+        DynMidDispatch::Karatsuba
+    } else{
+        DynMidDispatch::FFT
+    }
+}
+
+fn mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> u64{
+    debug_assert_eq!(long.len(), 2*short.len()-1, "incorrect size of long compared to short for middle product");
+    debug_assert_eq!(out.len(), short.len(), "size of out must be the same size as short");
+    match dyn_mid_dispatch(short.len()) {
+        DynMidDispatch::School => {
+            mid_mul_buf(long, short, out)
+        },
+        DynMidDispatch::Karatsuba => {
+            let mut scratch_guard = ScratchGuard::acquire();
+            let n = short.len();
+            let [big_out, scratch] = scratch_guard.get_splits([3*n - 2, find_karatsuba_scratch(2*n-1, n)]);
+            let of = karatsuba_mul(long, short, big_out, scratch);
+            out.copy_from_slice(&big_out[n-1..2*n-1]);
+            of
+        },
+        DynMidDispatch::FFT => {
+            fft_mid_mul(long, short, out)
+        }
+    }
+
+}
+
+fn mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> u64{
+    debug_assert_eq!(long.len(), 2*short.len()-1, "incorrect size of long compared to short for middle product");
+    debug_assert_eq!(out.len(), short.len(), "size of out must be the same size as short");
+    let n = short.len();
+    if n < KARATSUBA_MID_CUTOFF{
+        mid_mul_buf(long, short, out)
+    }else{
+        let mut big_out = [0; N];
+        let of = karatsuba_entry_static::<N>(long, short, &mut big_out);
+        out.copy_from_slice(&big_out[n-1..2*n-1]);
+        of
+    }
+}
+
+//FAST EXPONENTIATION
+// does an integer powers via log(n) squaring s
+fn reverse_pow(pow: usize) -> usize {
+    debug_assert!(pow < (1 << 63), "Bro this was a bad idea anyway");
+    let marked_pow = (pow << 1) + 1;
+    (marked_pow << marked_pow.leading_zeros()).reverse_bits()
+}
+
+pub fn powi_sz(buf: &[u64], pow: usize) -> (usize, usize) {
+    let bit_length = (buf.len() - 1) * 64 + buf.last().copied().unwrap().ilog2() as usize;
+    (
+        (bit_length * pow + 63) / 64,
+        ((bit_length + 1) * pow + 63) / 64,
+    )
+}
+
+fn powi_dyn_core(buf: &[u64], reverse_pow: usize, src: &mut [u64], dst: &mut [u64]) {
+    if reverse_pow == 1 {
+        return;
+    }
+    let src_len = buf_len(src);
+    sqr_dyn(&src[..src_len], dst);
+    if reverse_pow & 1 == 1 {
+        let dst_len = buf_len(dst);
+        mul_dyn(&dst[..dst_len], buf, src);
+        powi_dyn_core(buf, reverse_pow >> 1, src, dst);
+        return;
+    }
+    powi_dyn_core(buf, reverse_pow >> 1, dst, src);
+}
+
+pub fn powi_dyn_entry(buf: &[u64], pow: usize, out: &mut [u64]) {
+    if pow == 0 {
+        out[0] = 1;
+        return;
+    }
+    let reverse_pow = reverse_pow(pow);
+    let mut scratch = ScratchGuard::acquire();
+    let tmp = scratch.get(out.len());
+    tmp.fill(0);
+    if (pow.ilog2() + pow.count_ones()) % 2 == 0 {
+        out[..buf.len()].copy_from_slice(buf);
+        powi_dyn_core(buf, reverse_pow, out, tmp);
+    } else {
+        tmp[..buf.len()].copy_from_slice(buf);
+        powi_dyn_core(buf, reverse_pow, tmp, out);
+    }
 }
 
 pub fn powi_vec(buf: &[u64], pow: usize) -> Vec<u64> {
-    if pow == 0 {
-        return vec![1];
-    }
-    let out_sz = get_powi_size(buf.len(), buf.last().copied().unwrap(), pow);
-    let mut out = vec![0_u64; out_sz];
-    let mut tmp = vec![0_u64; out_sz];
-    ensure_sqr(1 + out_sz / 2);
-    ensure_mul(out_sz, buf.len());
-
-    let mut len = buf.len();
-    out[..len].copy_from_slice(buf);
-    let mut io = true;
-
-    let log = pow.ilog2() as usize;
-    for i in (0..log).rev() {
-        let sqr_len = 2 * len - 1;
-        let (src, dst): (&[u64], &mut [u64]) = if io {
-            (&out, &mut tmp)
-        } else {
-            (&tmp, &mut out)
-        };
-
-        let sqr_c = sqr_dyn(&src[..len], &mut dst[..sqr_len]);
-        len = sqr_len;
-        if sqr_c > 0 {
-            dst[len] = sqr_c;
-            len += 1;
-        }
-        io = !io;
-
-        if (pow >> i) & 1 == 1 {
-            let mul_len = len + buf.len() - 1;
-            let (src, dst): (&[u64], &mut [u64]) = if io {
-                (&out, &mut tmp)
-            } else {
-                (&tmp, &mut out)
-            };
-
-            let mul_c = mul_dyn(&src[..len], &buf, &mut dst[..mul_len]);
-            len = mul_len;
-            if mul_c > 0 {
-                dst[len] = mul_c;
-                len += 1
-            }
-            io = !io;
-        }
-    }
-
-    if !io {
-        out[..len].copy_from_slice(&tmp[..len]);
-    }
+    let (_, max) = powi_sz(buf, pow);
+    let mut out = vec![0; max];
+    powi_dyn_entry(buf, pow, &mut out);
     trim_lz(&mut out);
-    return out;
+    out
+}
+
+fn powi_static_core<const N: usize>(
+    buf: &[u64],
+    reverse_pow: usize,
+    src: &mut [u64],
+    dst: &mut [u64],
+) -> Result<(), ()> {
+    if reverse_pow == 1 {
+        return Ok(());
+    }
+    let src_len = buf_len(src);
+    sqr_static::<N>(&src[..src_len], dst)?;
+    if reverse_pow & 1 == 1 {
+        let dst_len = buf_len(dst);
+        mul_static::<N>(&dst[..dst_len], buf, src)?;
+        return powi_static_core::<N>(buf, reverse_pow >> 1, src, dst);
+    }
+    powi_static_core::<N>(buf, reverse_pow >> 1, dst, src)
+}
+
+pub fn powi_static_entry<const N: usize>(
+    buf: &[u64],
+    pow: usize,
+    out: &mut [u64],
+) -> Result<(), ()> {
+    if pow == 0 {
+        out[0] = 1;
+        return Ok(());
+    }
+    let reverse_pow = reverse_pow(pow);
+    let mut tmp = [0; N];
+    if (pow.ilog2() + pow.count_ones()) % 2 == 0 {
+        out[..buf.len()].copy_from_slice(buf);
+        powi_static_core::<N>(buf, reverse_pow, out, &mut tmp)
+    } else {
+        tmp[..buf.len()].copy_from_slice(buf);
+        powi_static_core::<N>(buf, reverse_pow, &mut tmp, out)
+    }
 }
 
 pub fn powi_arr<const N: usize>(buf: &[u64], pow: usize) -> Result<[u64; N], ()> {
-    let out_sz = get_powi_size(buf.len(), buf.last().copied().unwrap(), pow);
-    if out_sz > N {
+    let (min, _) = powi_sz(buf, pow);
+    if N < min {
         return Err(());
     }
-
     let mut out = [0; N];
-    let mut tmp = [0; N];
-
-    let buf_len = buf_len(buf);
-    let mut len = buf_len;
-    out[..len].copy_from_slice(&buf[..len]);
-    let mut io = true;
-
-    let log = pow.ilog2();
-    for i in (0..log).rev() {
-        let sqr_len = 2 * len - 1;
-        let (src, dst): (&[u64], &mut [u64]) = if io {
-            (&out, &mut tmp)
-        } else {
-            (&tmp, &mut out)
-        };
-
-        let sqr_c = sqr_static::<N>(&src[..len], &mut dst[..sqr_len]).unwrap();
-        len = sqr_len;
-        if sqr_c > 0 {
-            if len == N {
-                return Err(());
-            }
-            dst[len] = sqr_c;
-            len += 1;
-        }
-        io = !io;
-        if (pow >> i) & 1 == 1 {
-            let mul_len = len + buf_len - 1;
-            let (src, dst): (&[u64], &mut [u64]) = if io {
-                (&out, &mut tmp)
-            } else {
-                (&tmp, &mut out)
-            };
-
-            let mul_c = mul_static::<N>(&src[..len], &buf[..buf_len], &mut dst[..mul_len]).unwrap();
-            len = mul_len;
-            if mul_c > 0 {
-                if len == N {
-                    return Err(());
-                }
-                dst[len] = mul_c;
-                len += 1
-            }
-            io = !io;
-        }
-    }
-
-    if !io {
-        out.copy_from_slice(&tmp);
-    }
-    return Ok(out);
+    powi_static_entry::<N>(buf, pow, &mut out)?;
+    Ok(out)
 }

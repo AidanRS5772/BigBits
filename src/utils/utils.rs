@@ -409,9 +409,8 @@ pub fn inc_buf(buf: &mut [u64]) -> bool {
         return true;
     }
 
-    let buf_ptr = buf.as_mut_ptr();
     unsafe {
-        return inc_asm(buf_ptr, buf_len);
+        return inc_asm(buf.as_mut_ptr(), buf_len);
     }
 }
 
@@ -422,10 +421,51 @@ pub fn dec_buf(buf: &mut [u64]) -> bool {
         return true;
     }
 
-    let buf_ptr = buf.as_mut_ptr();
     unsafe {
-        return dec_asm(buf_ptr, buf_len);
+        return dec_asm(buf.as_mut_ptr(), buf_len);
     }
+}
+
+#[inline]
+pub fn add_prim(buf: &mut [u64], prim: u64) -> bool{
+    if prim == 0{
+        return false
+    }
+    let buf_len = buf.len();
+    if buf_len == 0{
+        return true;
+    }
+    let (res, c) = buf[0].overflowing_add(prim);
+    buf[0] = res;
+    return if c{
+        unsafe {
+            inc_asm(buf.as_mut_ptr().add(1), buf_len)
+        }
+    }else{
+        false
+    }
+
+}
+
+#[inline]
+pub fn sub_prim(buf: &mut [u64], prim: u64) -> bool{
+    if prim == 0{
+        return false;
+    }
+    let buf_len = buf.len();
+    if buf_len == 0{
+        return true;
+    }
+    let (res, c) = buf[0].overflowing_sub(prim);
+    buf[0] = res;
+    return if c{
+        unsafe {
+            dec_asm(buf.as_mut_ptr().add(1), buf_len)
+        }
+    }else{
+        false
+    }
+
 }
 
 pub fn twos_comp(buf: &mut [u64]) {

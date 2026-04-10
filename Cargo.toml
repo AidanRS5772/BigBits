@@ -7,6 +7,7 @@ edition = "2021"
 criterion = "0.5.1"
 
 [dependencies]
+criterion = "0.5.1"
 itertools = "0.12.1"
 rand = "0.8.5"
 rustfft = "6.4.1"
@@ -23,5 +24,10 @@ _bench_internals = []
 
 [[bench]]
 name = "utils_bench"
+harness = false
+required-features = ["_bench_internals"]
+
+[[bench]]
+name = "cutoffs_bench"
 harness = false
 required-features = ["_bench_internals"]

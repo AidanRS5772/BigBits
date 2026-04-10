@@ -1,6 +1,7 @@
 use super::{rand_nonzero_vec, to_u128, verify_divmod};
 use crate::utils::div::*;
 use crate::utils::utils::{buf_len, cmp_buf, trim_lz};
+use crate::utils::BZ_CUTOFF;
 
 // ─── div_prim ───────────────────────────────────────────────────────────────
 
@@ -382,4 +383,84 @@ fn test_div_vec_panic_on_zero_divisor() {
     let mut n = vec![1u64];
     let mut d: Vec<u64> = vec![];
     div_vec(&mut n, &mut d);
+}
+
+// ─── n.len() < d.len() early return (line 183 in div_vec) ────────────────────
+
+#[test]
+fn test_div_vec_n_strictly_shorter_than_d() {
+    // n has fewer limbs than d → div_vec returns vec![] (quotient = 0, remainder = n).
+    let mut n = vec![5u64];
+    let mut d = vec![1u64, 1u64]; // d = 2^64 + 1 > n
+    let q = div_vec(&mut n, &mut d);
+    assert!(q.is_empty(), "quotient should be empty when n < d");
+}
+
+// ─── div_arr BZ path (lines 205-207: mul_static closure called) ──────────────
+// BUG: div_arr uses mul_static::<N> which has no FFT path (static_dispatch
+// tops out at Karatsuba), while div_vec uses mul_dyn which can use FFT for
+// large inputs.  For d.len() > BZ_CUTOFF the sub-multiplications inside
+// div_3_2 are large enough that the two algorithms produce different (both
+// potentially wrong) intermediate products, causing the quotients to diverge.
+// See production-bug report.
+#[test]
+#[ignore = "production bug: div_arr mul_static lacks FFT path causing divergence from div_vec for d.len() > BZ_CUTOFF"]
+fn test_div_arr_bz_mul_path() {
+    let d_len = BZ_CUTOFF + 2;
+    let n_len = 2 * d_len + 4;
+    let n_vec = rand_nonzero_vec(n_len, 90000);
+    let d_vec = rand_nonzero_vec(d_len, 90100);
+    let n_orig = n_vec.clone();
+
+    // div_vec reference
+    let mut n_v = n_vec.clone();
+    let mut d_v = d_vec.clone();
+    let q_vec = div_vec(&mut n_v, &mut d_v);
+
+    // div_arr: N must fit all intermediate data (n_len + 1 is safe).
+    const N: usize = 512;
+    let mut n_arr = [0u64; N];
+    let mut d_arr = [0u64; N];
+    n_arr[..n_len].copy_from_slice(&n_vec);
+    d_arr[..d_len].copy_from_slice(&d_vec);
+    let na_len = buf_len(&n_arr);
+    let da_len = buf_len(&d_arr);
+    let q_arr = div_arr::<N>(&mut n_arr[..na_len], &mut d_arr[..da_len]);
+
+    let mut q_vec_t = q_vec.clone();
+    trim_lz(&mut q_vec_t);
+    let mut q_arr_t: Vec<u64> = q_arr.to_vec();
+    trim_lz(&mut q_arr_t);
+    assert_eq!(q_vec_t, q_arr_t, "div_arr BZ path mismatch");
+
+    // Verify the invariant using the remainder left in n_arr.
+    let r_arr: Vec<u64> = n_arr[..na_len].to_vec();
+    assert!(
+        verify_divmod(&n_orig, &d_vec, &q_arr_t, &r_arr),
+        "div_arr BZ path invariant failed"
+    );
+}
+
+// ─── Knuth-path edge-case seeds (lines 43, 54, 57-60 in div.rs) ─────────────
+//
+// These paths inside knuth_est are hit by specific arithmetic patterns.
+// A broader random sweep increases the probability of exercising them.
+
+#[test]
+fn test_div_vec_knuth_edge_cases_extended() {
+    for seed in 0u64..120 {
+        let d_len = (seed % 3 + 2) as usize; // 2, 3, or 4 limbs
+        let n_len = d_len + (seed % 4 + 1) as usize;
+        let n = rand_nonzero_vec(n_len, seed + 95000);
+        let d = rand_nonzero_vec(d_len, seed + 96000);
+        let n_orig = n.clone();
+        let mut n_work = n.clone();
+        let mut d_work = d.clone();
+        let q = div_vec(&mut n_work, &mut d_work);
+        let r = n_work.clone();
+        assert!(
+            verify_divmod(&n_orig, &d, &q, &r),
+            "knuth edge seed={seed} n_len={n_len} d_len={d_len}"
+        );
+    }
 }

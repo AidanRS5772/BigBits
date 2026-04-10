@@ -1,0 +1,2 @@
+[alias]
+bench-int = "bench --features _bench_internals"

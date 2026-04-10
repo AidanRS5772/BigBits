@@ -1,17 +1,12 @@
-use big_bits::utils::mul::mul_vec;
-use rand::Rng;
+#![allow(unused_imports)]
+use big_bits::utils::mul::fft_entry;
+use criterion::black_box;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
-fn random_limbs(n: usize) -> Vec<u64> {
-    let mut rng = rand::thread_rng();
+fn random_vec(n: usize) -> Vec<u64> {
+    let mut rng = StdRng::seed_from_u64(42);
     (0..n).map(|_| rng.gen()).collect()
 }
 
-fn main() {
-    let a = random_limbs(45);
-    let b = random_limbs(45);
-
-    for _ in 0..10_000 {
-        let (mut c, carry) = std::hint::black_box(mul_vec(&a, &b));
-        c.push(carry);
-    }
-}
+fn main() {}
