@@ -5,6 +5,8 @@ use rustfft::{num_complex::Complex, Fft, FftDirection, FftPlanner};
 use std::arch::asm;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::marker::PhantomData;
+use std::ops::*;
 use std::f64::consts::PI;
 
 #[cfg(target_arch = "x86_64")]
@@ -524,7 +526,7 @@ thread_local! {
     static FFT_CACHE: RefCell<FFTCache> = RefCell::new(FFTCache { planner: FftPlanner::new(), twidles: HashMap::new(), scratch: Vec::new()});
 }
 
-const LENGTH_PRIMES: [usize; 3] = [3, 5, 7];
+const FFT_RADIX: [usize; 3] = [3, 5, 7];
 
 const fn log_prim_search(init: usize, target: usize, mut idx: usize) -> usize {
     if init >= target {
@@ -539,7 +541,7 @@ const fn log_prim_search(init: usize, target: usize, mut idx: usize) -> usize {
         return result;
     }
     idx -= 1;
-    let p = LENGTH_PRIMES[idx];
+    let p = FFT_RADIX[idx];
     let mut val = init;
     let mut best = log_prim_search(val, target, idx);
     if best == target {
@@ -561,7 +563,7 @@ const fn log_prim_search(init: usize, target: usize, mut idx: usize) -> usize {
 
 const fn find_fft_size(n: usize) -> usize {
     const INIT: usize = 4; // guarantee that size is a multiple of 4
-    return log_prim_search(INIT, n, LENGTH_PRIMES.len());
+    return log_prim_search(INIT, n, FFT_RADIX.len());
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1129,10 +1131,151 @@ pub fn fft_entry(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     })
 }
 
-//END FFT MULTIPLICATION
+//NTT MULTIPLICATION
 
-pub fn fft_cost(l: usize, s: usize) -> f64 {
-    let sum = (l + s) as f64;
+const NTT_RADIX: [usize; 1] = [2];
+
+trait NTTPrime {
+    const P: u64;
+    const P_INV: u64;
+    const R_SQR: u64;
+    const G: u64;
+    const K: u64;
+    const M: u64;
+}
+// P = K*M + 1 where P is prime
+// P_INV*P = -1 mod 2^64
+// R_SQR = 2^128 mod P
+
+struct P1;
+
+impl NTTPrime for P1 {
+    const P: u64 = 9097271247288401921;
+    const P_INV: u64 = 9097271247288401919;
+    const R_SQR: u64 = 6171946961806066123;
+    const G: u64 = 6;
+    const K: u64 = 505;
+    const M: u64 = 1 << 54;
+}
+
+#[derive(Debug, Copy, Clone)]
+#[repr(transparent)]
+struct Montgomery<P: NTTPrime> {
+    val: u64,
+    _phantom: PhantomData<P>,
+}
+
+impl<P: NTTPrime> Montgomery<P> {
+    #[inline(always)]
+    fn reduce_ext(t: u128) -> u64 {
+        let t_lo = t as u64;
+        let m = t_lo.wrapping_mul(P::P_INV);
+        let mp = (m as u128) * (P::P as u128);
+        let mut val = ((t + mp) >> 64) as u64;
+        if val >= P::P {
+            val -= P::P;
+        }
+        return val;
+    }
+
+    fn reduce_mut(&mut self){
+        self.val = Self::reduce_ext(self.val as u128);
+    }
+
+    fn to(a: u64) -> Self {
+        let t = (a as u128) * (P::R_SQR as u128);
+        Montgomery {
+            val: Self::reduce_ext(t),
+            _phantom: PhantomData,
+        }
+    }
+
+    fn from(self) -> u64 {
+        Self::reduce_ext(self.val as u128)
+    }
+}
+
+impl<P: NTTPrime> PartialEq for Montgomery<P>{
+    fn eq(&self, other: &Self) -> bool {
+        self.val == other.val
+    }
+}
+
+impl<P: NTTPrime> Eq for Montgomery<P>{}
+
+
+impl<P: NTTPrime> Add for Montgomery<P>{
+    type Output = Montgomery<P>;
+    fn add(self, rhs: Self) -> Self::Output {
+        let mut val = self.val + rhs.val;
+        if val >= P::P{
+            val -= P::P;
+        }
+        return Montgomery{val, _phantom: PhantomData}
+    }
+}
+
+impl<P: NTTPrime> AddAssign for Montgomery<P>{
+    fn add_assign(&mut self, rhs: Self) {
+        self.val += rhs.val;
+        if self.val >= P::P{
+            self.val -= P::P;
+        }
+    }
+}
+
+impl<P: NTTPrime> Sub for Montgomery<P>{
+    type Output = Montgomery<P>;
+    fn sub(self, rhs: Self) -> Self::Output {
+        let val = if self.val >= rhs.val{
+            self.val - rhs.val
+        }else{
+            P::P - (rhs.val - self.val) 
+        };
+        Montgomery{val, _phantom: PhantomData}
+    }
+}
+
+impl<P: NTTPrime> SubAssign for Montgomery<P>{
+    fn sub_assign(&mut self, rhs: Self) {
+        if self.val >= rhs.val{
+            self.val -= rhs.val;
+        }else{
+            self.val = P::P - (rhs.val - self.val);
+        }
+    }
+}
+
+impl<P: NTTPrime> Neg for Montgomery<P>{
+    type Output = Montgomery<P>;
+    fn neg(self) -> Self::Output {
+        if self.val == 0 {
+            self
+        }else{
+            Montgomery{val: P::P - self.val, _phantom: PhantomData}
+        }
+    }
+}
+
+impl<P: NTTPrime> Mul for Montgomery<P>{
+    type Output = Montgomery<P>;
+    fn mul(self, rhs: Self) -> Self::Output {
+        let t = (self.val as u128)*(rhs.val as u128);
+        Montgomery{val: Self::reduce_ext(t), _phantom: PhantomData}
+    }
+}
+
+impl<P: NTTPrime> MulAssign for Montgomery<P>{
+    fn mul_assign(&mut self, rhs: Self) {
+        let t = (self.val as u128)*(rhs.val as u128);
+        self.val = Self::reduce_ext(t);
+    }
+}
+
+//END NTT MULTIPLICATION
+
+pub fn fft_cost(l: usize, s: usize) -> f64{
+    let sum = (l+s) as f64;
     sum * sum.ln()
 }
 
@@ -1809,7 +1952,6 @@ pub fn short_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -
     return of;
 }
 
-
 //MIDDLE MULTIPLICATION
 // gets the middle part n limbs of a n x 2n product
 // n: [0..n-1] x 2n: [0..2n-1] -> 3n-1: [0..3n-2] -> [n .. 2n-1]
@@ -1822,7 +1964,7 @@ fn mid_mul_buf(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     let mut acc2: u64 = 0;
     for i in 0..n {
         unsafe {
-            for j in 0..n{
+            for j in 0..n {
                 let a_val = *long.get_unchecked(j + i);
                 let b_val = *short.get_unchecked(n - j - 1);
                 mul_asm(a_val, b_val, &mut acc0, &mut acc1, &mut acc2);
@@ -1836,7 +1978,7 @@ fn mid_mul_buf(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     return acc0;
 }
 
-fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> u64{
+fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     let sz = short.len();
     let bit_size = bit_sz_dispatch(sz);
     let (l_len, s_len, w) = match bit_size {
@@ -1851,7 +1993,7 @@ fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> u64{
             8,
         ),
     };
-    let n = find_fft_size(l_len + s_len - (sz - 1)*w - 1);
+    let n = find_fft_size(l_len + s_len - (sz - 1) * w - 1);
     FFT_CACHE.with(|cell| {
         let fft_cache = &mut *cell.borrow_mut();
         let FFTCache {
@@ -1881,60 +2023,72 @@ fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> u64{
         fft_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
 
         match bit_size {
-            BitSize::Bit16 => accumulate_16(&x[(sz-1)*w .. (2*sz-1)*w], out),
-            BitSize::Bit8 => accumulate_8(&x[(sz-1)*w .. (2*sz-1)*w], out),
+            BitSize::Bit16 => accumulate_16(&x[(sz - 1) * w..(2 * sz - 1) * w], out),
+            BitSize::Bit8 => accumulate_8(&x[(sz - 1) * w..(2 * sz - 1) * w], out),
         }
     })
 }
 
-enum DynMidDispatch{
+enum DynMidDispatch {
     School,
     Karatsuba,
-    FFT
+    FFT,
 }
 
-fn dyn_mid_dispatch(n: usize) -> DynMidDispatch{
-    return if n < KARATSUBA_MID_CUTOFF{
+fn dyn_mid_dispatch(n: usize) -> DynMidDispatch {
+    return if n < KARATSUBA_MID_CUTOFF {
         DynMidDispatch::School
-    }else if n < FFT_MID_CUTOFF{
+    } else if n < FFT_MID_CUTOFF {
         DynMidDispatch::Karatsuba
-    } else{
+    } else {
         DynMidDispatch::FFT
-    }
+    };
 }
 
-fn mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> u64{
-    debug_assert_eq!(long.len(), 2*short.len()-1, "incorrect size of long compared to short for middle product");
-    debug_assert_eq!(out.len(), short.len(), "size of out must be the same size as short");
+fn mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+    debug_assert_eq!(
+        long.len(),
+        2 * short.len() - 1,
+        "incorrect size of long compared to short for middle product"
+    );
+    debug_assert_eq!(
+        out.len(),
+        short.len(),
+        "size of out must be the same size as short"
+    );
     match dyn_mid_dispatch(short.len()) {
-        DynMidDispatch::School => {
-            mid_mul_buf(long, short, out)
-        },
+        DynMidDispatch::School => mid_mul_buf(long, short, out),
         DynMidDispatch::Karatsuba => {
             let mut scratch_guard = ScratchGuard::acquire();
             let n = short.len();
-            let [big_out, scratch] = scratch_guard.get_splits([3*n - 2, find_karatsuba_scratch(2*n-1, n)]);
+            let [big_out, scratch] =
+                scratch_guard.get_splits([3 * n - 2, find_karatsuba_scratch(2 * n - 1, n)]);
             let of = karatsuba_mul(long, short, big_out, scratch);
-            out.copy_from_slice(&big_out[n-1..2*n-1]);
+            out.copy_from_slice(&big_out[n - 1..2 * n - 1]);
             of
-        },
-        DynMidDispatch::FFT => {
-            fft_mid_mul(long, short, out)
         }
+        DynMidDispatch::FFT => fft_mid_mul(long, short, out),
     }
-
 }
 
-fn mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> u64{
-    debug_assert_eq!(long.len(), 2*short.len()-1, "incorrect size of long compared to short for middle product");
-    debug_assert_eq!(out.len(), short.len(), "size of out must be the same size as short");
+fn mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+    debug_assert_eq!(
+        long.len(),
+        2 * short.len() - 1,
+        "incorrect size of long compared to short for middle product"
+    );
+    debug_assert_eq!(
+        out.len(),
+        short.len(),
+        "size of out must be the same size as short"
+    );
     let n = short.len();
-    if n < KARATSUBA_MID_CUTOFF{
+    if n < KARATSUBA_MID_CUTOFF {
         mid_mul_buf(long, short, out)
-    }else{
+    } else {
         let mut big_out = [0; N];
         let of = karatsuba_entry_static::<N>(long, short, &mut big_out);
-        out.copy_from_slice(&big_out[n-1..2*n-1]);
+        out.copy_from_slice(&big_out[n - 1..2 * n - 1]);
         of
     }
 }
