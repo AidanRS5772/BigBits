@@ -6,9 +6,12 @@ pub mod utils;
 
 pub const CHUNKING_KARATSUBA_CUTOFF: usize = 15;
 pub const KARATSUBA_CUTOFF: usize = 21;
+
 pub const FFT_CHUNKING_KARATSUBA_CUTOFF: f64 = 1.834;
 pub const FFT_KARATSUBA_CUTOFF: f64 = 1.907;
 pub const FFT_BIT_CUTOFF: usize = 1 << 17;
+
+pub const NTT_CUTOFF: usize = 20;
 
 pub const FFT_SQR_BIT_CUTOFF: usize = 1 << 16;
 pub const KARATSUBA_SQR_CUTOFF: usize = 26;

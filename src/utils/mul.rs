@@ -5,15 +5,16 @@ use rustfft::{num_complex::Complex, Fft, FftDirection, FftPlanner};
 use std::arch::asm;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::f64::consts::PI;
 use std::marker::PhantomData;
 use std::ops::*;
-use std::f64::consts::PI;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
+use std::sync::Arc;
 
 // SCHOOL BOOK MULTIPLICATION
 // Worst complexity lowest overhead optimized for small inputs. Base tier algorithm.
@@ -409,7 +410,7 @@ pub fn karatsuba_entry_static<const N: usize>(long: &[u64], short: &[u64], out: 
 //  Complex Space: O(2s)
 //  Real Space: O(2s)
 
-struct TwidleTower {
+struct FTTTwidleTower {
     table: Vec<Complex<f64>>,
     veiw: Vec<Complex<f64>>,
     res: usize,
@@ -417,7 +418,7 @@ struct TwidleTower {
     base: usize,
 }
 
-impl TwidleTower {
+impl FTTTwidleTower {
     const MAX_GEN: u8 = 3;
 
     fn build(n: usize) -> Self {
@@ -429,7 +430,7 @@ impl TwidleTower {
             table.push(Complex::cis(th * k as f64));
         }
 
-        TwidleTower {
+        FTTTwidleTower {
             table,
             veiw: Vec::new(),
             res: n,
@@ -518,17 +519,59 @@ impl TwidleTower {
 
 struct FFTCache {
     planner: FftPlanner<f64>,
-    twidles: HashMap<usize, TwidleTower>,
-    scratch: Vec<Complex<f64>>,
+    twidles: HashMap<usize, FTTTwidleTower>,
+}
+
+impl FFTCache {
+    fn new() -> Self {
+        FFTCache {
+            planner: FftPlanner::new(),
+            twidles: HashMap::new(),
+        }
+    }
+
+    fn prep_mul(
+        &mut self,
+        n: usize,
+    ) -> (Arc<dyn Fft<f64>>, Arc<dyn Fft<f64>>, &[Complex<f64>], usize) {
+        let fwd = self.planner.plan_fft_forward(n);
+        let bwd = self.planner.plan_fft_inverse(n / 2);
+        let tw = self
+            .twidles
+            .entry(n >> n.trailing_zeros())
+            .or_insert_with(|| FTTTwidleTower::build(n))
+            .get(n);
+        let scratch_sz = n + fwd
+            .get_inplace_scratch_len()
+            .max(bwd.get_inplace_scratch_len());
+        (fwd, bwd, tw, 2 * scratch_sz)
+    }
+
+    fn prep_sqr(
+        &mut self,
+        m: usize,
+    ) -> (Arc<dyn Fft<f64>>, Arc<dyn Fft<f64>>, &[Complex<f64>], usize) {
+        let fwd = self.planner.plan_fft_forward(m);
+        let bwd = self.planner.plan_fft_inverse(m);
+        let tw = self
+            .twidles
+            .entry(m >> m.trailing_zeros())
+            .or_insert_with(|| FTTTwidleTower::build(m))
+            .get(m);
+        let scratch_sz = m + fwd
+            .get_inplace_scratch_len()
+            .max(bwd.get_inplace_scratch_len());
+        (fwd, bwd, tw, 2 * scratch_sz)
+    }
 }
 
 thread_local! {
-    static FFT_CACHE: RefCell<FFTCache> = RefCell::new(FFTCache { planner: FftPlanner::new(), twidles: HashMap::new(), scratch: Vec::new()});
+    static FFT_CACHE: RefCell<FFTCache> = RefCell::new(FFTCache::new());
 }
 
 const FFT_RADIX: [usize; 3] = [3, 5, 7];
 
-const fn log_prim_search(init: usize, target: usize, mut idx: usize) -> usize {
+const fn log_prim_search(init: usize, target: usize, mut idx: usize, primes: &[usize]) -> usize {
     if init >= target {
         return init;
     }
@@ -541,15 +584,15 @@ const fn log_prim_search(init: usize, target: usize, mut idx: usize) -> usize {
         return result;
     }
     idx -= 1;
-    let p = FFT_RADIX[idx];
+    let p = primes[idx];
     let mut val = init;
-    let mut best = log_prim_search(val, target, idx);
+    let mut best = log_prim_search(val, target, idx, primes);
     if best == target {
         return best;
     }
     val *= p;
     while val < best {
-        let cur = log_prim_search(val, target, idx);
+        let cur = log_prim_search(val, target, idx, primes);
         if cur < best {
             best = cur;
             if best == target {
@@ -563,7 +606,7 @@ const fn log_prim_search(init: usize, target: usize, mut idx: usize) -> usize {
 
 const fn find_fft_size(n: usize) -> usize {
     const INIT: usize = 4; // guarantee that size is a multiple of 4
-    return log_prim_search(INIT, n, FFT_RADIX.len());
+    return log_prim_search(INIT, n, FFT_RADIX.len(), &FFT_RADIX);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1098,24 +1141,11 @@ pub fn fft_entry(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     let n = find_fft_size(l_len + s_len - 1);
     FFT_CACHE.with(|cell| {
         let fft_cache = &mut *cell.borrow_mut();
-        let FFTCache {
-            planner,
-            twidles,
-            scratch,
-        } = fft_cache;
-        let fwd = planner.plan_fft_forward(n);
-        let bwd = planner.plan_fft_inverse(n / 2);
-        let tw = twidles
-            .entry(n >> n.trailing_zeros())
-            .or_insert_with(|| TwidleTower::build(n))
-            .get(n);
-        let scratch_sz = n + fwd
-            .get_inplace_scratch_len()
-            .max(bwd.get_inplace_scratch_len());
-        if scratch_sz > scratch.len() {
-            scratch.resize(scratch_sz, Complex::zero());
-        }
-        let (x, fft_scratch) = scratch.split_at_mut(n);
+        let (fwd, bwd, tw, scratch_sz) = fft_cache.prep_mul(n);
+        let mut scratch_gaurd = ScratchGuard::acquire();
+        let complex_scratch: &mut [Complex<f64>] =
+            unsafe { std::mem::transmute(scratch_gaurd.get(scratch_sz)) };
+        let (x, fft_scratch) = complex_scratch.split_at_mut(n);
 
         match bit_size {
             BitSize::Bit16 => decompose_16(long, short, x),
@@ -1139,6 +1169,7 @@ trait NTTPrime {
     const P: u64;
     const P_INV: u64;
     const R_SQR: u64;
+    const R: u64;
     const G: u64;
     const K: u64;
     const M: u64;
@@ -1153,21 +1184,32 @@ impl NTTPrime for P1 {
     const P: u64 = 9097271247288401921;
     const P_INV: u64 = 9097271247288401919;
     const R_SQR: u64 = 6171946961806066123;
+    const R: u64 = 252201579132747774;
     const G: u64 = 6;
     const K: u64 = 505;
     const M: u64 = 1 << 54;
 }
 
-#[derive(Debug, Copy, Clone)]
 #[repr(transparent)]
+#[derive(Debug)]
 struct Montgomery<P: NTTPrime> {
     val: u64,
     _phantom: PhantomData<P>,
 }
 
 impl<P: NTTPrime> Montgomery<P> {
+    const ZERO: Self = Montgomery {
+        val: 0,
+        _phantom: PhantomData,
+    };
+
+    const ONE: Self = Montgomery {
+        val: P::R,
+        _phantom: PhantomData,
+    };
+
     #[inline(always)]
-    fn reduce_ext(t: u128) -> u64 {
+    fn reduce(t: u128) -> u64 {
         let t_lo = t as u64;
         let m = t_lo.wrapping_mul(P::P_INV);
         let mp = (m as u128) * (P::P as u128);
@@ -1178,104 +1220,239 @@ impl<P: NTTPrime> Montgomery<P> {
         return val;
     }
 
-    fn reduce_mut(&mut self){
-        self.val = Self::reduce_ext(self.val as u128);
-    }
-
     fn to(a: u64) -> Self {
         let t = (a as u128) * (P::R_SQR as u128);
         Montgomery {
-            val: Self::reduce_ext(t),
+            val: Self::reduce(t),
             _phantom: PhantomData,
         }
     }
 
+    fn to_mut(&mut self) {
+        let t = (self.val as u128) * (P::R_SQR as u128);
+        let m = (t as u64).wrapping_mul(P::P_INV);
+        let mp = (m as u128) * (P::P as u128);
+        self.val = ((t + mp) >> 64) as u64;
+        if self.val >= P::P {
+            self.val -= P::P;
+        }
+    }
+
     fn from(self) -> u64 {
-        Self::reduce_ext(self.val as u128)
+        Self::reduce(self.val as u128)
+    }
+
+    fn from_mut(&mut self) {
+        let m = self.val.wrapping_mul(P::P_INV);
+        let mp = (m as u128) * (P::P as u128);
+        self.val = ((self.val as u128 + mp) >> 64) as u64;
+        if self.val >= P::P {
+            self.val -= P::P
+        }
+    }
+
+    fn pow(self, pow: u64) -> Self {
+        if pow == 0 {
+            return Self::ZERO;
+        } else if pow == 1 {
+            return self;
+        }
+        let mut val = self.pow(pow / 2);
+        val *= val;
+        if pow & 1 == 1 {
+            val *= self;
+        }
+        return val;
     }
 }
 
-impl<P: NTTPrime> PartialEq for Montgomery<P>{
+impl<P: NTTPrime> Copy for Montgomery<P> {}
+
+impl<P: NTTPrime> Clone for Montgomery<P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P: NTTPrime> PartialEq for Montgomery<P> {
     fn eq(&self, other: &Self) -> bool {
         self.val == other.val
     }
 }
 
-impl<P: NTTPrime> Eq for Montgomery<P>{}
+impl<P: NTTPrime> Eq for Montgomery<P> {}
 
-
-impl<P: NTTPrime> Add for Montgomery<P>{
+impl<P: NTTPrime> Add for Montgomery<P> {
     type Output = Montgomery<P>;
     fn add(self, rhs: Self) -> Self::Output {
         let mut val = self.val + rhs.val;
-        if val >= P::P{
+        if val >= P::P {
             val -= P::P;
         }
-        return Montgomery{val, _phantom: PhantomData}
+        return Montgomery {
+            val,
+            _phantom: PhantomData,
+        };
     }
 }
 
-impl<P: NTTPrime> AddAssign for Montgomery<P>{
+impl<P: NTTPrime> AddAssign for Montgomery<P> {
     fn add_assign(&mut self, rhs: Self) {
         self.val += rhs.val;
-        if self.val >= P::P{
+        if self.val >= P::P {
             self.val -= P::P;
         }
     }
 }
 
-impl<P: NTTPrime> Sub for Montgomery<P>{
+impl<P: NTTPrime> Sub for Montgomery<P> {
     type Output = Montgomery<P>;
     fn sub(self, rhs: Self) -> Self::Output {
-        let val = if self.val >= rhs.val{
+        let val = if self.val >= rhs.val {
             self.val - rhs.val
-        }else{
-            P::P - (rhs.val - self.val) 
+        } else {
+            P::P - (rhs.val - self.val)
         };
-        Montgomery{val, _phantom: PhantomData}
+        Montgomery {
+            val,
+            _phantom: PhantomData,
+        }
     }
 }
 
-impl<P: NTTPrime> SubAssign for Montgomery<P>{
+impl<P: NTTPrime> SubAssign for Montgomery<P> {
     fn sub_assign(&mut self, rhs: Self) {
-        if self.val >= rhs.val{
+        if self.val >= rhs.val {
             self.val -= rhs.val;
-        }else{
+        } else {
             self.val = P::P - (rhs.val - self.val);
         }
     }
 }
 
-impl<P: NTTPrime> Neg for Montgomery<P>{
+impl<P: NTTPrime> Neg for Montgomery<P> {
     type Output = Montgomery<P>;
     fn neg(self) -> Self::Output {
         if self.val == 0 {
             self
-        }else{
-            Montgomery{val: P::P - self.val, _phantom: PhantomData}
+        } else {
+            Montgomery {
+                val: P::P - self.val,
+                _phantom: PhantomData,
+            }
         }
     }
 }
 
-impl<P: NTTPrime> Mul for Montgomery<P>{
+impl<P: NTTPrime> Mul for Montgomery<P> {
     type Output = Montgomery<P>;
     fn mul(self, rhs: Self) -> Self::Output {
-        let t = (self.val as u128)*(rhs.val as u128);
-        Montgomery{val: Self::reduce_ext(t), _phantom: PhantomData}
+        let t = (self.val as u128) * (rhs.val as u128);
+        Montgomery {
+            val: Self::reduce(t),
+            _phantom: PhantomData,
+        }
     }
 }
 
-impl<P: NTTPrime> MulAssign for Montgomery<P>{
+impl<P: NTTPrime> MulAssign for Montgomery<P> {
     fn mul_assign(&mut self, rhs: Self) {
-        let t = (self.val as u128)*(rhs.val as u128);
-        self.val = Self::reduce_ext(t);
+        let t = (self.val as u128) * (rhs.val as u128);
+        self.val = Self::reduce(t);
+    }
+}
+
+fn ntt<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, scratch: &mut [Montgomery<P>]) {
+    if buf.len() <= NTT_CUTOFF {
+        dft_naive(buf, w, scratch);
+    } else {
+        ntt_2(buf, w, scratch);
+    }
+}
+
+fn dft_naive<P: NTTPrime>(
+    buf: &mut [Montgomery<P>],
+    w: Montgomery<P>,
+    scratch: &mut [Montgomery<P>],
+) {
+    let n = buf.len();
+    let mut t = Montgomery::<P>::ONE;
+    for i in 0..n {
+        let mut sum = Montgomery::<P>::ZERO;
+        let mut l = Montgomery::<P>::ONE;
+        for j in 0..n {
+            sum += buf[j] * l;
+            l *= t;
+        }
+        scratch[i] = sum;
+        t *= w;
+    }
+    buf.copy_from_slice(&scratch[..n]);
+}
+
+fn shuffle_2<P: NTTPrime>(buf: &mut [Montgomery<P>], scratch: &mut [Montgomery<P>]) {
+    let m = buf.len() / 2;
+    for i in 0..m {
+        buf[i] = buf[2 * i];
+        scratch[i] = buf[2 * i + 1];
+    }
+    buf[m..].copy_from_slice(&scratch[..m]);
+}
+
+fn ntt_2<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, scratch: &mut [Montgomery<P>]) {
+    let m = buf.len() / 2;
+    shuffle_2(buf, scratch);
+    ntt(&mut buf[..m], w * w, scratch);
+    ntt(&mut buf[m..], w * w, scratch);
+    let mut t = Montgomery::<P>::ONE;
+    for i in 0..m {
+        let u = buf[i];
+        let v = buf[i + m] * t;
+        buf[i] = u + v;
+        buf[i + m] = u - v;
+        t *= w;
+    }
+}
+
+fn ntt_mul_core<P: NTTPrime>(
+    a: &[u64],
+    b: &[u64],
+    out: &mut [u64],
+    n: usize,
+    buf_scratch: &mut [u64],
+    ntt_scratch: &mut [u64],
+) {
+    out[..a.len()].copy_from_slice(a);
+    out[a.len()..].fill(0);
+    buf_scratch[..b.len()].copy_from_slice(b);
+    buf_scratch[b.len()..].fill(0);
+    let mont_a: &mut [Montgomery<P>] = unsafe { std::mem::transmute(out) };
+    let mont_b: &mut [Montgomery<P>] = unsafe { std::mem::transmute(buf_scratch) };
+    for i in 0..n {
+        mont_a[i].to_mut();
+        mont_b[i].to_mut();
+    }
+    let mont_scratch: &mut [Montgomery<P>] = unsafe { std::mem::transmute(ntt_scratch) };
+
+    let w = Montgomery::<P>::to(P::G).pow((P::P - 1) / (n as u64));
+    ntt(mont_a, w, mont_scratch);
+    ntt(mont_b, w, mont_scratch);
+
+    for i in 0..n {
+        mont_a[i] *= mont_b[i];
+    }
+
+    let inv_w = Montgomery::<P>::to(P::G).pow((n - 1) as u64);
+    ntt(mont_a, inv_w, mont_scratch);
+    for i in 0..n {
+        mont_a[i].from_mut();
     }
 }
 
 //END NTT MULTIPLICATION
 
-pub fn fft_cost(l: usize, s: usize) -> f64{
-    let sum = (l+s) as f64;
+pub fn fft_cost(l: usize, s: usize) -> f64 {
+    let sum = (l + s) as f64;
     sum * sum.ln()
 }
 
@@ -1788,24 +1965,12 @@ pub fn fft_sqr_entry(buf: &[u64], out: &mut [u64]) -> u64 {
     let n = find_fft_size(2 * bit_len - 1);
     let m = n / 2;
     FFT_CACHE.with(|cell| {
-        let FFTCache {
-            planner,
-            twidles,
-            scratch,
-        } = &mut *cell.borrow_mut();
-        let fwd = planner.plan_fft_forward(m);
-        let bwd = planner.plan_fft_inverse(m);
-        let tw = twidles
-            .entry(n >> n.trailing_zeros())
-            .or_insert_with(|| TwidleTower::build(n))
-            .get(n);
-        let scratch_sz = m + fwd
-            .get_inplace_scratch_len()
-            .max(bwd.get_inplace_scratch_len());
-        if scratch_sz > scratch.len() {
-            scratch.resize(scratch_sz, Complex::zero());
-        }
-        let (x, fft_scratch) = scratch.split_at_mut(m);
+        let fft_cache = &mut *cell.borrow_mut();
+        let (fwd, bwd, tw, scratch_sz) = fft_cache.prep_sqr(m);
+        let mut scratch_gaurd = ScratchGuard::acquire();
+        let complex_scratch: &mut [Complex<f64>] =
+            unsafe { std::mem::transmute(scratch_gaurd.get(scratch_sz)) };
+        let (x, fft_scratch) = complex_scratch.split_at_mut(n);
 
         match bit_size {
             BitSize::Bit16 => sqr_decompose_16(buf, x),
@@ -1996,24 +2161,11 @@ fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     let n = find_fft_size(l_len + s_len - (sz - 1) * w - 1);
     FFT_CACHE.with(|cell| {
         let fft_cache = &mut *cell.borrow_mut();
-        let FFTCache {
-            planner,
-            twidles,
-            scratch,
-        } = fft_cache;
-        let fwd = planner.plan_fft_forward(n);
-        let bwd = planner.plan_fft_inverse(n / 2);
-        let tw = twidles
-            .entry(n >> n.trailing_zeros())
-            .or_insert_with(|| TwidleTower::build(n))
-            .get(n);
-        let scratch_sz = n + fwd
-            .get_inplace_scratch_len()
-            .max(bwd.get_inplace_scratch_len());
-        if scratch_sz > scratch.len() {
-            scratch.resize(scratch_sz, Complex::zero());
-        }
-        let (x, fft_scratch) = scratch.split_at_mut(n);
+        let (fwd, bwd, tw, scratch_sz) = fft_cache.prep_mul(n);
+        let mut scratch_gaurd = ScratchGuard::acquire();
+        let complex_scratch: &mut [Complex<f64>] =
+            unsafe { std::mem::transmute(scratch_gaurd.get(scratch_sz)) };
+        let (x, fft_scratch) = complex_scratch.split_at_mut(n);
 
         match bit_size {
             BitSize::Bit16 => decompose_16(long, short, x),
