@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::marker::PhantomData;
-use std::ops::*;
+use std::{ops::*, u64};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -1165,29 +1165,65 @@ pub fn fft_entry(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
 
 const NTT_RADIX: [usize; 1] = [2];
 
+const fn neg_inv_mod_2_64(p: u64) -> u64 {
+    let mut x: u64 = 1;
+    while x.wrapping_mul(p) != u64::MAX {
+        let mut tmp = x.wrapping_mul(p);
+        tmp = tmp.wrapping_add(2);
+        x = x.wrapping_mul(tmp);
+    }
+    return x;
+}
+
+// 505 * 2^54 + 1
+const PRIME_1: u64 = 9_097_271_247_288_401_921;
+const PRIM_ROOT_1: u64 = 6;
+
+// 477 * 2^54 + 1
+const PRIME_2: u64 = 8_592_868_089_022_906_369;
+const PRIM_ROOT_2: u64 = 11; 
+
+// 439 * 2^54 + 1
+const PRIME_3: u64 = 7_908_320_945_662_590_977;
+const PRIM_ROOT_3: u64 = 3; 
+
 trait NTTPrime {
     const P: u64;
     const P_INV: u64;
     const R_SQR: u64;
     const R: u64;
     const G: u64;
-    const K: u64;
-    const M: u64;
 }
-// P = K*M + 1 where P is prime
 // P_INV*P = -1 mod 2^64
+// G^(P-1) = 1 mod P (primitive root)
 // R_SQR = 2^128 mod P
+// R = 2^64 mod P;
 
 struct P1;
-
 impl NTTPrime for P1 {
-    const P: u64 = 9097271247288401921;
-    const P_INV: u64 = 9097271247288401919;
-    const R_SQR: u64 = 6171946961806066123;
-    const R: u64 = 252201579132747774;
-    const G: u64 = 6;
-    const K: u64 = 505;
-    const M: u64 = 1 << 54;
+    const P: u64 = PRIME_1;
+    const G: u64 = PRIM_ROOT_1;
+    const P_INV: u64 = neg_inv_mod_2_64(PRIME_1);
+    const R_SQR: u64 = (u128::MAX % PRIME_1 as u128) as u64 + 1;
+    const R: u64 = (u64::MAX % PRIME_1) + 1;
+}
+
+struct P2;
+impl NTTPrime for P2 {
+    const P: u64 = PRIME_2;
+    const G: u64 = PRIM_ROOT_2;
+    const P_INV: u64 = neg_inv_mod_2_64(PRIME_2);
+    const R_SQR: u64 = (u128::MAX % PRIME_2 as u128) as u64 + 1;
+    const R: u64 = (u64::MAX % PRIME_2) + 1;
+}
+
+struct P3;
+impl NTTPrime for P3 {
+    const P: u64 = PRIME_3;
+    const G: u64 = PRIM_ROOT_3;
+    const P_INV: u64 = neg_inv_mod_2_64(PRIME_3);
+    const R_SQR: u64 = (u128::MAX % PRIME_3 as u128) as u64 + 1;
+    const R: u64 = (u64::MAX % PRIME_3) + 1;
 }
 
 #[repr(transparent)]
@@ -1209,7 +1245,7 @@ impl<P: NTTPrime> Montgomery<P> {
     };
 
     #[inline(always)]
-    fn reduce(t: u128) -> u64 {
+    const fn reduce(t: u128) -> u64 {
         let t_lo = t as u64;
         let m = t_lo.wrapping_mul(P::P_INV);
         let mp = (m as u128) * (P::P as u128);
@@ -1220,7 +1256,7 @@ impl<P: NTTPrime> Montgomery<P> {
         return val;
     }
 
-    fn to(a: u64) -> Self {
+    const fn to(a: u64) -> Self {
         let t = (a as u128) * (P::R_SQR as u128);
         Montgomery {
             val: Self::reduce(t),
@@ -1228,7 +1264,7 @@ impl<P: NTTPrime> Montgomery<P> {
         }
     }
 
-    fn to_mut(&mut self) {
+    const fn to_mut(&mut self) {
         let t = (self.val as u128) * (P::R_SQR as u128);
         let m = (t as u64).wrapping_mul(P::P_INV);
         let mp = (m as u128) * (P::P as u128);
@@ -1238,11 +1274,11 @@ impl<P: NTTPrime> Montgomery<P> {
         }
     }
 
-    fn from(self) -> u64 {
+    const fn from(self) -> u64 {
         Self::reduce(self.val as u128)
     }
 
-    fn from_mut(&mut self) {
+    const fn from_mut(&mut self) {
         let m = self.val.wrapping_mul(P::P_INV);
         let mp = (m as u128) * (P::P as u128);
         self.val = ((self.val as u128 + mp) >> 64) as u64;
@@ -1251,16 +1287,36 @@ impl<P: NTTPrime> Montgomery<P> {
         }
     }
 
-    fn pow(self, pow: u64) -> Self {
+    const fn add_mut(&mut self, rhs: Self){
+        self.val += rhs.val;
+        if self.val >= P::P {
+            self.val -= P::P;
+        }
+    }
+
+    const fn sub_mut(&mut self, rhs: Self){
+        if self.val >= rhs.val {
+            self.val -= rhs.val;
+        } else {
+            self.val = P::P - (rhs.val - self.val);
+        }
+    }
+
+    const fn mul_mut(&mut self, rhs: Self){
+        let t = (self.val as u128) * (rhs.val as u128);
+        self.val = Self::reduce(t);
+    }
+
+    const fn pow(self, pow: u64) -> Self {
         if pow == 0 {
             return Self::ZERO;
         } else if pow == 1 {
             return self;
         }
         let mut val = self.pow(pow / 2);
-        val *= val;
+        val.mul_mut(val);
         if pow & 1 == 1 {
-            val *= self;
+            val.mul_mut(self);
         }
         return val;
     }
@@ -1282,51 +1338,33 @@ impl<P: NTTPrime> PartialEq for Montgomery<P> {
 
 impl<P: NTTPrime> Eq for Montgomery<P> {}
 
-impl<P: NTTPrime> Add for Montgomery<P> {
-    type Output = Montgomery<P>;
-    fn add(self, rhs: Self) -> Self::Output {
-        let mut val = self.val + rhs.val;
-        if val >= P::P {
-            val -= P::P;
-        }
-        return Montgomery {
-            val,
-            _phantom: PhantomData,
-        };
+impl<P: NTTPrime> AddAssign for Montgomery<P> {
+    fn add_assign(&mut self, rhs: Self) {
+        self.add_mut(rhs);
     }
 }
 
-impl<P: NTTPrime> AddAssign for Montgomery<P> {
-    fn add_assign(&mut self, rhs: Self) {
-        self.val += rhs.val;
-        if self.val >= P::P {
-            self.val -= P::P;
-        }
+impl<P: NTTPrime> Add for Montgomery<P> {
+    type Output = Montgomery<P>;
+    fn add(self, rhs: Self) -> Self::Output {
+        let mut out = self;
+        out.add_mut(rhs);
+        out
+    }
+}
+
+impl<P: NTTPrime> SubAssign for Montgomery<P> {
+    fn sub_assign(&mut self, rhs: Self) {
+        self.sub_mut(rhs);
     }
 }
 
 impl<P: NTTPrime> Sub for Montgomery<P> {
     type Output = Montgomery<P>;
     fn sub(self, rhs: Self) -> Self::Output {
-        let val = if self.val >= rhs.val {
-            self.val - rhs.val
-        } else {
-            P::P - (rhs.val - self.val)
-        };
-        Montgomery {
-            val,
-            _phantom: PhantomData,
-        }
-    }
-}
-
-impl<P: NTTPrime> SubAssign for Montgomery<P> {
-    fn sub_assign(&mut self, rhs: Self) {
-        if self.val >= rhs.val {
-            self.val -= rhs.val;
-        } else {
-            self.val = P::P - (rhs.val - self.val);
-        }
+        let mut out = self;
+        out.sub_mut(rhs);
+        out
     }
 }
 
@@ -1447,6 +1485,24 @@ fn ntt_mul_core<P: NTTPrime>(
     for i in 0..n {
         mont_a[i].from_mut();
     }
+}
+
+fn find_ntt_size(n: usize) -> usize {
+    log_prim_search(1, n, NTT_RADIX.len(), &NTT_RADIX)
+}
+
+fn ntt_dyn_entry(a: &[u64], b: &[u64], out: &mut [u64]) {
+    let n = find_ntt_size(a.len() + b.len() - 1);
+    let mut scratch_gaurd = ScratchGuard::acquire();
+    let [out1, out2, out3, buf_scratch, ntt_scratch] = scratch_gaurd.get_splits([n, n, n, n, n]);
+
+    ntt_mul_core::<P1>(a, b, out1, n, buf_scratch, ntt_scratch);
+    ntt_mul_core::<P2>(a, b, out1, n, buf_scratch, ntt_scratch);
+    ntt_mul_core::<P3>(a, b, out1, n, buf_scratch, ntt_scratch);
+}
+
+fn crt_in_place<P1: NTTPrime, P2: NTTPrime, P3: NTTPrime>(r1: &mut u64, r2: &mut u64, r3: &mut u64){
+    
 }
 
 //END NTT MULTIPLICATION
