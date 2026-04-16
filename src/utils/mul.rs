@@ -1494,7 +1494,7 @@ fn split<P: NTTPrime, const N: usize>(buf: &mut [Montgomery<P>]) -> [&mut [Montg
     let base = buf.as_mut_ptr();
     let mut offset = 0usize;
     let size = buf.len() / N;
-    std::array::from_fn(|i| unsafe {
+    std::array::from_fn(|_| unsafe {
         let s = std::slice::from_raw_parts_mut(base.add(offset), size);
         offset += size;
         s
@@ -1504,7 +1504,7 @@ fn split<P: NTTPrime, const N: usize>(buf: &mut [Montgomery<P>]) -> [&mut [Montg
 fn shuffle<P: NTTPrime, const N: usize>(buf: &mut [Montgomery<P>], scratch: &mut [Montgomery<P>]) {
     debug_assert!(buf.len() % N == 0, "length of buf must be evenly divided by N");
     let m = buf.len() / N;
-    let mut tmp: [&mut [Montgomery<P>]; N] = split::<P, N>(&mut scratch[..N*m]);
+    let tmp: [&mut [Montgomery<P>]; N] = split::<P, N>(&mut scratch[..N*m]);
     for i in 0..m{
         buf[i] = buf[N*i];
         for j in 1..N{
@@ -1531,7 +1531,7 @@ fn ntt_2<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, mut t: Montgo
     }
 }
 
-fn ntt_3<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, mut t: Montgomery<P>, scratch: &mut [Montgomery<P>]) {
+fn ntt_3<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, t: Montgomery<P>, scratch: &mut [Montgomery<P>]) {
     let m = buf.len() / 3;
     shuffle::<P, 3>(buf, scratch);
     let sqr_w = w*w;
