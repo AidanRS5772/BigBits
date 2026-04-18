@@ -6,6 +6,7 @@ use std::arch::asm;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::f64::consts::PI;
+use std::ffi::c_short;
 use std::marker::PhantomData;
 use std::ops::*;
 
@@ -1253,51 +1254,34 @@ const fn exp_decomp(p: u64) -> [usize; NTT_RADIX_CNT] {
     exp
 }
 
-const fn primitive_prime_nth_root(p: u64, g: u64, n: u64) -> u64 {
-    let exp = (p - 1) / n;
-    let mut a = 2u64;
-    loop {
-        let c = mod_pow(a, exp, p);
-        if c != 1 {
-            return c;
-        }
-        a += 1;
-    }
-}
-
-// 2^46 * 3^3 * 5^5 + 1
-const PRIME_1: u64 = 5937362789990400001;
-
-// 19 * 2^46 * 3^5 * 5^2 + 1
-const PRIME_2: u64 = 8122312296706867201;
-
-// 53 * 2^46 * 3^4 * 5^2 + 1
-const PRIME_3: u64 = 7552325468867788801;
-
 trait NTTPrime {
     const P: u64;
     const G: u64 = primitive_root(Self::P);
     const G3: u64 = mod_pow(Self::G, (Self::P - 1) / 3, Self::P);
     const G5: u64 = mod_pow(Self::G, (Self::P - 1) / 5, Self::P);
-    const R: u64 = (u64::MAX % PRIME_1) + 1;
-    const P_INV: u64 = neg_inv_mod_2_64(PRIME_1);
-    const R_SQR: u64 = (u128::MAX % PRIME_1 as u128) as u64 + 1;
+    const R: u64 = (u64::MAX % Self::P) + 1;
+    const P_INV: u64 = neg_inv_mod_2_64(Self::P);
+    const R_SQR: u64 = (u128::MAX % Self::P as u128) as u64 + 1;
+    const R_CUB: u64 = (((Self::R as u128) * (Self::R_SQR as u128)) % (Self::P as u128)) as u64;
     const EXP: [usize; NTT_RADIX_CNT] = exp_decomp(Self::P);
 }
 
 struct P1;
 impl NTTPrime for P1 {
-    const P: u64 = PRIME_1;
+    const P: u64 = 5937362789990400001;
+    // 2^46 * 3^3 * 5^5 + 1
 }
 
 struct P2;
 impl NTTPrime for P2 {
-    const P: u64 = PRIME_2;
+    const P: u64 = 8122312296706867201;
+    // 19 * 2^46 * 3^5 * 5^2 + 1
 }
 
 struct P3;
 impl NTTPrime for P3 {
-    const P: u64 = PRIME_3;
+    const P: u64 = 7552325468867788801;
+    // 19 * 2^46 * 3^5 * 5^2 + 1
 }
 
 #[repr(transparent)]
@@ -1402,6 +1386,16 @@ impl<P: NTTPrime> Montgomery<P> {
             val.mul_mut(self);
         }
         return val;
+    }
+
+    const fn fuse_mul_to(a: u64, b: u64) -> Self {
+        let ab = (a as u128) * (b as u128);
+        let c = Self::reduce(ab);
+        let t = (c as u128) * (P::R_CUB as u128);
+        Montgomery {
+            val: Self::reduce(t),
+            _phantom: PhantomData,
+        }
     }
 }
 
@@ -1781,23 +1775,18 @@ fn ntt_log_prime_search(
 }
 
 fn find_ntt_size<P: NTTPrime>(n: usize) -> usize {
-    ntt_log_prime_search(1, n, &NTT_RADIX, &P::EXP).unwrap()
+    ntt_log_prime_search(1, n, &NTT_RADIX, &P::EXP).expect("Input Is too large for NTT")
 }
 
-fn ntt_mul_core(
-    a: &[u64],
-    b: &[u64],
-    out: &mut [u64],
-    res1: &mut [u64],
-    res2: &mut [u64],
-    res3: &mut [u64],
-    buf_scratch: &mut [u64],
-    ntt_scratch: &mut [u64],
-    n1: usize,
-    n2: usize,
-    n3: usize,
-) -> u64 {
+fn ntt_entry_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     let out_len = a.len() + b.len() - 1;
+    let n1 = find_ntt_size::<P1>(out_len);
+    let n2 = find_ntt_size::<P2>(out_len);
+    let n3 = find_ntt_size::<P3>(out_len);
+    let scratch_sz = n1.max(n2).max(n3);
+    let mut scratch_gaurd = ScratchGuard::acquire();
+    let [res1, res2, res3, buf_scratch, ntt_scratch] =
+        scratch_gaurd.get_splits([n1, n2, n3, scratch_sz, scratch_sz]);
     ntt_convolution::<P1>(
         a,
         b,
@@ -1847,55 +1836,153 @@ fn ntt_mul_core(
     return res2[len2] + res3[len3] + of1 + of2;
 }
 
-fn ntt_entry_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
-    let out_len = a.len() + b.len() - 1;
-    let n1 = find_ntt_size::<P1>(out_len);
-    let n2 = find_ntt_size::<P2>(out_len);
-    let n3 = find_ntt_size::<P3>(out_len);
-    let scratch_sz = n1.max(n2).max(n3);
-    let mut scratch_gaurd = ScratchGuard::acquire();
-    let [res1, res2, res3, buf_scratch, ntt_scratch] =
-        scratch_gaurd.get_splits([n1, n2, n3, scratch_sz, scratch_sz]);
-    ntt_mul_core(
-        a,
-        b,
-        out,
-        res1,
-        res2,
-        res3,
-        buf_scratch,
-        ntt_scratch,
-        n1,
-        n2,
-        n3,
-    )
+fn ntt_log_prime_search_for_split(
+    init: usize,
+    target: usize,
+    primes: &[usize],
+    max_exps: &[usize],
+) -> Option<usize> {
+    debug_assert_eq!(primes.len(), max_exps.len());
+    if init > target {
+        return None;
+    }
+
+    let Some((&p, rest_primes)) = primes.split_first() else {
+        return Some(init); // no more primes, init ≤ target is valid
+    };
+
+    let (&max_exp, rest_exps) = max_exps.split_first().unwrap();
+    let mut best: Option<usize> = None;
+    let mut val = init;
+    for exp in 0..=max_exp {
+        let cur = ntt_log_prime_search_for_split(val, target, rest_primes, rest_exps);
+        best = match (best, cur) {
+            (Some(b), Some(c)) => Some(b.max(c)),
+            (b, c) => b.or(c),
+        };
+        if best == Some(target) {
+            return best;
+        }
+        if exp < max_exp {
+            match val.checked_mul(p) {
+                Some(next) if next <= target => val = next,
+                _ => break,
+            }
+        }
+    }
+
+    best
+}
+
+fn find_ntt_size_for_split<const N: usize, P: NTTPrime>() -> usize {
+    ntt_log_prime_search_for_split(1, N, &NTT_RADIX, &P::EXP).expect("Input Is too large for NTT")
+}
+
+fn acc_convolution<P: NTTPrime>(short: &[u64], long_hi: &[u64], res: &mut [u64]){
+    let mont_res: &mut [Montgomery<P>] = unsafe { std::mem::transmute(res)};
+    for (i, &s) in short.iter().enumerate(){
+        for (j, &l) in long_hi.iter().enumerate(){
+            mont_res[i+j] += Montgomery::fuse_mul_to(s, l);
+        }
+    }
+}
+
+fn ntt_split_convolution<const N: usize, P: NTTPrime>(
+    long: &[u64],
+    short: &[u64],
+    res: &mut [u64],
+    buf_scratch: &mut [u64],
+    ntt_scratch: &mut [u64],
+) {
+    let n =  find_ntt_size_for_split::<N,P>();
+    let split = n + 1 - short.len();
+    let (long_lo, long_hi) = long.split_at(split);
+    ntt_convolution::<P>(
+        long_lo,
+        short,
+        &mut res[..n],
+        n,
+        &mut buf_scratch[..n],
+        &mut ntt_scratch[..n],
+    );
+    acc_convolution::<P>(short, long_hi, &mut res[split..]);
 }
 
 fn ntt_entry_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     let out_len = a.len() + b.len() - 1;
-    let n1 = find_ntt_size::<P1>(out_len);
-    let n2 = find_ntt_size::<P2>(out_len);
-    let n3 = find_ntt_size::<P3>(out_len);
-
     let mut res1 = [0; N];
     let mut res2 = [0; N];
     let mut res3 = [0; N];
     let mut buf_scratch = [0; N];
     let mut ntt_scratch = [0; N];
 
-    ntt_mul_core(
-        a,
-        b,
-        out,
-        &mut res1,
-        &mut res2,
-        &mut res3,
-        &mut buf_scratch,
-        &mut ntt_scratch,
-        n1,
-        n2,
-        n3,
-    )
+    let n1 = find_ntt_size::<P1>(out_len);
+    if n1 <= N {
+        ntt_convolution::<P1>(
+            a,
+            b,
+            &mut res1[..n1],
+            n1,
+            &mut buf_scratch[..n1],
+            &mut ntt_scratch[..n1],
+        );
+    } else {
+        let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
+        ntt_split_convolution::<N, P1>(long, short, &mut res1, &mut buf_scratch, &mut ntt_scratch);
+    }
+
+    let n2 = find_ntt_size::<P2>(out_len);
+    if n2 <= N {
+        ntt_convolution::<P2>(
+            a,
+            b,
+            &mut res2[..n2],
+            n2,
+            &mut buf_scratch[..n2],
+            &mut ntt_scratch[..n2],
+        );
+    }else{
+        let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
+        ntt_split_convolution::<N, P2>(long, short, &mut res2, &mut buf_scratch, &mut ntt_scratch);
+    }
+
+    let n3 = find_ntt_size::<P3>(out_len);
+    if n3 <= N {
+        ntt_convolution::<P3>(
+            a,
+            b,
+            &mut res3[..n3],
+            n3,
+            &mut buf_scratch[..n3],
+            &mut ntt_scratch[..n3],
+        );
+    }else{
+        let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
+        ntt_split_convolution::<N, P3>(long, short, &mut res3, &mut buf_scratch, &mut ntt_scratch);
+    }
+
+    let inv_n1 = Montgomery::to(n1 as u64).pow(P1::P - 2);
+    let inv_n2 = Montgomery::to(n2 as u64).pow(P2::P - 2);
+    let inv_n3 = Montgomery::to(n3 as u64).pow(P3::P - 2);
+    for i in 0..out_len {
+        CRT.crt(
+            &mut res1[i],
+            &mut res2[i],
+            &mut res3[i],
+            inv_n1,
+            inv_n2,
+            inv_n3,
+        );
+    }
+
+    let len1 = n1.min(out.len());
+    out[..len1].copy_from_slice(&res1[..len1]);
+    let len2 = n2.min(out.len() - 1);
+    let of1 = add_buf(&mut out[1..], &res2[..len2]) as u64;
+    let len3 = n3.min(out.len() - 2);
+    let of2 = add_buf(&mut out[2..], &res2[..len3]) as u64;
+
+    return res2[len2] + res3[len3] + of1 + of2;
 }
 
 //END NTT MULTIPLICATION
