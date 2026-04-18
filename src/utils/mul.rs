@@ -1878,11 +1878,11 @@ fn find_ntt_size_for_split<const N: usize, P: NTTPrime>() -> usize {
     ntt_log_prime_search_for_split(1, N, &NTT_RADIX, &P::EXP).expect("Input Is too large for NTT")
 }
 
-fn acc_convolution<P: NTTPrime>(short: &[u64], long_hi: &[u64], res: &mut [u64]){
-    let mont_res: &mut [Montgomery<P>] = unsafe { std::mem::transmute(res)};
-    for (i, &s) in short.iter().enumerate(){
-        for (j, &l) in long_hi.iter().enumerate(){
-            mont_res[i+j] += Montgomery::fuse_mul_to(s, l);
+fn acc_convolution<P: NTTPrime>(short: &[u64], long_hi: &[u64], res: &mut [u64]) {
+    let mont_res: &mut [Montgomery<P>] = unsafe { std::mem::transmute(res) };
+    for (i, &s) in short.iter().enumerate() {
+        for (j, &l) in long_hi.iter().enumerate() {
+            mont_res[i + j] += Montgomery::fuse_mul_to(s, l);
         }
     }
 }
@@ -1894,7 +1894,7 @@ fn ntt_split_convolution<const N: usize, P: NTTPrime>(
     buf_scratch: &mut [u64],
     ntt_scratch: &mut [u64],
 ) {
-    let n =  find_ntt_size_for_split::<N,P>();
+    let n = find_ntt_size_for_split::<N, P>();
     let split = n + 1 - short.len();
     let (long_lo, long_hi) = long.split_at(split);
     ntt_convolution::<P>(
@@ -1941,7 +1941,7 @@ fn ntt_entry_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u6
             &mut buf_scratch[..n2],
             &mut ntt_scratch[..n2],
         );
-    }else{
+    } else {
         let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
         ntt_split_convolution::<N, P2>(long, short, &mut res2, &mut buf_scratch, &mut ntt_scratch);
     }
@@ -1956,7 +1956,7 @@ fn ntt_entry_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u6
             &mut buf_scratch[..n3],
             &mut ntt_scratch[..n3],
         );
-    }else{
+    } else {
         let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
         ntt_split_convolution::<N, P3>(long, short, &mut res3, &mut buf_scratch, &mut ntt_scratch);
     }
@@ -2005,13 +2005,13 @@ pub fn karatsuba_cost(l: usize, s: usize) -> f64 {
     l_pow - sum_pow
 }
 
-pub fn is_karatsuba(l: usize, s: usize) -> bool {
+pub fn is_karatsuba(l: usize, s: usize, chunk: f64, reg: f64) -> bool {
     let fft_cost = fft_cost(l, s);
     let half = (l + 1) / 2;
     if s <= half {
-        chunking_karatsuba_cost(l, s) < FFT_CHUNKING_KARATSUBA_CUTOFF * fft_cost
+        chunking_karatsuba_cost(l, s) < chunk * fft_cost
     } else {
-        karatsuba_cost(l, s) < FFT_KARATSUBA_CUTOFF * fft_cost
+        karatsuba_cost(l, s) < reg * fft_cost
     }
 }
 
@@ -2021,6 +2021,7 @@ enum DynDispatch {
     School,
     Karatsuba,
     FFT,
+    NTT,
 }
 
 fn dyn_dispatch(l: usize, s: usize) -> DynDispatch {
@@ -2030,10 +2031,12 @@ fn dyn_dispatch(l: usize, s: usize) -> DynDispatch {
         DynDispatch::Prim2
     } else if is_school(l, s) {
         DynDispatch::School
-    } else if is_karatsuba(l, s) {
+    } else if is_karatsuba(l, s, FFT_CHUNKING_KARATSUBA_CUTOFF, FFT_KARATSUBA_CUTOFF) {
         DynDispatch::Karatsuba
-    } else {
+    } else if (l + s - 1) < DYN_NTT_CUTOFF{
         DynDispatch::FFT
+    } else{
+        DynDispatch::NTT
     }
 }
 
@@ -2058,6 +2061,7 @@ pub fn mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
         DynDispatch::School => mul_buf(long, short, out),
         DynDispatch::Karatsuba => karatsuba_entry_dyn(long, short, out),
         DynDispatch::FFT => fft_entry(long, short, out),
+        DynDispatch::NTT => ntt_entry_dyn(long, short, out),
     }
 }
 
@@ -2072,6 +2076,7 @@ enum StaticDispatch {
     Prim2,
     School,
     Karatsuba,
+    NTT,
 }
 
 fn static_dispatch(l: usize, s: usize) -> StaticDispatch {
@@ -2081,8 +2086,10 @@ fn static_dispatch(l: usize, s: usize) -> StaticDispatch {
         StaticDispatch::Prim2
     } else if is_school(l, s) {
         StaticDispatch::School
-    } else {
+    } else if is_karatsuba(l, s, NTT_CHUNKING_KARATSUBA_CUTOFF, NTT_KARATSUBA_CUTOFF){
         StaticDispatch::Karatsuba
+    } else{
+        StaticDispatch::NTT
     }
 }
 
@@ -2102,6 +2109,7 @@ pub fn mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> Resu
         }
         StaticDispatch::School => mul_buf(long, short, out),
         StaticDispatch::Karatsuba => karatsuba_entry_static::<N>(long, short, out),
+        StaticDispatch::NTT => ntt_entry_static::<N>(a, b, out),
     })
 }
 
@@ -2224,6 +2232,8 @@ pub fn sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
 
     acc0
 }
+
+//KARATSUBA SQUARE
 
 fn karatsuba_sqr_core(
     buf: &[u64],

@@ -9,20 +9,22 @@ pub const KARATSUBA_CUTOFF: usize = 21;
 
 pub const FFT_CHUNKING_KARATSUBA_CUTOFF: f64 = 1.834;
 pub const FFT_KARATSUBA_CUTOFF: f64 = 1.907;
-pub const FFT_BIT_CUTOFF: usize = 1 << 17;
+pub const FFT_BIT_CUTOFF: usize = 1 << 17; // GUESS
 
-pub const NTT_CUTOFF: usize = 20;
+pub const DYN_NTT_CUTOFF: usize = 1 << 20; // GUESS
+pub const NTT_CHUNKING_KARATSUBA_CUTOFF: f64 = 2.5; // GUESS
+pub const NTT_KARATSUBA_CUTOFF: f64 = 2.75; // GUESS
 
-pub const FFT_SQR_BIT_CUTOFF: usize = 1 << 16;
-pub const KARATSUBA_SQR_CUTOFF: usize = 26;
-pub const FFT_SQR_CUTOFF: usize = 100;
+pub const FFT_SQR_BIT_CUTOFF: usize = 1 << 16; // GUESS
+pub const KARATSUBA_SQR_CUTOFF: usize = 26; // GUESS
+pub const FFT_SQR_CUTOFF: usize = 100; // GUESS
 
-pub const SHORT_MUL_CUTOFF: usize = 22;
+pub const SHORT_MUL_CUTOFF: usize = 22; // GUESS
 
-pub const KARATSUBA_MID_CUTOFF: usize = 30;
-pub const FFT_MID_CUTOFF: usize = 60;
+pub const KARATSUBA_MID_CUTOFF: usize = 30; // GUESS
+pub const FFT_MID_CUTOFF: usize = 60; // GUESS
 
-pub const BZ_CUTOFF: usize = 64;
+pub const BZ_CUTOFF: usize = 64; // GUESS
 
 thread_local! {
     static SCRATCH_POOL: RefCell<Vec<Vec<u64>>> = RefCell::new(Vec::new());
