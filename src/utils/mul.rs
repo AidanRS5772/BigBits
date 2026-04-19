@@ -1092,7 +1092,7 @@ fn decompose_8(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
     }
 }
 
-fn accumulate_16(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
+fn fft_accumulate_16(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
     let coefs = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const f64, x.len() * 2) };
     let mut carry = 0;
     for (chunk, elem) in coefs.chunks(4).zip(out.iter_mut()) {
@@ -1107,7 +1107,7 @@ fn accumulate_16(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
     return carry as u64;
 }
 
-fn accumulate_8(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
+fn fft_accumulate_8(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
     let coefs = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const f64, x.len() * 2) };
     let mut carry = 0;
     for (chunk, elem) in coefs.chunks(8).zip(out.iter_mut()) {
@@ -1161,8 +1161,8 @@ pub fn fft_entry(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
         fft_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
 
         match bit_size {
-            BitSize::Bit16 => accumulate_16(x, out),
-            BitSize::Bit8 => accumulate_8(x, out),
+            BitSize::Bit16 => fft_accumulate_16(x, out),
+            BitSize::Bit8 => fft_accumulate_8(x, out),
         }
     })
 }
@@ -1631,22 +1631,22 @@ fn ntt_5<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, scratch: &mut
 }
 
 fn ntt_convolution<P: NTTPrime>(
-    a: &[u64],
-    b: &[u64],
+    a_buf: &[u64],
+    b_buf: &[u64],
     res: &mut [u64],
     n: usize,
     buf_scratch: &mut [u64],
     ntt_scratch: &mut [u64],
 ) {
-    res[..a.len()].copy_from_slice(a);
-    res[a.len()..].fill(0);
-    buf_scratch[..b.len()].copy_from_slice(b);
-    buf_scratch[b.len()..].fill(0);
+    res[..a_buf.len()].copy_from_slice(a_buf);
+    buf_scratch[..b_buf.len()].copy_from_slice(b_buf);
     let mont_a: &mut [Montgomery<P>] = unsafe { std::mem::transmute(res) };
     let mont_b: &mut [Montgomery<P>] = unsafe { std::mem::transmute(buf_scratch) };
-    for i in 0..n {
-        mont_a[i].to_mut();
-        mont_b[i].to_mut();
+    for a in mont_a.iter_mut().take(a_buf.len()) {
+        a.to_mut();
+    }
+    for b in mont_b.iter_mut().take(a_buf.len()) {
+        b.to_mut();
     }
     let mont_scratch: &mut [Montgomery<P>] = unsafe { std::mem::transmute(ntt_scratch) };
 
@@ -1654,8 +1654,8 @@ fn ntt_convolution<P: NTTPrime>(
     ntt(mont_a, w, mont_scratch);
     ntt(mont_b, w, mont_scratch);
 
-    for i in 0..n {
-        mont_a[i] *= mont_b[i];
+    for (a, b) in mont_a.iter_mut().zip(mont_b) {
+        *a *= *b;
     }
 
     let inv_w = Montgomery::to(P::G).pow((n - 1) as u64);
@@ -1736,6 +1736,38 @@ impl<P1: NTTPrime, P2: NTTPrime, P3: NTTPrime> CRT<P1, P2, P3> {
 
 static CRT: LazyLock<CRT<P1, P2, P3>> = LazyLock::new(|| CRT::<P1, P2, P3>::new());
 
+fn ntt_accumulate(
+    res1: &mut [u64],
+    res2: &mut [u64],
+    res3: &mut [u64],
+    out: &mut [u64],
+    out_len: usize,
+) -> u64 {
+    let (n1, n2, n3) = (res1.len(), res2.len(), res3.len());
+    let inv_n1 = Montgomery::to(n1 as u64).pow(P1::P - 2);
+    let inv_n2 = Montgomery::to(n2 as u64).pow(P2::P - 2);
+    let inv_n3 = Montgomery::to(n3 as u64).pow(P3::P - 2);
+    for i in 0..out_len {
+        CRT.crt(
+            &mut res1[i],
+            &mut res2[i],
+            &mut res3[i],
+            inv_n1,
+            inv_n2,
+            inv_n3,
+        );
+    }
+
+    let len1 = n1.min(out.len());
+    out[..len1].copy_from_slice(&res1[..len1]);
+    let len2 = n2.min(out.len() - 1);
+    let of1 = add_buf(&mut out[1..], &res2[..len2]) as u64;
+    let len3 = n3.min(out.len() - 2);
+    let of2 = add_buf(&mut out[2..], &res2[..len3]) as u64;
+
+    return res2[len2] + res3[len3] + of1 + of2;
+}
+
 fn ntt_log_prime_search(
     init: usize,
     target: usize,
@@ -1778,7 +1810,7 @@ fn find_ntt_size<P: NTTPrime>(n: usize) -> usize {
     ntt_log_prime_search(1, n, &NTT_RADIX, &P::EXP).expect("Input Is too large for NTT")
 }
 
-fn ntt_entry_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+pub fn ntt_entry_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     let out_len = a.len() + b.len() - 1;
     let n1 = find_ntt_size::<P1>(out_len);
     let n2 = find_ntt_size::<P2>(out_len);
@@ -1812,28 +1844,7 @@ fn ntt_entry_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
         &mut ntt_scratch[..n3],
     );
 
-    let inv_n1 = Montgomery::to(n1 as u64).pow(P1::P - 2);
-    let inv_n2 = Montgomery::to(n2 as u64).pow(P2::P - 2);
-    let inv_n3 = Montgomery::to(n3 as u64).pow(P3::P - 2);
-    for i in 0..out_len {
-        CRT.crt(
-            &mut res1[i],
-            &mut res2[i],
-            &mut res3[i],
-            inv_n1,
-            inv_n2,
-            inv_n3,
-        );
-    }
-
-    let len1 = n1.min(out.len());
-    out[..len1].copy_from_slice(&res1[..len1]);
-    let len2 = n2.min(out.len() - 1);
-    let of1 = add_buf(&mut out[1..], &res2[..len2]) as u64;
-    let len3 = n3.min(out.len() - 2);
-    let of2 = add_buf(&mut out[2..], &res2[..len3]) as u64;
-
-    return res2[len2] + res3[len3] + of1 + of2;
+    ntt_accumulate(res1, res2, res3, out, out_len)
 }
 
 fn ntt_log_prime_search_for_split(
@@ -1878,11 +1889,14 @@ fn find_ntt_size_for_split<const N: usize, P: NTTPrime>() -> usize {
     ntt_log_prime_search_for_split(1, N, &NTT_RADIX, &P::EXP).expect("Input Is too large for NTT")
 }
 
-fn acc_convolution<P: NTTPrime>(short: &[u64], long_hi: &[u64], res: &mut [u64]) {
+fn acc_convolution<P: NTTPrime, F>(a_buf: &[u64], b_buf: &[u64], res: &mut [u64], op: F)
+where
+    F: Fn(u64, u64) -> Montgomery<P>,
+{
     let mont_res: &mut [Montgomery<P>] = unsafe { std::mem::transmute(res) };
-    for (i, &s) in short.iter().enumerate() {
-        for (j, &l) in long_hi.iter().enumerate() {
-            mont_res[i + j] += Montgomery::fuse_mul_to(s, l);
+    for (i, &a) in a_buf.iter().enumerate() {
+        for (j, &b) in b_buf.iter().enumerate() {
+            mont_res[i + j] += op(a, b);
         }
     }
 }
@@ -1905,11 +1919,13 @@ fn ntt_split_convolution<const N: usize, P: NTTPrime>(
         &mut buf_scratch[..n],
         &mut ntt_scratch[..n],
     );
-    acc_convolution::<P>(short, long_hi, &mut res[split..]);
+    acc_convolution::<P, _>(short, long_hi, &mut res[split..], |a, b| {
+        Montgomery::fuse_mul_to(a, b)
+    });
 }
 
-fn ntt_entry_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
-    let out_len = a.len() + b.len() - 1;
+pub fn ntt_entry_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+    let out_len = long.len() + short.len() - 1;
     let mut res1 = [0; N];
     let mut res2 = [0; N];
     let mut res3 = [0; N];
@@ -1919,70 +1935,46 @@ fn ntt_entry_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u6
     let n1 = find_ntt_size::<P1>(out_len);
     if n1 <= N {
         ntt_convolution::<P1>(
-            a,
-            b,
+            long,
+            short,
             &mut res1[..n1],
             n1,
             &mut buf_scratch[..n1],
             &mut ntt_scratch[..n1],
         );
     } else {
-        let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
         ntt_split_convolution::<N, P1>(long, short, &mut res1, &mut buf_scratch, &mut ntt_scratch);
     }
 
     let n2 = find_ntt_size::<P2>(out_len);
     if n2 <= N {
         ntt_convolution::<P2>(
-            a,
-            b,
+            long,
+            short,
             &mut res2[..n2],
             n2,
             &mut buf_scratch[..n2],
             &mut ntt_scratch[..n2],
         );
     } else {
-        let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
         ntt_split_convolution::<N, P2>(long, short, &mut res2, &mut buf_scratch, &mut ntt_scratch);
     }
 
     let n3 = find_ntt_size::<P3>(out_len);
     if n3 <= N {
         ntt_convolution::<P3>(
-            a,
-            b,
+            long,
+            short,
             &mut res3[..n3],
             n3,
             &mut buf_scratch[..n3],
             &mut ntt_scratch[..n3],
         );
     } else {
-        let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
         ntt_split_convolution::<N, P3>(long, short, &mut res3, &mut buf_scratch, &mut ntt_scratch);
     }
 
-    let inv_n1 = Montgomery::to(n1 as u64).pow(P1::P - 2);
-    let inv_n2 = Montgomery::to(n2 as u64).pow(P2::P - 2);
-    let inv_n3 = Montgomery::to(n3 as u64).pow(P3::P - 2);
-    for i in 0..out_len {
-        CRT.crt(
-            &mut res1[i],
-            &mut res2[i],
-            &mut res3[i],
-            inv_n1,
-            inv_n2,
-            inv_n3,
-        );
-    }
-
-    let len1 = n1.min(out.len());
-    out[..len1].copy_from_slice(&res1[..len1]);
-    let len2 = n2.min(out.len() - 1);
-    let of1 = add_buf(&mut out[1..], &res2[..len2]) as u64;
-    let len3 = n3.min(out.len() - 2);
-    let of2 = add_buf(&mut out[2..], &res2[..len3]) as u64;
-
-    return res2[len2] + res3[len3] + of1 + of2;
+    ntt_accumulate(&mut res1, &mut res2, &mut res3, out, out_len)
 }
 
 //END NTT MULTIPLICATION
@@ -2033,9 +2025,9 @@ fn dyn_dispatch(l: usize, s: usize) -> DynDispatch {
         DynDispatch::School
     } else if is_karatsuba(l, s, FFT_CHUNKING_KARATSUBA_CUTOFF, FFT_KARATSUBA_CUTOFF) {
         DynDispatch::Karatsuba
-    } else if (l + s - 1) < DYN_NTT_CUTOFF{
+    } else if (l + s - 1) < DYN_NTT_CUTOFF {
         DynDispatch::FFT
-    } else{
+    } else {
         DynDispatch::NTT
     }
 }
@@ -2086,9 +2078,9 @@ fn static_dispatch(l: usize, s: usize) -> StaticDispatch {
         StaticDispatch::Prim2
     } else if is_school(l, s) {
         StaticDispatch::School
-    } else if is_karatsuba(l, s, NTT_CHUNKING_KARATSUBA_CUTOFF, NTT_KARATSUBA_CUTOFF){
+    } else if is_karatsuba(l, s, NTT_CHUNKING_KARATSUBA_CUTOFF, NTT_KARATSUBA_CUTOFF) {
         StaticDispatch::Karatsuba
-    } else{
+    } else {
         StaticDispatch::NTT
     }
 }
@@ -2109,7 +2101,7 @@ pub fn mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> Resu
         }
         StaticDispatch::School => mul_buf(long, short, out),
         StaticDispatch::Karatsuba => karatsuba_entry_static::<N>(long, short, out),
-        StaticDispatch::NTT => ntt_entry_static::<N>(a, b, out),
+        StaticDispatch::NTT => ntt_entry_static::<N>(long, short, out),
     })
 }
 
@@ -2120,7 +2112,12 @@ pub fn mul_arr<const N: usize>(a: &[u64], b: &[u64]) -> Result<([u64; N], u64), 
 }
 
 //SQUARE MULTIPLICATION
-//simple hierarchy School < Karatsuba < FFT
+// Simple hierarchy School < Karatsuba < FFT < NTT. These are optimized algorithms specifically
+// for squaring buffers. They all have constant factor speed ups.
+// School -> 50%
+// Karatsuba -> 40% - 50%
+// FTT -> 33%
+// NTT -> 33%
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
@@ -2309,6 +2306,8 @@ pub fn karatsuba_sqr_entry_static<const N: usize>(buf: &[u64], out: &mut [u64]) 
         karatsuba_sqr_core(buf, half, out, cross, rest)
     }
 }
+
+//FFT SQUARE
 
 #[inline(always)]
 fn seperate(x: Complex<f64>, y: Complex<f64>) -> (Complex<f64>, Complex<f64>) {
@@ -2524,16 +2523,116 @@ pub fn fft_sqr_entry(buf: &[u64], out: &mut [u64]) -> u64 {
         }
         fft_sqr_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
         match bit_size {
-            BitSize::Bit16 => accumulate_16(x, out),
-            BitSize::Bit8 => accumulate_8(x, out),
+            BitSize::Bit16 => fft_accumulate_16(x, out),
+            BitSize::Bit8 => fft_accumulate_8(x, out),
         }
     })
 }
+
+//NTT SQUARE
+
+fn ntt_sqr_convolution<P: NTTPrime>(
+    buf: &[u64],
+    res: &mut [u64],
+    n: usize,
+    ntt_scratch: &mut [u64],
+) {
+    res[..buf.len()].copy_from_slice(buf);
+    res[buf.len()..].fill(0);
+    let mont_res: &mut [Montgomery<P>] = unsafe { std::mem::transmute(res) };
+    for elem in mont_res.iter_mut().take(buf.len()) {
+        elem.to_mut();
+    }
+    let mont_scratch: &mut [Montgomery<P>] = unsafe { std::mem::transmute(ntt_scratch) };
+
+    let w = Montgomery::to(P::G).pow((P::P - 1) / (n as u64));
+    ntt(mont_res, w, mont_scratch);
+
+    for elem in mont_res.iter_mut() {
+        *elem *= *elem;
+    }
+
+    let inv_w = Montgomery::to(P::G).pow((n - 1) as u64);
+    ntt(mont_res, inv_w, mont_scratch);
+}
+
+pub fn ntt_sqr_entry_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
+    let out_len = 2 * buf.len() - 1;
+    let n1 = find_ntt_size::<P1>(out_len);
+    let n2 = find_ntt_size::<P2>(out_len);
+    let n3 = find_ntt_size::<P3>(out_len);
+    let scratch_sz = n1.max(n2).max(n3);
+    let mut scratch_gaurd = ScratchGuard::acquire();
+    let [res1, res2, res3, ntt_scratch] = scratch_gaurd.get_splits([n1, n2, n3, scratch_sz]);
+    ntt_sqr_convolution::<P1>(buf, res1, n1, &mut ntt_scratch[..n1]);
+    ntt_sqr_convolution::<P2>(buf, res2, n2, &mut ntt_scratch[..n2]);
+    ntt_sqr_convolution::<P3>(buf, res3, n3, &mut ntt_scratch[..n3]);
+
+    ntt_accumulate(res1, res2, res3, out, out_len)
+}
+
+fn ntt_split_sqr_convolution<const N: usize, P: NTTPrime>(
+    buf: &[u64],
+    res: &mut [u64],
+    ntt_scratch: &mut [u64],
+) {
+    let n = find_ntt_size_for_split::<N, P>();
+    let split = (n + 1) / 2;
+    let (buf_lo, buf_hi) = buf.split_at(split);
+    ntt_sqr_convolution::<P>(buf_lo, &mut res[..n], n, &mut ntt_scratch[..n]);
+    acc_convolution::<P, _>(buf_lo, buf_hi, &mut res[split..], |a, b| {
+        let val = Montgomery::fuse_mul_to(a, b);
+        val + val
+    });
+    acc_convolution::<P, _>(buf_hi, buf_hi, &mut res[2 * split..], |a, b| {
+        Montgomery::fuse_mul_to(a, b)
+    });
+}
+
+pub fn ntt_sqr_entry_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
+    let out_len = 2 * buf.len() - 1;
+    let mut res1 = [0; N];
+    let mut res2 = [0; N];
+    let mut res3 = [0; N];
+    let mut ntt_scratch = [0; N];
+
+    let n1 = find_ntt_size::<P1>(out_len);
+    if n1 <= N {
+        ntt_sqr_convolution::<P1>(buf, &mut res1[..n1], n1, &mut ntt_scratch[..n1]);
+    } else {
+        ntt_split_sqr_convolution::<N, P1>(buf, &mut res1, &mut ntt_scratch);
+    }
+
+    let n2 = find_ntt_size::<P2>(out_len);
+    if n2 <= N {
+        ntt_sqr_convolution::<P2>(buf, &mut res2[..n2], n2, &mut ntt_scratch[..n2]);
+    } else {
+        ntt_split_sqr_convolution::<N, P2>(buf, &mut res2, &mut ntt_scratch);
+    }
+
+    let n3 = find_ntt_size::<P3>(out_len);
+    if n3 <= N {
+        ntt_sqr_convolution::<P3>(buf, &mut res3[..n3], n3, &mut ntt_scratch[..n3]);
+    } else {
+        ntt_split_sqr_convolution::<N, P3>(buf, &mut res3, &mut ntt_scratch);
+    }
+
+    ntt_accumulate(
+        &mut res1[..n1],
+        &mut res2[..n2],
+        &mut res3[..n3],
+        out,
+        out_len,
+    )
+}
+
+//END NTT SQUARE
 
 enum DynSqrDispatch {
     School,
     Karatsuba,
     FFT,
+    NTT,
 }
 
 fn dyn_sqr_dispatch(n: usize) -> DynSqrDispatch {
@@ -2541,8 +2640,10 @@ fn dyn_sqr_dispatch(n: usize) -> DynSqrDispatch {
         DynSqrDispatch::School
     } else if n <= FFT_SQR_CUTOFF {
         DynSqrDispatch::Karatsuba
-    } else {
+    } else if n <= DYN_NTT_SQR_CUTOFF {
         DynSqrDispatch::FFT
+    } else {
+        DynSqrDispatch::NTT
     }
 }
 
@@ -2555,6 +2656,7 @@ pub fn sqr_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
         DynSqrDispatch::School => sqr_buf(buf, out),
         DynSqrDispatch::Karatsuba => karatsuba_sqr_entry_dyn(buf, out),
         DynSqrDispatch::FFT => fft_sqr_entry(buf, out),
+        DynSqrDispatch::NTT => ntt_sqr_entry_dyn(buf, out),
     }
 }
 
@@ -2567,13 +2669,16 @@ pub fn sqr_vec(buf: &[u64]) -> (Vec<u64>, u64) {
 enum StaticSqrDispatch {
     School,
     Karatsubaa,
+    NTT,
 }
 
 fn static_sqr_dispatch(n: usize) -> StaticSqrDispatch {
     if n <= KARATSUBA_SQR_CUTOFF {
         StaticSqrDispatch::School
-    } else {
+    } else if n <= STATIC_NTT_SQR_CUTOFF {
         StaticSqrDispatch::Karatsubaa
+    } else {
+        StaticSqrDispatch::NTT
     }
 }
 
@@ -2584,6 +2689,7 @@ pub fn sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> Result<u64, (
     Ok(match static_sqr_dispatch(buf.len()) {
         StaticSqrDispatch::School => sqr_buf(buf, out),
         StaticSqrDispatch::Karatsubaa => karatsuba_sqr_entry_static::<N>(buf, out),
+        StaticSqrDispatch::NTT => ntt_sqr_entry_static::<N>(buf, out),
     })
 }
 
@@ -2656,16 +2762,17 @@ pub fn short_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -
     }
     let trunc_a = &a[a.len().saturating_sub(out.len())..];
     let trunc_b = &b[b.len().saturating_sub(out.len())..];
-    let mut scratch = [0; N];
+    let mut scratch = [0; MAX_STATIC_SIZE];
+    debug_assert!(trunc_a.len() + trunc_b.len() - 1 <= MAX_STATIC_SIZE);
     let val = &mut scratch[..trunc_a.len() + trunc_b.len() - 1];
-    let of = mul_dyn(trunc_a, trunc_b, val);
+    let of = mul_static::<MAX_STATIC_SIZE>(trunc_a, trunc_b, val).unwrap();
     out.copy_from_slice(&val[val.len() - out.len()..]);
     return of;
 }
 
 //MIDDLE MULTIPLICATION
 // gets the middle part n limbs of a n x 2n product
-// n: [0..n-1] x 2n: [0..2n-1] -> 3n-1: [0..3n-2] -> [n .. 2n-1]
+// n: [0..n-1] x 2n-1: [0..2n-2] -> 3n-1: [0..3n-3] -> [n-1 .. 2n-2]
 
 fn mid_mul_buf(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     // long (2n-1) , short (n)
@@ -2721,16 +2828,125 @@ fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
         fft_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
 
         match bit_size {
-            BitSize::Bit16 => accumulate_16(&x[(sz - 1) * w..(2 * sz - 1) * w], out),
-            BitSize::Bit8 => accumulate_8(&x[(sz - 1) * w..(2 * sz - 1) * w], out),
+            BitSize::Bit16 => fft_accumulate_16(&x[(sz - 1) * w..(2 * sz - 1) * w], out),
+            BitSize::Bit8 => fft_accumulate_8(&x[(sz - 1) * w..(2 * sz - 1) * w], out),
         }
     })
+}
+
+fn ntt_mid_accumulate(
+    res1: &mut [u64],
+    res2: &mut [u64],
+    res3: &mut [u64],
+    out: &mut [u64], // len == s
+    s: usize,
+) -> u64 {
+    let (n1, n2, n3) = (res1.len(), res2.len(), res3.len());
+    let inv_n1 = Montgomery::to(n1 as u64).pow(P1::P - 2);
+    let inv_n2 = Montgomery::to(n2 as u64).pow(P2::P - 2);
+    let inv_n3 = Montgomery::to(n3 as u64).pow(P3::P - 2);
+
+    let crt_start = s - 3;
+    let crt_end = 2 * s - 1;
+    for i in crt_start..crt_end {
+        CRT.crt(
+            &mut res1[i],
+            &mut res2[i],
+            &mut res3[i],
+            inv_n1,
+            inv_n2,
+            inv_n3,
+        );
+    }
+
+    out.copy_from_slice(&res1[s - 1..2 * s - 1]);
+    let of1 = add_buf(out, &res2[s - 2..2 * s - 2]) as u64;
+    let of2 = add_buf(out, &res3[s - 3..2 * s - 3]) as u64;
+
+    res2[2 * s - 2] + res3[2 * s - 3] + of1 + of2
+}
+
+fn ntt_mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+    let sz = short.len();
+    let n1 = find_ntt_size::<P1>(2 * sz - 1);
+    let n2 = find_ntt_size::<P2>(2 * sz - 1);
+    let n3 = find_ntt_size::<P3>(2 * sz - 1);
+    let scratch_sz = n1.max(n2).max(n3);
+    let mut scratch_gaurd = ScratchGuard::acquire();
+    let [res1, res2, res3, buf_scratch, ntt_scratch] =
+        scratch_gaurd.get_splits([n1, n2, n3, scratch_sz, scratch_sz]);
+    ntt_convolution::<P1>(
+        long,
+        short,
+        res1,
+        n1,
+        &mut buf_scratch[..n1],
+        &mut ntt_scratch[..n1],
+    );
+    ntt_convolution::<P2>(
+        long,
+        short,
+        res2,
+        n2,
+        &mut buf_scratch[..n2],
+        &mut ntt_scratch[..n2],
+    );
+    ntt_convolution::<P3>(
+        long,
+        short,
+        res3,
+        n3,
+        &mut buf_scratch[..n3],
+        &mut ntt_scratch[..n3],
+    );
+
+    ntt_mid_accumulate(res1, res2, res3, out, sz)
+}
+
+fn ntt_mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+    let sz = short.len();
+    let mut res1 = [0; MAX_STATIC_SIZE];
+    let mut res2 = [0; MAX_STATIC_SIZE];
+    let mut res3 = [0; MAX_STATIC_SIZE];
+    let mut buf_scratch = [0; MAX_STATIC_SIZE];
+    let mut ntt_scratch = [0; MAX_STATIC_SIZE];
+
+    let n1 = find_ntt_size::<P1>(2 * sz - 1);
+    let n2 = find_ntt_size::<P2>(2 * sz - 1);
+    let n3 = find_ntt_size::<P3>(2 * sz - 1);
+    ntt_convolution::<P1>(
+        long,
+        short,
+        &mut res1[..n1],
+        n1,
+        &mut buf_scratch[..n1],
+        &mut ntt_scratch[..n1],
+    );
+    ntt_convolution::<P2>(
+        long,
+        short,
+        &mut res2[..n2],
+        n2,
+        &mut buf_scratch[..n2],
+        &mut ntt_scratch[..n2],
+    );
+    ntt_convolution::<P3>(
+        long,
+        short,
+        &mut res3,
+        n3,
+        &mut buf_scratch[..n3],
+        &mut ntt_scratch[..n3],
+    );
+
+    ntt_mid_accumulate(&mut res1, &mut res2, &mut res3, out, sz)
 }
 
 enum DynMidDispatch {
     School,
     Karatsuba,
     FFT,
+    NTT,
 }
 
 fn dyn_mid_dispatch(n: usize) -> DynMidDispatch {
@@ -2738,8 +2954,10 @@ fn dyn_mid_dispatch(n: usize) -> DynMidDispatch {
         DynMidDispatch::School
     } else if n < FFT_MID_CUTOFF {
         DynMidDispatch::Karatsuba
-    } else {
+    } else if n < DYN_NTT_MID_CUTOFF {
         DynMidDispatch::FFT
+    } else {
+        DynMidDispatch::NTT
     };
 }
 
@@ -2766,7 +2984,24 @@ fn mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
             of
         }
         DynMidDispatch::FFT => fft_mid_mul(long, short, out),
+        DynMidDispatch::NTT => ntt_mid_mul_dyn(long, short, out),
     }
+}
+
+enum StaticMidDispatch {
+    School,
+    Karatsuba,
+    NTT,
+}
+
+fn static_mid_dispatch(n: usize) -> StaticMidDispatch {
+    return if n < KARATSUBA_MID_CUTOFF {
+        StaticMidDispatch::School
+    } else if n < STATIC_NTT_MID_CUTOFF {
+        StaticMidDispatch::Karatsuba
+    } else {
+        StaticMidDispatch::NTT
+    };
 }
 
 fn mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
@@ -2781,13 +3016,15 @@ fn mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) 
         "size of out must be the same size as short"
     );
     let n = short.len();
-    if n < KARATSUBA_MID_CUTOFF {
-        mid_mul_buf(long, short, out)
-    } else {
-        let mut big_out = [0; N];
-        let of = karatsuba_entry_static::<N>(long, short, &mut big_out);
-        out.copy_from_slice(&big_out[n - 1..2 * n - 1]);
-        of
+    match static_mid_dispatch(n) {
+        StaticMidDispatch::School => mid_mul_buf(long, short, out),
+        StaticMidDispatch::Karatsuba => {
+            let mut big_out = [0; MAX_STATIC_SIZE];
+            let of = karatsuba_entry_static::<MAX_STATIC_SIZE>(long, short, &mut big_out);
+            out.copy_from_slice(&big_out[n - 1..2 * n - 1]);
+            of
+        }
+        StaticMidDispatch::NTT => ntt_mid_mul_static::<N>(long, short, out),
     }
 }
 

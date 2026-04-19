@@ -4,6 +4,8 @@ pub mod div;
 pub mod mul;
 pub mod utils;
 
+pub const MAX_STATIC_SIZE: usize = 128;
+
 pub const CHUNKING_KARATSUBA_CUTOFF: usize = 15;
 pub const KARATSUBA_CUTOFF: usize = 21;
 
@@ -18,11 +20,15 @@ pub const NTT_KARATSUBA_CUTOFF: f64 = 2.75; // GUESS
 pub const FFT_SQR_BIT_CUTOFF: usize = 1 << 16; // GUESS
 pub const KARATSUBA_SQR_CUTOFF: usize = 26; // GUESS
 pub const FFT_SQR_CUTOFF: usize = 100; // GUESS
+pub const DYN_NTT_SQR_CUTOFF: usize = 1 << 14; // GUESS
+pub const STATIC_NTT_SQR_CUTOFF: usize = 100; //GUESS
 
 pub const SHORT_MUL_CUTOFF: usize = 22; // GUESS
 
 pub const KARATSUBA_MID_CUTOFF: usize = 30; // GUESS
 pub const FFT_MID_CUTOFF: usize = 60; // GUESS
+pub const DYN_NTT_MID_CUTOFF: usize = 1 << 14; // GUESS
+pub const STATIC_NTT_MID_CUTOFF: usize = 100;
 
 pub const BZ_CUTOFF: usize = 64; // GUESS
 
