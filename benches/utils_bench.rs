@@ -134,6 +134,22 @@ fn bench_fft_mul(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_ntt_mul(c: &mut Criterion){
+    let mut group = c.benchmark_group(format!("fft_mul_buf/{ARCH}"));
+    set_up_group(&mut group);
+    let sizes: Vec<usize> = vec![4, 16, 64, 256, 1024, 4096];
+    for &n in &sizes {
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
+            let a = random_limbs(n);
+            let b = random_limbs(n);
+            let mut out = vec![0; 2 * n];
+            bench.iter(|| ntt_entry_dyn(black_box(&a), black_box(&b), black_box(&mut out)));
+        });
+    }
+    group.finish();
+}
+
 fn bench_gen_mul(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("gen_mul_buf/{ARCH}"));
     set_up_group(&mut group);

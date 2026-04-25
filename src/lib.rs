@@ -1,4 +1,5 @@
 #![allow(unused_imports)]
+#![allow(long_running_const_eval)]
 extern crate core;
 
 pub mod bit_nums;

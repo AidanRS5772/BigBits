@@ -1,9 +1,10 @@
 #![allow(dead_code)]
 
-use big_bits::*;
-use criterion::{
-    black_box, criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, Criterion,
+use big_bits::{
+    utils::{FFT_CHUNKING_KARATSUBA_CUTOFF, FFT_KARATSUBA_CUTOFF},
+    *,
 };
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use rand::Rng;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -310,11 +311,6 @@ where
     }
 }
 
-fn set_up_group(group: &mut BenchmarkGroup<'_, WallTime>) {
-    group.sample_size(250); // default is 100
-    group.warm_up_time(std::time::Duration::from_secs(5)); // default is 3s
-}
-
 fn make_inputs(lengths: &Vec<(usize, usize)>) -> Vec<(Vec<u64>, Vec<u64>)> {
     let mut rng = rand::thread_rng();
     let mut inputs: Vec<(Vec<u64>, Vec<u64>)> = Vec::with_capacity(lengths.len());
@@ -328,21 +324,50 @@ fn make_inputs(lengths: &Vec<(usize, usize)>) -> Vec<(Vec<u64>, Vec<u64>)> {
     inputs
 }
 
-fn avg_bench(
+fn ratio_bench(
     iters: u64,
-    inputs: &Vec<(Vec<u64>, Vec<u64>)>,
-    mut func: impl FnMut(&[u64], &[u64], &mut [u64]) -> u64,
+    inputs: &[(Vec<u64>, Vec<u64>)],
+    func_a: &mut dyn FnMut(&[u64], &[u64], &mut [u64]) -> u64,
+    func_b: &mut dyn FnMut(&[u64], &[u64], &mut [u64]) -> u64,
 ) -> Duration {
-    let mut total = Duration::ZERO;
+    let mut rng = rand::thread_rng();
+    let mut ratio_sum = 0.0f64;
     for _ in 0..iters {
         for (l, s) in inputs.iter() {
-            let mut out = vec![0; l.len() + s.len()];
-            let start = Instant::now();
-            func(black_box(l), black_box(s), black_box(&mut out));
-            total += start.elapsed();
+            let mut out_a = vec![0u64; l.len() + s.len()];
+            let mut out_b = vec![0u64; l.len() + s.len()];
+
+            let (t_a, t_b) = if rng.gen::<bool>() {
+                let t_a = {
+                    let start = Instant::now();
+                    func_a(black_box(l), black_box(s), black_box(&mut out_a));
+                    start.elapsed()
+                };
+                let t_b = {
+                    let start = Instant::now();
+                    func_b(black_box(l), black_box(s), black_box(&mut out_b));
+                    start.elapsed()
+                };
+                (t_a, t_b)
+            } else {
+                let t_b = {
+                    let start = Instant::now();
+                    func_b(black_box(l), black_box(s), black_box(&mut out_b));
+                    start.elapsed()
+                };
+                let t_a = {
+                    let start = Instant::now();
+                    func_a(black_box(l), black_box(s), black_box(&mut out_a));
+                    start.elapsed()
+                };
+                (t_a, t_b)
+            };
+
+            ratio_sum += t_a.as_nanos() as f64 / t_b.as_nanos() as f64;
         }
     }
-    total / inputs.len() as u32
+    let avg_ratio = ratio_sum / (inputs.len() as u64) as f64;
+    Duration::from_nanos((avg_ratio * 1_000_000.0) as u64)
 }
 
 fn avg_input(lengths: &Vec<(usize, usize)>) -> (f64, f64) {
@@ -356,34 +381,29 @@ fn avg_input(lengths: &Vec<(usize, usize)>) -> (f64, f64) {
     (sum_l as f64 / n, sum_s as f64 / n)
 }
 
-const NUM_OF_LENGTHS: usize = 256;
-const GAP: u32 = 8;
+const NUM_OF_LENGTHS: usize = 64;
+const GAP: u32 = 4;
 
 fn bench_school_to_chunking_karatsuba(c: &mut Criterion) {
-    let mut group = c.benchmark_group(format!("school_to_chunking_karatsuba/{ARCH}"));
-    set_up_group(&mut group);
     let lengths = BoundarySearch::new(|l, s| (s <= (l + 1) / 2) && (s > 2), |l, s| is_school(l, s))
-        .find((20, 3), NUM_OF_LENGTHS, GAP);
+        .find((50, 20), NUM_OF_LENGTHS, GAP);
     let inputs = make_inputs(&lengths);
     assert!(!inputs.is_empty(), "find inputs failed");
     println!("Average Input: {:?}", avg_input(&lengths));
 
-    group.bench_function("school", |b| {
-        b.iter_custom(|iters| avg_bench(iters, &inputs, |a, b, out| mul_buf(a, b, out)));
-    });
-
-    group.bench_function("chunking_karatsuba", |b| {
+    c.bench_function(&format!("school_to_chunking_karatsuba/{ARCH}"), |b| {
         b.iter_custom(|iters| {
-            avg_bench(iters, &inputs, |a, b, out| karatsuba_entry_dyn(a, b, out))
-        });
+            ratio_bench(
+                iters,
+                &inputs,
+                &mut |a, b, out| mul_buf(a, b, out),
+                &mut |a, b, out| karatsuba_entry_dyn(a, b, out),
+            )
+        })
     });
-
-    group.finish();
 }
 
 fn bench_school_to_karatsuba(c: &mut Criterion) {
-    let mut group = c.benchmark_group(format!("school_to_karatsuba/{ARCH}"));
-    set_up_group(&mut group);
     let lengths = BoundarySearch::new(
         |l, s| (l >= s) && (s > (l + 1) / 2) && (s > 2),
         |l, s| is_school(l, s),
@@ -393,25 +413,22 @@ fn bench_school_to_karatsuba(c: &mut Criterion) {
     assert!(!inputs.is_empty(), "find inputs failed");
     println!("Average Input: {:?}", avg_input(&lengths));
 
-    group.bench_function("school", |b| {
-        b.iter_custom(|iters| avg_bench(iters, &inputs, |a, b, out| mul_buf(a, b, out)));
-    });
-
-    group.bench_function("karatsuba", |b| {
+    c.bench_function(&format!("school_to_karatsuba/{ARCH}"), |b| {
         b.iter_custom(|iters| {
-            avg_bench(iters, &inputs, |a, b, out| karatsuba_entry_dyn(a, b, out))
-        });
+            ratio_bench(
+                iters,
+                &inputs,
+                &mut |a, b, out| mul_buf(a, b, out),
+                &mut |a, b, out| karatsuba_entry_dyn(a, b, out),
+            )
+        })
     });
-
-    group.finish();
 }
 
 fn bench_chunking_karatsuba_to_fft(c: &mut Criterion) {
-    let mut group = c.benchmark_group(format!("chunking_karatsuba_to_fft/{ARCH}"));
-    set_up_group(&mut group);
     let lengths = BoundarySearch::new(
         |l, s| (s <= (l + 1) / 2) && !is_school(l, s),
-        |l, s| is_karatsuba(l, s),
+        |l, s| is_karatsuba(l, s, FFT_CHUNKING_KARATSUBA_CUTOFF, FFT_KARATSUBA_CUTOFF),
     )
     .find((60, 25), NUM_OF_LENGTHS, GAP);
     let inputs = make_inputs(&lengths);
@@ -419,25 +436,29 @@ fn bench_chunking_karatsuba_to_fft(c: &mut Criterion) {
     println!("Average Input: {:?}", avg_input(&lengths));
     println!("Number of Inputs: {}", inputs.len());
 
-    group.bench_function("karatsuba", |b| {
+    c.bench_function(&format!("school_to_chunking_karatsuba/{ARCH}"), |b| {
         b.iter_custom(|iters| {
-            avg_bench(iters, &inputs, |a, b, out| karatsuba_entry_dyn(a, b, out))
-        });
+            ratio_bench(
+                iters,
+                &inputs,
+                &mut |a, b, out| karatsuba_entry_dyn(a, b, out),
+                &mut |a, b, out| fft_entry(a, b, out),
+            )
+        })
     });
-
-    group.bench_function("fft", |b| {
-        b.iter_custom(|iters| avg_bench(iters, &inputs, |a, b, out| fft_entry(a, b, out)));
-    });
-
-    group.finish();
 }
 
 fn bench_karatsuba_to_fft(c: &mut Criterion) {
-    let mut group = c.benchmark_group(format!("karatsuba_to_fft/{ARCH}"));
-    set_up_group(&mut group);
     let lengths = BoundarySearch::new(
         |l, s| (l >= s) && (s > (l + 1) / 2) && !is_school(l, s),
-        |l, s| is_karatsuba(l, s),
+        |l, s| {
+            is_karatsuba(
+                l,
+                s,
+                FFT_CHUNKING_KARATSUBA_CUTOFF,
+                FFT_CHUNKING_KARATSUBA_CUTOFF,
+            )
+        },
     )
     .find((150, 150), NUM_OF_LENGTHS, GAP);
     let inputs = make_inputs(&lengths);
@@ -445,18 +466,27 @@ fn bench_karatsuba_to_fft(c: &mut Criterion) {
     println!("Average Input: {:?}", avg_input(&lengths));
     println!("Number of Inputs: {}", inputs.len());
 
-    group.bench_function("karatsuba", |b| {
+    c.bench_function(&format!("school_to_chunking_karatsuba/{ARCH}"), |b| {
         b.iter_custom(|iters| {
-            avg_bench(iters, &inputs, |a, b, out| karatsuba_entry_dyn(a, b, out))
-        });
+            ratio_bench(
+                iters,
+                &inputs,
+                &mut |a, b, out| karatsuba_entry_dyn(a, b, out),
+                &mut |a, b, out| fft_entry(a, b, out),
+            )
+        })
     });
-
-    group.bench_function("fft", |b| {
-        b.iter_custom(|iters| avg_bench(iters, &inputs, |a, b, out| fft_entry(a, b, out)));
-    });
-
-    group.finish();
 }
 
-criterion_group!(benches, bench_chunking_karatsuba_to_fft,);
+fn cutoff_criterion() -> Criterion {
+    Criterion::default()
+        .sample_size(250)
+        .warm_up_time(Duration::from_secs(5))
+}
+
+criterion_group! {
+    name = benches;
+    config = cutoff_criterion();
+    targets = bench_school_to_chunking_karatsuba
+}
 criterion_main!(benches);

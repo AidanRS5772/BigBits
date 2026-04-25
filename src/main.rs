@@ -1,4 +1,4 @@
-#![allow(unused_imports)]
+#![allow(unused_imports, dead_code)]
 use big_bits::utils::mul::fft_entry;
 use criterion::black_box;
 use rand::rngs::StdRng;

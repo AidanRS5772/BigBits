@@ -278,10 +278,7 @@ fn chunking_karatsuba(long: &[u64], short: &[u64], out: &mut [u64], scratch: &mu
     let s = short.len();
     let l = long.len();
     let half = (s + 1) / 2;
-    let mut chunks = l / s;
-    if l % s == 0 {
-        chunks -= 1;
-    }
+    let chunks = (l - s + 1) / s;
     {
         let (val_cross, rest) = scratch.split_at_mut(2 * s + 2 * half + 1);
         let (cross, val) = val_cross.split_at_mut(2 * half + 1);
@@ -314,7 +311,7 @@ pub fn is_school(l: usize, s: usize) -> bool {
     if s <= half {
         s <= CHUNKING_KARATSUBA_CUTOFF
     } else {
-        let c = KARATSUBA_CUTOFF as f64;
+        let c = KARATSUBA_CUTOFF;
         let val = l as f64 - 1.5 * c;
         let boundary = (1.125 * c - val * val / (2.0 * c)).ceil() as usize;
         s <= boundary
@@ -557,8 +554,8 @@ impl FFTCache {
         let tw = self
             .twidles
             .entry(m >> m.trailing_zeros())
-            .or_insert_with(|| FTTTwidleTower::build(m))
-            .get(m);
+            .or_insert_with(|| FTTTwidleTower::build(2 * m))
+            .get(2 * m);
         let scratch_sz = m + fwd
             .get_inplace_scratch_len()
             .max(bwd.get_inplace_scratch_len());
@@ -611,8 +608,7 @@ const fn fft_log_prim_search(
 }
 
 const fn find_fft_size(n: usize) -> usize {
-    const INIT: usize = 4; // guarantee that size is a multiple of 4
-    return fft_log_prim_search(INIT, n, FFT_RADIX.len(), &FFT_RADIX);
+    return fft_log_prim_search(4, n, FFT_RADIX.len(), &FFT_RADIX);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -716,7 +712,7 @@ fn fft_core(
     fwd.process_with_scratch(x, fft_scratch);
     recombine(x, n / 2, n, tw);
     bwd.process_with_scratch(&mut x[..n / 2], fft_scratch);
-    scale_and_round(x, n as f64);
+    scale_and_round(&mut x[..n / 2], n as f64);
 }
 
 enum BitSize {
@@ -1094,42 +1090,65 @@ fn decompose_8(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
 
 fn fft_accumulate_16(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
     let coefs = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const f64, x.len() * 2) };
-    let mut carry = 0;
-    for (chunk, elem) in coefs.chunks(4).zip(out.iter_mut()) {
+    let mut chunks = coefs.chunks(4);
+    let mut carry: u128 = 0;
+
+    for elem in out.iter_mut() {
+        let chunk = chunks.next().unwrap();
         let mut tot = carry;
         for (i, c) in chunk.iter().enumerate() {
             let val = unsafe { c.to_int_unchecked::<u64>() } as u128;
-            tot += val << (i * 16)
+            tot += val << (i * 16);
         }
         *elem = tot as u64;
         carry = tot >> 64;
     }
-    return carry as u64;
+
+    // Drain any remaining chunk that didn't have a corresponding output limb
+    for chunk in chunks {
+        for (i, c) in chunk.iter().enumerate() {
+            let val = unsafe { c.to_int_unchecked::<u64>() } as u128;
+            carry += val << (i * 16);
+        }
+    }
+
+    carry as u64
 }
 
 fn fft_accumulate_8(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
     let coefs = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const f64, x.len() * 2) };
-    let mut carry = 0;
-    for (chunk, elem) in coefs.chunks(8).zip(out.iter_mut()) {
+    let mut chunks = coefs.chunks(8);
+    let mut carry: u128 = 0;
+
+    for elem in out.iter_mut() {
+        let chunk = chunks.next().unwrap();
         let mut tot = carry;
         for (i, c) in chunk.iter().enumerate() {
-            let val = unsafe { c.to_int_unchecked::<u64>() };
-            tot += (val as u128) << (i * 8)
+            let val = unsafe { c.to_int_unchecked::<u64>() } as u128;
+            tot += val << (i * 8);
         }
         *elem = tot as u64;
         carry = tot >> 64;
     }
-    return carry as u64;
+
+    for chunk in chunks {
+        for (i, c) in chunk.iter().enumerate() {
+            let val = unsafe { c.to_int_unchecked::<u64>() } as u128;
+            carry += val << (i * 8);
+        }
+    }
+
+    carry as u64
 }
 
 #[inline(always)]
 fn bit16_length(sz: usize, last: u64) -> usize {
-    (sz - 1) * 4 + (last.ilog2() as usize + 1) / 16
+    (sz - 1) * 4 + (last.ilog2() as usize) / 16 + 1
 }
 
 #[inline(always)]
 fn bit8_length(sz: usize, last: u64) -> usize {
-    (sz - 1) * 8 + (last.ilog2() as usize + 1) / 8
+    (sz - 1) * 8 + (last.ilog2() as usize) / 8 + 1
 }
 
 pub fn fft_entry(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
@@ -1161,8 +1180,8 @@ pub fn fft_entry(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
         fft_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
 
         match bit_size {
-            BitSize::Bit16 => fft_accumulate_16(x, out),
-            BitSize::Bit8 => fft_accumulate_8(x, out),
+            BitSize::Bit16 => fft_accumulate_16(&mut x[..n / 2], out),
+            BitSize::Bit8 => fft_accumulate_8(&mut x[..n / 2], out),
         }
     })
 }
@@ -1256,32 +1275,44 @@ const fn exp_decomp(p: u64) -> [usize; NTT_RADIX_CNT] {
 
 trait NTTPrime {
     const P: u64;
-    const G: u64 = primitive_root(Self::P);
-    const G3: u64 = mod_pow(Self::G, (Self::P - 1) / 3, Self::P);
-    const G5: u64 = mod_pow(Self::G, (Self::P - 1) / 5, Self::P);
+    const G: u64;
+    const G3: u64;
+    const G5: u64;
+    const EXP: [usize; NTT_RADIX_CNT];
     const R: u64 = (u64::MAX % Self::P) + 1;
     const P_INV: u64 = neg_inv_mod_2_64(Self::P);
     const R_SQR: u64 = (u128::MAX % Self::P as u128) as u64 + 1;
     const R_CUB: u64 = (((Self::R as u128) * (Self::R_SQR as u128)) % (Self::P as u128)) as u64;
-    const EXP: [usize; NTT_RADIX_CNT] = exp_decomp(Self::P);
 }
 
 struct P1;
 impl NTTPrime for P1 {
     const P: u64 = 5937362789990400001;
+    const G: u64 = 11;
+    const G3: u64 = 4922211885758269045;
+    const G5: u64 = 1487271088621240150;
+    const EXP: [usize; NTT_RADIX_CNT] = [46, 3, 5];
     // 2^46 * 3^3 * 5^5 + 1
 }
 
 struct P2;
 impl NTTPrime for P2 {
     const P: u64 = 8122312296706867201;
+    const G: u64 = 7;
+    const G3: u64 = 28707452713357919;
+    const G5: u64 = 5293944249257477682;
+    const EXP: [usize; NTT_RADIX_CNT] = [46, 5, 2];
     // 19 * 2^46 * 3^5 * 5^2 + 1
 }
 
 struct P3;
 impl NTTPrime for P3 {
     const P: u64 = 7552325468867788801;
-    // 19 * 2^46 * 3^5 * 5^2 + 1
+    const G: u64 = 19;
+    const G3: u64 = 877228236151578703;
+    const G5: u64 = 1513879670366840320;
+    const EXP: [usize; NTT_RADIX_CNT] = [46, 4, 2];
+    // 53 * 2^46 * 3^5 * 5^2 + 1
 }
 
 #[repr(transparent)]
@@ -1376,7 +1407,7 @@ impl<P: NTTPrime> Montgomery<P> {
 
     const fn pow(self, pow: u64) -> Self {
         if pow == 0 {
-            return Self::ZERO;
+            return Self::ONE;
         } else if pow == 1 {
             return self;
         }
@@ -1480,6 +1511,8 @@ impl<P: NTTPrime> MulAssign for Montgomery<P> {
 fn ntt<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, scratch: &mut [Montgomery<P>]) {
     if buf.len() <= NTT_CUTOFF {
         dft_naive(buf, w, scratch);
+    } else if buf.len() % 5 == 0 {
+        ntt_5(buf, w, scratch);
     } else if buf.len() % 3 == 0 {
         ntt_3(buf, w, scratch);
     } else {
@@ -1521,7 +1554,7 @@ fn split<P: NTTPrime, const N: usize>(buf: &mut [Montgomery<P>]) -> [&mut [Montg
 fn shuffle<P: NTTPrime, const N: usize>(buf: &mut [Montgomery<P>], scratch: &mut [Montgomery<P>]) {
     debug_assert!(
         buf.len() % N == 0,
-        "length of buf must be evenly divided by N"
+        "length of buf must be evenly divided by N = {N}"
     );
     let m = buf.len() / N;
     let tmp: [&mut [Montgomery<P>]; N] = split::<P, N>(&mut scratch[..N * m]);
@@ -1554,7 +1587,7 @@ fn ntt_2<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, scratch: &mut
 
 fn ntt_3<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, scratch: &mut [Montgomery<P>]) {
     let m = buf.len() / 3;
-    let mont_g = Montgomery::to(P::G3);
+    let mont_g = w.pow(m as u64);
     shuffle::<P, 3>(buf, scratch);
     let sqr_w = w * w;
     let tri_w = w * sqr_w;
@@ -1578,7 +1611,7 @@ fn ntt_3<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, scratch: &mut
 
 fn ntt_5<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, scratch: &mut [Montgomery<P>]) {
     let m = buf.len() / 5;
-    let g = Montgomery::to(P::G5);
+    let g = w.pow(m as u64);
     let g2 = g * g;
     let g3 = g2 * g;
     let g4 = g3 * g;
@@ -1639,13 +1672,15 @@ fn ntt_convolution<P: NTTPrime>(
     ntt_scratch: &mut [u64],
 ) {
     res[..a_buf.len()].copy_from_slice(a_buf);
+    res[a_buf.len()..].fill(0);
     buf_scratch[..b_buf.len()].copy_from_slice(b_buf);
+    buf_scratch[b_buf.len()..].fill(0);
     let mont_a: &mut [Montgomery<P>] = unsafe { std::mem::transmute(res) };
     let mont_b: &mut [Montgomery<P>] = unsafe { std::mem::transmute(buf_scratch) };
     for a in mont_a.iter_mut().take(a_buf.len()) {
         a.to_mut();
     }
-    for b in mont_b.iter_mut().take(a_buf.len()) {
+    for b in mont_b.iter_mut().take(b_buf.len()) {
         b.to_mut();
     }
     let mont_scratch: &mut [Montgomery<P>] = unsafe { std::mem::transmute(ntt_scratch) };
@@ -1658,7 +1693,8 @@ fn ntt_convolution<P: NTTPrime>(
         *a *= *b;
     }
 
-    let inv_w = Montgomery::to(P::G).pow((n - 1) as u64);
+    let inv_pow = (n - 1) as u64 * ((P::P - 1) / n as u64);
+    let inv_w = Montgomery::to(P::G).pow(inv_pow);
     ntt(mont_a, inv_w, mont_scratch);
 }
 
@@ -1763,7 +1799,7 @@ fn ntt_accumulate(
     let len2 = n2.min(out.len() - 1);
     let of1 = add_buf(&mut out[1..], &res2[..len2]) as u64;
     let len3 = n3.min(out.len() - 2);
-    let of2 = add_buf(&mut out[2..], &res2[..len3]) as u64;
+    let of2 = add_buf(&mut out[2..], &res3[..len3]) as u64;
 
     return res2[len2] + res3[len3] + of1 + of2;
 }
@@ -2318,23 +2354,21 @@ fn seperate(x: Complex<f64>, y: Complex<f64>) -> (Complex<f64>, Complex<f64>) {
     (Complex::new(a, b), Complex::new(c, -d))
 }
 
-#[inline(always)]
-fn c_sqr(x: Complex<f64>) -> Complex<f64> {
-    Complex::new((x.re + x.im) * (x.re - x.im), 2.0 * x.re * x.im)
-}
-
 fn sqr_recombine(x: &mut [Complex<f64>], m: usize, tw: &[Complex<f64>]) {
     let Complex::<f64> { re, im } = x[0];
     x[0] = Complex::new(re * re + im * im, 2.0 * re * im);
     for k in 1..m / 2 {
         let (e, o) = seperate(x[k], x[m - k]);
         let (a, b) = seperate(e, tw[k] * o.conj());
-        let s = c_sqr(a) - c_sqr(b);
+        let s = (a + b) * (a - b);
         let t = e * o;
         x[k] = Complex::new(s.re - t.im, s.im + t.re).scale(2.0);
-        x[m - k] = Complex::new(s.re + t.im, t.re - s.im).scale(2.0)
+        x[m - k] = Complex::new(s.re + t.im, t.re - s.im).scale(2.0);
     }
-    x[m / 2] = c_sqr(x[m / 2]);
+    x[m / 2] = Complex::new(
+        (x[m / 2].re + x[m / 2].im) * (x[m / 2].re - x[m / 2].im),
+        2.0 * x[m / 2].re * x[m / 2].im,
+    );
 }
 
 fn fft_sqr_core(
@@ -2494,7 +2528,7 @@ fn sqr_decompose_8(buf: &[u64], x: &mut [Complex<f64>]) {
 }
 
 fn bit_size_sqr_dispatch(n: usize) -> BitSize {
-    return if n <= FFT_SQR_BIT_CUTOFF {
+    return if n <= FFT_BIT_CUTOFF {
         BitSize::Bit16
     } else {
         BitSize::Bit8
@@ -2515,7 +2549,7 @@ pub fn fft_sqr_entry(buf: &[u64], out: &mut [u64]) -> u64 {
         let mut scratch_gaurd = ScratchGuard::acquire();
         let complex_scratch: &mut [Complex<f64>] =
             unsafe { std::mem::transmute(scratch_gaurd.get(scratch_sz)) };
-        let (x, fft_scratch) = complex_scratch.split_at_mut(n);
+        let (x, fft_scratch) = complex_scratch.split_at_mut(m);
 
         match bit_size {
             BitSize::Bit16 => sqr_decompose_16(buf, x),
@@ -2552,7 +2586,8 @@ fn ntt_sqr_convolution<P: NTTPrime>(
         *elem *= *elem;
     }
 
-    let inv_w = Montgomery::to(P::G).pow((n - 1) as u64);
+    let int_pow = (n - 1) as u64 * ((P::P - 1) / n as u64);
+    let inv_w = Montgomery::to(P::G).pow(int_pow);
     ntt(mont_res, inv_w, mont_scratch);
 }
 
@@ -2750,6 +2785,11 @@ pub fn short_mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
 }
 
 pub fn short_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+    const {
+        if 2 * N > MAX_STATIC_SIZE {
+            panic!("Cant call this function with 2N larger than 0.5 * MAX_STATIC_SIZE");
+        }
+    };
     debug_assert!(
         out.len() <= N,
         "out is to large for static parameter N: {N}"
@@ -2774,7 +2814,7 @@ pub fn short_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -
 // gets the middle part n limbs of a n x 2n product
 // n: [0..n-1] x 2n-1: [0..2n-2] -> 3n-1: [0..3n-3] -> [n-1 .. 2n-2]
 
-fn mid_mul_buf(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+pub fn mid_mul_buf(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     // long (2n-1) , short (n)
     let n = short.len();
     let mut acc0: u64 = 0;
@@ -2783,9 +2823,9 @@ fn mid_mul_buf(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     for i in 0..n {
         unsafe {
             for j in 0..n {
-                let a_val = *long.get_unchecked(j + i);
-                let b_val = *short.get_unchecked(n - j - 1);
-                mul_asm(a_val, b_val, &mut acc0, &mut acc1, &mut acc2);
+                let l_val = *long.get_unchecked(j + i);
+                let s_val = *short.get_unchecked(n - j - 1);
+                mul_asm(l_val, s_val, &mut acc0, &mut acc1, &mut acc2);
             }
             *out.get_unchecked_mut(i) = acc0;
         }
@@ -2828,8 +2868,8 @@ fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
         fft_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
 
         match bit_size {
-            BitSize::Bit16 => fft_accumulate_16(&x[(sz - 1) * w..(2 * sz - 1) * w], out),
-            BitSize::Bit8 => fft_accumulate_8(&x[(sz - 1) * w..(2 * sz - 1) * w], out),
+            BitSize::Bit16 => fft_accumulate_16(&x[(sz - 1) * w / 2..(2 * sz - 1) * w / 2], out),
+            BitSize::Bit8 => fft_accumulate_8(&x[(sz - 1) * w / 2..(2 * sz - 1) * w / 2], out),
         }
     })
 }
@@ -2904,6 +2944,11 @@ fn ntt_mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
 }
 
 fn ntt_mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+    const {
+        if 2 * N > MAX_STATIC_SIZE {
+            panic!("Cant call this function with 2N larger than MAX_STATIC_SIZE");
+        }
+    };
     let sz = short.len();
     let mut res1 = [0; MAX_STATIC_SIZE];
     let mut res2 = [0; MAX_STATIC_SIZE];
@@ -2961,7 +3006,7 @@ fn dyn_mid_dispatch(n: usize) -> DynMidDispatch {
     };
 }
 
-fn mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+pub fn mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     debug_assert_eq!(
         long.len(),
         2 * short.len() - 1,
@@ -3004,7 +3049,7 @@ fn static_mid_dispatch(n: usize) -> StaticMidDispatch {
     };
 }
 
-fn mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+pub fn mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     debug_assert_eq!(
         long.len(),
         2 * short.len() - 1,

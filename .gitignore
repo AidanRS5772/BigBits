@@ -1,1 +1,6 @@
 target/
+coverage/
+lcov.info
+coverage.lcov
+profile.json.gz
+coverage_out/
