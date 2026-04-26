@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use crate::utils::{utils::*, *};
+use rayon::*;
 use rustfft::num_traits::{One, Zero};
 use rustfft::{num_complex::Complex, Fft, FftDirection, FftPlanner};
 use std::arch::asm;
@@ -354,17 +355,30 @@ fn karatsuba_mul(a: &[u64], b: &[u64], out: &mut [u64], scratch: &mut [u64]) -> 
     karatsuba_core(long, short, half, out, cross, rest)
 }
 
-pub fn find_karatsuba_scratch(l: usize, s: usize) -> usize {
-    match kdispatch(l, s) {
-        KDispatch::Prim | KDispatch::Prim2 | KDispatch::School => 0,
-        KDispatch::Chunking => {
-            let half = (s + 1) / 2;
-            2 * s + 2 * half + 1 + find_karatsuba_scratch(s, s)
-        }
-        KDispatch::Recurse => {
-            let half = (l + 1) / 2;
-            2 * half + 1 + find_karatsuba_scratch(half + 1, half + 1)
-        }
+pub fn find_karatsuba_scratch(l_in: usize, s_in: usize) -> usize {
+    let (l, s) = if l_in >= s_in {
+        (l_in, s_in)
+    } else {
+        (s_in, l_in)
+    };
+
+    if s <= 2 || is_school(l, s) {
+        return 0;
+    }
+
+    if s <= (l + 1) / 2 {
+        let half = (s + 1) / 2;
+        let phase1 = 2 * s + 2 * half + 1 + find_karatsuba_scratch(half + 1, half + 1);
+        let chunks = (l - s + 1) / s;
+        let last_len = l - chunks * s;
+        let phase2 = (last_len + s - 1) + find_karatsuba_scratch(last_len, s);
+
+        phase1.max(phase2)
+    } else {
+        let half = (l + 1) / 2;
+        let inner = find_karatsuba_scratch(half + 1, half + 1)
+            .max(find_karatsuba_scratch(l - half, s - half));
+        2 * half + 1 + inner
     }
 }
 
@@ -715,19 +729,6 @@ fn fft_core(
     scale_and_round(&mut x[..n / 2], n as f64);
 }
 
-enum BitSize {
-    Bit16,
-    Bit8,
-}
-
-fn bit_sz_dispatch(s: usize) -> BitSize {
-    if s < FFT_BIT_CUTOFF {
-        return BitSize::Bit16;
-    } else {
-        return BitSize::Bit8;
-    }
-}
-
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn decompose_16_x86(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
@@ -872,7 +873,7 @@ fn decompose_16_standard(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
     }
 }
 
-fn decompose_16(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
+fn decompose(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") {
         unsafe {
@@ -888,207 +889,7 @@ fn decompose_16(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn decompose_8_x86(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
-    let out = x.as_mut_ptr() as *mut f64;
-    let mut idx = 0usize;
-
-    for (&l, &s) in long.iter().zip(short) {
-        let lv = _mm_set1_epi64x(l as i64);
-        let l_lo_u32 = _mm_cvtepu8_epi32(lv);
-        let l_lo_f64 = _mm256_cvtepi32_pd(l_lo_u32);
-        let lv_shifted = _mm_bsrli_si128(lv, 4);
-        let l_hi_u32 = _mm_cvtepu8_epi32(lv_shifted);
-        let l_hi_f64 = _mm256_cvtepi32_pd(l_hi_u32);
-
-        let sv = _mm_set1_epi64x(s as i64);
-        let s_lo_u32 = _mm_cvtepu8_epi32(sv);
-        let s_lo_f64 = _mm256_cvtepi32_pd(s_lo_u32);
-        let sv_shifted = _mm_bsrli_si128(sv, 4);
-        let s_hi_u32 = _mm_cvtepu8_epi32(sv_shifted);
-        let s_hi_f64 = _mm256_cvtepi32_pd(s_hi_u32);
-
-        // [l0, s0, l2, s2]
-        let lo_lo = _mm256_unpacklo_pd(l_lo_f64, s_lo_f64);
-        // [l1, s1, l3, s3]
-        let lo_hi = _mm256_unpackhi_pd(l_lo_f64, s_lo_f64);
-        // low lanes of both → [l0, s0, l1, s1]
-        let lo_first = _mm256_permute2f128_pd(lo_lo, lo_hi, 0x20);
-        // high lanes of both → [l2, s2, l3, s3]
-        let lo_second = _mm256_permute2f128_pd(lo_lo, lo_hi, 0x31);
-
-        _mm256_storeu_pd(out.add(idx), lo_first);
-        _mm256_storeu_pd(out.add(idx + 4), lo_second);
-
-        // ---- Interleave high group (bytes 4-7 from each) ----
-
-        let hi_lo = _mm256_unpacklo_pd(l_hi_f64, s_hi_f64);
-        let hi_hi = _mm256_unpackhi_pd(l_hi_f64, s_hi_f64);
-        let hi_first = _mm256_permute2f128_pd(hi_lo, hi_hi, 0x20);
-        let hi_second = _mm256_permute2f128_pd(hi_lo, hi_hi, 0x31);
-
-        _mm256_storeu_pd(out.add(idx + 8), hi_first);
-        _mm256_storeu_pd(out.add(idx + 12), hi_second);
-
-        idx += 16;
-    }
-
-    // ---- Overhang ----
-
-    let zero = _mm256_setzero_pd();
-    for &l in &long[short.len()..] {
-        let lv = _mm_set1_epi64x(l as i64);
-
-        let l_lo_f64 = _mm256_cvtepi32_pd(_mm_cvtepu8_epi32(lv));
-        let l_hi_f64 = _mm256_cvtepi32_pd(_mm_cvtepu8_epi32(_mm_bsrli_si128(lv, 4)));
-
-        let lo_lo = _mm256_unpacklo_pd(l_lo_f64, zero);
-        let lo_hi = _mm256_unpackhi_pd(l_lo_f64, zero);
-        _mm256_storeu_pd(out.add(idx), _mm256_permute2f128_pd(lo_lo, lo_hi, 0x20));
-        _mm256_storeu_pd(out.add(idx + 4), _mm256_permute2f128_pd(lo_lo, lo_hi, 0x31));
-
-        let hi_lo = _mm256_unpacklo_pd(l_hi_f64, zero);
-        let hi_hi = _mm256_unpackhi_pd(l_hi_f64, zero);
-        _mm256_storeu_pd(out.add(idx + 8), _mm256_permute2f128_pd(hi_lo, hi_hi, 0x20));
-        _mm256_storeu_pd(
-            out.add(idx + 12),
-            _mm256_permute2f128_pd(hi_lo, hi_hi, 0x31),
-        );
-
-        idx += 16;
-    }
-
-    let total = x.len() * 2;
-    if idx < total {
-        std::ptr::write_bytes(out.add(idx), 0, total - idx);
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn u64_into_2x4f64_aarch(l: u64) -> (float64x2_t, float64x2_t, float64x2_t, float64x2_t) {
-    let l_raw = vdup_n_u64(l);
-    let l_u8x8 = vreinterpret_u8_u64(l_raw);
-    let l_u16x8 = vmovl_u8(l_u8x8);
-    let (l_u16_lo, l_u16_hi) = (vget_low_u16(l_u16x8), vget_high_u16(l_u16x8));
-    let l_u32_lo = vmovl_u16(l_u16_lo);
-    let l_u32_hi = vmovl_u16(l_u16_hi);
-    let (l_u32_lo_lo, l_u32_lo_hi) = (vget_low_u32(l_u32_lo), vget_high_u32(l_u32_lo));
-    let (l_u32_hi_lo, l_u32_hi_hi) = (vget_low_u32(l_u32_hi), vget_high_u32(l_u32_hi));
-    let l_u64_lo_lo = vmovl_u32(l_u32_lo_lo);
-    let l_u64_lo_hi = vmovl_u32(l_u32_lo_hi);
-    let l_u64_hi_lo = vmovl_u32(l_u32_hi_lo);
-    let l_u64_hi_hi = vmovl_u32(l_u32_hi_hi);
-    (
-        vcvtq_f64_u64(l_u64_lo_lo),
-        vcvtq_f64_u64(l_u64_lo_hi),
-        vcvtq_f64_u64(l_u64_hi_lo),
-        vcvtq_f64_u64(l_u64_hi_hi),
-    )
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn decompose_8_aarch(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
-    let out = x.as_mut_ptr() as *mut f64;
-    let mut idx = 0usize;
-
-    for (&l, &s) in long.iter().zip(short) {
-        let (l_f0, l_f1, l_f2, l_f3) = u64_into_2x4f64_aarch(l);
-        let (s_f0, s_f1, s_f2, s_f3) = u64_into_2x4f64_aarch(s);
-        vst1q_f64(out.add(idx), vzip1q_f64(l_f0, s_f0)); // [l0, s0]
-        vst1q_f64(out.add(idx + 2), vzip2q_f64(l_f0, s_f0)); // [l1, s1]
-        vst1q_f64(out.add(idx + 4), vzip1q_f64(l_f1, s_f1)); // [l2, s2]
-        vst1q_f64(out.add(idx + 6), vzip2q_f64(l_f1, s_f1)); // [l3, s3]
-        vst1q_f64(out.add(idx + 8), vzip1q_f64(l_f2, s_f2)); // [l4, s4]
-        vst1q_f64(out.add(idx + 10), vzip2q_f64(l_f2, s_f2)); // [l5, s5]
-        vst1q_f64(out.add(idx + 12), vzip1q_f64(l_f3, s_f3)); // [l6, s6]
-        vst1q_f64(out.add(idx + 14), vzip2q_f64(l_f3, s_f3)); // [l7, s7]
-        idx += 16;
-    }
-
-    let zero = vdupq_n_f64(0.0);
-    for &l in &long[short.len()..] {
-        let (l_f0, l_f1, l_f2, l_f3) = u64_into_2x4f64_aarch(l);
-        vst1q_f64(out.add(idx), vzip1q_f64(l_f0, zero));
-        vst1q_f64(out.add(idx + 2), vzip2q_f64(l_f0, zero));
-        vst1q_f64(out.add(idx + 4), vzip1q_f64(l_f1, zero));
-        vst1q_f64(out.add(idx + 6), vzip2q_f64(l_f1, zero));
-        vst1q_f64(out.add(idx + 8), vzip1q_f64(l_f2, zero));
-        vst1q_f64(out.add(idx + 10), vzip2q_f64(l_f2, zero));
-        vst1q_f64(out.add(idx + 12), vzip1q_f64(l_f3, zero));
-        vst1q_f64(out.add(idx + 14), vzip2q_f64(l_f3, zero));
-        idx += 16;
-    }
-
-    let total = x.len() * 2;
-    if idx < total {
-        std::ptr::write_bytes(out.add(idx), 0, total - idx);
-    }
-}
-
-fn decompose_8_standard(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
-    const MASK: u64 = u8::MAX as u64;
-    let mut idx = 0;
-    for (&l, &s) in long.iter().zip(short) {
-        x[idx].re = (l & MASK) as f64;
-        x[idx].im = (s & MASK) as f64;
-        x[idx + 1].re = (l >> 8 & MASK) as f64;
-        x[idx + 1].im = (s >> 8 & MASK) as f64;
-        x[idx + 2].re = (l >> 16 & MASK) as f64;
-        x[idx + 2].im = (s >> 16 & MASK) as f64;
-        x[idx + 3].re = (l >> 24 & MASK) as f64;
-        x[idx + 3].im = (s >> 24 & MASK) as f64;
-        x[idx + 4].re = (l >> 32 & MASK) as f64;
-        x[idx + 4].im = (s >> 32 & MASK) as f64;
-        x[idx + 5].re = (l >> 40 & MASK) as f64;
-        x[idx + 5].im = (s >> 40 & MASK) as f64;
-        x[idx + 6].re = (l >> 48 & MASK) as f64;
-        x[idx + 6].im = (s >> 48 & MASK) as f64;
-        x[idx + 7].re = (l >> 56 & MASK) as f64;
-        x[idx + 7].im = (s >> 56 & MASK) as f64;
-        idx += 8;
-    }
-    for &l in &long[short.len()..] {
-        x[idx].re = (l & MASK) as f64;
-        x[idx].im = 0.0;
-        x[idx + 1].re = (l >> 8 & MASK) as f64;
-        x[idx + 1].im = 0.0;
-        x[idx + 2].re = (l >> 16 & MASK) as f64;
-        x[idx + 2].im = 0.0;
-        x[idx + 3].re = (l >> 24 & MASK) as f64;
-        x[idx + 3].im = 0.0;
-        x[idx + 4].re = (l >> 32 & MASK) as f64;
-        x[idx + 4].im = 0.0;
-        x[idx + 5].re = (l >> 40 & MASK) as f64;
-        x[idx + 5].im = 0.0;
-        x[idx + 6].re = (l >> 48 & MASK) as f64;
-        x[idx + 6].im = 0.0;
-        x[idx + 7].re = (l >> 56 & MASK) as f64;
-        x[idx + 7].im = 0.0;
-        idx += 8;
-    }
-    if idx < x.len() {
-        x[idx..].fill(Complex::zero());
-    }
-}
-
-fn decompose_8(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
-    #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
-        unsafe { decompose_8_x86(long, short, x) }
-    } else {
-        decompose_8_standard(long, short, x);
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        decompose_8_aarch(long, short, x);
-    }
-}
-
-fn fft_accumulate_16(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
+fn fft_accumulate(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
     let coefs = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const f64, x.len() * 2) };
     let mut chunks = coefs.chunks(4);
     let mut carry: u128 = 0;
@@ -1115,54 +916,16 @@ fn fft_accumulate_16(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
     carry as u64
 }
 
-fn fft_accumulate_8(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
-    let coefs = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const f64, x.len() * 2) };
-    let mut chunks = coefs.chunks(8);
-    let mut carry: u128 = 0;
-
-    for elem in out.iter_mut() {
-        let chunk = chunks.next().unwrap();
-        let mut tot = carry;
-        for (i, c) in chunk.iter().enumerate() {
-            let val = unsafe { c.to_int_unchecked::<u64>() } as u128;
-            tot += val << (i * 8);
-        }
-        *elem = tot as u64;
-        carry = tot >> 64;
-    }
-
-    for chunk in chunks {
-        for (i, c) in chunk.iter().enumerate() {
-            let val = unsafe { c.to_int_unchecked::<u64>() } as u128;
-            carry += val << (i * 8);
-        }
-    }
-
-    carry as u64
-}
-
 #[inline(always)]
 fn bit16_length(sz: usize, last: u64) -> usize {
     (sz - 1) * 4 + (last.ilog2() as usize) / 16 + 1
 }
 
-#[inline(always)]
-fn bit8_length(sz: usize, last: u64) -> usize {
-    (sz - 1) * 8 + (last.ilog2() as usize) / 8 + 1
-}
-
 pub fn fft_entry(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
-    let bit_size = bit_sz_dispatch(short.len());
-    let (l_len, s_len) = match bit_size {
-        BitSize::Bit16 => (
-            bit16_length(long.len(), long.last().copied().unwrap()),
-            bit16_length(short.len(), short.last().copied().unwrap()),
-        ),
-        BitSize::Bit8 => (
-            bit8_length(long.len(), long.last().copied().unwrap()),
-            bit8_length(short.len(), short.last().copied().unwrap()),
-        ),
-    };
+    let (l_len, s_len) = (
+        bit16_length(long.len(), long.last().copied().unwrap()),
+        bit16_length(short.len(), short.last().copied().unwrap()),
+    );
     let n = find_fft_size(l_len + s_len - 1);
     FFT_CACHE.with(|cell| {
         let fft_cache = &mut *cell.borrow_mut();
@@ -1172,17 +935,9 @@ pub fn fft_entry(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
             unsafe { std::mem::transmute(scratch_gaurd.get(scratch_sz)) };
         let (x, fft_scratch) = complex_scratch.split_at_mut(n);
 
-        match bit_size {
-            BitSize::Bit16 => decompose_16(long, short, x),
-            BitSize::Bit8 => decompose_8(long, short, x),
-        }
-
+        decompose(long, short, x);
         fft_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
-
-        match bit_size {
-            BitSize::Bit16 => fft_accumulate_16(&mut x[..n / 2], out),
-            BitSize::Bit8 => fft_accumulate_8(&mut x[..n / 2], out),
-        }
+        fft_accumulate(&mut x[..n / 2], out)
     })
 }
 
@@ -1276,8 +1031,6 @@ const fn exp_decomp(p: u64) -> [usize; NTT_RADIX_CNT] {
 trait NTTPrime {
     const P: u64;
     const G: u64;
-    const G3: u64;
-    const G5: u64;
     const EXP: [usize; NTT_RADIX_CNT];
     const R: u64 = (u64::MAX % Self::P) + 1;
     const P_INV: u64 = neg_inv_mod_2_64(Self::P);
@@ -1289,8 +1042,6 @@ struct P1;
 impl NTTPrime for P1 {
     const P: u64 = 5937362789990400001;
     const G: u64 = 11;
-    const G3: u64 = 4922211885758269045;
-    const G5: u64 = 1487271088621240150;
     const EXP: [usize; NTT_RADIX_CNT] = [46, 3, 5];
     // 2^46 * 3^3 * 5^5 + 1
 }
@@ -1299,8 +1050,6 @@ struct P2;
 impl NTTPrime for P2 {
     const P: u64 = 8122312296706867201;
     const G: u64 = 7;
-    const G3: u64 = 28707452713357919;
-    const G5: u64 = 5293944249257477682;
     const EXP: [usize; NTT_RADIX_CNT] = [46, 5, 2];
     // 19 * 2^46 * 3^5 * 5^2 + 1
 }
@@ -1309,8 +1058,6 @@ struct P3;
 impl NTTPrime for P3 {
     const P: u64 = 7552325468867788801;
     const G: u64 = 19;
-    const G3: u64 = 877228236151578703;
-    const G5: u64 = 1513879670366840320;
     const EXP: [usize; NTT_RADIX_CNT] = [46, 4, 2];
     // 53 * 2^46 * 3^5 * 5^2 + 1
 }
@@ -1551,6 +1298,51 @@ fn split<P: NTTPrime, const N: usize>(buf: &mut [Montgomery<P>]) -> [&mut [Montg
     })
 }
 
+fn ntt_2<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, scratch: &mut [Montgomery<P>]) {
+    let n = buf.len();
+    if n < 2 {
+        return;
+    }
+    debug_assert!(n.is_power_of_two());
+    debug_assert!(scratch.len() >= n / 2);
+    let log_n = n.trailing_zeros();
+
+    let shift = usize::BITS - log_n;
+    for i in 1..n {
+        let j = i.reverse_bits() >> shift;
+        if i < j {
+            buf.swap(i, j);
+        }
+    }
+
+    let tw = &mut scratch[..n / 2];
+    let mut acc = Montgomery::ONE;
+    for k in 0..n / 2 {
+        tw[k] = acc;
+        acc *= w;
+    }
+
+    let mut m_half = 1;
+    while m_half < n {
+        let m = m_half << 1;
+        let stride = n / m;
+        let mut k = 0;
+        while k < n {
+            let mut t_idx = 0;
+            for j in 0..m_half {
+                let t = tw[t_idx];
+                let u = buf[k + j];
+                let v = buf[k + j + m_half] * t;
+                buf[k + j] = u + v;
+                buf[k + j + m_half] = u - v;
+                t_idx += stride;
+            }
+            k += m;
+        }
+        m_half = m;
+    }
+}
+
 fn shuffle<P: NTTPrime, const N: usize>(buf: &mut [Montgomery<P>], scratch: &mut [Montgomery<P>]) {
     debug_assert!(
         buf.len() % N == 0,
@@ -1566,22 +1358,6 @@ fn shuffle<P: NTTPrime, const N: usize>(buf: &mut [Montgomery<P>], scratch: &mut
     }
     for j in 1..N {
         buf[j * m..(j + 1) * m].copy_from_slice(tmp[j - 1]);
-    }
-}
-
-fn ntt_2<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, scratch: &mut [Montgomery<P>]) {
-    let m = buf.len() / 2;
-    shuffle::<P, 2>(buf, scratch);
-    let sqr_w = w * w;
-    ntt(&mut buf[..m], sqr_w, scratch);
-    ntt(&mut buf[m..], sqr_w, scratch);
-    let mut t = Montgomery::ONE;
-    for i in 0..m {
-        let u = buf[i];
-        let v = buf[i + m] * t;
-        buf[i] = u + v;
-        buf[i + m] = u - v;
-        t *= w;
     }
 }
 
@@ -1851,34 +1627,44 @@ pub fn ntt_entry_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     let n1 = find_ntt_size::<P1>(out_len);
     let n2 = find_ntt_size::<P2>(out_len);
     let n3 = find_ntt_size::<P3>(out_len);
-    let scratch_sz = n1.max(n2).max(n3);
-    let mut scratch_gaurd = ScratchGuard::acquire();
-    let [res1, res2, res3, buf_scratch, ntt_scratch] =
-        scratch_gaurd.get_splits([n1, n2, n3, scratch_sz, scratch_sz]);
-    ntt_convolution::<P1>(
-        a,
-        b,
-        res1,
-        n1,
-        &mut buf_scratch[..n1],
-        &mut ntt_scratch[..n1],
-    );
-    ntt_convolution::<P2>(
-        a,
-        b,
-        res2,
-        n2,
-        &mut buf_scratch[..n2],
-        &mut ntt_scratch[..n2],
-    );
-    ntt_convolution::<P3>(
-        a,
-        b,
-        res3,
-        n3,
-        &mut buf_scratch[..n3],
-        &mut ntt_scratch[..n3],
-    );
+
+    let mut res_guard = ScratchGuard::acquire();
+    let [res1, res2, res3] = res_guard.get_splits([n1, n2, n3]);
+
+    {
+        let r1: &mut [_] = &mut *res1;
+        let r2: &mut [_] = &mut *res2;
+        let r3: &mut [_] = &mut *res3;
+
+        let mut task1 = move || {
+            let mut g = ScratchGuard::acquire();
+            let [bs, ns] = g.get_splits([n1, n1]);
+            ntt_convolution::<P1>(a, b, r1, n1, bs, ns);
+        };
+        let mut task2 = move || {
+            let mut g = ScratchGuard::acquire();
+            let [bs, ns] = g.get_splits([n2, n2]);
+            ntt_convolution::<P2>(a, b, r2, n2, bs, ns);
+        };
+        let mut task3 = move || {
+            let mut g = ScratchGuard::acquire();
+            let [bs, ns] = g.get_splits([n3, n3]);
+            ntt_convolution::<P3>(a, b, r3, n3, bs, ns);
+        };
+
+        // if n1.max(n2).max(n3) >= NTT_PARALLEL_CUTOFF{
+        //     rayon::join(task1, || rayon::join(task2, task3));
+        // } else {
+        //     task1();
+        //     task2();
+        //     task3();
+        // }
+
+        // rayon::join(task1, || rayon::join(task2, task3));
+        task1();
+        task2();
+        task3();
+    }
 
     ntt_accumulate(res1, res2, res3, out, out_len)
 }
@@ -2305,7 +2091,7 @@ fn karatsuba_sqr_core(
 }
 
 fn karatsuba_sqr_mul(buf: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
-    if buf.len() <= KARATSUBA_SQR_CUTOFF {
+    if buf.len() <= STATIC_KARATSUBA_SQR_CUTOFF {
         return sqr_buf(buf, out);
     }
     let half = (buf.len() + 1) / 2;
@@ -2314,20 +2100,11 @@ fn karatsuba_sqr_mul(buf: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
 }
 
 pub fn find_karatsuba_sqr_scratch_sz(n: usize) -> usize {
-    return if n > KARATSUBA_SQR_CUTOFF {
-        let half = (n + 1) / 2;
-        2 * half + 1 + find_karatsuba_sqr_scratch_sz(half + 1)
-    } else {
-        0
-    };
-}
-
-pub fn karatsuba_sqr_entry_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
-    let mut scratch_gaurd = ScratchGuard::acquire();
-    let scratch_sz = find_karatsuba_sqr_scratch_sz(buf.len());
-    let half = (buf.len() + 1) / 2;
-    let (cross, rest) = scratch_gaurd.get(scratch_sz).split_at_mut(2 * half + 1);
-    karatsuba_sqr_core(buf, half, out, cross, rest)
+    if n <= STATIC_KARATSUBA_SQR_CUTOFF {
+        return 0;
+    }
+    let half = (n + 1) / 2;
+    (2 * half + 1) + find_karatsuba_sqr_scratch_sz(half + 1)
 }
 
 pub fn karatsuba_sqr_entry_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
@@ -2439,12 +2216,12 @@ fn sqr_decompose_16_standard(buf: &[u64], x: &mut [Complex<f64>]) {
     }
 }
 
-fn sqr_decompose_16(buf: &[u64], x: &mut [Complex<f64>]) {
+fn sqr_decompose(buf: &[u64], x: &mut [Complex<f64>]) {
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") {
         unsafe { sqr_decompose_16_x86(buf, x) }
     } else {
-        sqr_decompose_16(buf, x);
+        sqr_decompose(buf, x);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -2453,94 +2230,8 @@ fn sqr_decompose_16(buf: &[u64], x: &mut [Complex<f64>]) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn sqr_decompose_8_x86(buf: &[u64], x: &mut [Complex<f64>]) {
-    let out = x.as_mut_ptr() as *mut f64;
-    let mut idx = 0usize;
-    for &b in buf {
-        let v = _mm_set1_epi64x(b as i64);
-        // pmovzxbd: zero-extend low 4 bytes → 4 u32s
-        let lo4 = _mm_cvtepu8_epi32(v);
-        // shift right 4 bytes, then same widening for bytes 4-7
-        let hi4 = _mm_cvtepu8_epi32(_mm_bsrli_si128(v, 4));
-        _mm256_storeu_pd(out.add(idx), _mm256_cvtepi32_pd(lo4));
-        _mm256_storeu_pd(out.add(idx + 4), _mm256_cvtepi32_pd(hi4));
-        idx += 8;
-    }
-    let written = buf.len() * 8;
-    if written < x.len() * 2 {
-        std::ptr::write_bytes(out.add(written), 0, x.len() * 2 - written);
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn sqr_decompose_8_aarch64(buf: &[u64], x: &mut [Complex<f64>]) {
-    let out = x.as_mut_ptr() as *mut f64;
-    let mut idx = 0usize;
-    for &b in buf {
-        let (f0, f1, f2, f3) = u64_into_2x4f64_aarch(b);
-        vst1q_f64(out.add(idx), f0);
-        vst1q_f64(out.add(idx + 2), f1);
-        vst1q_f64(out.add(idx + 4), f2);
-        vst1q_f64(out.add(idx + 6), f3);
-        idx += 8;
-    }
-    let written = buf.len() * 8;
-    if written < x.len() * 2 {
-        std::ptr::write_bytes(out.add(written), 0, x.len() * 2 - written);
-    }
-}
-
-fn sqr_decompose_8_standard(buf: &[u64], x: &mut [Complex<f64>]) {
-    let coefs = unsafe { std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut f64, x.len() * 2) };
-    const MASK: u64 = u8::MAX as u64;
-    let mut idx = 0;
-    for &b in buf {
-        coefs[idx] = (b & MASK) as f64;
-        coefs[idx + 1] = (b >> 8 & MASK) as f64;
-        coefs[idx + 2] = (b >> 16 & MASK) as f64;
-        coefs[idx + 3] = (b >> 24 & MASK) as f64;
-        coefs[idx + 4] = (b >> 32 & MASK) as f64;
-        coefs[idx + 5] = (b >> 40 & MASK) as f64;
-        coefs[idx + 6] = (b >> 48 & MASK) as f64;
-        coefs[idx + 7] = (b >> 56 & MASK) as f64;
-        idx += 8;
-    }
-    if idx < x.len() {
-        x[idx..].fill(Complex::zero());
-    }
-}
-
-fn sqr_decompose_8(buf: &[u64], x: &mut [Complex<f64>]) {
-    #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
-        unsafe { sqr_decompose_8_x86(buf, x) }
-    } else {
-        sqr_decompose_8(buf, x);
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        sqr_decompose_8_aarch64(buf, x);
-    }
-}
-
-fn bit_size_sqr_dispatch(n: usize) -> BitSize {
-    return if n <= FFT_BIT_CUTOFF {
-        BitSize::Bit16
-    } else {
-        BitSize::Bit8
-    };
-}
-
 pub fn fft_sqr_entry(buf: &[u64], out: &mut [u64]) -> u64 {
-    let bit_size = bit_size_sqr_dispatch(buf.len());
-    let bit_len = match bit_size {
-        BitSize::Bit16 => bit16_length(buf.len(), buf.last().copied().unwrap()),
-        BitSize::Bit8 => bit8_length(buf.len(), buf.last().copied().unwrap()),
-    };
+    let bit_len = bit16_length(buf.len(), buf.last().copied().unwrap());
     let n = find_fft_size(2 * bit_len - 1);
     let m = n / 2;
     FFT_CACHE.with(|cell| {
@@ -2551,15 +2242,9 @@ pub fn fft_sqr_entry(buf: &[u64], out: &mut [u64]) -> u64 {
             unsafe { std::mem::transmute(scratch_gaurd.get(scratch_sz)) };
         let (x, fft_scratch) = complex_scratch.split_at_mut(m);
 
-        match bit_size {
-            BitSize::Bit16 => sqr_decompose_16(buf, x),
-            BitSize::Bit8 => sqr_decompose_8(buf, x),
-        }
+        sqr_decompose(buf, x);
         fft_sqr_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
-        match bit_size {
-            BitSize::Bit16 => fft_accumulate_16(x, out),
-            BitSize::Bit8 => fft_accumulate_8(x, out),
-        }
+        fft_accumulate(x, out)
     })
 }
 
@@ -2665,16 +2350,13 @@ pub fn ntt_sqr_entry_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64
 
 enum DynSqrDispatch {
     School,
-    Karatsuba,
     FFT,
     NTT,
 }
 
 fn dyn_sqr_dispatch(n: usize) -> DynSqrDispatch {
-    if n <= KARATSUBA_SQR_CUTOFF {
+    if n <= FFT_SQR_CUTOFF {
         DynSqrDispatch::School
-    } else if n <= FFT_SQR_CUTOFF {
-        DynSqrDispatch::Karatsuba
     } else if n <= DYN_NTT_SQR_CUTOFF {
         DynSqrDispatch::FFT
     } else {
@@ -2689,7 +2371,6 @@ pub fn sqr_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
     );
     match dyn_sqr_dispatch(buf.len()) {
         DynSqrDispatch::School => sqr_buf(buf, out),
-        DynSqrDispatch::Karatsuba => karatsuba_sqr_entry_dyn(buf, out),
         DynSqrDispatch::FFT => fft_sqr_entry(buf, out),
         DynSqrDispatch::NTT => ntt_sqr_entry_dyn(buf, out),
     }
@@ -2708,7 +2389,7 @@ enum StaticSqrDispatch {
 }
 
 fn static_sqr_dispatch(n: usize) -> StaticSqrDispatch {
-    if n <= KARATSUBA_SQR_CUTOFF {
+    if n <= STATIC_KARATSUBA_SQR_CUTOFF {
         StaticSqrDispatch::School
     } else if n <= STATIC_NTT_SQR_CUTOFF {
         StaticSqrDispatch::Karatsubaa
@@ -2861,14 +2542,14 @@ fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
         let (x, fft_scratch) = complex_scratch.split_at_mut(n);
 
         match bit_size {
-            BitSize::Bit16 => decompose_16(long, short, x),
+            BitSize::Bit16 => decompose(long, short, x),
             BitSize::Bit8 => decompose_8(long, short, x),
         }
 
         fft_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
 
         match bit_size {
-            BitSize::Bit16 => fft_accumulate_16(&x[(sz - 1) * w / 2..(2 * sz - 1) * w / 2], out),
+            BitSize::Bit16 => fft_accumulate(&x[(sz - 1) * w / 2..(2 * sz - 1) * w / 2], out),
             BitSize::Bit8 => fft_accumulate_8(&x[(sz - 1) * w / 2..(2 * sz - 1) * w / 2], out),
         }
     })

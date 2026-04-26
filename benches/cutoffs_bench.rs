@@ -1,9 +1,6 @@
 #![allow(dead_code)]
 
-use big_bits::{
-    utils::{FFT_CHUNKING_KARATSUBA_CUTOFF, FFT_KARATSUBA_CUTOFF},
-    *,
-};
+use big_bits::{utils::*, *};
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use rand::Rng;
 use std::{
@@ -381,7 +378,7 @@ fn avg_input(lengths: &Vec<(usize, usize)>) -> (f64, f64) {
     (sum_l as f64 / n, sum_s as f64 / n)
 }
 
-const NUM_OF_LENGTHS: usize = 64;
+const NUM_OF_LENGTHS: usize = 128;
 const GAP: u32 = 4;
 
 fn bench_school_to_chunking_karatsuba(c: &mut Criterion) {
@@ -390,6 +387,8 @@ fn bench_school_to_chunking_karatsuba(c: &mut Criterion) {
     let inputs = make_inputs(&lengths);
     assert!(!inputs.is_empty(), "find inputs failed");
     println!("Average Input: {:?}", avg_input(&lengths));
+    println!("Number of Inputs: {}", inputs.len());
+    println!("CHUNKING KARATSUBA CUTOFF = {FFT_CHUNKING_KARATSUBA_CUTOFF}");
 
     c.bench_function(&format!("school_to_chunking_karatsuba/{ARCH}"), |b| {
         b.iter_custom(|iters| {
@@ -412,6 +411,8 @@ fn bench_school_to_karatsuba(c: &mut Criterion) {
     let inputs = make_inputs(&lengths);
     assert!(!inputs.is_empty(), "find inputs failed");
     println!("Average Input: {:?}", avg_input(&lengths));
+    println!("Number of Inputs: {}", inputs.len());
+    println!("KARATSUBA CUTOFF = {KARATSUBA_CUTOFF}");
 
     c.bench_function(&format!("school_to_karatsuba/{ARCH}"), |b| {
         b.iter_custom(|iters| {
@@ -435,8 +436,9 @@ fn bench_chunking_karatsuba_to_fft(c: &mut Criterion) {
     assert!(!inputs.is_empty(), "find inputs failed");
     println!("Average Input: {:?}", avg_input(&lengths));
     println!("Number of Inputs: {}", inputs.len());
+    println!("FFT CHUNKING KARATSUBA CUTOFF = {FFT_CHUNKING_KARATSUBA_CUTOFF}");
 
-    c.bench_function(&format!("school_to_chunking_karatsuba/{ARCH}"), |b| {
+    c.bench_function(&format!("chunking_karatsuba_to_fft/{ARCH}"), |b| {
         b.iter_custom(|iters| {
             ratio_bench(
                 iters,
@@ -451,28 +453,94 @@ fn bench_chunking_karatsuba_to_fft(c: &mut Criterion) {
 fn bench_karatsuba_to_fft(c: &mut Criterion) {
     let lengths = BoundarySearch::new(
         |l, s| (l >= s) && (s > (l + 1) / 2) && !is_school(l, s),
-        |l, s| {
-            is_karatsuba(
-                l,
-                s,
-                FFT_CHUNKING_KARATSUBA_CUTOFF,
-                FFT_CHUNKING_KARATSUBA_CUTOFF,
-            )
-        },
+        |l, s| is_karatsuba(l, s, FFT_CHUNKING_KARATSUBA_CUTOFF, FFT_KARATSUBA_CUTOFF),
     )
     .find((150, 150), NUM_OF_LENGTHS, GAP);
     let inputs = make_inputs(&lengths);
     assert!(!inputs.is_empty(), "find inputs failed");
     println!("Average Input: {:?}", avg_input(&lengths));
     println!("Number of Inputs: {}", inputs.len());
+    println!("FFT KARATSUBA CUTOFF = {FFT_KARATSUBA_CUTOFF}");
 
-    c.bench_function(&format!("school_to_chunking_karatsuba/{ARCH}"), |b| {
+    c.bench_function(&format!("karatsuba_to_fft/{ARCH}"), |b| {
         b.iter_custom(|iters| {
             ratio_bench(
                 iters,
                 &inputs,
                 &mut |a, b, out| karatsuba_entry_dyn(a, b, out),
                 &mut |a, b, out| fft_entry(a, b, out),
+            )
+        })
+    });
+}
+
+fn make_sqr_inputs(sz: usize, amt: usize) -> Vec<Vec<u64>>{
+    let mut rng = rand::thread_rng();
+    let min = sz.saturating_sub(amt/2).max(4);
+    let max = sz + amt/2;
+    let mut inputs: Vec<Vec<u64>> = Vec::with_capacity(amt);
+    for i in min..max{
+        inputs.push((0..i).map(|_| rng.gen()).collect());
+    }
+    return inputs;
+}
+
+fn sqr_ratio_bench(
+    iters: u64,
+    inputs: &[Vec<u64>],
+    func_a: &mut dyn FnMut(&[u64], &mut [u64]) -> u64,
+    func_b: &mut dyn FnMut(&[u64], &mut [u64]) -> u64,
+) -> Duration {
+    let mut rng = rand::thread_rng();
+    let mut ratio_sum = 0.0f64;
+    for _ in 0..iters {
+        for buf in inputs.iter() {
+            let mut out = vec![0u64; 2*buf.len()];
+            let (t_a, t_b) = if rng.gen::<bool>() {
+                let t_a = {
+                    let start = Instant::now();
+                    func_a(black_box(buf), black_box(&mut out));
+                    start.elapsed()
+                };
+                let t_b = {
+                    let start = Instant::now();
+                    func_b(black_box(buf), black_box(&mut out));
+                    start.elapsed()
+                };
+                (t_a, t_b)
+            } else {
+                let t_b = {
+                    let start = Instant::now();
+                    func_a(black_box(buf), black_box(&mut out));
+                    start.elapsed()
+                };
+                let t_a = {
+                    let start = Instant::now();
+                    func_b(black_box(buf), black_box(&mut out));
+                    start.elapsed()
+                };
+                (t_a, t_b)
+            };
+            ratio_sum += t_a.as_nanos().min(1) as f64 / t_b.as_nanos() as f64;
+        }
+    }
+    let avg_ratio = ratio_sum / (inputs.len() as u64) as f64;
+    Duration::from_nanos((avg_ratio * 1_000_000.0) as u64)
+}
+
+fn bench_sqr_school_to_fft(c: &mut Criterion){
+    let inputs = make_sqr_inputs(FFT_SQR_CUTOFF, 16);
+    assert!(!inputs.is_empty(), "find inputs failed");
+    println!("Number of Inputs: {}", inputs.len());
+    println!("FFT SQR CUTOFF = {FFT_SQR_CUTOFF}");
+
+    c.bench_function(&format!("sqr_karatsuba_to_fft/{ARCH}"), |b| {
+        b.iter_custom(|iters| {
+            sqr_ratio_bench(
+                iters,
+                &inputs,
+                &mut |buf, out| sqr_buf(buf, out),
+                &mut |buf, out| fft_sqr_entry(buf, out),
             )
         })
     });
@@ -487,6 +555,6 @@ fn cutoff_criterion() -> Criterion {
 criterion_group! {
     name = benches;
     config = cutoff_criterion();
-    targets = bench_school_to_chunking_karatsuba
+    targets = bench_sqr_school_to_fft
 }
 criterion_main!(benches);

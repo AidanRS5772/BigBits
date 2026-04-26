@@ -21,6 +21,7 @@ const ARCH: &'static str = std::env::consts::ARCH;
 
 fn set_up_group(group: &mut BenchmarkGroup<'_, WallTime>) {
     group.sample_size(250); // default is 100
+    group.sampling_mode(criterion::SamplingMode::Flat);
     group.warm_up_time(std::time::Duration::from_secs(5)); // default is 3s
 }
 
@@ -121,7 +122,7 @@ fn bench_karatsuba_mul(c: &mut Criterion) {
 fn bench_fft_mul(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("fft_mul_buf/{ARCH}"));
     set_up_group(&mut group);
-    let sizes: Vec<usize> = vec![4, 16, 64, 256, 1024, 4096];
+    let sizes: Vec<usize> = vec![1 << 10, 1 << 12, 1 << 14, 1 << 16, 1 << 18, 1 << 20];
     for &n in &sizes {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
@@ -135,9 +136,9 @@ fn bench_fft_mul(c: &mut Criterion) {
 }
 
 fn bench_ntt_mul(c: &mut Criterion){
-    let mut group = c.benchmark_group(format!("fft_mul_buf/{ARCH}"));
+    let mut group = c.benchmark_group(format!("ntt_mul_buf/{ARCH}"));
     set_up_group(&mut group);
-    let sizes: Vec<usize> = vec![4, 16, 64, 256, 1024, 4096];
+    let sizes: Vec<usize> = vec![1 << 10, 1 << 12, 1 << 14, 1 << 16, 1 << 18, 1 << 20];
     for &n in &sizes {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
@@ -181,21 +182,6 @@ fn bench_school_sqr(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_karatsuba_sqr(c: &mut Criterion) {
-    let mut group = c.benchmark_group(format!("karatsuba_sqr_buf/{ARCH}"));
-    set_up_group(&mut group);
-    let sizes: Vec<usize> = vec![4, 16, 64, 256, 1024, 4096];
-    for &n in &sizes {
-        group.throughput(Throughput::Elements(n as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
-            let a = random_limbs(n);
-            let mut out = vec![0; 2 * n];
-            bench.iter(|| karatsuba_sqr_entry_dyn(black_box(&a), black_box(&mut out)));
-        });
-    }
-    group.finish();
-}
-
 fn bench_fft_sqr(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("fft_sqr_buf/{ARCH}"));
     set_up_group(&mut group);
@@ -228,9 +214,7 @@ fn bench_gen_sqr(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_school_mul,
-    bench_fft_mul,
-    bench_school_sqr,
-    bench_fft_sqr,
+    bench_fft_mul, bench_ntt_mul
 );
+
 criterion_main!(benches);

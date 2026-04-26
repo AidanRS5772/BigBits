@@ -6,28 +6,28 @@ pub mod utils;
 
 pub const MAX_STATIC_SIZE: usize = 128;
 
-pub const CHUNKING_KARATSUBA_CUTOFF: usize = 15;
-pub const KARATSUBA_CUTOFF: f64 = 21.0;
+pub const CHUNKING_KARATSUBA_CUTOFF: usize = 22;
+pub const KARATSUBA_CUTOFF: f64 = 19.5;
 
-pub const FFT_CHUNKING_KARATSUBA_CUTOFF: f64 = 1.5;
-pub const FFT_KARATSUBA_CUTOFF: f64 = 1.825;
-pub const FFT_BIT_CUTOFF: usize = 1 << 15;
+pub const FFT_CHUNKING_KARATSUBA_CUTOFF: f64 = 1.74;
+pub const FFT_KARATSUBA_CUTOFF: f64 = 1.92;
+pub const FFT_BIT_CUTOFF: usize = 1 << 16;
 
-pub const DYN_NTT_CUTOFF: usize = 1 << 20; // GUESS
+pub const NTT_PARALLEL_CUTOFF: usize = 1 << 10;
 pub const NTT_CHUNKING_KARATSUBA_CUTOFF: f64 = 2.5; // GUESS
 pub const NTT_KARATSUBA_CUTOFF: f64 = 2.75; // GUESS
 
-pub const KARATSUBA_SQR_CUTOFF: usize = 26; // GUESS
-pub const FFT_SQR_CUTOFF: usize = 100; // GUESS
-pub const DYN_NTT_SQR_CUTOFF: usize = 1 << 14; // GUESS
+pub const FFT_SQR_CUTOFF: usize = 33;
+pub const STATIC_KARATSUBA_SQR_CUTOFF: usize = 36; //GUESS
 pub const STATIC_NTT_SQR_CUTOFF: usize = 100; //GUESS
+pub const DYN_NTT_SQR_CUTOFF: usize = 1 << 14; // GUESS
 
 pub const SHORT_MUL_CUTOFF: usize = 22; // GUESS
 
 pub const KARATSUBA_MID_CUTOFF: usize = 30; // GUESS
 pub const FFT_MID_CUTOFF: usize = 60; // GUESS
 pub const DYN_NTT_MID_CUTOFF: usize = 1 << 14; // GUESS
-pub const STATIC_NTT_MID_CUTOFF: usize = 100;
+pub const STATIC_NTT_MID_CUTOFF: usize = 100; // GUESS
 
 pub const NTT_CUTOFF: usize = 16; // GUESS
 pub const BZ_CUTOFF: usize = 64; // GUESS
