@@ -1545,6 +1545,41 @@ impl<P1: NTTPrime, P2: NTTPrime, P3: NTTPrime> CRT<P1, P2, P3> {
         *r3 = sum3 as u64;
     }
 }
+pub fn karatsuba_cost(l: usize, s: usize) -> f64 {
+    const LOG_2_3: f64 = 1.584962501;
+    let l_pow = (l as f64).powf(LOG_2_3);
+    let sum_pow = ((l - s) as f64).powf(LOG_2_3);
+    l_pow - sum_pow
+}
+
+pub fn is_karatsuba(l: usize, s: usize, chunk: f64, reg: f64) -> bool {
+    let fft_cost = fft_cost(l, s);
+    let half = (l + 1) / 2;
+    if s <= half {
+        chunking_karatsuba_cost(l, s) < chunk * fft_cost
+    } else {
+        karatsuba_cost(l, s) < reg * fft_cost
+    }
+}
+
+enum DynDispatch {
+    Prim,
+    Prim2,
+    School,
+    Karatsuba,
+    FFT,
+    NTT,
+}
+
+fn dyn_dispatch(l: usize, s: usize) -> DynDispatch {
+    if s == 1 {
+        DynDispatch::Prim
+    } else if s == 2 {
+        DynDispatch::Prim2
+    } else if is_school(l, s) {
+        DynDispatch::School
+    } else if is_karatsuba(l, s, FFT_CHUNKING_KARATSUBA_CUTOFF, FFT_KARATSUBA_CUTOFF) {
+        DynDispatch::Karatsuba
 
 static CRT: LazyLock<CRT<P1, P2, P3>> = LazyLock::new(|| CRT::<P1, P2, P3>::new());
 
@@ -1636,34 +1671,29 @@ pub fn ntt_entry_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
         let r2: &mut [_] = &mut *res2;
         let r3: &mut [_] = &mut *res3;
 
-        let mut task1 = move || {
+        let mut conv1 = move || {
             let mut g = ScratchGuard::acquire();
             let [bs, ns] = g.get_splits([n1, n1]);
             ntt_convolution::<P1>(a, b, r1, n1, bs, ns);
         };
-        let mut task2 = move || {
+        let mut conv2 = move || {
             let mut g = ScratchGuard::acquire();
             let [bs, ns] = g.get_splits([n2, n2]);
             ntt_convolution::<P2>(a, b, r2, n2, bs, ns);
         };
-        let mut task3 = move || {
+        let mut conv3 = move || {
             let mut g = ScratchGuard::acquire();
             let [bs, ns] = g.get_splits([n3, n3]);
             ntt_convolution::<P3>(a, b, r3, n3, bs, ns);
         };
 
-        // if n1.max(n2).max(n3) >= NTT_PARALLEL_CUTOFF{
-        //     rayon::join(task1, || rayon::join(task2, task3));
-        // } else {
-        //     task1();
-        //     task2();
-        //     task3();
-        // }
-
-        // rayon::join(task1, || rayon::join(task2, task3));
-        task1();
-        task2();
-        task3();
+        if n1.max(n2).max(n3) >= NTT_PARALLEL_CUTOFF{
+            rayon::join(conv1, || rayon::join(conv2, conv3));
+        } else {
+            conv1();
+            conv2();
+            conv3();
+        }
     }
 
     ntt_accumulate(res1, res2, res3, out, out_len)
@@ -1751,51 +1781,70 @@ pub fn ntt_entry_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [
     let mut res1 = [0; N];
     let mut res2 = [0; N];
     let mut res3 = [0; N];
-    let mut buf_scratch = [0; N];
-    let mut ntt_scratch = [0; N];
 
-    let n1 = find_ntt_size::<P1>(out_len);
-    if n1 <= N {
-        ntt_convolution::<P1>(
-            long,
-            short,
-            &mut res1[..n1],
-            n1,
-            &mut buf_scratch[..n1],
-            &mut ntt_scratch[..n1],
-        );
-    } else {
-        ntt_split_convolution::<N, P1>(long, short, &mut res1, &mut buf_scratch, &mut ntt_scratch);
+    {
+        let n1 = find_ntt_size::<P1>(out_len);
+        let mut conv1 = move || {
+            let mut buf_scratch = [0;N];
+            let mut ntt_scratch = [0;N];
+            if n1 <= N {
+                ntt_convolution::<P1>(
+                    long,
+                    short,
+                    &mut res1[..n1],
+                    n1,
+                    &mut buf_scratch[..n1],
+                    &mut ntt_scratch[..n1],
+                );
+            } else {
+                ntt_split_convolution::<N, P1>(long, short, &mut res1, &mut buf_scratch, &mut ntt_scratch);
+            }
+        };
+
+        let n2 = find_ntt_size::<P2>(out_len);
+        let mut conv2 = move || {
+            let mut buf_scratch = [0;N];
+            let mut ntt_scratch = [0;N];
+            if n2 <= N {
+                ntt_convolution::<P2>(
+                    long,
+                    short,
+                    &mut res2[..n2],
+                    n2,
+                    &mut buf_scratch[..n2],
+                    &mut ntt_scratch[..n2],
+                );
+            } else {
+                ntt_split_convolution::<N, P2>(long, short, &mut res2, &mut buf_scratch, &mut ntt_scratch);
+            }
+        };
+
+        let n3 = find_ntt_size::<P3>(out_len);
+        let mut conv3 = move || {
+            let mut buf_scratch = [0;N];
+            let mut ntt_scratch = [0;N];
+            if n3 <= N {
+                ntt_convolution::<P3>(
+                    long,
+                    short,
+                    &mut res3[..n3],
+                    n3,
+                    &mut buf_scratch[..n3],
+                    &mut ntt_scratch[..n3],
+                );
+            } else {
+                ntt_split_convolution::<N, P3>(long, short, &mut res3, &mut buf_scratch, &mut ntt_scratch);
+            }
+        };
+
+        if n1.max(n2).max(n3) >= NTT_PARALLEL_CUTOFF{
+            rayon::join(conv1, || rayon::join(conv2, conv3));
+        } else {
+            conv1();
+            conv2();
+            conv3();
+        }
     }
-
-    let n2 = find_ntt_size::<P2>(out_len);
-    if n2 <= N {
-        ntt_convolution::<P2>(
-            long,
-            short,
-            &mut res2[..n2],
-            n2,
-            &mut buf_scratch[..n2],
-            &mut ntt_scratch[..n2],
-        );
-    } else {
-        ntt_split_convolution::<N, P2>(long, short, &mut res2, &mut buf_scratch, &mut ntt_scratch);
-    }
-
-    let n3 = find_ntt_size::<P3>(out_len);
-    if n3 <= N {
-        ntt_convolution::<P3>(
-            long,
-            short,
-            &mut res3[..n3],
-            n3,
-            &mut buf_scratch[..n3],
-            &mut ntt_scratch[..n3],
-        );
-    } else {
-        ntt_split_convolution::<N, P3>(long, short, &mut res3, &mut buf_scratch, &mut ntt_scratch);
-    }
-
     ntt_accumulate(&mut res1, &mut res2, &mut res3, out, out_len)
 }
 
@@ -1812,42 +1861,7 @@ pub fn chunking_karatsuba_cost(l: usize, s: usize) -> f64 {
     (l as f64) * s_pow
 }
 
-pub fn karatsuba_cost(l: usize, s: usize) -> f64 {
-    const LOG_2_3: f64 = 1.584962501;
-    let l_pow = (l as f64).powf(LOG_2_3);
-    let sum_pow = ((l - s) as f64).powf(LOG_2_3);
-    l_pow - sum_pow
-}
-
-pub fn is_karatsuba(l: usize, s: usize, chunk: f64, reg: f64) -> bool {
-    let fft_cost = fft_cost(l, s);
-    let half = (l + 1) / 2;
-    if s <= half {
-        chunking_karatsuba_cost(l, s) < chunk * fft_cost
-    } else {
-        karatsuba_cost(l, s) < reg * fft_cost
-    }
-}
-
-enum DynDispatch {
-    Prim,
-    Prim2,
-    School,
-    Karatsuba,
-    FFT,
-    NTT,
-}
-
-fn dyn_dispatch(l: usize, s: usize) -> DynDispatch {
-    if s == 1 {
-        DynDispatch::Prim
-    } else if s == 2 {
-        DynDispatch::Prim2
-    } else if is_school(l, s) {
-        DynDispatch::School
-    } else if is_karatsuba(l, s, FFT_CHUNKING_KARATSUBA_CUTOFF, FFT_KARATSUBA_CUTOFF) {
-        DynDispatch::Karatsuba
-    } else if (l + s - 1) < DYN_NTT_CUTOFF {
+    } else if (l + s - 1) <= FFT_16BIT_CUTOFF {
         DynDispatch::FFT
     } else {
         DynDispatch::NTT
@@ -2004,7 +2018,7 @@ unsafe fn mul_double_asm(a_val: u64, b_val: u64, acc0: &mut u64, acc1: &mut u64,
 
     #[cfg(target_arch = "x86_64")]
     mul_double_asm_x86(a_val, b_val, acc0, acc1, acc2);
-}
+ <M-C-S-D-Z><M-C-S-D-Space>}
 
 pub fn sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
     if buf.is_empty() {
@@ -2357,7 +2371,7 @@ enum DynSqrDispatch {
 fn dyn_sqr_dispatch(n: usize) -> DynSqrDispatch {
     if n <= FFT_SQR_CUTOFF {
         DynSqrDispatch::School
-    } else if n <= DYN_NTT_SQR_CUTOFF {
+    } else if n <= FFT_16BIT_CUTOFF{
         DynSqrDispatch::FFT
     } else {
         DynSqrDispatch::NTT
@@ -2519,19 +2533,11 @@ pub fn mid_mul_buf(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
 
 fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     let sz = short.len();
-    let bit_size = bit_sz_dispatch(sz);
-    let (l_len, s_len, w) = match bit_size {
-        BitSize::Bit16 => (
-            bit16_length(long.len(), long.last().copied().unwrap()),
-            bit16_length(short.len(), short.last().copied().unwrap()),
-            4,
-        ),
-        BitSize::Bit8 => (
-            bit8_length(long.len(), long.last().copied().unwrap()),
-            bit8_length(short.len(), short.last().copied().unwrap()),
-            8,
-        ),
-    };
+    let (l_len, s_len, w) = (
+        bit16_length(long.len(), long.last().copied().unwrap()),
+        bit16_length(short.len(), short.last().copied().unwrap()),
+        4,
+    );
     let n = find_fft_size(l_len + s_len - (sz - 1) * w - 1);
     FFT_CACHE.with(|cell| {
         let fft_cache = &mut *cell.borrow_mut();
@@ -2541,17 +2547,9 @@ fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
             unsafe { std::mem::transmute(scratch_gaurd.get(scratch_sz)) };
         let (x, fft_scratch) = complex_scratch.split_at_mut(n);
 
-        match bit_size {
-            BitSize::Bit16 => decompose(long, short, x),
-            BitSize::Bit8 => decompose_8(long, short, x),
-        }
-
+        decompose(long, short, x);
         fft_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
-
-        match bit_size {
-            BitSize::Bit16 => fft_accumulate(&x[(sz - 1) * w / 2..(2 * sz - 1) * w / 2], out),
-            BitSize::Bit8 => fft_accumulate_8(&x[(sz - 1) * w / 2..(2 * sz - 1) * w / 2], out),
-        }
+        fft_accumulate(&x[(sz - 1) * w / 2..(2 * sz - 1) * w / 2], out)
     })
 }
 

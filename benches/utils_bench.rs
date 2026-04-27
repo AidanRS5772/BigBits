@@ -25,6 +25,26 @@ fn set_up_group(group: &mut BenchmarkGroup<'_, WallTime>) {
     group.warm_up_time(std::time::Duration::from_secs(5)); // default is 3s
 }
 
+macro_rules! bench_static_sizes {
+    ($group:expr, $fn:ident, $(($n:literal, $N:literal)),*) => {
+        $(
+            $group.throughput(Throughput::Elements($n as u64));
+            $group.bench_with_input(BenchmarkId::from_parameter($n), &$n, |bench, &_| {
+                let a = random_limbs($n);
+                let b = random_limbs($n);
+                let mut out = vec![0u64; 2 * $n];
+                bench.iter(|| {
+                    $fn::<$N>(
+                        black_box(&a),
+                        black_box(&b),
+                        black_box(&mut out),
+                    )
+                });
+            });
+        )*
+    };
+}
+
 fn bench_add(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("add_buf/{ARCH}"));
     set_up_group(&mut group);
@@ -135,10 +155,10 @@ fn bench_fft_mul(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_ntt_mul(c: &mut Criterion){
+fn bench_ntt_mul(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("ntt_mul_buf/{ARCH}"));
     set_up_group(&mut group);
-    let sizes: Vec<usize> = vec![1 << 10, 1 << 12, 1 << 14, 1 << 16, 1 << 18, 1 << 20];
+    let sizes: Vec<usize> = vec![320, 336, 352, 368, 384];
     for &n in &sizes {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
@@ -164,6 +184,38 @@ fn bench_gen_mul(c: &mut Criterion) {
             bench.iter(|| mul_dyn(black_box(&a), black_box(&b), black_box(&mut out)));
         });
     }
+    group.finish();
+}
+
+fn bench_static_karatsuba_mul(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("static_karatsuba_mul_buf/{ARCH}"));
+    set_up_group(&mut group);
+    bench_static_sizes!(
+        group,
+        karatsuba_entry_static,
+        (4, 16),
+        (16, 64),
+        (64, 256),
+        (256, 1024),
+        (1024, 4096),
+        (4096, 8192)
+    );
+    group.finish();
+}
+
+fn bench_static_ntt_mul(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("static_ntt_mul_buf/{ARCH}"));
+    set_up_group(&mut group);
+    bench_static_sizes!(
+        group,
+        ntt_entry_static,
+        (4, 16),
+        (16, 64),
+        (64, 256),
+        (256, 1024),
+        (1024, 4096),
+        (4096, 16384)
+    );
     group.finish();
 }
 
@@ -212,9 +264,6 @@ fn bench_gen_sqr(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_fft_mul, bench_ntt_mul
-);
+criterion_group!(benches, bench_static_karatsuba_mul, bench_static_ntt_mul);
 
 criterion_main!(benches);
