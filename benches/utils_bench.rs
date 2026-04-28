@@ -23,6 +23,7 @@ fn set_up_group(group: &mut BenchmarkGroup<'_, WallTime>) {
     group.sample_size(250); // default is 100
     group.sampling_mode(criterion::SamplingMode::Flat);
     group.warm_up_time(std::time::Duration::from_secs(5)); // default is 3s
+    group.measurement_time(std::time::Duration::from_secs(30));
 }
 
 macro_rules! bench_static_sizes {
@@ -158,7 +159,8 @@ fn bench_fft_mul(c: &mut Criterion) {
 fn bench_ntt_mul(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("ntt_mul_buf/{ARCH}"));
     set_up_group(&mut group);
-    let sizes: Vec<usize> = vec![320, 336, 352, 368, 384];
+    let mut sizes: Vec<usize> = vec![1 << 5, 1 << 6, 1 << 7, 1 << 8, 1 << 9, 1 << 10];
+    sizes.iter_mut().for_each(|x| *x *= 27 * 25);
     for &n in &sizes {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
@@ -174,7 +176,7 @@ fn bench_ntt_mul(c: &mut Criterion) {
 fn bench_gen_mul(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("gen_mul_buf/{ARCH}"));
     set_up_group(&mut group);
-    let sizes: Vec<usize> = vec![4, 16, 64, 256, 1024, 4096];
+    let sizes: Vec<usize> = vec![1 << 3, 1 << 6, 1 << 9, 1 << 12, 1 << 15, 1 << 18];
     for &n in &sizes {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
@@ -198,7 +200,7 @@ fn bench_static_karatsuba_mul(c: &mut Criterion) {
         (64, 256),
         (256, 1024),
         (1024, 4096),
-        (4096, 8192)
+        (4096, 16384)
     );
     group.finish();
 }
@@ -264,6 +266,6 @@ fn bench_gen_sqr(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_static_karatsuba_mul, bench_static_ntt_mul);
+criterion_group!(benches, bench_ntt_mul);
 
 criterion_main!(benches);

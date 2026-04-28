@@ -14,7 +14,18 @@ rayon = "1.12.0"
 rustfft = "6.4.1"
 
 [profile.release]
-debug = true
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.prof]
+inherits = "release"
+debug = 2
+strip = "none"
+lto = "thin"
+panic = "unwind"
 
 [profile.bench]
 lto = "thin"
@@ -22,6 +33,7 @@ codegen-units = 1
 
 [features]
 _bench_internals = []
+_fft_cutoffs = []
 
 [[bench]]
 name = "utils_bench"

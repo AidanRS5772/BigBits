@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use crate::utils::{utils::*, *};
+use core::task;
 use rayon::*;
 use rustfft::num_traits::{One, Zero};
 use rustfft::{num_complex::Complex, Fft, FftDirection, FftPlanner};
@@ -10,13 +11,13 @@ use std::f64::consts::PI;
 use std::ffi::c_short;
 use std::marker::PhantomData;
 use std::ops::*;
+use std::sync::{Arc, LazyLock};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
-use std::sync::{Arc, LazyLock};
 
 // SCHOOL BOOK MULTIPLICATION
 // Worst complexity lowest overhead optimized for small inputs. Base tier algorithm.
@@ -120,7 +121,7 @@ unsafe fn mul_asm_aarch(a_val: u64, b_val: u64, acc0: &mut u64, acc1: &mut u64, 
         a_val = in(reg) a_val,
         b_val = in(reg) b_val,
         lo = out(reg) _,
-        hi = out(reg) _,
+      hi = out(reg) _,
         acc0 = inout(reg) *acc0,
         acc1 = inout(reg) *acc1,
         acc2 = inout(reg) *acc2,
@@ -947,58 +948,18 @@ const NTT_RADIX_CNT: usize = 3;
 
 const NTT_RADIX: [usize; NTT_RADIX_CNT] = [2, 3, 5];
 
-const fn next_prime(x: &mut u64, prev_p: u64) -> u64 {
-    let mut p = if prev_p < 2 {
-        2
-    } else if prev_p == 2 {
-        3
-    } else {
-        prev_p + 2
-    };
-    while p * p <= *x {
-        if *x % p == 0 {
-            *x /= p;
-            while *x % p == 0 {
-                *x /= p;
-            }
-            return p;
+const fn exp_cnt(mut p: u64) -> [usize; NTT_RADIX_CNT] {
+    let mut exp = [0; NTT_RADIX_CNT];
+    let mut idx = 0;
+    while idx < NTT_RADIX_CNT {
+        let q = NTT_RADIX[idx] as u64;
+        while p % q == 0 {
+            exp[idx] += 1;
+            p /= q;
         }
-        p += 2;
+        idx += 1;
     }
-    return *x;
-}
-
-const fn mod_pow(n: u64, p: u64, m: u64) -> u64 {
-    if p == 0 {
-        1
-    } else if p == 1 {
-        n % m
-    } else if p % 2 == 0 {
-        let sqr = (n as u128) * (n as u128) % (m as u128);
-        mod_pow(sqr as u64, p / 2, m)
-    } else {
-        let sqr = (n as u128) * (n as u128) % (m as u128);
-        (((mod_pow(sqr as u64, p / 2, m) as u128) * (n as u128)) % (m as u128)) as u64
-    }
-}
-
-const fn primitive_root(p: u64) -> u64 {
-    let mut g = 1;
-    let mut found = false;
-    while g <= p && !found {
-        g += 1;
-        found = true;
-        let mut x = p - 1;
-        let mut pf = next_prime(&mut x, 1);
-        while pf != x && found {
-            found &= mod_pow(g, (p - 1) / pf, p) != 1;
-            pf = next_prime(&mut x, pf);
-        }
-        if found {
-            found &= mod_pow(g, (p - 1) / pf, p) != 1;
-        }
-    }
-    return g;
+    return exp;
 }
 
 const fn neg_inv_mod_2_64(p: u64) -> u64 {
@@ -1011,55 +972,96 @@ const fn neg_inv_mod_2_64(p: u64) -> u64 {
     return x;
 }
 
-const fn exp_decomp(p: u64) -> [usize; NTT_RADIX_CNT] {
-    let mut exp = [0; NTT_RADIX_CNT];
-    let mut val = (p - 1) as usize;
-    let mut r_idx = 0;
-    while r_idx < NTT_RADIX_CNT {
-        let r = NTT_RADIX[r_idx];
-        let mut cnt = 0;
-        while val % r == 0 {
-            val /= r;
-            cnt += 1
-        }
-        exp[r_idx] = cnt;
-        r_idx += 1;
+const fn split_mul(a: u64, b: u64) -> (u64, u64) {
+    const MASK: u64 = (1 << 32) - 1;
+    let a0 = a & MASK;
+    let a1 = a >> 32;
+    let b0 = b & MASK;
+    let b1 = b >> 32;
+    let mut r11 = a1 * b1;
+    let mut r00 = a0 * b0;
+    let r10 = a1 * b0;
+    let r01 = a0 * b1;
+    let (mid_sum, c0) = r10.overflowing_add(r01);
+    r11 += mid_sum >> 32;
+    if c0 {
+        r11 += 1 << 32;
     }
-    exp
+    let (lo_sum, c1) = r00.overflowing_add(mid_sum << 32);
+    r00 = lo_sum;
+    if c1 {
+        r11 += 1;
+    }
+    (r11, r00)
 }
 
-trait NTTPrime {
+const fn mod_mul(a: u64, b: u64, p: u64) -> u64 {
+    const MASK: u64 = (1 << 32) - 1;
+    let d = p << 1;
+    let (mut hi, mut lo) = split_mul(a, b);
+    hi = (hi << 1) | (lo >> 63);
+    lo <<= 1;
+    let n1 = lo >> 32;
+    let n0 = lo & MASK;
+    let d1 = d >> 32;
+    let d0 = d & MASK;
+
+    let mut q = hi / d1;
+    let mut r = hi % d1;
+    let mut c0 = q * d0;
+    let mut c1 = (r << 32) + n1;
+    if c0 > c1 {
+        q -= 1;
+        if d < (c0 - c1) {
+            q -= 1;
+        }
+    }
+    q &= MASK;
+
+    let rem = (hi << 32).wrapping_add(n1).wrapping_sub(q.wrapping_mul(d));
+    q = rem / d1;
+    r = rem % d1;
+    c0 = q * d0;
+    c1 = (r << 32) + n0;
+    if c0 > c1 {
+        q -= 1;
+        if d < (c0 - c1) {
+            q -= 1;
+        }
+    }
+    q &= MASK;
+
+    (rem << 32).wrapping_add(n0).wrapping_sub(q.wrapping_mul(d)) >> 1
+}
+
+trait NTTPrime: Send + Sync {
     const P: u64;
-    const G: u64;
-    const EXP: [usize; NTT_RADIX_CNT];
+    const EXP: [usize; NTT_RADIX_CNT] = exp_cnt(Self::P - 1);
     const R: u64 = (u64::MAX % Self::P) + 1;
     const P_INV: u64 = neg_inv_mod_2_64(Self::P);
-    const R_SQR: u64 = (u128::MAX % Self::P as u128) as u64 + 1;
-    const R_CUB: u64 = (((Self::R as u128) * (Self::R_SQR as u128)) % (Self::P as u128)) as u64;
+    const R_SQR: u64 = mod_mul(Self::R, Self::R, Self::P);
+    const R_CUB: u64 = mod_mul(Self::R, Self::R_SQR, Self::P);
+    const P_LO: u64 = Self::P & 0xFFFFFFFF;
+    const P_HI: u64 = Self::P >> 32;
 }
 
+// MIN_EXP = [46, 3, 2]
 struct P1;
 impl NTTPrime for P1 {
     const P: u64 = 5937362789990400001;
-    const G: u64 = 11;
-    const EXP: [usize; NTT_RADIX_CNT] = [46, 3, 5];
     // 2^46 * 3^3 * 5^5 + 1
 }
 
 struct P2;
 impl NTTPrime for P2 {
     const P: u64 = 8122312296706867201;
-    const G: u64 = 7;
-    const EXP: [usize; NTT_RADIX_CNT] = [46, 5, 2];
     // 19 * 2^46 * 3^5 * 5^2 + 1
 }
 
 struct P3;
 impl NTTPrime for P3 {
     const P: u64 = 7552325468867788801;
-    const G: u64 = 19;
-    const EXP: [usize; NTT_RADIX_CNT] = [46, 4, 2];
-    // 53 * 2^46 * 3^5 * 5^2 + 1
+    // 53 * 2^46 * 3^4 * 5^2 + 1
 }
 
 #[repr(transparent)]
@@ -1067,6 +1069,420 @@ impl NTTPrime for P3 {
 struct Montgomery<P: NTTPrime> {
     val: u64,
     _phantom: PhantomData<P>,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn reduce_x86(t: u128, p: u64, p_inv: u64) -> u64 {
+    let t_lo = t as u64;
+    let t_hi = (t >> 64) as u64;
+
+    let val: u64;
+
+    core::arch::asm!(
+        // m = t_lo * p_inv mod 2^64
+        "mov {m}, {t_lo}",
+        "imul {m}, {p_inv}",
+
+        // rdx:rax = m * p
+        "mov rax, {m}",
+        "mul {p}",
+
+        // rdx = high(m*p) + t_hi + carry(low(m*p) + t_lo)
+        "add rax, {t_lo}",
+        "adc rdx, {t_hi}",
+
+        // conditional subtract p
+        "mov {tmp}, rdx",
+        "sub {tmp}, {p}",
+        "cmovnc rdx, {tmp}",
+
+        m = lateout(reg) _,
+        tmp = lateout(reg) _,
+
+        t_lo = in(reg) t_lo,
+        t_hi = in(reg) t_hi,
+        p = in(reg) p,
+        p_inv = in(reg) p_inv,
+
+        lateout("rax") _,
+        lateout("rdx") val,
+
+        options(nostack, nomem, pure),
+    );
+
+    val
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn reduce_aarch(t: u128, p: u64, p_inv: u64) -> u64 {
+    let t_lo = t as u64;
+    let t_hi = (t >> 64) as u64;
+
+    let val: u64;
+
+    core::arch::asm!(
+        // m = t_lo * p_inv mod 2^64
+        "mul {m}, {t_lo}, {p_inv}",
+
+        // mp_lo = low64(m * p)
+        // mp_hi = high64(m * p)
+        "mul {mp_lo}, {m}, {p}",
+        "umulh {mp_hi}, {m}, {p}",
+
+        // val = t_hi + mp_hi + carry(t_lo + mp_lo)
+        "adds {mp_lo}, {mp_lo}, {t_lo}",
+        "adc {val}, {mp_hi}, {t_hi}",
+
+        // conditional subtract p
+        "subs {tmp}, {val}, {p}",
+        "csel {val}, {tmp}, {val}, hs",
+
+        m = lateout(reg) _,
+        mp_lo = lateout(reg) _,
+        mp_hi = lateout(reg) _,
+        tmp = lateout(reg) _,
+
+        val = lateout(reg) val,
+
+        t_lo = in(reg) t_lo,
+        t_hi = in(reg) t_hi,
+        p = in(reg) p,
+        p_inv = in(reg) p_inv,
+
+        options(nostack, nomem, pure),
+    );
+
+    val
+}
+
+#[inline(always)]
+fn reduce_no_asm(t: u128, p: u64, p_inv: u64) -> u64 {
+    let t_lo = t as u64;
+    let m = t_lo.wrapping_mul(p_inv);
+    let mp = (m as u128) * (p as u128);
+
+    let mut val = ((t + mp) >> 64) as u64;
+
+    if val >= p {
+        val -= p;
+    }
+
+    val
+}
+
+#[inline]
+fn reduce_mont(t: u128, p: u64, p_inv: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        return reduce_x86(t, p, p_inv);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return reduce_aarch(t, p, p_inv);
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        return reduce_no_asm(t, p, p_inv);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn mul_reduce_x86(a: u64, b: u64, p: u64, p_inv: u64) -> u64 {
+    let val: u64;
+
+    core::arch::asm!(
+        // rdx:rax = a * b
+        "mul {b}",
+
+        // Save t_lo and t_hi
+        "mov {t_lo}, rax",
+        "mov {t_hi}, rdx",
+
+        // m = t_lo * p_inv mod 2^64
+        "mov {m}, rax",
+        "imul {m}, {p_inv}",
+
+        // rdx:rax = m * p
+        "mov rax, {m}",
+        "mul {p}",
+
+        // val = t_hi + high(m*p) + carry(t_lo + low(m*p))
+        "add rax, {t_lo}",
+        "adc rdx, {t_hi}",
+
+        // Conditional subtract p
+        "mov {tmp}, rdx",
+        "sub {tmp}, {p}",
+        "cmovnc rdx, {tmp}",
+
+        t_lo = out(reg) _,
+        t_hi = out(reg) _,
+        m = out(reg) _,
+        tmp = out(reg) _,
+
+        inout("rax") a => _,
+        b = in(reg) b,
+        p = in(reg) p,
+        p_inv = in(reg) p_inv,
+
+        lateout("rdx") val,
+
+        options(nostack, nomem, pure),
+    );
+
+    val
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn mul_reduce_aarch(a: u64, b: u64, p: u64, p_inv: u64) -> u64 {
+    let val: u64;
+
+    core::arch::asm!(
+        // t = a * b
+        "mul {t_lo}, {a}, {b}",
+        "umulh {t_hi}, {a}, {b}",
+
+        // m = t_lo * p_inv mod 2^64
+        "mul {m}, {t_lo}, {p_inv}",
+
+        // mp = m * p
+        "mul {mp_lo}, {m}, {p}",
+        "umulh {mp_hi}, {m}, {p}",
+
+        // val = t_hi + mp_hi + carry(t_lo + mp_lo)
+        "adds {mp_lo}, {mp_lo}, {t_lo}",
+        "adc {val}, {mp_hi}, {t_hi}",
+
+        // if val >= p, val -= p
+        "subs {tmp}, {val}, {p}",
+        "csel {val}, {tmp}, {val}, hs",
+
+        t_lo = out(reg) _,
+        t_hi = out(reg) _,
+        m = out(reg) _,
+        mp_lo = out(reg) _,
+        mp_hi = out(reg) _,
+        tmp = out(reg) _,
+
+        val = out(reg) val,
+
+        a = in(reg) a,
+        b = in(reg) b,
+        p = in(reg) p,
+        p_inv = in(reg) p_inv,
+
+        options(nostack, nomem, pure),
+    );
+
+    val
+}
+
+#[inline(always)]
+fn mul_reduce_no_asm(a: u64, b: u64, p: u64, p_inv: u64) -> u64 {
+    let t = (a as u128) * (b as u128);
+
+    let t_lo = t as u64;
+    let m = t_lo.wrapping_mul(p_inv);
+    let mp = (m as u128) * (p as u128);
+
+    let mut val = ((t + mp) >> 64) as u64;
+
+    if val >= p {
+        val -= p;
+    }
+
+    val
+}
+
+#[inline]
+fn mul_reduce_mont(a: u64, b: u64, p: u64, p_inv: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        return mul_reduce_x86(a, b, p, p_inv);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return mul_reduce_aarch(a, b, p, p_inv);
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        return mul_reduce_no_asm(a, b, p, p_inv);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn add_mod_x86(mut a: u64, b: u64, p: u64) -> u64 {
+    core::arch::asm!(
+        "add {a}, {b}",
+        "mov {tmp}, {a}",
+        "sub {tmp}, {p}",
+        "cmovnc {a}, {tmp}",
+        a = inout(reg) a,
+        b = in(reg) b,
+        p = in(reg) p,
+        tmp = lateout(reg) _,
+        options(nostack, nomem, pure),
+    );
+    a
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn add_mod_aarch(mut a: u64, b: u64, p: u64) -> u64 {
+    core::arch::asm!(
+        "add {a}, {a}, {b}",
+        "subs {tmp}, {a}, {p}",
+        "csel {a}, {tmp}, {a}, hs",
+        a = inout(reg) a,
+        b = in(reg) b,
+        p = in(reg) p,
+        tmp = lateout(reg) _,
+        options(nostack, nomem, pure),
+    );
+    a
+}
+
+#[inline(always)]
+fn add_mod_no_asm(mut a: u64, b: u64, p: u64) -> u64 {
+    a += b;
+    if a >= p {
+        a -= p;
+    }
+    a
+}
+
+#[inline]
+fn add_mod(a: u64, b: u64, p: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        add_mod_x86(a, b, p)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        add_mod_aarch(a, b, p)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        add_mod_no_asm(a, b, p)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn sub_mod_x86(mut a: u64, b: u64, p: u64) -> u64 {
+    core::arch::asm!(
+        "sub {a}, {b}",
+        "sbb {tmp}, {tmp}",
+        "and {tmp}, {p}",
+        "add {a}, {tmp}",
+        a = inout(reg) a,
+        b = in(reg) b,
+        p = in(reg) p,
+        tmp = lateout(reg) _,
+        options(nostack, nomem, pure),
+    );
+    a
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sub_mod_aarch(mut a: u64, b: u64, p: u64) -> u64 {
+    core::arch::asm!(
+        "subs {a}, {a}, {b}",
+        "csel {tmp}, xzr, {p}, hs",
+        "add {a}, {a}, {tmp}",
+        a = inout(reg) a,
+        b = in(reg) b,
+        p = in(reg) p,
+        tmp = lateout(reg) _,
+        options(nostack, nomem, pure),
+    );
+    a
+}
+
+#[inline(always)]
+fn sub_mod_no_asm(a: u64, b: u64, p: u64) -> u64 {
+    let diff = a.wrapping_sub(b);
+    let mask = ((a < b) as u64).wrapping_neg();
+    diff.wrapping_add(p & mask)
+}
+
+#[inline(always)]
+fn sub_mod(a: u64, b: u64, p: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        return sub_mod_x86(a, b, p);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return sub_mod_aarch(a, b, p);
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        return sub_mod_no_asm(a, b, p);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn neg_mod_x86(mut a: u64, p: u64) -> u64 {
+    core::arch::asm!(
+        "test {a}, {a}",
+        "mov {tmp}, {p}",
+        "sub {tmp}, {a}",
+        "cmovnz {a}, {tmp}",
+        a = inout(reg) a,
+        p = in(reg) p,
+        tmp = lateout(reg) _,
+        options(nostack, nomem, pure),
+    );
+    a
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn neg_mod_aarch(mut a: u64, p: u64) -> u64 {
+    core::arch::asm!(
+        "cmp {a}, #0",
+        "sub {tmp}, {p}, {a}",
+        "csel {a}, xzr, {tmp}, eq",
+        a = inout(reg) a,
+        p = in(reg) p,
+        tmp = lateout(reg) _,
+        options(nostack, nomem, pure),
+    );
+    a
+}
+
+#[inline(always)]
+fn neg_mod_no_asm(a: u64, p: u64) -> u64 {
+    let mask = ((a != 0) as u64).wrapping_neg();
+    p.wrapping_sub(a) & mask
+}
+
+#[inline]
+fn neg_mod(a: u64, p: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        return neg_mod_x86(a, p);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return neg_mod_aarch(a, p);
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        return neg_mod_no_asm(a, p);
+    }
 }
 
 impl<P: NTTPrime> Montgomery<P> {
@@ -1080,56 +1496,56 @@ impl<P: NTTPrime> Montgomery<P> {
         _phantom: PhantomData,
     };
 
-    const HALF: Self = Self::to((P::P + 1) / 2);
+    const HALF: Self = Self::const_to((P::P + 1) / 2);
 
-    const fn cast(x: u64) -> Self {
-        Montgomery {
-            val: x,
-            _phantom: PhantomData,
-        }
-    }
+    const G: Self = Self::prim_root();
+
+    const G3: Self = Self::G.const_pow((P::P - 1) / 3);
+
+    const INV_G3: Self = Self::G3.const_pow(2);
+
+    const G5: Self = Self::G.const_pow((P::P - 1) / 5);
+
+    const INV_G5: Self = Self::G5.const_pow(4);
 
     #[inline(always)]
-    const fn reduce(t: u128) -> u64 {
-        let t_lo = t as u64;
+    const fn const_reduce(t_hi: u64, t_lo: u64) -> u64 {
+        const MASK32: u64 = (1 << 32) - 1;
         let m = t_lo.wrapping_mul(P::P_INV);
-        let mp = (m as u128) * (P::P as u128);
-        let mut val = ((t + mp) >> 64) as u64;
+        let (mp_hi, mp_lo) = split_mul(m, P::P);
+        let (_, c) = mp_lo.overflowing_add(t_lo);
+        let mut val = t_hi + mp_hi + c as u64;
         if val >= P::P {
             val -= P::P;
         }
-        return val;
+        val
     }
 
-    const fn to(a: u64) -> Self {
-        let t = (a as u128) * (P::R_SQR as u128);
+    const fn const_to(a: u64) -> Self {
+        let (t_hi, t_lo) = split_mul(a, P::R_SQR);
         Montgomery {
-            val: Self::reduce(t),
+            val: Self::const_reduce(t_hi, t_lo),
             _phantom: PhantomData,
         }
     }
 
-    const fn to_mut(&mut self) {
-        let t = (self.val as u128) * (P::R_SQR as u128);
-        let m = (t as u64).wrapping_mul(P::P_INV);
-        let mp = (m as u128) * (P::P as u128);
-        self.val = ((t + mp) >> 64) as u64;
-        if self.val >= P::P {
-            self.val -= P::P;
-        }
+    const fn mul_mut(&mut self, rhs: Self) {
+        let (t_hi, t_lo) = split_mul(self.val, rhs.val);
+        self.val = Self::const_reduce(t_hi, t_lo);
     }
 
-    const fn from(self) -> u64 {
-        Self::reduce(self.val as u128)
-    }
-
-    const fn from_mut(&mut self) {
-        let m = self.val.wrapping_mul(P::P_INV);
-        let mp = (m as u128) * (P::P as u128);
-        self.val = ((self.val as u128 + mp) >> 64) as u64;
-        if self.val >= P::P {
-            self.val -= P::P
+    const fn const_pow(self, pow: u64) -> Self {
+        if pow == 0 {
+            return Self::ONE;
+        } else if pow == 1 {
+            return self;
         }
+        let mut val = self.const_pow(pow / 2);
+        val.mul_mut(val);
+        if pow & 1 == 1 {
+            val.mul_mut(self);
+        }
+        return val;
     }
 
     const fn add_mut(&mut self, rhs: Self) {
@@ -1139,41 +1555,63 @@ impl<P: NTTPrime> Montgomery<P> {
         }
     }
 
-    const fn sub_mut(&mut self, rhs: Self) {
-        if self.val >= rhs.val {
-            self.val -= rhs.val;
-        } else {
-            self.val = P::P - (rhs.val - self.val);
+    const fn prim_root() -> Self {
+        let mut g = Montgomery::ONE;
+        let mut found = false;
+        while !found {
+            g.add_mut(Self::ONE);
+            found = true;
+            let mut idx = 0;
+            while idx < NTT_RADIX_CNT && found {
+                let q = NTT_RADIX[idx] as u64;
+                found &= g.const_pow((P::P - 1) / q).val != P::R;
+                idx += 1;
+            }
         }
+        return g;
     }
 
-    const fn mul_mut(&mut self, rhs: Self) {
-        let t = (self.val as u128) * (rhs.val as u128);
-        self.val = Self::reduce(t);
-    }
-
-    const fn pow(self, pow: u64) -> Self {
-        if pow == 0 {
-            return Self::ONE;
-        } else if pow == 1 {
-            return self;
-        }
-        let mut val = self.pow(pow / 2);
-        val.mul_mut(val);
-        if pow & 1 == 1 {
-            val.mul_mut(self);
-        }
-        return val;
-    }
-
-    const fn fuse_mul_to(a: u64, b: u64) -> Self {
-        let ab = (a as u128) * (b as u128);
-        let c = Self::reduce(ab);
-        let t = (c as u128) * (P::R_CUB as u128);
+    const fn cast(x: u64) -> Self {
         Montgomery {
-            val: Self::reduce(t),
+            val: x,
             _phantom: PhantomData,
         }
+    }
+
+    fn to(a: u64) -> Self {
+        Montgomery {
+            val: mul_reduce_mont(a, P::R_SQR, P::P, P::P_INV),
+            _phantom: PhantomData,
+        }
+    }
+
+    fn to_mut(&mut self) {
+        self.val = mul_reduce_mont(self.val, P::R_SQR, P::P, P::P_INV);
+    }
+
+    fn from(self) -> u64 {
+        reduce_mont(self.val as u128, P::P, P::P_INV)
+    }
+
+    fn fuse_mul_to(a: u64, b: u64) -> Self {
+        let c = mul_reduce_mont(a, b, P::P, P::P_INV);
+        Montgomery {
+            val: mul_reduce_mont(c, P::R_CUB, P::P, P::P_INV),
+            _phantom: PhantomData,
+        }
+    }
+
+    fn pow(self, mut exp: u64) -> Self {
+        let mut base = self;
+        let mut result = Self::ONE;
+        while exp > 0 {
+            if exp & 1 == 1 {
+                result *= base;
+            }
+            base *= base;
+            exp >>= 1;
+        }
+        result
     }
 }
 
@@ -1195,44 +1633,42 @@ impl<P: NTTPrime> Eq for Montgomery<P> {}
 
 impl<P: NTTPrime> AddAssign for Montgomery<P> {
     fn add_assign(&mut self, rhs: Self) {
-        self.add_mut(rhs);
+        self.val = add_mod(self.val, rhs.val, P::P);
     }
 }
 
 impl<P: NTTPrime> Add for Montgomery<P> {
     type Output = Montgomery<P>;
     fn add(self, rhs: Self) -> Self::Output {
-        let mut out = self;
-        out.add_mut(rhs);
-        out
+        Montgomery {
+            val: add_mod(self.val, rhs.val, P::P),
+            _phantom: PhantomData,
+        }
     }
 }
 
 impl<P: NTTPrime> SubAssign for Montgomery<P> {
     fn sub_assign(&mut self, rhs: Self) {
-        self.sub_mut(rhs);
+        self.val = sub_mod(self.val, rhs.val, P::P);
     }
 }
 
 impl<P: NTTPrime> Sub for Montgomery<P> {
     type Output = Montgomery<P>;
     fn sub(self, rhs: Self) -> Self::Output {
-        let mut out = self;
-        out.sub_mut(rhs);
-        out
+        Montgomery {
+            val: sub_mod(self.val, rhs.val, P::P),
+            _phantom: PhantomData,
+        }
     }
 }
 
 impl<P: NTTPrime> Neg for Montgomery<P> {
     type Output = Montgomery<P>;
     fn neg(self) -> Self::Output {
-        if self.val == 0 {
-            self
-        } else {
-            Montgomery {
-                val: P::P - self.val,
-                _phantom: PhantomData,
-            }
+        Montgomery {
+            val: neg_mod(self.val, P::P),
+            _phantom: PhantomData,
         }
     }
 }
@@ -1240,9 +1676,8 @@ impl<P: NTTPrime> Neg for Montgomery<P> {
 impl<P: NTTPrime> Mul for Montgomery<P> {
     type Output = Montgomery<P>;
     fn mul(self, rhs: Self) -> Self::Output {
-        let t = (self.val as u128) * (rhs.val as u128);
         Montgomery {
-            val: Self::reduce(t),
+            val: mul_reduce_mont(self.val, rhs.val, P::P, P::P_INV),
             _phantom: PhantomData,
         }
     }
@@ -1250,63 +1685,227 @@ impl<P: NTTPrime> Mul for Montgomery<P> {
 
 impl<P: NTTPrime> MulAssign for Montgomery<P> {
     fn mul_assign(&mut self, rhs: Self) {
-        let t = (self.val as u128) * (rhs.val as u128);
-        self.val = Self::reduce(t);
+        self.val = mul_reduce_mont(self.val, rhs.val, P::P, P::P_INV);
     }
 }
 
-fn ntt<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, scratch: &mut [Montgomery<P>]) {
-    if buf.len() <= NTT_CUTOFF {
-        dft_naive(buf, w, scratch);
-    } else if buf.len() % 5 == 0 {
-        ntt_5(buf, w, scratch);
-    } else if buf.len() % 3 == 0 {
-        ntt_3(buf, w, scratch);
-    } else {
-        ntt_2(buf, w, scratch);
+struct DynNTTTwidles<P: NTTPrime> {
+    tw: Vec<Montgomery<P>>,
+    max_n: usize,
+    n: usize,
+}
+
+impl<P: NTTPrime> DynNTTTwidles<P> {
+    fn build(n: usize) -> Self {
+        let w = Montgomery::G.pow((P::P - 1) / (n as u64));
+        let mut tw = Vec::<Montgomery<P>>::with_capacity(n);
+        let mut acc = Montgomery::ONE;
+        for _ in 0..n {
+            tw.push(acc);
+            acc *= w;
+        }
+        DynNTTTwidles { tw, max_n: n, n: n }
+    }
+
+    fn ensure(&mut self, new_n: usize) {
+        if new_n > self.max_n {
+            debug_assert!(new_n % self.max_n == 0);
+            let growth = new_n / self.max_n;
+            debug_assert!(growth.is_power_of_two());
+            let mut new_tw = Vec::<Montgomery<P>>::with_capacity(new_n);
+            let w = Montgomery::G.pow((P::P - 1) / (new_n as u64));
+            for &tw in &self.tw {
+                let mut acc = tw;
+                new_tw.push(acc);
+                for _ in 1..growth {
+                    acc *= w;
+                    new_tw.push(acc);
+                }
+            }
+            self.tw = new_tw;
+            self.max_n = new_n;
+        }
+        self.n = new_n;
     }
 }
 
-fn dft_naive<P: NTTPrime>(
+struct StaticNTTTwidles<const N: usize, P: NTTPrime> {
+    tw: [Montgomery<P>; N],
+    n: usize,
+}
+
+impl<P: NTTPrime, const N: usize> StaticNTTTwidles<N, P> {
+    fn build(n: usize) -> Self {
+        let w = Montgomery::G.pow((P::P - 1) / (n as u64));
+        let mut tw = [Montgomery::ZERO; N];
+        let mut acc = Montgomery::ONE;
+        for i in 0..n {
+            tw[i] = acc;
+            acc *= w;
+        }
+        Self { tw, n }
+    }
+}
+
+trait NTTDir {
+    const INV: bool;
+    fn advance(idx: usize, step: usize, len: usize) -> usize;
+}
+
+struct NTTForward {}
+
+impl NTTDir for NTTForward {
+    const INV: bool = false;
+    fn advance(idx: usize, step: usize, len: usize) -> usize {
+        add_mod(idx as u64, step as u64, len as u64) as usize
+    }
+}
+
+struct NTTBackward {}
+
+impl NTTDir for NTTBackward {
+    const INV: bool = true;
+    fn advance(idx: usize, step: usize, len: usize) -> usize {
+        sub_mod(idx as u64, step as u64, len as u64) as usize
+    }
+}
+
+struct TwiddleIter<'a, P: NTTPrime, D: NTTDir> {
+    tw: &'a [Montgomery<P>],
+    idx: usize,
+    step: usize,
+    len: usize,
+    _dir: PhantomData<D>,
+}
+
+impl<'a, P: NTTPrime, D: NTTDir> Iterator for TwiddleIter<'a, P, D> {
+    type Item = Montgomery<P>;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        debug_assert!(self.idx < self.tw.len());
+        debug_assert!(self.len <= self.tw.len());
+        debug_assert!(self.step <= self.len);
+        let x = unsafe { *self.tw.get_unchecked(self.idx) };
+        self.idx = D::advance(self.idx, self.step, self.len);
+        Some(x)
+    }
+}
+
+trait NTTTwidles<P: NTTPrime>: Send + Sync {
+    fn twidles_iter<'a, const R: usize, D: NTTDir>(
+        &'a self,
+        stride: usize,
+    ) -> [TwiddleIter<'a, P, D>; R];
+}
+
+impl<const N: usize, P: NTTPrime> NTTTwidles<P> for StaticNTTTwidles<N, P> {
+    fn twidles_iter<'a, const R: usize, D: NTTDir>(
+        &'a self,
+        stride: usize,
+    ) -> [TwiddleIter<'a, P, D>; R] {
+        std::array::from_fn(|r| TwiddleIter {
+            tw: &self.tw,
+            idx: 0,
+            step: (r + 1) * stride,
+            len: self.n,
+            _dir: PhantomData,
+        })
+    }
+}
+
+impl<P: NTTPrime> NTTTwidles<P> for DynNTTTwidles<P> {
+    fn twidles_iter<'a, const R: usize, D: NTTDir>(
+        &'a self,
+        stride: usize,
+    ) -> [TwiddleIter<'a, P, D>; R] {
+        let cache_stride = self.max_n / self.n;
+        debug_assert_eq!(self.tw.len(), self.max_n);
+        debug_assert_eq!(self.max_n % self.n, 0);
+        std::array::from_fn(|r| {
+            let step = (r + 1) * stride * cache_stride;
+            debug_assert!(step <= self.max_n);
+            TwiddleIter {
+                tw: &self.tw,
+                idx: 0,
+                step,
+                len: self.max_n,
+                _dir: PhantomData,
+            }
+        })
+    }
+}
+
+thread_local! {
+    static DYN_NTT_CACHE_P1: RefCell<HashMap<usize, DynNTTTwidles<P1>>> = RefCell::new(HashMap::new());
+    static DYN_NTT_CACHE_P2: RefCell<HashMap<usize, DynNTTTwidles<P2>>> = RefCell::new(HashMap::new());
+    static DYN_NTT_CACHE_P3: RefCell<HashMap<usize, DynNTTTwidles<P3>>> = RefCell::new(HashMap::new());
+}
+
+fn ntt<P: NTTPrime, D: NTTDir>(
     buf: &mut [Montgomery<P>],
-    w: Montgomery<P>,
+    stride: usize,
+    tw: &impl NTTTwidles<P>,
     scratch: &mut [Montgomery<P>],
 ) {
-    let n = buf.len();
-    let mut t = Montgomery::ONE;
-    for i in 0..n {
-        let mut sum = Montgomery::ZERO;
-        let mut l = Montgomery::ONE;
-        for j in 0..n {
-            sum += buf[j] * l;
-            l *= t;
-        }
-        scratch[i] = sum;
-        t *= w;
+    debug_assert!(scratch.len() >= ntt_scratch_len(buf.len()));
+    if buf.len() % 5 == 0 {
+        ntt_5::<P, D>(buf, stride, tw, scratch);
+    } else if buf.len() % 3 == 0 {
+        ntt_3::<P, D>(buf, stride, tw, scratch);
+    } else {
+        ntt_2::<P, D>(buf, stride, tw, scratch);
     }
-    buf.copy_from_slice(&scratch[..n]);
 }
 
-fn split<P: NTTPrime, const N: usize>(buf: &mut [Montgomery<P>]) -> [&mut [Montgomery<P>]; N] {
-    let base = buf.as_mut_ptr();
-    let mut offset = 0usize;
-    let size = buf.len() / N;
-    std::array::from_fn(|_| unsafe {
-        let s = std::slice::from_raw_parts_mut(base.add(offset), size);
-        offset += size;
-        s
-    })
+fn ntt_scratch_len(n: usize) -> usize {
+    if n < 2 {
+        return 0;
+    }
+
+    if n % 5 == 0 {
+        ntt_radix_scratch_len(n, 5, NTT_PAR_CUTOFF_NTT_5)
+    } else if n % 3 == 0 {
+        ntt_radix_scratch_len(n, 3, NTT_PAR_CUTOFF_NTT_3)
+    } else {
+        0
+    }
 }
 
-fn ntt_2<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, scratch: &mut [Montgomery<P>]) {
+fn ntt_radix_scratch_len(n: usize, radix: usize, par_cutoff: usize) -> usize {
+    let m = n / radix;
+    let shuffle_scratch = (radix - 1) * m;
+    let child_scratch = ntt_scratch_len(m);
+    let recursive_scratch = if n > par_cutoff {
+        radix * child_scratch
+    } else {
+        child_scratch
+    };
+    shuffle_scratch.max(recursive_scratch)
+}
+
+fn ntt_convolution_scratch_len(n: usize) -> usize {
+    let ntt_scratch = ntt_scratch_len(n);
+    if n > NTT_PAR_CUTOFF_NTT {
+        2 * ntt_scratch
+    } else {
+        ntt_scratch
+    }
+}
+
+fn ntt_2<P: NTTPrime, D: NTTDir>(
+    buf: &mut [Montgomery<P>],
+    stride: usize,
+    tw: &impl NTTTwidles<P>,
+    _scratch: &mut [Montgomery<P>],
+) {
     let n = buf.len();
     if n < 2 {
         return;
     }
     debug_assert!(n.is_power_of_two());
-    debug_assert!(scratch.len() >= n / 2);
-    let log_n = n.trailing_zeros();
 
+    let log_n = n.trailing_zeros();
     let shift = usize::BITS - log_n;
     for i in 1..n {
         let j = i.reverse_bits() >> shift;
@@ -1315,27 +1914,20 @@ fn ntt_2<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, scratch: &mut
         }
     }
 
-    let tw = &mut scratch[..n / 2];
-    let mut acc = Montgomery::ONE;
-    for k in 0..n / 2 {
-        tw[k] = acc;
-        acc *= w;
-    }
-
     let mut m_half = 1;
     while m_half < n {
         let m = m_half << 1;
-        let stride = n / m;
+        let stage_stride = stride * (n / m);
         let mut k = 0;
         while k < n {
-            let mut t_idx = 0;
+            let [mut tw0] = tw.twidles_iter::<1, D>(stage_stride);
             for j in 0..m_half {
-                let t = tw[t_idx];
-                let u = buf[k + j];
-                let v = buf[k + j + m_half] * t;
-                buf[k + j] = u + v;
-                buf[k + j + m_half] = u - v;
-                t_idx += stride;
+                let t = unsafe { tw0.next().unwrap_unchecked() };
+                let [x0, x1] = unsafe { buf.get_disjoint_unchecked_mut([k + j, k + j + m_half]) };
+                let u = *x0;
+                let v = *x1 * t;
+                *x0 = u + v;
+                *x1 = u - v;
             }
             k += m;
         }
@@ -1343,51 +1935,132 @@ fn ntt_2<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, scratch: &mut
     }
 }
 
-fn shuffle<P: NTTPrime, const N: usize>(buf: &mut [Montgomery<P>], scratch: &mut [Montgomery<P>]) {
+fn split<const N: usize, P: NTTPrime>(buf: &mut [Montgomery<P>]) -> [&mut [Montgomery<P>]; N] {
     debug_assert!(
         buf.len() % N == 0,
         "length of buf must be evenly divided by N = {N}"
     );
     let m = buf.len() / N;
-    let tmp: [&mut [Montgomery<P>]; N] = split::<P, N>(&mut scratch[..N * m]);
+    let base = buf.as_mut_ptr();
+    let mut offset = 0usize;
+    std::array::from_fn(|_| unsafe {
+        let s = std::slice::from_raw_parts_mut(base.add(offset), m);
+        offset += m;
+        s
+    })
+}
+
+fn shuffle<const N: usize, P: NTTPrime>(buf: &mut [Montgomery<P>], scratch: &mut [Montgomery<P>]) {
+    let m = buf.len() / N;
+    debug_assert!(scratch.len() >= (N - 1) * m);
     for i in 0..m {
         buf[i] = buf[N * i];
         for j in 1..N {
-            tmp[j - 1][i] = buf[N * i + j];
+            scratch[(j - 1) * m + i] = buf[N * i + j];
         }
     }
     for j in 1..N {
-        buf[j * m..(j + 1) * m].copy_from_slice(tmp[j - 1]);
+        let start = (j - 1) * m;
+        buf[j * m..(j + 1) * m].copy_from_slice(&scratch[start..start + m]);
     }
 }
 
-fn ntt_3<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, scratch: &mut [Montgomery<P>]) {
+fn ntt_3<P: NTTPrime, D: NTTDir>(
+    buf: &mut [Montgomery<P>],
+    stride: usize,
+    tw: &impl NTTTwidles<P>,
+    scratch: &mut [Montgomery<P>],
+) {
+    let n = buf.len();
     let m = buf.len() / 3;
-    let mont_g = w.pow(m as u64);
-    shuffle::<P, 3>(buf, scratch);
-    let sqr_w = w * w;
-    let tri_w = w * sqr_w;
-    ntt(&mut buf[..m], tri_w, scratch);
-    ntt(&mut buf[m..2 * m], tri_w, scratch);
-    ntt(&mut buf[2 * m..], tri_w, scratch);
-    let mut t1 = Montgomery::ONE;
-    let mut t2 = Montgomery::ONE;
+    debug_assert!(scratch.len() >= ntt_scratch_len(n));
+    shuffle::<3, P>(buf, scratch);
+
+    let new_stride = 3 * stride;
+    {
+        let [b0, b1, b2] = split(buf);
+        let child_scratch_len = ntt_scratch_len(m);
+        if n > NTT_PAR_CUTOFF_NTT_3 {
+            let (s0, rest) = scratch.split_at_mut(child_scratch_len);
+            let (s1, rest) = rest.split_at_mut(child_scratch_len);
+            let (s2, _) = rest.split_at_mut(child_scratch_len);
+            let ntt0 = || ntt::<P, D>(b0, new_stride, tw, s0);
+            let ntt1 = || ntt::<P, D>(b1, new_stride, tw, s1);
+            let ntt2 = || ntt::<P, D>(b2, new_stride, tw, s2);
+            rayon::join(ntt0, || rayon::join(ntt1, ntt2));
+        } else {
+            let child_scratch = &mut scratch[..child_scratch_len];
+            ntt::<P, D>(b0, new_stride, tw, child_scratch);
+            ntt::<P, D>(b1, new_stride, tw, child_scratch);
+            ntt::<P, D>(b2, new_stride, tw, child_scratch);
+        }
+    }
+
+    let g = if D::INV {
+        Montgomery::INV_G3
+    } else {
+        Montgomery::G3
+    };
+
+    let [mut tw0, mut tw1] = tw.twidles_iter::<2, D>(stride);
     for i in 0..m {
-        let a = buf[i];
-        let b = buf[i + m] * t1;
-        let c = buf[i + 2 * m] * t2;
-        let diff = (b - c) * mont_g;
-        buf[i] = a + b + c;
-        buf[i + m] = a - c + diff;
-        buf[i + 2 * m] = a - b - diff;
-        t1 *= w;
-        t2 *= sqr_w;
+        let [x0, x1, x2] = unsafe { buf.get_disjoint_unchecked_mut([i, i + m, i + 2 * m]) };
+        let (t0, t1) = unsafe { (tw0.next().unwrap_unchecked(), tw1.next().unwrap_unchecked()) };
+        let a = *x0;
+        let b = *x1 * t0;
+        let c = *x2 * t1;
+        let diff = (b - c) * g;
+        *x0 = a + b + c;
+        *x1 = a - c + diff;
+        *x2 = a - b - diff;
     }
 }
 
-fn ntt_5<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, scratch: &mut [Montgomery<P>]) {
+fn ntt_5<P: NTTPrime, D: NTTDir>(
+    buf: &mut [Montgomery<P>],
+    stride: usize,
+    tw: &impl NTTTwidles<P>,
+    scratch: &mut [Montgomery<P>],
+) {
+    let n = buf.len();
     let m = buf.len() / 5;
-    let g = w.pow(m as u64);
+    debug_assert!(scratch.len() >= ntt_scratch_len(n));
+    shuffle::<5, P>(buf, scratch);
+
+    let new_stride = 5 * stride;
+    {
+        let [b0, b1, b2, b3, b4] = split(buf);
+        let child_scratch_len = ntt_scratch_len(m);
+        if n > NTT_PAR_CUTOFF_NTT_5 {
+            let (s0, rest) = scratch.split_at_mut(child_scratch_len);
+            let (s1, rest) = rest.split_at_mut(child_scratch_len);
+            let (s2, rest) = rest.split_at_mut(child_scratch_len);
+            let (s3, rest) = rest.split_at_mut(child_scratch_len);
+            let (s4, _) = rest.split_at_mut(child_scratch_len);
+            let ntt0 = || ntt::<P, D>(b0, new_stride, tw, s0);
+            let ntt1 = || ntt::<P, D>(b1, new_stride, tw, s1);
+            let ntt2 = || ntt::<P, D>(b2, new_stride, tw, s2);
+            let ntt3 = || ntt::<P, D>(b3, new_stride, tw, s3);
+            let ntt4 = || ntt::<P, D>(b4, new_stride, tw, s4);
+            rayon::join(
+                || rayon::join(ntt0, ntt1),
+                || rayon::join(ntt2, || rayon::join(ntt3, ntt4)),
+            );
+        } else {
+            let child_scratch = &mut scratch[..child_scratch_len];
+            ntt::<P, D>(b0, new_stride, tw, child_scratch);
+            ntt::<P, D>(b1, new_stride, tw, child_scratch);
+            ntt::<P, D>(b2, new_stride, tw, child_scratch);
+            ntt::<P, D>(b3, new_stride, tw, child_scratch);
+            ntt::<P, D>(b4, new_stride, tw, child_scratch);
+        }
+    }
+
+    let g = if D::INV {
+        Montgomery::INV_G5
+    } else {
+        Montgomery::G5
+    };
     let g2 = g * g;
     let g3 = g2 * g;
     let g4 = g3 * g;
@@ -1395,26 +2068,25 @@ fn ntt_5<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, scratch: &mut
     let beta = (g2 + g3) * Montgomery::HALF;
     let gamma = (g - g4) * Montgomery::HALF;
     let delta = (g2 - g3) * Montgomery::HALF;
-    let w2 = w * w;
-    let w3 = w2 * w;
-    let w4 = w3 * w;
-    let w5 = w4 * w;
-    shuffle::<P, 5>(buf, scratch);
-    ntt(&mut buf[..m], w5, scratch);
-    ntt(&mut buf[m..2 * m], w5, scratch);
-    ntt(&mut buf[2 * m..3 * m], w5, scratch);
-    ntt(&mut buf[3 * m..4 * m], w5, scratch);
-    ntt(&mut buf[4 * m..], w5, scratch);
-    let mut t1 = Montgomery::ONE;
-    let mut t2 = Montgomery::ONE;
-    let mut t3 = Montgomery::ONE;
-    let mut t4 = Montgomery::ONE;
+
+    let [mut tw0, mut tw1, mut tw2, mut tw3] = tw.twidles_iter::<4, D>(stride);
     for i in 0..m {
-        let a = buf[i];
-        let b = buf[i + m] * t1;
-        let c = buf[i + 2 * m] * t2;
-        let d = buf[i + 3 * m] * t3;
-        let e = buf[i + 4 * m] * t4;
+        let [x0, x1, x2, x3, x4] =
+            unsafe { buf.get_disjoint_unchecked_mut([i, i + m, i + 2 * m, i + 3 * m, i + 4 * m]) };
+        let (t0, t1, t2, t3) = unsafe {
+            (
+                tw0.next().unwrap_unchecked(),
+                tw1.next().unwrap_unchecked(),
+                tw2.next().unwrap_unchecked(),
+                tw3.next().unwrap_unchecked(),
+            )
+        };
+        let a = *x0;
+        let b = *x1 * t0;
+        let c = *x2 * t1;
+        let d = *x3 * t2;
+        let e = *x4 * t3;
+
         let sum1 = b + e;
         let dif1 = b - e;
         let sum2 = c + d;
@@ -1427,15 +2099,12 @@ fn ntt_5<P: NTTPrime>(buf: &mut [Montgomery<P>], w: Montgomery<P>, scratch: &mut
         let dd1 = delta * dif1;
         let as2 = alpha * sum2;
         let gd2 = gamma * dif2;
-        buf[i] = a + sum1 + sum2;
-        buf[i + m] = a + (as1 + gd1) + (bs2 + dd2);
-        buf[i + 4 * m] = a + (as1 - gd1) + (bs2 - dd2);
-        buf[i + 2 * m] = a + (bs1 + dd1) + (as2 - gd2);
-        buf[i + 3 * m] = a + (bs1 - dd1) + (as2 + gd2);
-        t1 *= w;
-        t2 *= w2;
-        t3 *= w3;
-        t4 *= w4;
+
+        *x0 = a + sum1 + sum2;
+        *x1 = a + (as1 + gd1) + (bs2 + dd2);
+        *x2 = a + (bs1 + dd1) + (as2 - gd2);
+        *x3 = a + (bs1 - dd1) + (as2 + gd2);
+        *x4 = a + (as1 - gd1) + (bs2 - dd2);
     }
 }
 
@@ -1443,35 +2112,70 @@ fn ntt_convolution<P: NTTPrime>(
     a_buf: &[u64],
     b_buf: &[u64],
     res: &mut [u64],
-    n: usize,
+    tw: &impl NTTTwidles<P>,
     buf_scratch: &mut [u64],
     ntt_scratch: &mut [u64],
 ) {
+    let n = res.len();
+    let ntt_scratch_len = ntt_scratch_len(n);
+    debug_assert!(buf_scratch.len() >= n);
+    debug_assert!(ntt_scratch.len() >= ntt_scratch_len);
+
     res[..a_buf.len()].copy_from_slice(a_buf);
     res[a_buf.len()..].fill(0);
     buf_scratch[..b_buf.len()].copy_from_slice(b_buf);
     buf_scratch[b_buf.len()..].fill(0);
+
+    {
+        let (a, b) = (&mut *res, &mut *buf_scratch);
+
+        let ntt_a = move || {
+            let mont_a: &mut [Montgomery<P>] = unsafe { std::mem::transmute(a) };
+            for a in mont_a.iter_mut().take(a_buf.len()) {
+                a.to_mut();
+            }
+            mont_a
+        };
+
+        let ntt_b = move || {
+            let mont_b: &mut [Montgomery<P>] = unsafe { std::mem::transmute(b) };
+            for b in mont_b.iter_mut().take(b_buf.len()) {
+                b.to_mut();
+            }
+            mont_b
+        };
+
+        if n > NTT_PAR_CUTOFF_NTT && ntt_scratch.len() >= 2 * ntt_scratch_len {
+            let (a_ntt_scratch, b_ntt_scratch) = ntt_scratch.split_at_mut(ntt_scratch_len);
+            let (mont_a, mont_b) = rayon::join(ntt_a, ntt_b);
+            let mont_a_scratch: &mut [Montgomery<P>] =
+                unsafe { std::mem::transmute(a_ntt_scratch) };
+            let mont_b_scratch: &mut [Montgomery<P>] =
+                unsafe { std::mem::transmute(&mut b_ntt_scratch[..ntt_scratch_len]) };
+            rayon::join(
+                || ntt::<P, NTTForward>(mont_a, 1, tw, mont_a_scratch),
+                || ntt::<P, NTTForward>(mont_b, 1, tw, mont_b_scratch),
+            );
+        } else {
+            let mont_a = ntt_a();
+            let mont_ntt_scratch: &mut [Montgomery<P>] =
+                unsafe { std::mem::transmute(&mut ntt_scratch[..ntt_scratch_len]) };
+            ntt::<P, NTTForward>(mont_a, 1, tw, mont_ntt_scratch);
+
+            let mont_b = ntt_b();
+            let mont_ntt_scratch: &mut [Montgomery<P>] =
+                unsafe { std::mem::transmute(&mut ntt_scratch[..ntt_scratch_len]) };
+            ntt::<P, NTTForward>(mont_b, 1, tw, mont_ntt_scratch);
+        }
+    }
+
     let mont_a: &mut [Montgomery<P>] = unsafe { std::mem::transmute(res) };
     let mont_b: &mut [Montgomery<P>] = unsafe { std::mem::transmute(buf_scratch) };
-    for a in mont_a.iter_mut().take(a_buf.len()) {
-        a.to_mut();
-    }
-    for b in mont_b.iter_mut().take(b_buf.len()) {
-        b.to_mut();
-    }
-    let mont_scratch: &mut [Montgomery<P>] = unsafe { std::mem::transmute(ntt_scratch) };
-
-    let w = Montgomery::to(P::G).pow((P::P - 1) / (n as u64));
-    ntt(mont_a, w, mont_scratch);
-    ntt(mont_b, w, mont_scratch);
-
-    for (a, b) in mont_a.iter_mut().zip(mont_b) {
+    for (a, b) in mont_a.iter_mut().zip(mont_b.iter()) {
         *a *= *b;
     }
 
-    let inv_pow = (n - 1) as u64 * ((P::P - 1) / n as u64);
-    let inv_w = Montgomery::to(P::G).pow(inv_pow);
-    ntt(mont_a, inv_w, mont_scratch);
+    ntt::<P, NTTBackward>(mont_a, 1, tw, mont_b);
 }
 
 struct CRT<P1: NTTPrime, P2: NTTPrime, P3: NTTPrime> {
@@ -1545,41 +2249,6 @@ impl<P1: NTTPrime, P2: NTTPrime, P3: NTTPrime> CRT<P1, P2, P3> {
         *r3 = sum3 as u64;
     }
 }
-pub fn karatsuba_cost(l: usize, s: usize) -> f64 {
-    const LOG_2_3: f64 = 1.584962501;
-    let l_pow = (l as f64).powf(LOG_2_3);
-    let sum_pow = ((l - s) as f64).powf(LOG_2_3);
-    l_pow - sum_pow
-}
-
-pub fn is_karatsuba(l: usize, s: usize, chunk: f64, reg: f64) -> bool {
-    let fft_cost = fft_cost(l, s);
-    let half = (l + 1) / 2;
-    if s <= half {
-        chunking_karatsuba_cost(l, s) < chunk * fft_cost
-    } else {
-        karatsuba_cost(l, s) < reg * fft_cost
-    }
-}
-
-enum DynDispatch {
-    Prim,
-    Prim2,
-    School,
-    Karatsuba,
-    FFT,
-    NTT,
-}
-
-fn dyn_dispatch(l: usize, s: usize) -> DynDispatch {
-    if s == 1 {
-        DynDispatch::Prim
-    } else if s == 2 {
-        DynDispatch::Prim2
-    } else if is_school(l, s) {
-        DynDispatch::School
-    } else if is_karatsuba(l, s, FFT_CHUNKING_KARATSUBA_CUTOFF, FFT_KARATSUBA_CUTOFF) {
-        DynDispatch::Karatsuba
 
 static CRT: LazyLock<CRT<P1, P2, P3>> = LazyLock::new(|| CRT::<P1, P2, P3>::new());
 
@@ -1612,7 +2281,7 @@ fn ntt_accumulate(
     let len3 = n3.min(out.len() - 2);
     let of2 = add_buf(&mut out[2..], &res3[..len3]) as u64;
 
-    return res2[len2] + res3[len3] + of1 + of2;
+    res2.get(len2).copied().unwrap_or(0) + res3.get(len3).copied().unwrap_or(0) + of1 + of2
 }
 
 fn ntt_log_prime_search(
@@ -1657,6 +2326,12 @@ fn find_ntt_size<P: NTTPrime>(n: usize) -> usize {
     ntt_log_prime_search(1, n, &NTT_RADIX, &P::EXP).expect("Input Is too large for NTT")
 }
 
+pub fn find_max_ntt_size(n: usize) -> usize {
+    find_ntt_size::<P1>(n)
+        .max(find_ntt_size::<P2>(n))
+        .max(find_ntt_size::<P3>(n))
+}
+
 pub fn ntt_entry_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     let out_len = a.len() + b.len() - 1;
     let n1 = find_ntt_size::<P1>(out_len);
@@ -1667,27 +2342,46 @@ pub fn ntt_entry_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     let [res1, res2, res3] = res_guard.get_splits([n1, n2, n3]);
 
     {
-        let r1: &mut [_] = &mut *res1;
-        let r2: &mut [_] = &mut *res2;
-        let r3: &mut [_] = &mut *res3;
+        let (r1, r2, r3) = (&mut *res1, &mut *res2, &mut *res3);
 
         let mut conv1 = move || {
-            let mut g = ScratchGuard::acquire();
-            let [bs, ns] = g.get_splits([n1, n1]);
-            ntt_convolution::<P1>(a, b, r1, n1, bs, ns);
+            DYN_NTT_CACHE_P1.with(|cell| {
+                let mut g = ScratchGuard::acquire();
+                let [bs, ns] = g.get_splits([n1, ntt_convolution_scratch_len(n1)]);
+                let cache = &mut *cell.borrow_mut();
+                let tw = cache
+                    .entry(n1 >> n1.trailing_zeros())
+                    .or_insert_with(|| DynNTTTwidles::build(n1));
+                tw.ensure(n1);
+                ntt_convolution::<P1>(a, b, r1, tw, bs, ns);
+            });
         };
         let mut conv2 = move || {
-            let mut g = ScratchGuard::acquire();
-            let [bs, ns] = g.get_splits([n2, n2]);
-            ntt_convolution::<P2>(a, b, r2, n2, bs, ns);
+            DYN_NTT_CACHE_P2.with(|cell| {
+                let mut g = ScratchGuard::acquire();
+                let [bs, ns] = g.get_splits([n2, ntt_convolution_scratch_len(n2)]);
+                let cache = &mut *cell.borrow_mut();
+                let tw = cache
+                    .entry(n2 >> n2.trailing_zeros())
+                    .or_insert_with(|| DynNTTTwidles::build(n2));
+                tw.ensure(n2);
+                ntt_convolution::<P2>(a, b, r2, tw, bs, ns);
+            });
         };
         let mut conv3 = move || {
-            let mut g = ScratchGuard::acquire();
-            let [bs, ns] = g.get_splits([n3, n3]);
-            ntt_convolution::<P3>(a, b, r3, n3, bs, ns);
+            DYN_NTT_CACHE_P3.with(|cell| {
+                let mut g = ScratchGuard::acquire();
+                let [bs, ns] = g.get_splits([n3, ntt_convolution_scratch_len(n3)]);
+                let cache = &mut *cell.borrow_mut();
+                let tw = cache
+                    .entry(n3 >> n3.trailing_zeros())
+                    .or_insert_with(|| DynNTTTwidles::build(n3));
+                tw.ensure(n3);
+                ntt_convolution::<P3>(a, b, r3, tw, bs, ns);
+            });
         };
 
-        if n1.max(n2).max(n3) >= NTT_PARALLEL_CUTOFF{
+        if out_len > NTT_PAR_CUTOFF_NTT_CONV {
             rayon::join(conv1, || rayon::join(conv2, conv3));
         } else {
             conv1();
@@ -1711,7 +2405,7 @@ fn ntt_log_prime_search_for_split(
     }
 
     let Some((&p, rest_primes)) = primes.split_first() else {
-        return Some(init); // no more primes, init ≤ target is valid
+        return Some(init);
     };
 
     let (&max_exp, rest_exps) = max_exps.split_first().unwrap();
@@ -1763,17 +2457,41 @@ fn ntt_split_convolution<const N: usize, P: NTTPrime>(
     let n = find_ntt_size_for_split::<N, P>();
     let split = n + 1 - short.len();
     let (long_lo, long_hi) = long.split_at(split);
+    let mut tw = StaticNTTTwidles::<N, P>::build(n);
     ntt_convolution::<P>(
         long_lo,
         short,
         &mut res[..n],
-        n,
+        &mut tw,
         &mut buf_scratch[..n],
-        &mut ntt_scratch[..n],
+        &mut ntt_scratch[..ntt_convolution_scratch_len(n)],
     );
     acc_convolution::<P, _>(short, long_hi, &mut res[split..], |a, b| {
         Montgomery::fuse_mul_to(a, b)
     });
+}
+
+fn ntt_static_convolution<const N: usize, P: NTTPrime>(
+    long: &[u64],
+    short: &[u64],
+    res: &mut [u64],
+    n: usize,
+    buf_scratch: &mut [u64],
+    ntt_scratch: &mut [u64],
+) {
+    if n <= N {
+        let mut tw = StaticNTTTwidles::<N, P>::build(n);
+        ntt_convolution::<P>(
+            long,
+            short,
+            &mut res[..n],
+            &mut tw,
+            &mut buf_scratch[..n],
+            &mut ntt_scratch[..ntt_scratch_len(n)],
+        );
+    } else {
+        ntt_split_convolution::<N, P>(long, short, res, buf_scratch, ntt_scratch);
+    }
 }
 
 pub fn ntt_entry_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
@@ -1782,70 +2500,86 @@ pub fn ntt_entry_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [
     let mut res2 = [0; N];
     let mut res3 = [0; N];
 
-    {
-        let n1 = find_ntt_size::<P1>(out_len);
-        let mut conv1 = move || {
-            let mut buf_scratch = [0;N];
-            let mut ntt_scratch = [0;N];
-            if n1 <= N {
-                ntt_convolution::<P1>(
-                    long,
-                    short,
-                    &mut res1[..n1],
-                    n1,
-                    &mut buf_scratch[..n1],
-                    &mut ntt_scratch[..n1],
-                );
-            } else {
-                ntt_split_convolution::<N, P1>(long, short, &mut res1, &mut buf_scratch, &mut ntt_scratch);
-            }
+    let n1 = find_ntt_size::<P1>(out_len);
+    let n2 = find_ntt_size::<P2>(out_len);
+    let n3 = find_ntt_size::<P3>(out_len);
+
+    if out_len > NTT_PAR_CUTOFF_NTT_CONV {
+        let conv1 = || {
+            let mut buf_scratch = [0; N];
+            let mut ntt_scratch = [0; N];
+            ntt_static_convolution::<N, P1>(
+                long,
+                short,
+                &mut res1,
+                n1,
+                &mut buf_scratch,
+                &mut ntt_scratch,
+            );
         };
 
-        let n2 = find_ntt_size::<P2>(out_len);
-        let mut conv2 = move || {
-            let mut buf_scratch = [0;N];
-            let mut ntt_scratch = [0;N];
-            if n2 <= N {
-                ntt_convolution::<P2>(
-                    long,
-                    short,
-                    &mut res2[..n2],
-                    n2,
-                    &mut buf_scratch[..n2],
-                    &mut ntt_scratch[..n2],
-                );
-            } else {
-                ntt_split_convolution::<N, P2>(long, short, &mut res2, &mut buf_scratch, &mut ntt_scratch);
-            }
+        let conv2 = || {
+            let mut buf_scratch = [0; N];
+            let mut ntt_scratch = [0; N];
+            ntt_static_convolution::<N, P2>(
+                long,
+                short,
+                &mut res2,
+                n2,
+                &mut buf_scratch,
+                &mut ntt_scratch,
+            );
         };
 
-        let n3 = find_ntt_size::<P3>(out_len);
-        let mut conv3 = move || {
-            let mut buf_scratch = [0;N];
-            let mut ntt_scratch = [0;N];
-            if n3 <= N {
-                ntt_convolution::<P3>(
-                    long,
-                    short,
-                    &mut res3[..n3],
-                    n3,
-                    &mut buf_scratch[..n3],
-                    &mut ntt_scratch[..n3],
-                );
-            } else {
-                ntt_split_convolution::<N, P3>(long, short, &mut res3, &mut buf_scratch, &mut ntt_scratch);
-            }
+        let conv3 = || {
+            let mut buf_scratch = [0; N];
+            let mut ntt_scratch = [0; N];
+            ntt_static_convolution::<N, P3>(
+                long,
+                short,
+                &mut res3,
+                n3,
+                &mut buf_scratch,
+                &mut ntt_scratch,
+            );
         };
 
-        if n1.max(n2).max(n3) >= NTT_PARALLEL_CUTOFF{
-            rayon::join(conv1, || rayon::join(conv2, conv3));
-        } else {
-            conv1();
-            conv2();
-            conv3();
-        }
+        rayon::join(conv1, || rayon::join(conv2, conv3));
+    } else {
+        let mut buf_scratch = [0; N];
+        let mut ntt_scratch = [0; N];
+        ntt_static_convolution::<N, P1>(
+            long,
+            short,
+            &mut res1,
+            n1,
+            &mut buf_scratch,
+            &mut ntt_scratch,
+        );
+        ntt_static_convolution::<N, P2>(
+            long,
+            short,
+            &mut res2,
+            n2,
+            &mut buf_scratch,
+            &mut ntt_scratch,
+        );
+        ntt_static_convolution::<N, P3>(
+            long,
+            short,
+            &mut res3,
+            n3,
+            &mut buf_scratch,
+            &mut ntt_scratch,
+        );
     }
-    ntt_accumulate(&mut res1, &mut res2, &mut res3, out, out_len)
+    ntt_accumulate(
+        &mut res1[..n1],
+        &mut res2[..n2],
+        &mut res3[..n3],
+        out,
+        out_len,
+    )
 }
 
 //END NTT MULTIPLICATION
@@ -1861,6 +2595,41 @@ pub fn chunking_karatsuba_cost(l: usize, s: usize) -> f64 {
     (l as f64) * s_pow
 }
 
+pub fn karatsuba_cost(l: usize, s: usize) -> f64 {
+    const LOG_2_3: f64 = 1.584962501;
+    let l_pow = (l as f64).powf(LOG_2_3);
+    let sum_pow = ((l - s) as f64).powf(LOG_2_3);
+    l_pow - sum_pow
+}
+
+pub fn is_karatsuba(l: usize, s: usize, chunk: f64, reg: f64) -> bool {
+    let fft_cost = fft_cost(l, s);
+    let half = (l + 1) / 2;
+    if s <= half {
+        chunking_karatsuba_cost(l, s) < chunk * fft_cost
+    } else {
+        karatsuba_cost(l, s) < reg * fft_cost
+    }
+}
+
+enum DynDispatch {
+    Prim,
+    Prim2,
+    School,
+    Karatsuba,
+    FFT,
+    NTT,
+}
+
+fn dyn_dispatch(l: usize, s: usize) -> DynDispatch {
+    if s == 1 {
+        DynDispatch::Prim
+    } else if s == 2 {
+        DynDispatch::Prim2
+    } else if is_school(l, s) {
+        DynDispatch::School
+    } else if is_karatsuba(l, s, FFT_CHUNKING_KARATSUBA_CUTOFF, FFT_KARATSUBA_CUTOFF) {
+        DynDispatch::Karatsuba
     } else if (l + s - 1) <= FFT_16BIT_CUTOFF {
         DynDispatch::FFT
     } else {
@@ -2018,7 +2787,7 @@ unsafe fn mul_double_asm(a_val: u64, b_val: u64, acc0: &mut u64, acc1: &mut u64,
 
     #[cfg(target_arch = "x86_64")]
     mul_double_asm_x86(a_val, b_val, acc0, acc1, acc2);
- <M-C-S-D-Z><M-C-S-D-Space>}
+}
 
 pub fn sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
     if buf.is_empty() {
@@ -2267,7 +3036,7 @@ pub fn fft_sqr_entry(buf: &[u64], out: &mut [u64]) -> u64 {
 fn ntt_sqr_convolution<P: NTTPrime>(
     buf: &[u64],
     res: &mut [u64],
-    n: usize,
+    tw: &mut impl NTTTwidles<P>,
     ntt_scratch: &mut [u64],
 ) {
     res[..buf.len()].copy_from_slice(buf);
@@ -2278,16 +3047,13 @@ fn ntt_sqr_convolution<P: NTTPrime>(
     }
     let mont_scratch: &mut [Montgomery<P>] = unsafe { std::mem::transmute(ntt_scratch) };
 
-    let w = Montgomery::to(P::G).pow((P::P - 1) / (n as u64));
-    ntt(mont_res, w, mont_scratch);
+    ntt::<P, NTTForward>(mont_res, 1, tw, mont_scratch);
 
     for elem in mont_res.iter_mut() {
         *elem *= *elem;
     }
 
-    let int_pow = (n - 1) as u64 * ((P::P - 1) / n as u64);
-    let inv_w = Montgomery::to(P::G).pow(int_pow);
-    ntt(mont_res, inv_w, mont_scratch);
+    ntt::<P, NTTBackward>(mont_res, 1, tw, mont_scratch);
 }
 
 pub fn ntt_sqr_entry_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
@@ -2295,13 +3061,58 @@ pub fn ntt_sqr_entry_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
     let n1 = find_ntt_size::<P1>(out_len);
     let n2 = find_ntt_size::<P2>(out_len);
     let n3 = find_ntt_size::<P3>(out_len);
-    let scratch_sz = n1.max(n2).max(n3);
-    let mut scratch_gaurd = ScratchGuard::acquire();
-    let [res1, res2, res3, ntt_scratch] = scratch_gaurd.get_splits([n1, n2, n3, scratch_sz]);
-    ntt_sqr_convolution::<P1>(buf, res1, n1, &mut ntt_scratch[..n1]);
-    ntt_sqr_convolution::<P2>(buf, res2, n2, &mut ntt_scratch[..n2]);
-    ntt_sqr_convolution::<P3>(buf, res3, n3, &mut ntt_scratch[..n3]);
 
+    let mut scratch_gaurd = ScratchGuard::acquire();
+    let [res1, res2, res3] = scratch_gaurd.get_splits([n1, n2, n3]);
+
+    {
+        let (r1, r2, r3) = (&mut *res1, &mut *res2, &mut *res3);
+
+        let mut conv1 = move || {
+            DYN_NTT_CACHE_P1.with(|cell| {
+                let mut g = ScratchGuard::acquire();
+                let ns = g.get(ntt_scratch_len(n1));
+                let cache = &mut *cell.borrow_mut();
+                let tw = cache
+                    .entry(n1 >> n1.trailing_zeros())
+                    .or_insert_with(|| DynNTTTwidles::build(n1));
+                tw.ensure(n1);
+                ntt_sqr_convolution::<P1>(buf, r1, tw, ns);
+            });
+        };
+        let mut conv2 = move || {
+            DYN_NTT_CACHE_P2.with(|cell| {
+                let mut g = ScratchGuard::acquire();
+                let ns = g.get(ntt_scratch_len(n2));
+                let cache = &mut *cell.borrow_mut();
+                let tw = cache
+                    .entry(n2 >> n2.trailing_zeros())
+                    .or_insert_with(|| DynNTTTwidles::build(n2));
+                tw.ensure(n2);
+                ntt_sqr_convolution::<P2>(buf, r2, tw, ns);
+            });
+        };
+        let mut conv3 = move || {
+            DYN_NTT_CACHE_P3.with(|cell| {
+                let mut g = ScratchGuard::acquire();
+                let ns = g.get(ntt_scratch_len(n3));
+                let cache = &mut *cell.borrow_mut();
+                let tw = cache
+                    .entry(n3 >> n3.trailing_zeros())
+                    .or_insert_with(|| DynNTTTwidles::build(n3));
+                tw.ensure(n3);
+                ntt_sqr_convolution::<P3>(buf, r3, tw, ns);
+            });
+        };
+
+        if out_len > NTT_PAR_CUTOFF_NTT_CONV {
+            rayon::join(conv1, || rayon::join(conv2, conv3));
+        } else {
+            conv1();
+            conv2();
+            conv3();
+        }
+    }
     ntt_accumulate(res1, res2, res3, out, out_len)
 }
 
@@ -2313,7 +3124,13 @@ fn ntt_split_sqr_convolution<const N: usize, P: NTTPrime>(
     let n = find_ntt_size_for_split::<N, P>();
     let split = (n + 1) / 2;
     let (buf_lo, buf_hi) = buf.split_at(split);
-    ntt_sqr_convolution::<P>(buf_lo, &mut res[..n], n, &mut ntt_scratch[..n]);
+    let mut tw = StaticNTTTwidles::<N, P>::build(n);
+    ntt_sqr_convolution::<P>(
+        buf_lo,
+        &mut res[..n],
+        &mut tw,
+        &mut ntt_scratch[..ntt_scratch_len(n)],
+    );
     acc_convolution::<P, _>(buf_lo, buf_hi, &mut res[split..], |a, b| {
         let val = Montgomery::fuse_mul_to(a, b);
         val + val
@@ -2323,34 +3140,57 @@ fn ntt_split_sqr_convolution<const N: usize, P: NTTPrime>(
     });
 }
 
+fn ntt_static_sqr_convolution<const N: usize, P: NTTPrime>(
+    buf: &[u64],
+    res: &mut [u64],
+    n: usize,
+    ntt_scratch: &mut [u64],
+) {
+    if n <= N {
+        let mut tw = StaticNTTTwidles::<N, P>::build(n);
+        ntt_sqr_convolution::<P>(
+            buf,
+            &mut res[..n],
+            &mut tw,
+            &mut ntt_scratch[..ntt_scratch_len(n)],
+        );
+    } else {
+        ntt_split_sqr_convolution::<N, P>(buf, res, ntt_scratch);
+    }
+}
+
 pub fn ntt_sqr_entry_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
     let out_len = 2 * buf.len() - 1;
     let mut res1 = [0; N];
     let mut res2 = [0; N];
     let mut res3 = [0; N];
-    let mut ntt_scratch = [0; N];
-
     let n1 = find_ntt_size::<P1>(out_len);
-    if n1 <= N {
-        ntt_sqr_convolution::<P1>(buf, &mut res1[..n1], n1, &mut ntt_scratch[..n1]);
-    } else {
-        ntt_split_sqr_convolution::<N, P1>(buf, &mut res1, &mut ntt_scratch);
-    }
-
     let n2 = find_ntt_size::<P2>(out_len);
-    if n2 <= N {
-        ntt_sqr_convolution::<P2>(buf, &mut res2[..n2], n2, &mut ntt_scratch[..n2]);
-    } else {
-        ntt_split_sqr_convolution::<N, P2>(buf, &mut res2, &mut ntt_scratch);
-    }
-
     let n3 = find_ntt_size::<P3>(out_len);
-    if n3 <= N {
-        ntt_sqr_convolution::<P3>(buf, &mut res3[..n3], n3, &mut ntt_scratch[..n3]);
-    } else {
-        ntt_split_sqr_convolution::<N, P3>(buf, &mut res3, &mut ntt_scratch);
-    }
 
+    if out_len > NTT_PAR_CUTOFF_NTT_CONV {
+        let conv1 = || {
+            let mut ntt_scratch = [0; N];
+            ntt_static_sqr_convolution::<N, P1>(buf, &mut res1, n1, &mut ntt_scratch);
+        };
+
+        let conv2 = || {
+            let mut ntt_scratch = [0; N];
+            ntt_static_sqr_convolution::<N, P2>(buf, &mut res2, n2, &mut ntt_scratch);
+        };
+
+        let conv3 = || {
+            let mut ntt_scratch = [0; N];
+            ntt_static_sqr_convolution::<N, P3>(buf, &mut res3, n3, &mut ntt_scratch);
+        };
+
+        rayon::join(conv1, || rayon::join(conv2, conv3));
+    } else {
+        let mut ntt_scratch = [0; N];
+        ntt_static_sqr_convolution::<N, P1>(buf, &mut res1, n1, &mut ntt_scratch);
+        ntt_static_sqr_convolution::<N, P2>(buf, &mut res2, n2, &mut ntt_scratch);
+        ntt_static_sqr_convolution::<N, P3>(buf, &mut res3, n3, &mut ntt_scratch);
+    }
     ntt_accumulate(
         &mut res1[..n1],
         &mut res2[..n2],
@@ -2371,7 +3211,7 @@ enum DynSqrDispatch {
 fn dyn_sqr_dispatch(n: usize) -> DynSqrDispatch {
     if n <= FFT_SQR_CUTOFF {
         DynSqrDispatch::School
-    } else if n <= FFT_16BIT_CUTOFF{
+    } else if n <= FFT_16BIT_CUTOFF {
         DynSqrDispatch::FFT
     } else {
         DynSqrDispatch::NTT
@@ -2590,35 +3430,58 @@ fn ntt_mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     let n1 = find_ntt_size::<P1>(2 * sz - 1);
     let n2 = find_ntt_size::<P2>(2 * sz - 1);
     let n3 = find_ntt_size::<P3>(2 * sz - 1);
-    let scratch_sz = n1.max(n2).max(n3);
     let mut scratch_gaurd = ScratchGuard::acquire();
-    let [res1, res2, res3, buf_scratch, ntt_scratch] =
-        scratch_gaurd.get_splits([n1, n2, n3, scratch_sz, scratch_sz]);
-    ntt_convolution::<P1>(
-        long,
-        short,
-        res1,
-        n1,
-        &mut buf_scratch[..n1],
-        &mut ntt_scratch[..n1],
-    );
-    ntt_convolution::<P2>(
-        long,
-        short,
-        res2,
-        n2,
-        &mut buf_scratch[..n2],
-        &mut ntt_scratch[..n2],
-    );
-    ntt_convolution::<P3>(
-        long,
-        short,
-        res3,
-        n3,
-        &mut buf_scratch[..n3],
-        &mut ntt_scratch[..n3],
-    );
+    let [res1, res2, res3] = scratch_gaurd.get_splits([n1, n2, n3]);
 
+    {
+        let (r1, r2, r3) = (&mut *res1, &mut *res2, &mut *res3);
+
+        let mut conv1 = move || {
+            DYN_NTT_CACHE_P1.with(|cell| {
+                let mut g = ScratchGuard::acquire();
+                let [bs, ns] = g.get_splits([n1, ntt_convolution_scratch_len(n1)]);
+                let cache = &mut *cell.borrow_mut();
+                let tw = cache
+                    .entry(n1 >> n1.trailing_zeros())
+                    .or_insert_with(|| DynNTTTwidles::build(n1));
+                tw.ensure(n1);
+                ntt_convolution::<P1>(long, short, r1, tw, bs, ns);
+            });
+        };
+
+        let mut conv2 = move || {
+            DYN_NTT_CACHE_P2.with(|cell| {
+                let mut g = ScratchGuard::acquire();
+                let [bs, ns] = g.get_splits([n2, ntt_convolution_scratch_len(n2)]);
+                let cache = &mut *cell.borrow_mut();
+                let tw = cache
+                    .entry(n2 >> n2.trailing_zeros())
+                    .or_insert_with(|| DynNTTTwidles::build(n2));
+                tw.ensure(n2);
+                ntt_convolution::<P2>(long, short, r2, tw, bs, ns);
+            });
+        };
+        let mut conv3 = move || {
+            DYN_NTT_CACHE_P3.with(|cell| {
+                let mut g = ScratchGuard::acquire();
+                let [bs, ns] = g.get_splits([n3, ntt_convolution_scratch_len(n3)]);
+                let cache = &mut *cell.borrow_mut();
+                let tw = cache
+                    .entry(n3 >> n3.trailing_zeros())
+                    .or_insert_with(|| DynNTTTwidles::build(n3));
+                tw.ensure(n3);
+                ntt_convolution::<P3>(long, short, r3, tw, bs, ns);
+            });
+        };
+
+        if 2 * sz - 1 > NTT_PAR_CUTOFF_NTT_CONV {
+            rayon::join(conv1, || rayon::join(conv2, conv3));
+        } else {
+            conv1();
+            conv2();
+            conv3();
+        }
+    }
     ntt_mid_accumulate(res1, res2, res3, out, sz)
 }
 
@@ -2632,38 +3495,81 @@ fn ntt_mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u6
     let mut res1 = [0; MAX_STATIC_SIZE];
     let mut res2 = [0; MAX_STATIC_SIZE];
     let mut res3 = [0; MAX_STATIC_SIZE];
-    let mut buf_scratch = [0; MAX_STATIC_SIZE];
-    let mut ntt_scratch = [0; MAX_STATIC_SIZE];
 
     let n1 = find_ntt_size::<P1>(2 * sz - 1);
     let n2 = find_ntt_size::<P2>(2 * sz - 1);
     let n3 = find_ntt_size::<P3>(2 * sz - 1);
-    ntt_convolution::<P1>(
-        long,
-        short,
-        &mut res1[..n1],
-        n1,
-        &mut buf_scratch[..n1],
-        &mut ntt_scratch[..n1],
-    );
-    ntt_convolution::<P2>(
-        long,
-        short,
-        &mut res2[..n2],
-        n2,
-        &mut buf_scratch[..n2],
-        &mut ntt_scratch[..n2],
-    );
-    ntt_convolution::<P3>(
-        long,
-        short,
-        &mut res3,
-        n3,
-        &mut buf_scratch[..n3],
-        &mut ntt_scratch[..n3],
-    );
 
-    ntt_mid_accumulate(&mut res1, &mut res2, &mut res3, out, sz)
+    if 2 * sz - 1 > NTT_PAR_CUTOFF_NTT_CONV {
+        let conv1 = move || {
+            let mut buf_scratch = [0; N];
+            let mut ntt_scratch = [0; N];
+            ntt_static_convolution::<N, P1>(
+                long,
+                short,
+                &mut res1,
+                n1,
+                &mut buf_scratch,
+                &mut ntt_scratch,
+            );
+        };
+
+        let conv2 = move || {
+            let mut buf_scratch = [0; N];
+            let mut ntt_scratch = [0; N];
+            ntt_static_convolution::<N, P2>(
+                long,
+                short,
+                &mut res2,
+                n2,
+                &mut buf_scratch,
+                &mut ntt_scratch,
+            );
+        };
+
+        let conv3 = move || {
+            let mut buf_scratch = [0; N];
+            let mut ntt_scratch = [0; N];
+            ntt_static_convolution::<N, P3>(
+                long,
+                short,
+                &mut res3,
+                n3,
+                &mut buf_scratch,
+                &mut ntt_scratch,
+            );
+        };
+
+        rayon::join(conv1, || rayon::join(conv2, conv3));
+    } else {
+        let mut buf_scratch = [0; N];
+        let mut ntt_scratch = [0; N];
+        ntt_static_convolution::<N, P1>(
+            long,
+            short,
+            &mut res1,
+            n1,
+            &mut buf_scratch,
+            &mut ntt_scratch,
+        );
+        ntt_static_convolution::<N, P2>(
+            long,
+            short,
+            &mut res2,
+            n2,
+            &mut buf_scratch,
+            &mut ntt_scratch,
+        );
+        ntt_static_convolution::<N, P3>(
+            long,
+            short,
+            &mut res3,
+            n3,
+            &mut buf_scratch,
+            &mut ntt_scratch,
+        );
+    }
+    ntt_mid_accumulate(&mut res1[..n1], &mut res2[..n2], &mut res3[..n3], out, sz)
 }
 
 enum DynMidDispatch {

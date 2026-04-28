@@ -238,10 +238,7 @@ fn test_div_vec_invariant_bz_cutoff_even() {
 /// Tests both even (2*BZ_CUTOFF+2) and odd (2*BZ_CUTOFF+1) at this depth.
 #[test]
 fn test_div_vec_invariant_bz_deep_recursive() {
-    for (d_len, seed_base) in [
-        (BZ_CUTOFF * 2 + 2, 10000u64),
-        (BZ_CUTOFF * 2 + 1, 11000u64),
-    ] {
+    for (d_len, seed_base) in [(BZ_CUTOFF * 2 + 2, 10000u64), (BZ_CUTOFF * 2 + 1, 11000u64)] {
         for seed in 0u64..3 {
             let n_len = d_len * 2 + 4;
             let n = rand_nonzero_vec(n_len, seed + seed_base);
@@ -397,14 +394,7 @@ fn test_div_vec_n_strictly_shorter_than_d() {
 }
 
 // ─── div_arr BZ path (lines 205-207: mul_static closure called) ──────────────
-// BUG: div_arr uses mul_static::<N> which has no FFT path (static_dispatch
-// tops out at Karatsuba), while div_vec uses mul_dyn which can use FFT for
-// large inputs.  For d.len() > BZ_CUTOFF the sub-multiplications inside
-// div_3_2 are large enough that the two algorithms produce different (both
-// potentially wrong) intermediate products, causing the quotients to diverge.
-// See production-bug report.
 #[test]
-#[ignore = "production bug: div_arr mul_static lacks FFT path causing divergence from div_vec for d.len() > BZ_CUTOFF"]
 fn test_div_arr_bz_mul_path() {
     let d_len = BZ_CUTOFF + 2;
     let n_len = 2 * d_len + 4;

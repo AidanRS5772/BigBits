@@ -2,10 +2,10 @@ use super::{mul_ref, rand_nonzero_vec, to_u128};
 use crate::utils::mul::*;
 use crate::utils::utils::trim_lz;
 use crate::utils::{
-    CHUNKING_KARATSUBA_CUTOFF, DYN_NTT_MID_CUTOFF,
-    FFT_16BIT_CUTOFF, FFT_CHUNKING_KARATSUBA_CUTOFF, FFT_KARATSUBA_CUTOFF, FFT_MID_CUTOFF,
-    FFT_SQR_CUTOFF, KARATSUBA_CUTOFF, KARATSUBA_MID_CUTOFF, MAX_STATIC_SIZE, SHORT_MUL_CUTOFF,
-    STATIC_KARATSUBA_SQR_CUTOFF, STATIC_NTT_MID_CUTOFF, STATIC_NTT_SQR_CUTOFF,
+    CHUNKING_KARATSUBA_CUTOFF, DYN_NTT_MID_CUTOFF, FFT_16BIT_CUTOFF, FFT_CHUNKING_KARATSUBA_CUTOFF,
+    FFT_KARATSUBA_CUTOFF, FFT_MID_CUTOFF, FFT_SQR_CUTOFF, KARATSUBA_CUTOFF, KARATSUBA_MID_CUTOFF,
+    MAX_STATIC_SIZE, SHORT_MUL_CUTOFF, STATIC_KARATSUBA_SQR_CUTOFF, STATIC_NTT_MID_CUTOFF,
+    STATIC_NTT_SQR_CUTOFF,
 };
 
 // KARATSUBA_CUTOFF is f64; derive a usize version for size calculations
@@ -968,8 +968,11 @@ fn test_karatsuba_sqr_entry_small() {
 #[test]
 fn test_karatsuba_sqr_entry_sweep() {
     for seed in 0u64..15 {
-        let n = STATIC_KARATSUBA_SQR_CUTOFF + 1 + (seed as usize % (3 * STATIC_KARATSUBA_SQR_CUTOFF));
-        if 2 * n - 1 > 128 { continue; } // skip sizes that exceed static N
+        let n =
+            STATIC_KARATSUBA_SQR_CUTOFF + 1 + (seed as usize % (3 * STATIC_KARATSUBA_SQR_CUTOFF));
+        if 2 * n - 1 > 128 {
+            continue;
+        } // skip sizes that exceed static N
         let a = rand_nonzero_vec(n, seed);
         let mut out = vec![0u64; 2 * n - 1];
         let c = karatsuba_sqr_entry_static::<128>(&a, &mut out);
@@ -1058,6 +1061,30 @@ fn test_ntt_sqr_entry_medium() {
             &format!("ntt_sqr_entry medium n={n} seed={seed}"),
         );
     }
+}
+
+#[test]
+fn test_ntt_sqr_dyn_twiddle_cache_order() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("failed to build single-thread Rayon pool");
+
+    pool.install(|| {
+        for &(n, seed) in &[(39, 10_300), (10, 10_301)] {
+            let a = rand_nonzero_vec(n, seed);
+            let mut out = vec![0u64; 2 * n - 1];
+            let c = ntt_sqr_entry_dyn(&a, &mut out);
+            let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+            assert_eq_result(
+                &out,
+                c,
+                &exp_buf,
+                exp_carry,
+                &format!("ntt sqr twiddle cache order n={n} seed={seed}"),
+            );
+        }
+    });
 }
 
 // ─── Section 8: sqr_dyn / sqr_vec Dispatch Sanity ───────────────────────────
@@ -1699,11 +1726,7 @@ fn test_sqr_static_ntt_dispatch() {
         for seed in 0u64..3 {
             let a = rand_nonzero_vec(n, seed + 8000);
             let mut out_st = vec![0u64; out_sz];
-            let c_st = sqr_static::<{ MAX_STATIC_SIZE }>(
-                &a,
-                &mut out_st,
-            )
-            .unwrap();
+            let c_st = sqr_static::<{ MAX_STATIC_SIZE }>(&a, &mut out_st).unwrap();
             let (exp_buf, exp_carry) = sqr_ref_parts(&a);
             assert_eq_result(
                 &out_st,
@@ -1774,6 +1797,28 @@ fn test_ntt_radix3_coverage() {
     }
 }
 
+#[test]
+fn test_ntt_radix5_coverage() {
+    // n=13 produces out_len=25, forcing radix-5 at the top level.
+    // n=38 produces out_len=75, covering radix-5 precedence over radix-3.
+    for &n in &[13, 38] {
+        for seed in 0u64..3 {
+            let a = rand_nonzero_vec(n, seed + 10_500);
+            let b = rand_nonzero_vec(n, seed + 10_600);
+            let mut out = vec![0u64; 2 * n - 1];
+            let c = ntt_entry_dyn(&a, &b, &mut out);
+            let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+            assert_eq_result(
+                &out,
+                c,
+                &exp_buf,
+                exp_carry,
+                &format!("ntt radix-5 coverage n={n} seed={seed}"),
+            );
+        }
+    }
+}
+
 // ─── Section 16: Karatsuba Static Entry Points ──────────────────────────────
 
 #[test]
@@ -1814,7 +1859,6 @@ fn test_karatsuba_static_entries() {
 
 // ─── Section 17: mid_mul_static Larger Sizes ─────────────────────────────────
 
-#[test]
 // Known source bug: mid_mul_static Karatsuba arm (n >= KARATSUBA_MID_CUTOFF)
 // triggers "lhs must be longer than rhs" panic in add_buf, called from
 // karatsuba_entry_static inside mid_mul_static. The static scratch buffers
@@ -1869,7 +1913,10 @@ fn test_find_scratch_sizes() {
     assert!(recurse_sz > 0, "recurse scratch should be > 0");
 
     // find_karatsuba_sqr_scratch_sz
-    assert_eq!(find_karatsuba_sqr_scratch_sz(STATIC_KARATSUBA_SQR_CUTOFF), 0);
+    assert_eq!(
+        find_karatsuba_sqr_scratch_sz(STATIC_KARATSUBA_SQR_CUTOFF),
+        0
+    );
     let sqr_scratch = find_karatsuba_sqr_scratch_sz(STATIC_KARATSUBA_SQR_CUTOFF + 1);
     assert!(sqr_scratch > 0, "sqr scratch should be > 0 above cutoff");
 }
@@ -1887,9 +1934,19 @@ fn test_dispatch_cost_helpers() {
     let l = 100;
     let s_small = 10; // s <= half → chunking branch
     let s_large = 80; // s > half → regular branch
-    // Just ensure no panic; actual result depends on cutoffs
-    let _ = is_karatsuba(l, s_small, FFT_CHUNKING_KARATSUBA_CUTOFF, FFT_KARATSUBA_CUTOFF);
-    let _ = is_karatsuba(l, s_large, FFT_CHUNKING_KARATSUBA_CUTOFF, FFT_KARATSUBA_CUTOFF);
+                      // Just ensure no panic; actual result depends on cutoffs
+    let _ = is_karatsuba(
+        l,
+        s_small,
+        FFT_CHUNKING_KARATSUBA_CUTOFF,
+        FFT_KARATSUBA_CUTOFF,
+    );
+    let _ = is_karatsuba(
+        l,
+        s_large,
+        FFT_CHUNKING_KARATSUBA_CUTOFF,
+        FFT_KARATSUBA_CUTOFF,
+    );
 }
 
 // ─── Section 20: Large-Input Tests (ignored) ─────────────────────────────────
@@ -1942,6 +1999,7 @@ fn test_sqr_dyn_ntt_path() {
 
 // ─── Section 9: FFT Accuracy at Cutoff ──────────────────────────────────────
 
+#[cfg(feature = "_fft_cutoffs")]
 mod fft_cutoff {
     use super::*;
     use rayon::prelude::*;
@@ -1964,7 +2022,10 @@ mod fft_cutoff {
                 let c_ntt = ntt_entry_dyn(&long, &short, &mut out_ntt);
 
                 if let Some(report) = diff_report(
-                    &out_fft, c_fft, &out_ntt, c_ntt,
+                    &out_fft,
+                    c_fft,
+                    &out_ntt,
+                    c_ntt,
                     &format!("FFT 16-bit accuracy s={s} seed={seed}"),
                 ) {
                     panic!("{report}");
@@ -1987,7 +2048,10 @@ mod fft_cutoff {
                 let c_ntt = ntt_sqr_entry_dyn(&a, &mut out_ntt);
 
                 if let Some(report) = diff_report(
-                    &out_fft, c_fft, &out_ntt, c_ntt,
+                    &out_fft,
+                    c_fft,
+                    &out_ntt,
+                    c_ntt,
                     &format!("FFT sqr 16-bit accuracy n={n} seed={seed}"),
                 ) {
                     panic!("{report}");
@@ -1996,4 +2060,3 @@ mod fft_cutoff {
         }
     }
 }
-

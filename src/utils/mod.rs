@@ -13,9 +13,13 @@ pub const FFT_CHUNKING_KARATSUBA_CUTOFF: f64 = 1.74;
 pub const FFT_KARATSUBA_CUTOFF: f64 = 1.92;
 pub const FFT_16BIT_CUTOFF: usize = 1 << 16;
 
-pub const NTT_PARALLEL_CUTOFF: usize = 320;
-pub const NTT_CHUNKING_KARATSUBA_CUTOFF: f64 = 2.5; // GUESS
+pub const NTT_CHUNKING_KARATSUBA_CUTOFF: f64 = 4.5; // GUESS
 pub const NTT_KARATSUBA_CUTOFF: f64 = 2.75; // GUESS
+
+pub const NTT_PAR_CUTOFF_NTT_CONV: usize = 512;
+pub const NTT_PAR_CUTOFF_NTT: usize = 3600;
+pub const NTT_PAR_CUTOFF_NTT_3: usize = 27648;
+pub const NTT_PAR_CUTOFF_NTT_5: usize = 25600;
 
 pub const FFT_SQR_CUTOFF: usize = 33;
 pub const STATIC_KARATSUBA_SQR_CUTOFF: usize = 36; //GUESS
@@ -28,7 +32,6 @@ pub const FFT_MID_CUTOFF: usize = 60; // GUESS
 pub const DYN_NTT_MID_CUTOFF: usize = 1 << 14; // GUESS
 pub const STATIC_NTT_MID_CUTOFF: usize = 100; // GUESS
 
-pub const NTT_CUTOFF: usize = 16; // GUESS
 pub const BZ_CUTOFF: usize = 64; // GUESS
 
 thread_local! {

@@ -14,28 +14,36 @@ def find_prim_root(prime):
         g += 1
     return g - 1
 
+def neg_inv()
+
 
 def main():
     p1 = 5937362789990400001
     g1 = find_prim_root(p1)
     print(f"p  = {p1}")
     print(f"g  = {g1}")
-    print(f"g3 = {pow(g1, (p1- 1) // 3, p1)}")
-    print(f"g5 = {pow(g1, (p1- 1) // 5, p1)}")
+    print(f"g3 = {pow(g1, (p1 - 1) // 3, p1)}")
+    print(f"inv_g3 = {pow(g1, 2 * ((p1 - 1) // 3), p1)}")
+    print(f"g5 = {pow(g1, (p1 - 1) // 5, p1)}")
+    print(f"inv_g5 = {pow(g1, 4 * ((p1 - 1) // 5), p1)}")
     print()
     p2 = 8122312296706867201
     g2 = find_prim_root(p2)
     print(f"p  = {p2}")
     print(f"g  = {g2}")
-    print(f"g3 = {pow(g2, (p2- 1) // 3, p2)}")
-    print(f"g5 = {pow(g2, (p2- 1) // 5, p2)}")
+    print(f"g3 = {pow(g2, (p2 - 1) // 3, p2)}")
+    print(f"inv_g3 = {pow(g2, 2 * ((p1 - 1) // 3), p2)}")
+    print(f"g5 = {pow(g2, (p2 - 1) // 5, p2)}")
+    print(f"inv_g5 = {pow(g2, 4 * ((p1 - 1) // 5), p2)}")
     print()
     p3 = 7552325468867788801
     g3 = find_prim_root(p3)
     print(f"p  = {p3}")
     print(f"g  = {g3}")
-    print(f"g3 = {pow(g3, (p3- 1) // 3, p3)}")
-    print(f"g5 = {pow(g3, (p3- 1) // 5, p3)}")
+    print(f"g3 = {pow(g3, (p3 - 1) // 3, p3)}")
+    print(f"inv_g3 = {pow(g3, 2 * ((p1 - 1) // 3), p3)}")
+    print(f"g5 = {pow(g3, (p3 - 1) // 5, p3)}")
+    print(f"inv_g5 = {pow(g3, 4 * ((p1 - 1) // 5), p3)}")
 
 
 if __name__ == "__main__":
