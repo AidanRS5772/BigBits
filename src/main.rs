@@ -10,7 +10,7 @@ fn random_vec(n: usize) -> Vec<u64> {
 }
 
 fn main() {
-    let n = 25 * 243 * (1 << 6);
+    let n = 25 * 27 * (1 << 8);
     let a = random_vec(n);
     let b = random_vec(n);
     let mut out = vec![0;2*n];

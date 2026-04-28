@@ -46,7 +46,7 @@ where
         Self {
             hard,
             soft,
-            exploration_budget: 200_000,
+            exploration_budget: 2_000_000,
         }
     }
 
@@ -474,12 +474,90 @@ fn bench_karatsuba_to_fft(c: &mut Criterion) {
     });
 }
 
-fn make_sqr_inputs(sz: usize, amt: usize) -> Vec<Vec<u64>>{
+fn bench_static_chunking_karatsuba_to_ntt(c: &mut Criterion) {
+    const N: usize = 7100;
+    let lengths = BoundarySearch::new(
+        |l, s| (s <= (l + 1) / 2) && !is_school(l, s),
+        |l, s| is_karatsuba(l, s, NTT_CHUNKING_KARATSUBA_CUTOFF, NTT_KARATSUBA_CUTOFF),
+    )
+    .find((1500, 500), NUM_OF_LENGTHS, GAP);
+    assert!(!lengths.is_empty(), "find inputs failed");
+
+    let max_out = lengths.iter().map(|&(l, s)| l + s - 1).max().unwrap();
+    let max_karatuba_scratch = lengths
+        .iter()
+        .map(|&(l, s)| find_karatsuba_scratch(l, s))
+        .max()
+        .unwrap();
+    let max_ntt_scratch = lengths
+        .iter()
+        .map(|&(l, s)| find_max_ntt_size(l + s - 1))
+        .max()
+        .unwrap();
+    assert!(max_out <= N && max_karatuba_scratch <= N && max_ntt_scratch <= N, "N = {N} to small: need out = {max_out}, karatsuba = {max_karatuba_scratch}, ntt = {max_ntt_scratch}\n set N = {}", 3 * max_out.max(max_karatuba_scratch).max(max_ntt_scratch) / 2);
+
+    println!("Average Input: {:?}", avg_input(&lengths));
+    println!("Number of Inputs: {}", lengths.len());
+    println!("NTT CHUNKING KARATSUBA CUTOFF = {NTT_CHUNKING_KARATSUBA_CUTOFF}");
+    let inputs = make_inputs(&lengths);
+
+    c.bench_function(&format!("static_chunking_karatsuba_to_ntt/{ARCH}"), |b| {
+        b.iter_custom(|iters| {
+            ratio_bench(
+                iters,
+                &inputs,
+                &mut |a, b, out| karatsuba_entry_static::<N>(a, b, out),
+                &mut |a, b, out| ntt_entry_static::<N>(a, b, out),
+            )
+        })
+    });
+}
+
+fn bench_static_karatsuba_to_ntt(c: &mut Criterion) {
+    const N: usize = 7000;
+    let lengths = BoundarySearch::new(
+        |l, s| (l >= s) && (s > (l + 1) / 2) && !is_school(l, s),
+        |l, s| is_karatsuba(l, s, FFT_CHUNKING_KARATSUBA_CUTOFF, FFT_KARATSUBA_CUTOFF),
+    )
+    .find((150, 150), NUM_OF_LENGTHS, GAP);
+    assert!(!lengths.is_empty(), "find inputs failed");
+
+    let max_out = lengths.iter().map(|&(l, s)| l + s - 1).max().unwrap();
+    let max_karatuba_scratch = lengths
+        .iter()
+        .map(|&(l, s)| find_karatsuba_scratch(l, s))
+        .max()
+        .unwrap();
+    let max_ntt_scratch = lengths
+        .iter()
+        .map(|&(l, s)| find_max_ntt_size(l + s - 1))
+        .max()
+        .unwrap();
+    assert!(max_out <= N && max_karatuba_scratch <= N && max_ntt_scratch <= N, "N = {N} to small: need out = {max_out}, karatsuba = {max_karatuba_scratch}, ntt = {max_ntt_scratch}\n set N = {}", 3 * max_out.max(max_karatuba_scratch).max(max_ntt_scratch) / 2);
+
+    println!("Average Input: {:?}", avg_input(&lengths));
+    println!("Number of Inputs: {}", lengths.len());
+    println!("NTT KARATSUBA CUTOFF = {NTT_KARATSUBA_CUTOFF}");
+    let inputs = make_inputs(&lengths);
+
+    c.bench_function(&format!("static_chunking_karatsuba_to_ntt/{ARCH}"), |b| {
+        b.iter_custom(|iters| {
+            ratio_bench(
+                iters,
+                &inputs,
+                &mut |a, b, out| karatsuba_entry_static::<N>(a, b, out),
+                &mut |a, b, out| ntt_entry_static::<N>(a, b, out),
+            )
+        })
+    });
+}
+
+fn make_sqr_inputs(sz: usize, amt: usize) -> Vec<Vec<u64>> {
     let mut rng = rand::thread_rng();
-    let min = sz.saturating_sub(amt/2).max(4);
-    let max = sz + amt/2;
+    let min = sz.saturating_sub(amt / 2).max(4);
+    let max = sz + amt / 2;
     let mut inputs: Vec<Vec<u64>> = Vec::with_capacity(amt);
-    for i in min..max{
+    for i in min..max {
         inputs.push((0..i).map(|_| rng.gen()).collect());
     }
     return inputs;
@@ -495,7 +573,7 @@ fn sqr_ratio_bench(
     let mut ratio_sum = 0.0f64;
     for _ in 0..iters {
         for buf in inputs.iter() {
-            let mut out = vec![0u64; 2*buf.len()];
+            let mut out = vec![0u64; 2 * buf.len()];
             let (t_a, t_b) = if rng.gen::<bool>() {
                 let t_a = {
                     let start = Instant::now();
@@ -528,7 +606,7 @@ fn sqr_ratio_bench(
     Duration::from_nanos((avg_ratio * 1_000_000.0) as u64)
 }
 
-fn bench_sqr_school_to_fft(c: &mut Criterion){
+fn bench_sqr_school_to_fft(c: &mut Criterion) {
     let inputs = make_sqr_inputs(FFT_SQR_CUTOFF, 16);
     assert!(!inputs.is_empty(), "find inputs failed");
     println!("Number of Inputs: {}", inputs.len());
@@ -550,11 +628,12 @@ fn cutoff_criterion() -> Criterion {
     Criterion::default()
         .sample_size(250)
         .warm_up_time(Duration::from_secs(5))
+        .measurement_time(Duration::from_secs(60))
 }
 
 criterion_group! {
     name = benches;
     config = cutoff_criterion();
-    targets = bench_sqr_school_to_fft
+    targets = bench_static_chunking_karatsuba_to_ntt 
 }
 criterion_main!(benches);
