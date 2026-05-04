@@ -105,6 +105,11 @@ NTT supports radix-2, radix-3, and radix-5 butterflies to handle transform sizes
 
 **Known source bugs** (do not fix without explicit instruction): `sqr_arr` OOB, `sqr_buf` loop bound, `div_buf_of` OOB, `bz_div_init` formula, recursive BZ odd-length divisor. Tests that hit these are expected to fail at runtime; this documents real source bugs.
 
+Multiplication bug reports from coverage work:
+- `powi_vec(&[3], 1)` returns `[9]`; expected `[3]`. Suspected cause: `reverse_pow` encodes the exponent one step too high, so the powi core squares for exponent 1.
+- `powi_vec(&[3], 0)` panics with an index-out-of-bounds write; expected `[1]`. Suspected cause: `powi_sz` returns max size `0`, so `powi_vec` allocates an empty output before `powi_dyn_entry` writes `out[0]`.
+- `short_sqr_buf(&[1, 1], &mut [0; 3])` returns buffer `[1, 2, 0]` with carry `0`; expected `[1, 2, 1]` with carry `0`. Suspected cause: the loop stops before the final square column and returns the wrong final limb for full-product output.
+
 ### Compile-time constraints
 
 Avoid `u128` arithmetic in `const fn` contexts — it significantly increases compile times. Use `u64` or split operations instead.

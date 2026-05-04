@@ -178,7 +178,6 @@ fn test_div_vec_multi_by_multi() {
 }
 
 /// The fundamental invariant: q * d + r == n and r < d.
-/// Tested with random inputs at several sizes including the BZ_CUTOFF boundary.
 #[test]
 fn test_div_vec_invariant_small_random() {
     for seed in 0u64..40 {

@@ -423,7 +423,7 @@ pub fn karatsuba_entry_static<const N: usize>(long: &[u64], short: &[u64], out: 
 //  Complex Space: O(2s)
 //  Real Space: O(2s)
 
-struct FTTTwidleTower {
+pub struct FTTTwidleTower {
     table: Vec<Complex<f64>>,
     veiw: Vec<Complex<f64>>,
     res: usize,
@@ -434,7 +434,7 @@ struct FTTTwidleTower {
 impl FTTTwidleTower {
     const MAX_GEN: u8 = 3;
 
-    fn build(n: usize) -> Self {
+    pub fn build(n: usize) -> Self {
         let len = n / 4 + 1;
         let th = 2.0 * PI / (n as f64);
         let mut table = Vec::<Complex<f64>>::with_capacity(len);
@@ -452,7 +452,7 @@ impl FTTTwidleTower {
         }
     }
 
-    fn refine(&mut self, new_res: usize) {
+    pub fn refine(&mut self, new_res: usize) {
         debug_assert!(new_res > self.res);
         debug_assert!(new_res % self.res == 0);
 
@@ -480,7 +480,7 @@ impl FTTTwidleTower {
         self.base *= growth;
     }
 
-    fn rebuild(&mut self, new_res: usize) {
+    pub fn rebuild(&mut self, new_res: usize) {
         debug_assert!(new_res > self.res);
         debug_assert!(new_res % self.res == 0);
 
@@ -504,7 +504,7 @@ impl FTTTwidleTower {
         self.base = 1;
     }
 
-    fn get(&mut self, res: usize) -> &[Complex<f64>] {
+    pub fn get(&mut self, res: usize) -> &[Complex<f64>] {
         return match res.cmp(&self.res) {
             std::cmp::Ordering::Equal => &self.table,
             std::cmp::Ordering::Greater => {
@@ -622,7 +622,7 @@ const fn fft_log_prim_search(
     return best;
 }
 
-const fn find_fft_size(n: usize) -> usize {
+pub const fn find_fft_size(n: usize) -> usize {
     return fft_log_prim_search(4, n, FFT_RADIX.len(), &FFT_RADIX);
 }
 
@@ -666,7 +666,7 @@ unsafe fn scale_and_round_aarch(x: &mut [Complex<f64>], scale: f64) {
     }
 }
 
-fn scale_and_round_standard(x: &mut [Complex<f64>], scale: f64) {
+pub fn scale_and_round_standard(x: &mut [Complex<f64>], scale: f64) {
     let coefs = unsafe { std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut f64, x.len() * 2) };
     for c in coefs {
         *c /= scale;
@@ -844,7 +844,7 @@ unsafe fn decompose_16_aarch(long: &[u64], short: &[u64], x: &mut [Complex<f64>]
     }
 }
 
-fn decompose_16_standard(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
+pub fn decompose_16_standard(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
     const MASK: u64 = u16::MAX as u64;
     let mut idx = 0;
     for (&l, &s) in long.iter().zip(short) {
@@ -948,7 +948,7 @@ const NTT_RADIX_CNT: usize = 3;
 
 const NTT_RADIX: [usize; NTT_RADIX_CNT] = [2, 3, 5];
 
-const fn exp_cnt(mut p: u64) -> [usize; NTT_RADIX_CNT] {
+pub(crate) const fn exp_cnt(mut p: u64) -> [usize; NTT_RADIX_CNT] {
     let mut exp = [0; NTT_RADIX_CNT];
     let mut idx = 0;
     while idx < NTT_RADIX_CNT {
@@ -962,7 +962,7 @@ const fn exp_cnt(mut p: u64) -> [usize; NTT_RADIX_CNT] {
     return exp;
 }
 
-const fn neg_inv_mod_2_64(p: u64) -> u64 {
+pub(crate) const fn neg_inv_mod_2_64(p: u64) -> u64 {
     let mut x: u64 = 1;
     while x.wrapping_mul(p) != u64::MAX {
         let mut tmp = x.wrapping_mul(p);
@@ -972,7 +972,7 @@ const fn neg_inv_mod_2_64(p: u64) -> u64 {
     return x;
 }
 
-const fn split_mul(a: u64, b: u64) -> (u64, u64) {
+pub(crate) const fn split_mul(a: u64, b: u64) -> (u64, u64) {
     const MASK: u64 = (1 << 32) - 1;
     let a0 = a & MASK;
     let a1 = a >> 32;
@@ -995,7 +995,7 @@ const fn split_mul(a: u64, b: u64) -> (u64, u64) {
     (r11, r00)
 }
 
-const fn mod_mul(a: u64, b: u64, p: u64) -> u64 {
+pub(crate) const fn mod_mul(a: u64, b: u64, p: u64) -> u64 {
     const MASK: u64 = (1 << 32) - 1;
     let d = p << 1;
     let (mut hi, mut lo) = split_mul(a, b);
@@ -1034,7 +1034,7 @@ const fn mod_mul(a: u64, b: u64, p: u64) -> u64 {
     (rem << 32).wrapping_add(n0).wrapping_sub(q.wrapping_mul(d)) >> 1
 }
 
-trait NTTPrime: Send + Sync {
+pub(crate) trait NTTPrime: Send + Sync {
     const P: u64;
     const EXP: [usize; NTT_RADIX_CNT] = exp_cnt(Self::P - 1);
     const R: u64 = (u64::MAX % Self::P) + 1;
@@ -1046,19 +1046,19 @@ trait NTTPrime: Send + Sync {
 }
 
 // MIN_EXP = [46, 3, 2]
-struct P1;
+pub(crate) struct P1;
 impl NTTPrime for P1 {
     const P: u64 = 5937362789990400001;
     // 2^46 * 3^3 * 5^5 + 1
 }
 
-struct P2;
+pub(crate) struct P2;
 impl NTTPrime for P2 {
     const P: u64 = 8122312296706867201;
     // 19 * 2^46 * 3^5 * 5^2 + 1
 }
 
-struct P3;
+pub(crate) struct P3;
 impl NTTPrime for P3 {
     const P: u64 = 7552325468867788801;
     // 53 * 2^46 * 3^4 * 5^2 + 1
@@ -1066,7 +1066,7 @@ impl NTTPrime for P3 {
 
 #[repr(transparent)]
 #[derive(Debug)]
-struct Montgomery<P: NTTPrime> {
+pub(crate) struct Montgomery<P: NTTPrime> {
     val: u64,
     _phantom: PhantomData<P>,
 }
@@ -1158,7 +1158,7 @@ unsafe fn reduce_aarch(t: u128, p: u64, p_inv: u64) -> u64 {
 }
 
 #[inline(always)]
-fn reduce_no_asm(t: u128, p: u64, p_inv: u64) -> u64 {
+pub fn reduce_no_asm(t: u128, p: u64, p_inv: u64) -> u64 {
     let t_lo = t as u64;
     let m = t_lo.wrapping_mul(p_inv);
     let mp = (m as u128) * (p as u128);
@@ -1284,7 +1284,7 @@ unsafe fn mul_reduce_aarch(a: u64, b: u64, p: u64, p_inv: u64) -> u64 {
 }
 
 #[inline(always)]
-fn mul_reduce_no_asm(a: u64, b: u64, p: u64, p_inv: u64) -> u64 {
+pub fn mul_reduce_no_asm(a: u64, b: u64, p: u64, p_inv: u64) -> u64 {
     let t = (a as u128) * (b as u128);
 
     let t_lo = t as u64;
@@ -1350,7 +1350,7 @@ unsafe fn add_mod_aarch(mut a: u64, b: u64, p: u64) -> u64 {
 }
 
 #[inline(always)]
-fn add_mod_no_asm(mut a: u64, b: u64, p: u64) -> u64 {
+pub fn add_mod_no_asm(mut a: u64, b: u64, p: u64) -> u64 {
     a += b;
     if a >= p {
         a -= p;
@@ -1408,7 +1408,7 @@ unsafe fn sub_mod_aarch(mut a: u64, b: u64, p: u64) -> u64 {
 }
 
 #[inline(always)]
-fn sub_mod_no_asm(a: u64, b: u64, p: u64) -> u64 {
+pub fn sub_mod_no_asm(a: u64, b: u64, p: u64) -> u64 {
     let diff = a.wrapping_sub(b);
     let mask = ((a < b) as u64).wrapping_neg();
     diff.wrapping_add(p & mask)
@@ -1464,7 +1464,7 @@ unsafe fn neg_mod_aarch(mut a: u64, p: u64) -> u64 {
 }
 
 #[inline(always)]
-fn neg_mod_no_asm(a: u64, p: u64) -> u64 {
+pub fn neg_mod_no_asm(a: u64, p: u64) -> u64 {
     let mask = ((a != 0) as u64).wrapping_neg();
     p.wrapping_sub(a) & mask
 }
@@ -1578,7 +1578,7 @@ impl<P: NTTPrime> Montgomery<P> {
         }
     }
 
-    fn to(a: u64) -> Self {
+    pub(crate) fn to(a: u64) -> Self {
         Montgomery {
             val: mul_reduce_mont(a, P::R_SQR, P::P, P::P_INV),
             _phantom: PhantomData,
@@ -1589,11 +1589,11 @@ impl<P: NTTPrime> Montgomery<P> {
         self.val = mul_reduce_mont(self.val, P::R_SQR, P::P, P::P_INV);
     }
 
-    fn from(self) -> u64 {
+    pub(crate) fn from(self) -> u64 {
         reduce_mont(self.val as u128, P::P, P::P_INV)
     }
 
-    fn fuse_mul_to(a: u64, b: u64) -> Self {
+    pub(crate) fn fuse_mul_to(a: u64, b: u64) -> Self {
         let c = mul_reduce_mont(a, b, P::P, P::P_INV);
         Montgomery {
             val: mul_reduce_mont(c, P::R_CUB, P::P, P::P_INV),
@@ -1601,7 +1601,7 @@ impl<P: NTTPrime> Montgomery<P> {
         }
     }
 
-    fn pow(self, mut exp: u64) -> Self {
+    pub(crate) fn pow(self, mut exp: u64) -> Self {
         let mut base = self;
         let mut result = Self::ONE;
         while exp > 0 {
@@ -2431,11 +2431,11 @@ fn ntt_log_prime_search_for_split(
     best
 }
 
-fn find_ntt_size_for_split<const N: usize, P: NTTPrime>() -> usize {
+pub(crate) fn find_ntt_size_for_split<const N: usize, P: NTTPrime>() -> usize {
     ntt_log_prime_search_for_split(1, N, &NTT_RADIX, &P::EXP).expect("Input Is too large for NTT")
 }
 
-fn acc_convolution<P: NTTPrime, F>(a_buf: &[u64], b_buf: &[u64], res: &mut [u64], op: F)
+pub(crate) fn acc_convolution<P: NTTPrime, F>(a_buf: &[u64], b_buf: &[u64], res: &mut [u64], op: F)
 where
     F: Fn(u64, u64) -> Montgomery<P>,
 {
@@ -2983,7 +2983,7 @@ unsafe fn sqr_decompose_16_aarch64(buf: &[u64], x: &mut [Complex<f64>]) {
     }
 }
 
-fn sqr_decompose_16_standard(buf: &[u64], x: &mut [Complex<f64>]) {
+pub fn sqr_decompose_16_standard(buf: &[u64], x: &mut [Complex<f64>]) {
     let coefs = unsafe { std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut f64, x.len() * 2) };
     const MASK: u64 = u16::MAX as u64;
     let mut idx = 0;
@@ -3434,16 +3434,6 @@ pub fn mid_mul_buf(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
         acc2 = 0;
     }
     return acc0;
-}
-
-pub fn mid_karatsuba(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
-    let mut scratch_guard = ScratchGuard::acquire();
-    let n = short.len();
-    let [big_out, scratch] =
-        scratch_guard.get_splits([3 * n - 2, find_karatsuba_scratch(2 * n - 1, n)]);
-    let of = karatsuba_mul(long, short, big_out, scratch);
-    out.copy_from_slice(&big_out[n - 1..2 * n - 1]);
-    of
 }
 
 pub fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
