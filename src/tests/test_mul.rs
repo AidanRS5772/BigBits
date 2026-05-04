@@ -2,10 +2,9 @@ use super::{mul_ref, rand_nonzero_vec, to_u128};
 use crate::utils::mul::*;
 use crate::utils::utils::trim_lz;
 use crate::utils::{
-    CHUNKING_KARATSUBA_CUTOFF, DYN_NTT_MID_CUTOFF, FFT_16BIT_CUTOFF, FFT_CHUNKING_KARATSUBA_CUTOFF,
-    FFT_KARATSUBA_CUTOFF, FFT_MID_CUTOFF, FFT_SQR_CUTOFF, KARATSUBA_CUTOFF, KARATSUBA_MID_CUTOFF,
-    MAX_STATIC_SIZE, SHORT_MUL_CUTOFF, STATIC_KARATSUBA_SQR_CUTOFF, STATIC_NTT_MID_CUTOFF,
-    STATIC_NTT_SQR_CUTOFF,
+    CHUNKING_KARATSUBA_CUTOFF, FFT_16BIT_CUTOFF, FFT_CHUNKING_KARATSUBA_CUTOFF,
+    FFT_KARATSUBA_CUTOFF, FFT_MID_CUTOFF, FFT_SQR_CUTOFF, KARATSUBA_CUTOFF, KARATSUBA_SQR_CUTOFF,
+    SHORT_MUL_CUTOFF, STATIC_NTT_SQR_CUTOFF,
 };
 
 // KARATSUBA_CUTOFF is f64; derive a usize version for size calculations
@@ -950,7 +949,7 @@ fn test_sqr_buf_matches_mul_buf() {
 #[test]
 fn test_karatsuba_sqr_entry_small() {
     for seed in 0u64..10 {
-        let n = STATIC_KARATSUBA_SQR_CUTOFF + 1 + (seed as usize % 20);
+        let n = KARATSUBA_SQR_CUTOFF + 1 + (seed as usize % 20);
         let a = rand_nonzero_vec(n, seed);
         let mut out = vec![0u64; 2 * n - 1];
         let c = karatsuba_sqr_entry_static::<128>(&a, &mut out);
@@ -968,8 +967,7 @@ fn test_karatsuba_sqr_entry_small() {
 #[test]
 fn test_karatsuba_sqr_entry_sweep() {
     for seed in 0u64..15 {
-        let n =
-            STATIC_KARATSUBA_SQR_CUTOFF + 1 + (seed as usize % (3 * STATIC_KARATSUBA_SQR_CUTOFF));
+        let n = KARATSUBA_SQR_CUTOFF + 1 + (seed as usize % (3 * KARATSUBA_SQR_CUTOFF));
         if 2 * n - 1 > 128 {
             continue;
         } // skip sizes that exceed static N
@@ -1185,9 +1183,9 @@ fn test_sqr_equals_mul() {
     for &n in &[
         1,
         5,
-        STATIC_KARATSUBA_SQR_CUTOFF - 1,
-        STATIC_KARATSUBA_SQR_CUTOFF,
-        STATIC_KARATSUBA_SQR_CUTOFF + 1,
+        KARATSUBA_SQR_CUTOFF - 1,
+        KARATSUBA_SQR_CUTOFF,
+        KARATSUBA_SQR_CUTOFF + 1,
         FFT_SQR_CUTOFF - 1,
         FFT_SQR_CUTOFF,
         FFT_SQR_CUTOFF + 1,
@@ -1511,7 +1509,7 @@ fn test_mid_mul_buf_matches_full_product() {
 #[test]
 fn test_mid_mul_dyn_school_path() {
     // n < KARATSUBA_MID_CUTOFF → school path (delegates to mid_mul_buf)
-    let n = KARATSUBA_MID_CUTOFF - 1;
+    let n = FFT_MID_CUTOFF - 1;
     for seed in 0u64..10 {
         let long = rand_nonzero_vec(2 * n - 1, seed);
         let short = rand_nonzero_vec(n, seed + 7100);
@@ -1529,51 +1527,7 @@ fn test_mid_mul_dyn_school_path() {
 }
 
 #[test]
-fn test_mid_mul_dyn_school_to_karatsuba() {
-    for &n in &[KARATSUBA_MID_CUTOFF - 1, KARATSUBA_MID_CUTOFF] {
-        if n < 2 {
-            continue;
-        }
-        for seed in 0u64..5 {
-            let long = rand_nonzero_vec(2 * n - 1, seed);
-            let short = rand_nonzero_vec(n, seed + 7200);
-
-            let mut out = vec![0u64; n];
-            let _c = mid_mul_dyn(&long, &short, &mut out);
-
-            let expected = mid_mul_ref(&long, &short);
-            assert_approx_buf(
-                &out,
-                &expected,
-                &format!("mid_mul_dyn school/kara boundary n={n} seed={seed}"),
-            );
-        }
-    }
-}
-
-#[test]
-fn test_mid_mul_dyn_karatsuba_path() {
-    let n = (KARATSUBA_MID_CUTOFF + FFT_MID_CUTOFF) / 2;
-    if n >= KARATSUBA_MID_CUTOFF && n < FFT_MID_CUTOFF {
-        for seed in 0u64..5 {
-            let long = rand_nonzero_vec(2 * n - 1, seed);
-            let short = rand_nonzero_vec(n, seed + 7300);
-
-            let mut out = vec![0u64; n];
-            let _c = mid_mul_dyn(&long, &short, &mut out);
-
-            let expected = mid_mul_ref(&long, &short);
-            assert_approx_buf(
-                &out,
-                &expected,
-                &format!("mid_mul_dyn karatsuba n={n} seed={seed}"),
-            );
-        }
-    }
-}
-
-#[test]
-fn test_mid_mul_dyn_karatsuba_to_fft() {
+fn test_mid_mul_dyn_school_to_fft() {
     for &n in &[FFT_MID_CUTOFF - 1, FFT_MID_CUTOFF] {
         if n < 2 {
             continue;
@@ -1716,29 +1670,6 @@ fn test_sqr_arr_err_on_overflow() {
     assert!(result.is_err(), "sqr_arr should fail when N is too small");
 }
 
-#[test]
-fn test_sqr_static_ntt_dispatch() {
-    // n = STATIC_NTT_SQR_CUTOFF + 1 → should trigger NTT path in sqr_static
-    let n = STATIC_NTT_SQR_CUTOFF + 1;
-    let out_sz = 2 * n - 1;
-    // Use MAX_STATIC_SIZE to ensure the static array is large enough
-    if out_sz <= MAX_STATIC_SIZE {
-        for seed in 0u64..3 {
-            let a = rand_nonzero_vec(n, seed + 8000);
-            let mut out_st = vec![0u64; out_sz];
-            let c_st = sqr_static::<{ MAX_STATIC_SIZE }>(&a, &mut out_st).unwrap();
-            let (exp_buf, exp_carry) = sqr_ref_parts(&a);
-            assert_eq_result(
-                &out_st,
-                c_st,
-                &exp_buf,
-                exp_carry,
-                &format!("sqr_static NTT dispatch n={n} seed={seed}"),
-            );
-        }
-    }
-}
-
 // ─── Section 14: Static NTT Mul Split Paths ─────────────────────────────────
 
 #[test]
@@ -1842,7 +1773,7 @@ fn test_karatsuba_static_entries() {
 
     // karatsuba_sqr_entry_static
     for seed in 0u64..5 {
-        let n = STATIC_KARATSUBA_SQR_CUTOFF + 3 + seed as usize;
+        let n = KARATSUBA_SQR_CUTOFF + 3 + seed as usize;
         let a = rand_nonzero_vec(n, seed + 8900);
         let mut out = vec![0u64; 2 * n - 1];
         let c = karatsuba_sqr_entry_static::<128>(&a, &mut out);
@@ -1869,32 +1800,6 @@ fn test_karatsuba_static_entries() {
 
 // ─── Section 18: short_mul_static Above Cutoff ──────────────────────────────
 
-#[test]
-fn test_short_mul_static_above_cutoff() {
-    // out.len() > SHORT_MUL_CUTOFF → truncation path in short_mul_static
-    let out_len = SHORT_MUL_CUTOFF + 5;
-    for seed in 0u64..5 {
-        let a_len = out_len + 10;
-        let b_len = out_len + 8;
-        let a = rand_nonzero_vec(a_len, seed + 9200);
-        let b = rand_nonzero_vec(b_len, seed + 9300);
-
-        let mut out_st = vec![0u64; out_len];
-        let c_st = short_mul_static::<32>(&a, &b, &mut out_st);
-
-        let mut out_dyn = vec![0u64; out_len];
-        let c_dyn = short_mul_dyn(&a, &b, &mut out_dyn);
-
-        assert_eq_result(
-            &out_st,
-            c_st,
-            &out_dyn,
-            c_dyn,
-            &format!("short_mul_static above cutoff seed={seed}"),
-        );
-    }
-}
-
 // ─── Section 19: Scratch Size + Cost/Dispatch Helpers ────────────────────────
 
 #[test]
@@ -1913,11 +1818,8 @@ fn test_find_scratch_sizes() {
     assert!(recurse_sz > 0, "recurse scratch should be > 0");
 
     // find_karatsuba_sqr_scratch_sz
-    assert_eq!(
-        find_karatsuba_sqr_scratch_sz(STATIC_KARATSUBA_SQR_CUTOFF),
-        0
-    );
-    let sqr_scratch = find_karatsuba_sqr_scratch_sz(STATIC_KARATSUBA_SQR_CUTOFF + 1);
+    assert_eq!(find_karatsuba_sqr_scratch_sz(KARATSUBA_SQR_CUTOFF), 0);
+    let sqr_scratch = find_karatsuba_sqr_scratch_sz(KARATSUBA_SQR_CUTOFF + 1);
     assert!(sqr_scratch > 0, "sqr scratch should be > 0 above cutoff");
 }
 

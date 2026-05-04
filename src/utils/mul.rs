@@ -2874,7 +2874,7 @@ fn karatsuba_sqr_core(
 }
 
 fn karatsuba_sqr_mul(buf: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
-    if buf.len() <= STATIC_KARATSUBA_SQR_CUTOFF {
+    if buf.len() <= KARATSUBA_SQR_CUTOFF {
         return sqr_buf(buf, out);
     }
     let half = (buf.len() + 1) / 2;
@@ -2883,7 +2883,7 @@ fn karatsuba_sqr_mul(buf: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
 }
 
 pub fn find_karatsuba_sqr_scratch_sz(n: usize) -> usize {
-    if n <= STATIC_KARATSUBA_SQR_CUTOFF {
+    if n <= KARATSUBA_SQR_CUTOFF {
         return 0;
     }
     let half = (n + 1) / 2;
@@ -3243,7 +3243,7 @@ enum StaticSqrDispatch {
 }
 
 fn static_sqr_dispatch(n: usize) -> StaticSqrDispatch {
-    if n <= STATIC_KARATSUBA_SQR_CUTOFF {
+    if n <= KARATSUBA_SQR_CUTOFF {
         StaticSqrDispatch::School
     } else if n <= STATIC_NTT_SQR_CUTOFF {
         StaticSqrDispatch::Karatsubaa
@@ -3304,7 +3304,7 @@ pub fn short_mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
 }
 
 pub fn short_mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
-    if a.len() + b.len() - 1 < out.len() {
+    if a.len() + b.len() - 1 <= out.len() {
         return mul_dyn(a, b, out);
     }
     if out.len() <= SHORT_MUL_CUTOFF {
@@ -3320,29 +3320,94 @@ pub fn short_mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
 }
 
 pub fn short_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
-    const {
-        if 2 * N > MAX_STATIC_SIZE {
-            panic!("Cant call this function with 2N larger than 0.5 * MAX_STATIC_SIZE");
-        }
-    };
     debug_assert!(
         out.len() <= N,
         "out is to large for static parameter N: {N}"
     );
-    if a.len() + b.len() - 1 < out.len() {
-        return mul_static::<N>(a, b, out).unwrap();
+    if a.len() + b.len() - 1 <= out.len() {
+        mul_static::<N>(a, b, out).unwrap()
+    } else {
+        short_mul_buf(a, b, out)
     }
-    if out.len() <= SHORT_MUL_CUTOFF {
-        return short_mul_buf(a, b, out);
+}
+
+//SHORT SQUARING
+
+pub fn short_sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
+    if buf.is_empty() {
+        return 0;
     }
-    let trunc_a = &a[a.len().saturating_sub(out.len())..];
-    let trunc_b = &b[b.len().saturating_sub(out.len())..];
-    let mut scratch = [0; MAX_STATIC_SIZE];
-    debug_assert!(trunc_a.len() + trunc_b.len() - 1 <= MAX_STATIC_SIZE);
-    let val = &mut scratch[..trunc_a.len() + trunc_b.len() - 1];
-    let of = mul_static::<MAX_STATIC_SIZE>(trunc_a, trunc_b, val).unwrap();
+    let len = buf.len() - 1;
+    let d = (2 * len).saturating_sub(out.len());
+    let mut start = d;
+
+    let mut acc0: u64 = 0;
+    let mut acc1: u64 = 0;
+    let mut acc2: u64 = 0;
+
+    if start == 0 {
+        unsafe {
+            mul_asm(buf[0], buf[0], &mut acc0, &mut acc1, &mut acc2);
+            *out.get_unchecked_mut(0) = acc0;
+        }
+        start += 1
+    }
+    acc0 = acc1;
+    acc1 = acc2;
+    acc2 = 0;
+
+    for n in start..(2 * len) {
+        let mi = n.saturating_sub(len);
+        let mf = ((n - 1) / 2).min(len);
+        unsafe {
+            for m in mi..=mf {
+                let a_val = *buf.get_unchecked(m);
+                let b_val = *buf.get_unchecked(n - m);
+                mul_double_asm(a_val, b_val, &mut acc0, &mut acc1, &mut acc2);
+            }
+        }
+
+        if n % 2 == 0 && n / 2 <= len {
+            unsafe {
+                let v = *buf.get_unchecked(n / 2);
+                mul_asm(v, v, &mut acc0, &mut acc1, &mut acc2);
+            }
+        }
+
+        out[n - d] = acc0;
+        acc0 = acc1;
+        acc1 = acc2;
+        acc2 = 0;
+    }
+
+    return acc0;
+}
+
+pub fn short_sqr_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
+    if 2 * buf.len() - 1 < out.len() {
+        return sqr_dyn(buf, out);
+    }
+    if out.len() <= SHORT_SQR_CUTOFF {
+        return short_sqr_buf(buf, out);
+    }
+    let trunc_buf = &buf[buf.len().saturating_sub(out.len())..];
+    let mut scratch = ScratchGuard::acquire();
+    let val = scratch.get(2 * trunc_buf.len() - 1);
+    let of = sqr_dyn(trunc_buf, val);
     out.copy_from_slice(&val[val.len() - out.len()..]);
     return of;
+}
+
+pub fn short_sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
+    debug_assert!(
+        out.len() <= N,
+        "out is to large for static parameter N: {N}"
+    );
+    if 2 * buf.len() - 1 <= out.len() {
+        sqr_static::<N>(buf, out).unwrap()
+    } else {
+        short_sqr_buf(buf, out)
+    }
 }
 
 //MIDDLE MULTIPLICATION
@@ -3371,7 +3436,17 @@ pub fn mid_mul_buf(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     return acc0;
 }
 
-fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+pub fn mid_karatsuba(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+    let mut scratch_guard = ScratchGuard::acquire();
+    let n = short.len();
+    let [big_out, scratch] =
+        scratch_guard.get_splits([3 * n - 2, find_karatsuba_scratch(2 * n - 1, n)]);
+    let of = karatsuba_mul(long, short, big_out, scratch);
+    out.copy_from_slice(&big_out[n - 1..2 * n - 1]);
+    of
+}
+
+pub fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     let sz = short.len();
     let (l_len, s_len, w) = (
         bit16_length(long.len(), long.last().copied().unwrap()),
@@ -3485,106 +3560,16 @@ fn ntt_mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     ntt_mid_accumulate(res1, res2, res3, out, sz)
 }
 
-fn ntt_mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
-    const {
-        if 2 * N > MAX_STATIC_SIZE {
-            panic!("Cant call this function with 2N larger than MAX_STATIC_SIZE");
-        }
-    };
-    let sz = short.len();
-    let mut res1 = [0; MAX_STATIC_SIZE];
-    let mut res2 = [0; MAX_STATIC_SIZE];
-    let mut res3 = [0; MAX_STATIC_SIZE];
-
-    let n1 = find_ntt_size::<P1>(2 * sz - 1);
-    let n2 = find_ntt_size::<P2>(2 * sz - 1);
-    let n3 = find_ntt_size::<P3>(2 * sz - 1);
-
-    if 2 * sz - 1 > NTT_PAR_CUTOFF_NTT_CONV {
-        let conv1 = move || {
-            let mut buf_scratch = [0; N];
-            let mut ntt_scratch = [0; N];
-            ntt_static_convolution::<N, P1>(
-                long,
-                short,
-                &mut res1,
-                n1,
-                &mut buf_scratch,
-                &mut ntt_scratch,
-            );
-        };
-
-        let conv2 = move || {
-            let mut buf_scratch = [0; N];
-            let mut ntt_scratch = [0; N];
-            ntt_static_convolution::<N, P2>(
-                long,
-                short,
-                &mut res2,
-                n2,
-                &mut buf_scratch,
-                &mut ntt_scratch,
-            );
-        };
-
-        let conv3 = move || {
-            let mut buf_scratch = [0; N];
-            let mut ntt_scratch = [0; N];
-            ntt_static_convolution::<N, P3>(
-                long,
-                short,
-                &mut res3,
-                n3,
-                &mut buf_scratch,
-                &mut ntt_scratch,
-            );
-        };
-
-        rayon::join(conv1, || rayon::join(conv2, conv3));
-    } else {
-        let mut buf_scratch = [0; N];
-        let mut ntt_scratch = [0; N];
-        ntt_static_convolution::<N, P1>(
-            long,
-            short,
-            &mut res1,
-            n1,
-            &mut buf_scratch,
-            &mut ntt_scratch,
-        );
-        ntt_static_convolution::<N, P2>(
-            long,
-            short,
-            &mut res2,
-            n2,
-            &mut buf_scratch,
-            &mut ntt_scratch,
-        );
-        ntt_static_convolution::<N, P3>(
-            long,
-            short,
-            &mut res3,
-            n3,
-            &mut buf_scratch,
-            &mut ntt_scratch,
-        );
-    }
-    ntt_mid_accumulate(&mut res1[..n1], &mut res2[..n2], &mut res3[..n3], out, sz)
-}
-
 enum DynMidDispatch {
     School,
-    Karatsuba,
     FFT,
     NTT,
 }
 
 fn dyn_mid_dispatch(n: usize) -> DynMidDispatch {
-    return if n < KARATSUBA_MID_CUTOFF {
+    return if n < FFT_MID_CUTOFF {
         DynMidDispatch::School
-    } else if n < FFT_MID_CUTOFF {
-        DynMidDispatch::Karatsuba
-    } else if n < DYN_NTT_MID_CUTOFF {
+    } else if 2 * n < FFT_16BIT_CUTOFF {
         DynMidDispatch::FFT
     } else {
         DynMidDispatch::NTT
@@ -3604,34 +3589,9 @@ pub fn mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     );
     match dyn_mid_dispatch(short.len()) {
         DynMidDispatch::School => mid_mul_buf(long, short, out),
-        DynMidDispatch::Karatsuba => {
-            let mut scratch_guard = ScratchGuard::acquire();
-            let n = short.len();
-            let [big_out, scratch] =
-                scratch_guard.get_splits([3 * n - 2, find_karatsuba_scratch(2 * n - 1, n)]);
-            let of = karatsuba_mul(long, short, big_out, scratch);
-            out.copy_from_slice(&big_out[n - 1..2 * n - 1]);
-            of
-        }
         DynMidDispatch::FFT => fft_mid_mul(long, short, out),
         DynMidDispatch::NTT => ntt_mid_mul_dyn(long, short, out),
     }
-}
-
-enum StaticMidDispatch {
-    School,
-    Karatsuba,
-    NTT,
-}
-
-fn static_mid_dispatch(n: usize) -> StaticMidDispatch {
-    return if n < KARATSUBA_MID_CUTOFF {
-        StaticMidDispatch::School
-    } else if n < STATIC_NTT_MID_CUTOFF {
-        StaticMidDispatch::Karatsuba
-    } else {
-        StaticMidDispatch::NTT
-    };
 }
 
 pub fn mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
@@ -3645,17 +3605,7 @@ pub fn mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u6
         short.len(),
         "size of out must be the same size as short"
     );
-    let n = short.len();
-    match static_mid_dispatch(n) {
-        StaticMidDispatch::School => mid_mul_buf(long, short, out),
-        StaticMidDispatch::Karatsuba => {
-            let mut big_out = [0; MAX_STATIC_SIZE];
-            let of = karatsuba_entry_static::<MAX_STATIC_SIZE>(long, short, &mut big_out);
-            out.copy_from_slice(&big_out[n - 1..2 * n - 1]);
-            of
-        }
-        StaticMidDispatch::NTT => ntt_mid_mul_static::<N>(long, short, out),
-    }
+    mid_mul_buf(long, short, out)
 }
 
 //FAST EXPONENTIATION

@@ -517,7 +517,7 @@ fn bench_static_karatsuba_to_ntt(c: &mut Criterion) {
     const N: usize = 7000;
     let lengths = BoundarySearch::new(
         |l, s| (l >= s) && (s > (l + 1) / 2) && !is_school(l, s),
-        |l, s| is_karatsuba(l, s, FFT_CHUNKING_KARATSUBA_CUTOFF, FFT_KARATSUBA_CUTOFF),
+        |l, s| is_karatsuba(l, s, NTT_CHUNKING_KARATSUBA_CUTOFF, NTT_KARATSUBA_CUTOFF),
     )
     .find((150, 150), NUM_OF_LENGTHS, GAP);
     assert!(!lengths.is_empty(), "find inputs failed");
@@ -628,12 +628,12 @@ fn cutoff_criterion() -> Criterion {
     Criterion::default()
         .sample_size(250)
         .warm_up_time(Duration::from_secs(5))
-        .measurement_time(Duration::from_secs(60))
+        .measurement_time(Duration::from_secs(90))
 }
 
 criterion_group! {
     name = benches;
     config = cutoff_criterion();
-    targets = bench_static_chunking_karatsuba_to_ntt
+    targets = bench_static_karatsuba_to_ntt
 }
 criterion_main!(benches);
