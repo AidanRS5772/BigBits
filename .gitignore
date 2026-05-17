@@ -4,3 +4,4 @@ lcov.info
 coverage.lcov
 profile.json.gz
 coverage_out/
+.DS_Store

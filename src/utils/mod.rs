@@ -28,7 +28,7 @@ pub const SHORT_SQR_CUTOFF: usize = 128;
 
 pub const FFT_MID_CUTOFF: usize = 90;
 
-pub const BZ_CUTOFF: usize = 64; // GUESS
+pub const BZ_CUTOFF: usize = 120;
 
 thread_local! {
     static SCRATCH_POOL: RefCell<Vec<Vec<u64>>> = RefCell::new(Vec::new());

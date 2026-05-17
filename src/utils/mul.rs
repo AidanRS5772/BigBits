@@ -923,11 +923,13 @@ fn bit16_length(sz: usize, last: u64) -> usize {
 }
 
 pub fn fft_entry(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
-    let (l_len, s_len) = (
-        bit16_length(long.len(), long.last().copied().unwrap()),
-        bit16_length(short.len(), short.last().copied().unwrap()),
+    let l_len = buf_len(&long);
+    let s_len = buf_len(&short);
+    let (l_len16, s_len16) = (
+        bit16_length(l_len, long[l_len - 1]),
+        bit16_length(s_len, short[s_len - 1]),
     );
-    let n = find_fft_size(l_len + s_len - 1);
+    let n = find_fft_size(l_len16 + s_len16 - 1);
     FFT_CACHE.with(|cell| {
         let fft_cache = &mut *cell.borrow_mut();
         let (fwd, bwd, tw, scratch_sz) = fft_cache.prep_mul(n);

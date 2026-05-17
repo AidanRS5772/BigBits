@@ -1,6 +1,12 @@
 #![allow(dead_code)]
 
-use big_bits::*;
+use big_bits::{
+    utils::{
+        div::{div_buf_of, div_dyn},
+        BZ_CUTOFF,
+    },
+    *,
+};
 use criterion::{
     black_box, criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId,
     Criterion, Throughput,
@@ -384,22 +390,6 @@ fn bench_mid_school(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_mid_karatsuba(c: &mut Criterion) {
-    let mut group = c.benchmark_group(format!("mid_karatsuba_mul/{ARCH}"));
-    set_up_group(&mut group);
-    let sizes: Vec<usize> = vec![16, 32, 64, 128, 256, 512];
-    for &n in &sizes {
-        group.throughput(Throughput::Elements(n as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
-            let short = random_limbs(n);
-            let long = random_limbs(2 * n - 1);
-            let mut out = vec![0; n];
-            bench.iter(|| mid_karatsuba(black_box(&long), black_box(&short), black_box(&mut out)));
-        });
-    }
-    group.finish();
-}
-
 fn bench_mid_fft(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("mid_fft_mul/{ARCH}"));
     set_up_group(&mut group);
@@ -416,6 +406,52 @@ fn bench_mid_fft(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_mid_school, bench_mid_fft);
+fn bench_knuth_div(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("knuth_div_buf/{ARCH}"));
+    set_up_group(&mut group);
+    let sizes: Vec<usize> = vec![4, 16, 64, 256, 1024, 4096];
+    for &n in &sizes {
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
+            let mut short = random_limbs(n - 1);
+            short.push(u64::MAX);
+            let mut long = random_limbs(2 * n);
+            let mut out = vec![0; n + 1];
+            bench.iter(|| {
+                div_buf_of(
+                    black_box(&mut long),
+                    &mut 0,
+                    black_box(&short),
+                    black_box(&mut out),
+                )
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_bz_div(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("bz_div_buf/{ARCH}"));
+    set_up_group(&mut group);
+    let sizes: Vec<usize> = vec![BZ_CUTOFF - 1, BZ_CUTOFF + 1];
+    for &n in &sizes {
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
+            let mut short = random_limbs(n);
+            let mut long = random_limbs(2 * n);
+            let mut out = vec![0; n + 1];
+            bench.iter(|| {
+                div_dyn(
+                    black_box(&mut long),
+                    black_box(&mut short),
+                    black_box(&mut out),
+                )
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_bz_div);
 
 criterion_main!(benches);
