@@ -1,10 +1,7 @@
 #![allow(dead_code)]
 
 use big_bits::{
-    utils::{
-        div::{div_buf_of, div_dyn},
-        BZ_CUTOFF,
-    },
+    utils::{div::*, BZ_CUTOFF},
     *,
 };
 use criterion::{
@@ -441,7 +438,7 @@ fn bench_bz_div(c: &mut Criterion) {
             let mut long = random_limbs(2 * n);
             let mut out = vec![0; n + 1];
             bench.iter(|| {
-                div_dyn(
+                bz_div_dyn(
                     black_box(&mut long),
                     black_box(&mut short),
                     black_box(&mut out),

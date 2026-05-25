@@ -27,6 +27,7 @@ pub const SHORT_MUL_CUTOFF: usize = 114;
 pub const SHORT_SQR_CUTOFF: usize = 128;
 
 pub const FFT_MID_CUTOFF: usize = 90;
+pub const NTT_MID_CUTOFF: usize = 200;
 
 pub const BZ_CUTOFF: usize = 120;
 

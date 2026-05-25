@@ -1,5 +1,6 @@
 #![allow(unused_imports, dead_code)]
-use big_bits::utils::mul::{fft_entry, ntt_entry_dyn};
+use big_bits::utils::div::nr_rcp_core;
+use big_bits::utils::mul::{mul_dyn, mul_vec};
 use criterion::black_box;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -10,9 +11,8 @@ fn random_vec(n: usize) -> Vec<u64> {
 }
 
 fn main() {
-    let n = 25 * 27 * (1 << 8);
-    let a = random_vec(n);
-    let b = random_vec(n);
-    let mut out = vec![0; 2 * n];
-    ntt_entry_dyn(&a, &b, &mut out);
+    let n = 64;
+    let mut d = random_vec(2 * n);
+    let mut rcp = vec![0; n];
+    nr_rcp_core(&mut d, &mut rcp);
 }

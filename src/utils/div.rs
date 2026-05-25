@@ -1,3 +1,5 @@
+use rustfft::num_traits::zero;
+
 use crate::utils::{mul::*, utils::*, ScratchGuard, BZ_CUTOFF, SCRATCH_POOL};
 
 pub fn div_prim(buf: &mut [u64], prim: u64) -> u64 {
@@ -207,280 +209,71 @@ pub fn bz_div_static<const N: usize>(n: &mut [u64], d: &mut [u64], out: &mut [u6
     }
 }
 
-const NR_GUARD_LIMBS: usize = 2;
-
-fn end_slice_mut(buf: &mut [u64], len: usize) -> &mut [u64] {
-    let buf_len = buf.len();
-    &mut buf[buf_len.saturating_sub(len)..]
+fn end_ref(buf: &[u64], idx: usize) -> &[u64] {
+    &buf[buf.len().saturating_sub(idx)..]
 }
 
-fn end_slice_ref(buf: &[u64], len: usize) -> &[u64] {
-    let buf_len = buf.len();
-    &buf[buf_len.saturating_sub(len)..]
+fn end_mut(buf: &mut [u64], idx: usize) -> &mut [u64] {
+    let len = buf.len();
+    &mut buf[len.saturating_sub(idx)..]
 }
 
-fn nr_rcp_required_d_len(pf: usize) -> usize {
-    let mut p = 1;
-    while 2 * p < pf {
-        p *= 2;
-    }
-    2 * p + 1
-}
+pub fn nr_rcp_dyn(d: &mut [u64], rcp: &mut [u64]) {
+    let mut prod = vec![0; d.len() + rcp.len()];
+    let mut e = vec![0; 2 * rcp.len() + 1];
+    let mut c = vec![0; 2 * rcp.len() + 1];
 
-fn nr_rcp_core(
-    d: &mut [u64],
-    out: &mut [u64],
-    guard: usize,
-    rcp: &mut [u64],
-    e: &mut [u64],
-    c: &mut [u64],
-    init_win: &mut [u64],
-    mut mid_mul: impl FnMut(&[u64], &[u64], &mut [u64]) -> u64,
-    mut short_mul: impl FnMut(&[u64], &[u64], &mut [u64]) -> u64,
-) {
-    let dlen = d.len();
-    let pf = out.len() + guard;
-    debug_assert!(
-        out.len() >= 2,
-        "reciprocal output must have at least 2 limbs"
-    );
-    debug_assert!(
-        rcp.len() >= pf && e.len() >= pf && c.len() >= pf,
-        "reciprocal scratch buffers are too small"
-    );
-    debug_assert!(
-        init_win.len() > dlen,
-        "initial reciprocal window is too small"
-    );
-    debug_assert!(
-        dlen >= nr_rcp_required_d_len(pf),
-        "divisor is too short for this reciprocal precision"
-    );
-
-    let sh = d[dlen - 1].leading_zeros() as u8;
+    let sh = d[d.len() - 1].leading_zeros() as u8;
     shl_buf(d, sh);
 
-    let rcp = &mut rcp[..pf];
-    let e = &mut e[..pf];
-    let c = &mut c[..pf];
-    let init_win = &mut init_win[..=dlen];
-    init_win.fill(0);
-    rcp.fill(0);
     let mut of = 1;
-    div_buf_of(init_win, &mut of, d, end_slice_mut(rcp, 2));
-    if of != 0 || init_win.iter().any(|&x| x != 0) {
-        inc_buf(end_slice_mut(rcp, 2));
-    }
+    let mut zeros = vec![0; d.len() + 1];
+    div_buf_of(&mut zeros, &mut of, d, end_mut(rcp, 2));
+    inc_buf(end_mut(rcp, 2));
     let mut p = 1;
-    while 2 * p < pf {
-        mid_mul(
-            end_slice_ref(d, 2 * p + 1),
-            end_slice_ref(rcp, p + 1),
-            &mut e[..p + 1],
+
+    println!("Test: p = {p}");
+    mul_dyn(
+        end_ref(d, 2 * p + 1),
+        end_ref(rcp, p + 1),
+        &mut prod[..3 * p + 2],
+    );
+    println!("  Prod: {:?}", &prod[2 * p + 1..3 * p + 2]);
+
+    while 2 * p < rcp.len() {
+        mid_mul_dyn(end_ref(d, 2 * p + 1), end_ref(rcp, p + 1), &mut e[..p + 1]);
+        mul_dyn(end_ref(rcp, p + 1), &e[..p + 1], &mut c[..2 * p + 2]);
+        sub_buf(end_mut(rcp, 2 * p + 1), &c[p + 1..2 * p + 2]);
+        p *= 2;
+
+        // Test Full Prod:
+        println!("Test: p = {p}");
+        mul_dyn(
+            end_ref(d, 2 * p + 1),
+            end_ref(rcp, p + 1),
+            &mut prod[..3 * p + 2],
         );
-        mul_dyn(end_slice_ref(rcp, p + 1), &e[..p + 1], &mut c[..2*p+1]);
-        sub_buf(end_slice_mut(rcp, 2 * p + 1), &c[p..2*p+1]);
-        inc_buf(end_slice_mut(rcp, 2 * p + 1));
-        p *= 2
+        println!("  Prod: {:?}", &prod[2 * p + 1..3 * p + 2]);
     }
+    mid_mul_dyn(end_ref(d, 2 * p + 1), end_ref(rcp, p + 1), &mut e[..p + 1]);
+    c[rcp.len() - p] = short_mul_dyn(end_ref(rcp, p + 1), &e[..p + 1], &mut c[..rcp.len()-p]);
+    sub_buf(rcp, &c[..=rcp.len() - p]);
 
-    //final iteration
-    mid_mul(
-        end_slice_ref(d, 2 * p + 1),
-        end_slice_ref(rcp, p + 1),
-        &mut e[..p + 1],
-    );
-    c[pf - p] = short_mul(end_slice_ref(rcp, p + 1), &e[..p + 1], &mut c[..pf - p]);
-    let rcp_out = &mut rcp[guard..];
-    sub_buf(rcp_out, &c[guard..pf - p + 1]);
-    inc_buf(rcp_out);
-
-    shl_buf(rcp_out, sh);
-    out.copy_from_slice(&rcp[guard..]);
-    shr_buf(d, sh);
-}
-
-fn nr_rcp_dyn(d: &mut [u64], out: &mut [u64]) {
-    let pf = out.len() + NR_GUARD_LIMBS;
-    let mut scratch = ScratchGuard::acquire();
-    let [work, e, c, init_win] = scratch.get_splits([pf, pf, pf, d.len() + 1]);
-    nr_rcp_core(
+    println!("Final Test:");
+    mul_dyn(
         d,
-        out,
-        NR_GUARD_LIMBS,
-        work,
-        e,
-        c,
-        init_win,
-        mid_mul_dyn,
-        short_mul_dyn,
+        rcp,
+        &mut prod[..d.len() + rcp.len()],
     );
+    println!("  Prod: {:?}", &prod[d.len() ..]);
+
 }
 
-fn nr_rcp_static<const N: usize>(d: &mut [u64], out: &mut [u64]) -> Result<(), ()> {
-    let pf = out.len();
-    if out.len() < 2 || out.len() > N || pf > N || d.len() + 1 > N {
-        return Err(());
-    }
-    if d.len() < nr_rcp_required_d_len(pf) {
-        return Err(());
-    }
-
-    let mut work = [0; N];
-    let mut e = [0; N];
-    let mut c = [0; N];
-    let mut init_win = [0; N];
-    nr_rcp_core(
-        d,
-        out,
-        0,
-        &mut work,
-        &mut e,
-        &mut c,
-        &mut init_win,
-        mid_mul_static::<N>,
-        short_mul_static::<N>,
-    );
-    Ok(())
+// Dummy Functions for now as I change stuff
+pub fn div_vec(_: &mut [u64], _: &mut [u64]) -> Vec<u64> {
+    Vec::new()
 }
 
-fn rem_adj_core(
-    n: &mut [u64],
-    d: &[u64],
-    q: &mut [u64],
-    prod: &mut [u64],
-    mut mul: impl FnMut(&[u64], &[u64], &mut [u64]) -> u64,
-) {
-    debug_assert_eq!(prod.len(), n.len(), "product buffer has wrong length");
-    prod.fill(0);
-    let of = mul(d, q, prod);
-    if of != 0 || sub_buf(n, prod) {
-        dec_buf(q);
-        add_buf(n, d);
-    }
-    if cmp_buf(n, d).is_ge() {
-        inc_buf(q);
-        sub_buf(n, d);
-    }
-}
-
-fn rem_adj(n: &mut [u64], d: &[u64], q: &mut [u64]) {
-    let mut scratch = ScratchGuard::acquire();
-    let prod = scratch.get(n.len());
-    rem_adj_core(n, d, q, prod, mul_dyn);
-}
-
-fn rem_adj_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) {
-    let mut prod = [0; N];
-    rem_adj_core(n, d, q, &mut prod[..n.len()], |d, q, prod| {
-        mul_static::<N>(d, q, prod).unwrap()
-    });
-}
-
-pub fn nr_div_dyn(n: &[u64], d: &mut [u64], out: &mut [u64]) {
-    let guard = d.len().ilog10() as usize;
-    let qlen = n.len() - d.len() + 1;
-    debug_assert_eq!(
-        qlen,
-        out.len(),
-        "out buffer is not large enough for division"
-    );
-
-    let p = qlen + guard;
-    let mut scratch = ScratchGuard::acquire();
-    let [rcp, hi] = scratch.get_splits([p, p]);
-    nr_rcp_dyn(d, rcp);
-    hi[p - 1] = short_mul_dyn(n, rcp, &mut hi[..p - 1]);
-    out.copy_from_slice(&hi[guard..]);
-    if hi[..guard].iter().all(|&x| x == 0) {
-        let tmp_n = scratch.get(n.len());
-        tmp_n.copy_from_slice(n);
-        rem_adj(tmp_n, d, out);
-    }
-}
-
-pub fn nr_div_rem_dyn(n: &mut [u64], d: &mut [u64], out: &mut [u64]) {
-    let qlen = n.len() - d.len() + 1;
-    debug_assert_eq!(
-        qlen,
-        out.len(),
-        "out buffer is not large enough for division"
-    );
-    let mut scratch = ScratchGuard::acquire();
-    let rcp = scratch.get(qlen);
-    nr_rcp_dyn(d, rcp);
-    out[qlen - 1] = short_mul_dyn(n, rcp, &mut out[..qlen - 1]);
-    rem_adj(n, d, out);
-}
-
-pub fn nr_div_rem_static<const N: usize>(
-    n: &mut [u64],
-    d: &mut [u64],
-    out: &mut [u64],
-) -> Result<(), ()> {
-    if d.len() == 0 {
-        panic!("division by zero");
-    }
-    if n.len() < d.len() {
-        return Ok(());
-    }
-
-    let qlen = n.len() - d.len() + 1;
-    debug_assert_eq!(
-        qlen,
-        out.len(),
-        "out buffer is not large enough for division"
-    );
-    if n.len() > N || d.len() > N || qlen > N || out.len() != qlen {
-        return Err(());
-    }
-
-    if d.len() == 1 {
-        out.copy_from_slice(n);
-        let rem = div_prim(out, d[0]);
-        n.fill(0);
-        n[0] = rem;
-        return Ok(());
-    }
-    let p = qlen.checked_add(NR_GUARD_LIMBS).ok_or(())?;
-    if p > N {
-        return Err(());
-    }
-
-    let mut rcp = [0; N];
-    let mut hi = [0; N];
-    nr_rcp_static::<N>(d, &mut rcp[..p])?;
-    hi[p - 1] = short_mul_static::<N>(n, &rcp[..p], &mut hi[..p - 1]);
-    out.copy_from_slice(&hi[NR_GUARD_LIMBS..p]);
-    rem_adj_static::<N>(n, d, out);
-    Ok(())
-}
-
-pub fn div_vec(n: &mut [u64], d: &mut [u64]) -> Vec<u64> {
-    if d.len() == 0 {
-        panic!("division by zero");
-    }
-    if n.len() < d.len() {
-        return vec![];
-    }
-    let mut out = vec![0_u64; n.len() + 1 - d.len()];
-    bz_div_dyn(n, d, &mut out);
-    return out;
-}
-
-pub fn div_arr<const N: usize>(n: &mut [u64], d: &mut [u64]) -> [u64; N] {
-    if d.len() == 0 {
-        panic!("division by zero");
-    }
-
-    let mut out = [0_u64; N];
-    if n.len() < d.len() {
-        return out;
-    }
-
-    let qlen = n.len() + 1 - d.len();
-    if nr_div_rem_static::<N>(n, d, &mut out[..qlen]).is_err() {
-        bz_div_static::<N>(n, d, &mut out);
-    }
-    return out;
+pub fn div_arr<const N: usize>(_: &mut [u64], _: &mut [u64]) -> [u64; N] {
+    [0; N]
 }

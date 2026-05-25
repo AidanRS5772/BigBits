@@ -2027,6 +2027,75 @@ fn test_mid_mul_static_matches_dyn() {
     }
 }
 
+#[test]
+fn test_ntt_mid_mul_static_direct_matches_dyn() {
+    for seed in 0u64..5 {
+        let n = FFT_MID_CUTOFF + 5 + seed as usize * 7;
+        let long = rand_nonzero_vec(2 * n - 1, seed + 8000);
+        let short = rand_nonzero_vec(n, seed + 8100);
+
+        let mut out_dyn = vec![0u64; n];
+        let c_dyn = ntt_mid_mul_dyn(&long, &short, &mut out_dyn);
+
+        let mut out_st = vec![0u64; n];
+        let c_st = ntt_mid_mul_static::<512>(&long, &short, &mut out_st);
+
+        assert_eq_result(
+            &out_st,
+            c_st,
+            &out_dyn,
+            c_dyn,
+            &format!("ntt_mid_mul_static direct n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_ntt_mid_mul_static_split_matches_dyn() {
+    let n = 49usize;
+    for seed in 0u64..5 {
+        let long = rand_nonzero_vec(2 * n - 1, seed + 8200);
+        let short = rand_nonzero_vec(n, seed + 8300);
+
+        let mut out_dyn = vec![0u64; n];
+        let c_dyn = ntt_mid_mul_dyn(&long, &short, &mut out_dyn);
+
+        let mut out_st = vec![0u64; n];
+        let c_st = ntt_mid_mul_static::<98>(&long, &short, &mut out_st);
+
+        assert_eq_result(
+            &out_st,
+            c_st,
+            &out_dyn,
+            c_dyn,
+            &format!("ntt_mid_mul_static split n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_mid_mul_static_ntt_dispatch_matches_dyn() {
+    for seed in 0u64..5 {
+        let n = FFT_MID_CUTOFF + seed as usize;
+        let long = rand_nonzero_vec(2 * n - 1, seed + 8400);
+        let short = rand_nonzero_vec(n, seed + 8500);
+
+        let mut out_dyn = vec![0u64; n];
+        let c_dyn = ntt_mid_mul_dyn(&long, &short, &mut out_dyn);
+
+        let mut out_st = vec![0u64; n];
+        let c_st = mid_mul_static::<256>(&long, &short, &mut out_st);
+
+        assert_eq_result(
+            &out_st,
+            c_st,
+            &out_dyn,
+            c_dyn,
+            &format!("mid_mul_static NTT dispatch n={n} seed={seed}"),
+        );
+    }
+}
+
 // ─── Section 12: Power Functions (powi_*) ───────────────────────────────────
 
 // Known source bug: powi_vec computes wrong results — reverse_pow encoding
