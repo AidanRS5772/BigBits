@@ -49,6 +49,16 @@ fn mul_ref_parts(a: &[u64], b: &[u64]) -> (Vec<u64>, u64) {
     (out, c)
 }
 
+fn mul_ref_oversized(a: &[u64], b: &[u64], out_len: usize) -> Vec<u64> {
+    let raw_len = a.len() + b.len() - 1;
+    let (mut out, carry) = mul_ref_parts(a, b);
+    out.resize(out_len, 0);
+    if out_len > raw_len {
+        out[raw_len] = carry;
+    }
+    out
+}
+
 fn sqr_ref_parts(a: &[u64]) -> (Vec<u64>, u64) {
     mul_ref_parts(a, a)
 }
@@ -72,7 +82,7 @@ fn short_mul_ref(a: &[u64], b: &[u64], out_len: usize) -> Vec<u64> {
     let mut full = vec![0u64; full_len];
     let _c = mul_buf(a, b, &mut full);
     // short_mul_buf computes columns d..d+out_len where:
-    let d = (a.len() - 1 + b.len() - 1).saturating_sub(out_len);
+    let d = full_len.saturating_sub(out_len);
     full[d..d + out_len].to_vec()
 }
 
@@ -80,7 +90,7 @@ fn short_sqr_ref(a: &[u64], out_len: usize) -> Vec<u64> {
     let full_len = 2 * a.len() - 1;
     let mut full = vec![0u64; full_len];
     let _c = mul_buf(a, a, &mut full);
-    let d = (2 * (a.len() - 1)).saturating_sub(out_len);
+    let d = full_len.saturating_sub(out_len);
     full[d..d + out_len].to_vec()
 }
 
@@ -954,6 +964,46 @@ fn test_mul_dyn_fft_dispatch() {
     let c = mul_dyn(&a, &b, &mut out);
     let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
     assert_eq_result(&out, c, &exp_buf, exp_carry, "mul_dyn FFT dispatch");
+}
+
+#[test]
+fn test_mul_dyn_oversized_output_absorbs_carry() {
+    let cases = [
+        (vec![u64::MAX; 4], vec![u64::MAX]),
+        (rand_nonzero_vec(9, 9550), rand_nonzero_vec(7, 9551)),
+        (rand_nonzero_vec(90, 9552), rand_nonzero_vec(45, 9553)),
+        (rand_nonzero_vec(300, 9554), rand_nonzero_vec(300, 9555)),
+    ];
+
+    for (idx, (a, b)) in cases.into_iter().enumerate() {
+        let raw_len = a.len() + b.len() - 1;
+        let out_len = raw_len + 3;
+        let mut out = vec![u64::MAX; out_len];
+        let carry = mul_dyn(&a, &b, &mut out);
+        let expected = mul_ref_oversized(&a, &b, out_len);
+
+        assert_eq_result(
+            &out,
+            carry,
+            &expected,
+            0,
+            &format!("mul_dyn oversized output case={idx}"),
+        );
+    }
+}
+
+#[test]
+fn test_mul_static_oversized_output_absorbs_carry() {
+    let a = rand_nonzero_vec(50, 9560);
+    let b = rand_nonzero_vec(50, 9561);
+    let raw_len = a.len() + b.len() - 1;
+    let out_len = raw_len + 2;
+    let mut out = vec![u64::MAX; out_len];
+
+    let carry = mul_static::<128>(&a, &b, &mut out).unwrap();
+    let expected = mul_ref_oversized(&a, &b, out_len);
+
+    assert_eq_result(&out, carry, &expected, 0, "mul_static oversized output");
 }
 
 #[test]
@@ -1854,7 +1904,6 @@ fn test_short_sqr_static_full_product_arm() {
 }
 
 #[test]
-#[should_panic]
 fn test_short_sqr_buf_full_product_regression() {
     let a = [1u64, 1];
     let mut out = vec![0u64; 2 * a.len() - 1];
@@ -2440,6 +2489,51 @@ fn test_karatsuba_static_fallback_scratch() {
 // fn test_mid_mul_static_larger_sizes() { ... }
 
 // ─── Section 18: short_mul_static Above Cutoff ──────────────────────────────
+
+#[test]
+fn test_short_mul_static_split_matches_dyn() {
+    const N: usize = SHORT_MUL_CUTOFF + 1;
+    for seed in 0u64..5 {
+        let a = rand_nonzero_vec(N, seed + 9_700);
+        let b = rand_nonzero_vec(N, seed + 9_800);
+
+        let mut out_dyn = vec![0u64; N];
+        let c_dyn = short_mul_dyn(&a, &b, &mut out_dyn);
+
+        let mut out_static = vec![0u64; N];
+        let c_static = short_mul_static::<N>(&a, &b, &mut out_static);
+
+        assert_eq_result(
+            &out_static,
+            c_static,
+            &out_dyn,
+            c_dyn,
+            &format!("short_mul_static split seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_short_sqr_static_split_matches_dyn() {
+    const N: usize = SHORT_SQR_CUTOFF + 1;
+    for seed in 0u64..5 {
+        let a = rand_nonzero_vec(N, seed + 9_900);
+
+        let mut out_dyn = vec![0u64; N];
+        let c_dyn = short_sqr_dyn(&a, &mut out_dyn);
+
+        let mut out_static = vec![0u64; N];
+        let c_static = short_sqr_static::<N>(&a, &mut out_static);
+
+        assert_eq_result(
+            &out_static,
+            c_static,
+            &out_dyn,
+            c_dyn,
+            &format!("short_sqr_static split seed={seed}"),
+        );
+    }
+}
 
 // ─── Section 19: Scratch Size + Cost/Dispatch Helpers ────────────────────────
 

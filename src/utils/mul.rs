@@ -186,6 +186,7 @@ pub fn mul_prim2(buf: &mut [u64], prim: u128) -> u128 {
     (acc1 as u128) << 64 | acc0 as u128
 }
 
+#[inline(always)]
 pub fn mul_elem(
     a: &[u64],
     b: &[u64],
@@ -2647,27 +2648,37 @@ fn dyn_dispatch(l: usize, s: usize) -> DynDispatch {
 }
 
 pub fn mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
-    debug_assert!(
-        out.len() >= a.len() + b.len() - 1,
-        "out is not large enough for multiplication"
-    );
     if a.is_empty() || b.is_empty() {
         return 0;
     }
+    let out_len = a.len() + b.len() - 1;
+    debug_assert!(
+        out.len() >= out_len,
+        "out is not large enough for multiplication"
+    );
     let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
-    match dyn_dispatch(long.len(), short.len()) {
+    let out_core = &mut out[..out_len];
+    let overflow = match dyn_dispatch(long.len(), short.len()) {
         DynDispatch::Prim => {
-            out[..long.len()].copy_from_slice(long);
-            mul_prim(out, short[0])
+            out_core[..long.len()].copy_from_slice(long);
+            mul_prim(out_core, short[0])
         }
         DynDispatch::Prim2 => {
-            out[..long.len()].copy_from_slice(long);
-            mul_prim2(out, combine_u64(short[0], short[1])) as u64
+            out_core[..long.len()].copy_from_slice(long);
+            out_core[long.len()] = 0;
+            mul_prim2(out_core, combine_u64(short[0], short[1])) as u64
         }
-        DynDispatch::School => mul_buf(long, short, out),
-        DynDispatch::Karatsuba => karatsuba_entry_dyn(long, short, out),
-        DynDispatch::FFT => fft_entry(long, short, out),
-        DynDispatch::NTT => ntt_entry_dyn(long, short, out),
+        DynDispatch::School => mul_buf(long, short, out_core),
+        DynDispatch::Karatsuba => karatsuba_entry_dyn(long, short, out_core),
+        DynDispatch::FFT => fft_entry(long, short, out_core),
+        DynDispatch::NTT => ntt_entry_dyn(long, short, out_core),
+    };
+    if out.len() > out_len {
+        out[out_len] = overflow;
+        out[out_len + 1..].fill(0);
+        0
+    } else {
+        overflow
     }
 }
 
@@ -2700,22 +2711,35 @@ fn static_dispatch(l: usize, s: usize) -> StaticDispatch {
 }
 
 pub fn mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> Result<u64, ()> {
-    if a.len() + b.len() - 1 > N {
+    if a.is_empty() || b.is_empty() {
+        return Ok(0);
+    }
+    let out_len = a.len() + b.len() - 1;
+    if out_len > out.len() {
         return Err(());
     }
     let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
-    Ok(match static_dispatch(long.len(), short.len()) {
+    let out_core = &mut out[..out_len];
+    let overflow = match static_dispatch(long.len(), short.len()) {
         StaticDispatch::Prim => {
-            out[..long.len()].copy_from_slice(long);
-            mul_prim(out, short[0])
+            out_core[..long.len()].copy_from_slice(long);
+            mul_prim(out_core, short[0])
         }
         StaticDispatch::Prim2 => {
-            out[..long.len()].copy_from_slice(long);
-            mul_prim2(out, combine_u64(short[0], short[1])) as u64
+            out_core[..long.len()].copy_from_slice(long);
+            out_core[long.len()] = 0;
+            mul_prim2(out_core, combine_u64(short[0], short[1])) as u64
         }
-        StaticDispatch::School => mul_buf(long, short, out),
-        StaticDispatch::Karatsuba => karatsuba_entry_static::<N>(long, short, out),
-        StaticDispatch::NTT => ntt_entry_static::<N>(long, short, out),
+        StaticDispatch::School => mul_buf(long, short, out_core),
+        StaticDispatch::Karatsuba => karatsuba_entry_static::<N>(long, short, out_core),
+        StaticDispatch::NTT => ntt_entry_static::<N>(long, short, out_core),
+    };
+    Ok(if out.len() > out_len {
+        out[out_len] = overflow;
+        out[out_len + 1..].fill(0);
+        0
+    } else {
+        overflow
     })
 }
 
@@ -2800,15 +2824,15 @@ unsafe fn mul_double_asm(a_val: u64, b_val: u64, acc0: &mut u64, acc1: &mut u64,
 
 fn sqr_elem(buf: &[u64], n: usize, acc0: &mut u64, acc1: &mut u64, acc2: &mut u64) -> u64 {
     let mi = n.saturating_sub(buf.len() - 1);
-    let mf = (n.saturating_sub(1) / 2).min(buf.len() - 1);
+    let mf = ((n + 1) / 2).min(buf.len());
     unsafe {
-        for m in mi..=mf {
+        for m in mi..mf {
             let a_val = *buf.get_unchecked(m);
             let b_val = *buf.get_unchecked(n - m);
             mul_double_asm(a_val, b_val, acc0, acc1, acc2);
         }
     }
-    if n % 2 == 0 && n / 2 <= buf.len() {
+    if n % 2 == 0 && n / 2 < buf.len() {
         unsafe {
             let d = *buf.get_unchecked(n / 2);
             mul_asm(d, d, acc0, acc1, acc2);
@@ -3274,7 +3298,7 @@ pub fn short_mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     if a.is_empty() || b.is_empty() {
         return 0;
     }
-    let d = (a.len() + b.len() - 2).saturating_sub(out.len());
+    let d = (a.len() + b.len() - 1).saturating_sub(out.len());
 
     let (mut acc0, mut acc1, mut acc2) = (0, 0, 0);
     if d >= 2 {
@@ -3349,17 +3373,37 @@ pub fn short_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -
     let (s0, s1) = short.split_at(s_split_idx);
 
     let mut of = mul_static::<N>(l1, s1, out).unwrap();
+    let mut low_carry = 0u64;
+    let low_len = l0.len() + s0.len();
+    let mut low = [0; N];
 
-    let tmp1_len = l0.len() + s1.len() - 1;
-    let mut tmp1 = [0; N];
-    let tmp1_of = mul_static::<N>(l0, s1, &mut tmp1[..tmp1_len]).unwrap();
-    let tmp2_len = l1.len() + s0.len();
-    let mut tmp2 = [0; N];
-    let tmp2_of = mul_static::<N>(l1, s0, &mut tmp2[..tmp2_len]).unwrap();
-    of += add_buf(out, &tmp1[l0.len()..tmp1_len]) as u64;
-    of += add_prim(&mut out[tmp1_len..], tmp1_of) as u64;
-    of += add_buf(out, &tmp2[s0.len()..tmp2_len]) as u64;
-    of += add_prim(&mut out[tmp2_len..], tmp2_of) as u64;
+    if !l0.is_empty() && !s0.is_empty() {
+        debug_assert!(low_len <= N);
+        let low_of = mul_static::<N>(l0, s0, &mut low[..low_len]).unwrap();
+        debug_assert_eq!(low_of, 0);
+    }
+
+    if !l0.is_empty() {
+        let tmp1_len = l0.len() + s1.len() - 1;
+        let mut tmp1 = [0; N];
+        let tmp1_of = mul_static::<N>(l0, s1, &mut tmp1[..tmp1_len]).unwrap();
+
+        low_carry += add_buf(&mut low[s0.len()..low_len], &tmp1[..l0.len()]) as u64;
+        of += add_buf(out, &tmp1[l0.len()..tmp1_len]) as u64;
+        of += add_prim(&mut out[tmp1_len - l0.len()..], tmp1_of) as u64;
+    }
+
+    if !s0.is_empty() {
+        let tmp2_len = l1.len() + s0.len();
+        let mut tmp2 = [0; N];
+        let tmp2_of = mul_static::<N>(l1, s0, &mut tmp2[..tmp2_len]).unwrap();
+        debug_assert_eq!(tmp2_of, 0);
+
+        low_carry += add_buf(&mut low[l0.len()..low_len], &tmp2[..s0.len()]) as u64;
+        of += add_buf(out, &tmp2[s0.len()..tmp2_len]) as u64;
+    }
+
+    of += add_prim(out, low_carry) as u64;
 
     return of;
 }
@@ -3370,16 +3414,22 @@ pub fn short_sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
     if buf.is_empty() {
         return 0;
     }
-    let d = (2 * buf.len() - 2).saturating_sub(out.len());
+    let d = (2 * buf.len() - 1).saturating_sub(out.len());
     let (mut acc0, mut acc1, mut acc2) = (0, 0, 0);
-    for n in d..d + buf.len() {
-        out[n] = sqr_elem(buf, n, &mut acc0, &mut acc1, &mut acc2);
+    if d >= 2 {
+        sqr_elem(buf, d - 2, &mut acc0, &mut acc1, &mut acc2);
+    }
+    if d >= 1 {
+        sqr_elem(buf, d - 1, &mut acc0, &mut acc1, &mut acc2);
+    }
+    for n in d..d + out.len() {
+        out[n - d] = sqr_elem(buf, n, &mut acc0, &mut acc1, &mut acc2);
     }
     return acc0;
 }
 
 pub fn short_sqr_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
-    if 2 * buf.len() - 1 < out.len() {
+    if 2 * buf.len() - 1 <= out.len() {
         return sqr_dyn(buf, out);
     }
     if out.len() <= SHORT_SQR_CUTOFF {
@@ -3412,7 +3462,7 @@ pub fn short_sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
     let tmp_len = 2 * trunc_buf.len() - 1;
     if tmp_len <= N {
         let mut tmp = [0; N];
-        let of = sqr_dyn(trunc_buf, &mut tmp[..tmp_len]);
+        let of = sqr_static::<N>(trunc_buf, &mut tmp[..tmp_len]).unwrap();
         out.copy_from_slice(&tmp[tmp_len - out.len()..tmp_len]);
         return of;
     }
@@ -3421,18 +3471,46 @@ pub fn short_sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
     let (x0, x1) = trunc_buf.split_at(trunc_buf.len() - h);
 
     let hi_ofs = out.len() + 1 - 2 * h;
-    let mut of = sqr_static::<N>(x1, out).unwrap();
+    let d = tmp_len - out_len;
+    debug_assert_eq!(2 * x0.len() - hi_ofs, d);
 
-    let tmp_len = x0.len() + x1.len() - 1;
-    let mut tmp = [0u64; N];
-    let mut tmp_of = mul_static::<N>(x0, x1, &mut tmp[..tmp_len]).unwrap();
-    let shl_of = shl_buf(&mut tmp[..tmp_len], 1);
-    tmp_of <<= 1;
-    tmp_of |= shl_of;
+    out[..hi_ofs].fill(0);
+    let mut of = sqr_static::<N>(x1, &mut out[hi_ofs..]).unwrap();
 
-    let tmp_start = x0.len() - hi_ofs;
-    of += add_buf(out, &tmp[tmp_start..tmp_len]) as u64;
-    of += add_prim(&mut out[tmp_len..], tmp_of) as u64;
+    let mut low = [0u64; N];
+    let x0_sqr_len = 2 * x0.len() - 1;
+    let x0_sqr_of = sqr_static::<N>(x0, &mut low[..x0_sqr_len]).unwrap();
+    let x0_high = if x0_sqr_len < d {
+        low[x0_sqr_len] = x0_sqr_of;
+        0
+    } else {
+        x0_sqr_of
+    };
+
+    let cross_len = x0.len() + x1.len() - 1;
+    let mut cross = [0u64; N];
+    let mut cross_of = mul_static::<N>(x0, x1, &mut cross[..cross_len]).unwrap();
+    let shl_of = shl_buf(&mut cross[..cross_len], 1);
+    let cross_of_hi = cross_of >> 63;
+    cross_of = (cross_of << 1) | shl_of;
+
+    let cross_start = d - x0.len();
+    let mut low_carry = 0u64;
+    if cross_start > 0 {
+        low_carry += add_buf(&mut low[x0.len()..d], &cross[..cross_start]) as u64;
+    }
+
+    of += add_prim(out, x0_high) as u64;
+    of += add_prim(out, low_carry) as u64;
+    if cross_start < cross_len {
+        let cross_high_len = cross_len - cross_start;
+        of += add_buf(out, &cross[cross_start..cross_len]) as u64;
+        of += add_prim(&mut out[cross_high_len..], cross_of) as u64;
+        of += add_prim(&mut out[cross_high_len + 1..], cross_of_hi) as u64;
+    } else {
+        of += add_prim(out, cross_of) as u64;
+        of += add_prim(&mut out[1..], cross_of_hi) as u64;
+    }
 
     return of;
 }
@@ -3445,6 +3523,14 @@ pub fn middle_correction(long: &[u64], short: &[u64]) -> (u64, u64) {
     debug_assert!(long.len() == 2 * short.len() - 1);
     let n = short.len();
     let (mut acc0, mut acc1, mut acc2) = (0, 0, 0);
+    mul_elem(
+        long,
+        short,
+        n.saturating_sub(3),
+        &mut acc0,
+        &mut acc1,
+        &mut acc2,
+    );
     mul_elem(
         long,
         short,
@@ -3624,7 +3710,7 @@ fn ntt_mid_static_convolution<const N: usize, P: NTTPrime>(
     }
 }
 
-pub(crate) fn ntt_mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+pub fn ntt_mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     let sz = short.len();
     let n1 = find_ntt_size::<P1>(2 * sz - 1);
     let n2 = find_ntt_size::<P2>(2 * sz - 1);

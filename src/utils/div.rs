@@ -1,6 +1,11 @@
+use core::error;
+
 use rustfft::num_traits::zero;
 
-use crate::utils::{mul::*, utils::*, ScratchGuard, BZ_CUTOFF, SCRATCH_POOL};
+use crate::utils::{
+    mul::*, utils::*, ScratchGuard, BZ_CUTOFF, FFT_16BIT_CUTOFF, FFT_CHUNKING_KARATSUBA_CUTOFF,
+    FFT_KARATSUBA_CUTOFF, FFT_MID_CUTOFF, SHORT_MUL_CUTOFF,
+};
 
 pub fn div_prim(buf: &mut [u64], prim: u64) -> u64 {
     let prim_u128 = prim as u128;
@@ -209,64 +214,168 @@ pub fn bz_div_static<const N: usize>(n: &mut [u64], d: &mut [u64], out: &mut [u6
     }
 }
 
+#[inline(always)]
 fn end_ref(buf: &[u64], idx: usize) -> &[u64] {
     &buf[buf.len().saturating_sub(idx)..]
 }
 
+#[inline(always)]
 fn end_mut(buf: &mut [u64], idx: usize) -> &mut [u64] {
     let len = buf.len();
     &mut buf[len.saturating_sub(idx)..]
 }
 
-pub fn nr_rcp_dyn(d: &mut [u64], rcp: &mut [u64]) {
-    let mut prod = vec![0; d.len() + rcp.len()];
-    let mut e = vec![0; 2 * rcp.len() + 1];
-    let mut c = vec![0; 2 * rcp.len() + 1];
-
-    let sh = d[d.len() - 1].leading_zeros() as u8;
-    shl_buf(d, sh);
-
-    let mut of = 1;
-    let mut zeros = vec![0; d.len() + 1];
-    div_buf_of(&mut zeros, &mut of, d, end_mut(rcp, 2));
-    inc_buf(end_mut(rcp, 2));
-    let mut p = 1;
-
-    println!("Test: p = {p}");
-    mul_dyn(
-        end_ref(d, 2 * p + 1),
-        end_ref(rcp, p + 1),
-        &mut prod[..3 * p + 2],
-    );
-    println!("  Prod: {:?}", &prod[2 * p + 1..3 * p + 2]);
-
-    while 2 * p < rcp.len() {
-        mid_mul_dyn(end_ref(d, 2 * p + 1), end_ref(rcp, p + 1), &mut e[..p + 1]);
-        mul_dyn(end_ref(rcp, p + 1), &e[..p + 1], &mut c[..2 * p + 2]);
-        sub_buf(end_mut(rcp, 2 * p + 1), &c[p + 1..2 * p + 2]);
-        p *= 2;
-
-        // Test Full Prod:
-        println!("Test: p = {p}");
-        mul_dyn(
-            end_ref(d, 2 * p + 1),
-            end_ref(rcp, p + 1),
-            &mut prod[..3 * p + 2],
-        );
-        println!("  Prod: {:?}", &prod[2 * p + 1..3 * p + 2]);
+fn find_start_p(rcp_len: usize) -> usize {
+    const MAX: usize = 15;
+    let target = rcp_len / 2;
+    if target <= 1 {
+        return 1;
     }
-    mid_mul_dyn(end_ref(d, 2 * p + 1), end_ref(rcp, p + 1), &mut e[..p + 1]);
-    c[rcp.len() - p] = short_mul_dyn(end_ref(rcp, p + 1), &e[..p + 1], &mut c[..rcp.len()-p]);
-    sub_buf(rcp, &c[..=rcp.len() - p]);
 
-    println!("Final Test:");
-    mul_dyn(
-        d,
-        rcp,
-        &mut prod[..d.len() + rcp.len()],
+    let mut final_p = target;
+    while final_p >> final_p.trailing_zeros() > MAX {
+        final_p += 1;
+    }
+
+    (final_p >> final_p.trailing_zeros()).max(1)
+}
+
+pub fn nr_rcp_dyn(denom: &mut [u64], rcp: &mut [u64]) {
+    rcp.fill(0);
+    let sh = denom[denom.len() - 1].leading_zeros() as u8;
+    shl_buf(denom, sh);
+
+    let start_p = find_start_p(rcp.len());
+    let final_p = {
+        let t = rcp.len() / 2;
+        let scale = (t + start_p - 1) / start_p;
+        let log2 = (scale - 1).ilog2() + 1;
+        start_p << log2
+    };
+    let err_len = final_p + 1;
+    let cor_len = (final_p + 2).max(rcp.len().saturating_sub(final_p));
+    let d_len = 2 * final_p + 1;
+    let zeros_len = 3 * start_p + 1;
+
+    let mut scratch = ScratchGuard::acquire();
+    let (err, cor, zeros, d_work) = if d_len < denom.len() {
+        let [err, cor, zeros] = scratch.get_splits([err_len, cor_len, zeros_len]);
+        zeros.fill(0);
+        (err, cor, zeros, end_mut(denom, d_len))
+    } else {
+        let [err, cor, zeros, d_work] = scratch.get_splits([err_len, cor_len, zeros_len, d_len]);
+        zeros.fill(0);
+        let d_idx = d_len - denom.len();
+        d_work[..d_idx].fill(0);
+        d_work[d_idx..].copy_from_slice(denom);
+        (err, cor, zeros, d_work)
+    };
+
+    div_buf_of(
+        zeros,
+        &mut 1,
+        end_ref(d_work, 2 * start_p + 1),
+        end_mut(rcp, start_p + 1),
     );
-    println!("  Prod: {:?}", &prod[d.len() ..]);
+    inc_buf(end_mut(rcp, start_p + 1));
+    let mut p = start_p;
 
+    while 2 * p + 1 < rcp.len() {
+        let (x, d, e, c) = (
+            end_ref(rcp, p + 1),
+            end_ref(d_work, 2 * p + 1),
+            &mut err[..p + 1],
+            &mut cor[..2 * p + 2],
+        );
+        let of = mid_mul_dyn(d, x, e);
+        let neg = {
+            let (mut acc0, mut acc1, mut acc2) = (of, 0, 0);
+            let conv = mul_elem(d, x, 2 * p + 1, &mut acc0, &mut acc1, &mut acc2);
+            match conv {
+                0 => false,
+                u64::MAX => true,
+                _ => panic!("middle product is not sign-extended: p={p}, conv={conv}, acc0={acc0}, acc1={acc1}, acc2={acc2}"),
+            }
+        };
+        mul_dyn(x, e, c);
+        let hi_c = end_mut(c, p + 1);
+        if neg {
+            sub_buf(hi_c, x);
+            twos_comp(hi_c);
+            add_buf(end_mut(rcp, 2 * p + 1), hi_c);
+        } else {
+            sub_buf(end_mut(rcp, 2 * p + 1), hi_c);
+        }
+        p *= 2;
+    }
+
+    let (x, d, e) = (
+        end_ref(rcp, p + 1),
+        end_ref(d_work, 2 * p + 1),
+        &mut err[..p + 1],
+    );
+    let of = mid_mul_dyn(d, x, e);
+    let neg = {
+        let (mut acc0, mut acc1, mut acc2) = (of, 0, 0);
+        let conv = mul_elem(d, x, 2 * p + 1, &mut acc0, &mut acc1, &mut acc2);
+        match conv {
+            0 => false,
+            u64::MAX => true,
+            _ => {
+                let mut exact_e = vec![0u64; p + 1];
+                let exact_of = mid_mul_buf(d, x, &mut exact_e);
+                let (mut eacc0, mut eacc1, mut eacc2) = (exact_of, 0, 0);
+                let exact_conv = mul_elem(d, x, 2 * p + 1, &mut eacc0, &mut eacc1, &mut eacc2);
+                panic!(
+                    "middle product is not sign-extended: final p={p}, conv={conv}, acc0={acc0}, acc1={acc1}, acc2={acc2}; exact_conv={exact_conv}, exact_next=[{eacc0},{eacc1},{eacc2}], exact_of={exact_of}"
+                )
+            }
+        }
+    };
+
+    let final_c_len = rcp.len() - p;
+    let hi_c = &mut cor[..final_c_len];
+    hi_c[final_c_len - 1] = short_mul_dyn(x, e, &mut hi_c[..final_c_len - 1]);
+
+    if neg {
+        let hi_x = end_ref(x, final_c_len);
+        sub_buf(hi_c, hi_x);
+        twos_comp(hi_c);
+        add_buf(rcp, hi_c);
+    } else {
+        sub_buf(rcp, hi_c);
+    }
+
+    shr_buf(denom, sh);
+    shl_buf(rcp, sh);
+}
+
+fn nr_rem_correction(n: &mut [u64], d: &mut [u64], q: &mut [u64], prod: &mut [u64]) {
+    mul_dyn(d, q, prod);
+    if sub_buf(n, prod) {
+        dec_buf(q);
+        return;
+    }
+    if cmp_buf(n, d).is_ge() {
+        inc_buf(q);
+        return;
+    }
+}
+
+pub fn nr_div_dyn(n: &[u64], d: &mut [u64], q: &mut [u64]) {
+    const GAURD: usize = 3;
+    let mut scratch = ScratchGuard::acquire();
+    let [rcp, gaurded_q] = scratch.get_splits([q.len() + GAURD + 1, q.len() + GAURD]);
+    nr_rcp_dyn(d, rcp);
+    gaurded_q[q.len() + GAURD - 1] =
+        short_mul_dyn(n, &rcp[1..], &mut gaurded_q[..q.len() + GAURD - 1]);
+    let gaurd = &gaurded_q[..GAURD];
+    q.copy_from_slice(&gaurded_q[GAURD..]);
+    if gaurd.iter().all(|&r| r == 0) || gaurd.iter().all(|&r| r == u64::MAX) {
+        let [prod, num] = scratch.get_splits([n.len(), n.len()]);
+        num.copy_from_slice(n);
+        nr_rem_correction(num, d, q, prod);
+    }
 }
 
 // Dummy Functions for now as I change stuff
