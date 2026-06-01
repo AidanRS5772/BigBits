@@ -75,6 +75,11 @@ fn mid_mul_ref(long: &[u64], short: &[u64]) -> Vec<u64> {
     }
 }
 
+fn mid_mul_school_carry(long: &[u64], short: &[u64]) -> u64 {
+    let mut out = vec![0u64; short.len()];
+    mid_mul_buf(long, short, &mut out)
+}
+
 /// Reference for short_mul: compute the full product (untrimmed), extract the
 /// same columns that short_mul_buf targets.
 fn short_mul_ref(a: &[u64], b: &[u64], out_len: usize) -> Vec<u64> {
@@ -243,6 +248,20 @@ fn assert_approx_buf(got: &[u64], expected: &[u64], msg: &str) {
         report += &format!("    ... and {} more\n", bad.len() - 5);
     }
     panic!("{report}");
+}
+
+fn assert_approx_result(
+    got: &[u64],
+    got_carry: u64,
+    expected: &[u64],
+    expected_carry: u64,
+    msg: &str,
+) {
+    assert_eq!(
+        got_carry, expected_carry,
+        "{msg}: carry mismatch; got={got_carry:#018x}, expected={expected_carry:#018x}"
+    );
+    assert_approx_buf(got, expected, msg);
 }
 
 // ─── Section 0: Exposed FFT/NTT Helper Paths ────────────────────────────────
@@ -1949,10 +1968,17 @@ fn test_mid_mul_buf_matches_full_product() {
         let short = rand_nonzero_vec(n, seed + 7000);
 
         let mut out = vec![0u64; n];
-        let _c = mid_mul_buf(&long, &short, &mut out);
+        let c = mid_mul_buf(&long, &short, &mut out);
 
         let expected = mid_mul_ref(&long, &short);
-        assert_approx_buf(&out, &expected, &format!("mid_mul_buf n={n} seed={seed}"));
+        let expected_carry = mid_mul_school_carry(&long, &short);
+        assert_approx_result(
+            &out,
+            c,
+            &expected,
+            expected_carry,
+            &format!("mid_mul_buf n={n} seed={seed}"),
+        );
     }
 }
 
@@ -1967,12 +1993,15 @@ fn test_mid_mul_dyn_school_path() {
         let short = rand_nonzero_vec(n, seed + 7100);
 
         let mut out = vec![0u64; n];
-        let _c = mid_mul_dyn(&long, &short, &mut out);
+        let c = mid_mul_dyn(&long, &short, &mut out);
 
         let expected = mid_mul_ref(&long, &short);
-        assert_approx_buf(
+        let expected_carry = mid_mul_school_carry(&long, &short);
+        assert_approx_result(
             &out,
+            c,
             &expected,
+            expected_carry,
             &format!("mid_mul_dyn school n={n} seed={seed}"),
         );
     }
@@ -1989,12 +2018,15 @@ fn test_mid_mul_dyn_school_to_fft() {
             let short = rand_nonzero_vec(n, seed + 7400);
 
             let mut out = vec![0u64; n];
-            let _c = mid_mul_dyn(&long, &short, &mut out);
+            let c = mid_mul_dyn(&long, &short, &mut out);
 
             let expected = mid_mul_ref(&long, &short);
-            assert_approx_buf(
+            let expected_carry = mid_mul_school_carry(&long, &short);
+            assert_approx_result(
                 &out,
+                c,
                 &expected,
+                expected_carry,
                 &format!("mid_mul_dyn kara/fft boundary n={n} seed={seed}"),
             );
         }
@@ -2004,21 +2036,29 @@ fn test_mid_mul_dyn_school_to_fft() {
 #[test]
 fn test_mid_mul_dyn_fft_path() {
     // FFT path: n >= FFT_MID_CUTOFF and n < DYN_NTT_MID_CUTOFF
-    for seed in 0u64..5 {
-        let n = FFT_MID_CUTOFF + 10 + (seed as usize * 30);
-        let n = n.min(300);
-        let long = rand_nonzero_vec(2 * n - 1, seed);
-        let short = rand_nonzero_vec(n, seed + 7500);
+    for &(n, seed_base) in &[
+        (FFT_MID_CUTOFF + 10, 7500u64),
+        (FFT_MID_CUTOFF + 40, 7600),
+        (177, 7700),
+        (FFT_MID_CUTOFF + 130, 7800),
+    ] {
+        for seed in 0u64..3 {
+            let long = rand_nonzero_vec(2 * n - 1, seed);
+            let short = rand_nonzero_vec(n, seed_base + seed);
 
-        let mut out = vec![0u64; n];
-        let _c = mid_mul_dyn(&long, &short, &mut out);
+            let mut out = vec![0u64; n];
+            let c = mid_mul_dyn(&long, &short, &mut out);
 
-        let expected = mid_mul_ref(&long, &short);
-        assert_approx_buf(
-            &out,
-            &expected,
-            &format!("mid_mul_dyn fft path n={n} seed={seed}"),
-        );
+            let expected = mid_mul_ref(&long, &short);
+            let expected_carry = mid_mul_school_carry(&long, &short);
+            assert_approx_result(
+                &out,
+                c,
+                &expected,
+                expected_carry,
+                &format!("mid_mul_dyn fft path n={n} seed={seed}"),
+            );
+        }
     }
 }
 
@@ -2043,12 +2083,15 @@ fn test_mid_mul_dyn_random_sweep() {
         let short = rand_nonzero_vec(n, seed + 7800);
 
         let mut out = vec![0u64; n];
-        let _c = mid_mul_dyn(&long, &short, &mut out);
+        let c = mid_mul_dyn(&long, &short, &mut out);
 
         let expected = mid_mul_ref(&long, &short);
-        assert_approx_buf(
+        let expected_carry = mid_mul_school_carry(&long, &short);
+        assert_approx_result(
             &out,
+            c,
             &expected,
+            expected_carry,
             &format!("mid_mul_dyn sweep n={n} seed={seed}"),
         );
     }
@@ -2074,6 +2117,16 @@ fn test_mid_mul_static_matches_dyn() {
             c_st,
             &format!("mid_mul static vs dyn n={n} seed={seed}"),
         );
+
+        let expected = mid_mul_ref(&long, &short);
+        let expected_carry = mid_mul_school_carry(&long, &short);
+        assert_approx_result(
+            &out_dyn,
+            c_dyn,
+            &expected,
+            expected_carry,
+            &format!("mid_mul static/dyn reference n={n} seed={seed}"),
+        );
     }
 }
 
@@ -2096,6 +2149,16 @@ fn test_ntt_mid_mul_static_direct_matches_dyn() {
             &out_dyn,
             c_dyn,
             &format!("ntt_mid_mul_static direct n={n} seed={seed}"),
+        );
+
+        let expected = mid_mul_ref(&long, &short);
+        let expected_carry = mid_mul_school_carry(&long, &short);
+        assert_approx_result(
+            &out_dyn,
+            c_dyn,
+            &expected,
+            expected_carry,
+            &format!("ntt_mid_mul_static direct reference n={n} seed={seed}"),
         );
     }
 }
@@ -2120,6 +2183,16 @@ fn test_ntt_mid_mul_static_split_matches_dyn() {
             c_dyn,
             &format!("ntt_mid_mul_static split n={n} seed={seed}"),
         );
+
+        let expected = mid_mul_ref(&long, &short);
+        let expected_carry = mid_mul_school_carry(&long, &short);
+        assert_approx_result(
+            &out_dyn,
+            c_dyn,
+            &expected,
+            expected_carry,
+            &format!("ntt_mid_mul_static split reference n={n} seed={seed}"),
+        );
     }
 }
 
@@ -2131,12 +2204,15 @@ fn test_ntt_mid_mul_dyn_matches_full_product_approximately() {
             let short = rand_nonzero_vec(n, seed + 8360);
 
             let mut out = vec![0u64; n];
-            let _c = ntt_mid_mul_dyn(&long, &short, &mut out);
+            let c = ntt_mid_mul_dyn(&long, &short, &mut out);
 
             let expected = mid_mul_ref(&long, &short);
-            assert_approx_buf(
+            let expected_carry = mid_mul_school_carry(&long, &short);
+            assert_approx_result(
                 &out,
+                c,
                 &expected,
+                expected_carry,
                 &format!("ntt_mid_mul_dyn approx n={n} seed={seed}"),
             );
         }
@@ -2156,11 +2232,22 @@ fn test_mid_mul_static_cutoff_approximately_matches_ntt() {
         let mut out_st = vec![0u64; n];
         let c_st = mid_mul_static::<256>(&long, &short, &mut out_st);
 
-        assert_eq!(c_st, c_dyn, "mid_mul_static cutoff carry n={n} seed={seed}");
-        assert_approx_buf(
+        assert_approx_result(
             &out_st,
+            c_st,
             &out_dyn,
+            c_dyn,
             &format!("mid_mul_static cutoff approx n={n} seed={seed}"),
+        );
+
+        let expected = mid_mul_ref(&long, &short);
+        let expected_carry = mid_mul_school_carry(&long, &short);
+        assert_approx_result(
+            &out_dyn,
+            c_dyn,
+            &expected,
+            expected_carry,
+            &format!("mid_mul_static cutoff reference n={n} seed={seed}"),
         );
     }
 }

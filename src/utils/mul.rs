@@ -3553,6 +3553,32 @@ pub fn mid_mul_buf(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     return acc0;
 }
 
+fn fft_accumulate_mid(x: &[Complex<f64>], out: &mut [u64], next_col_lo: u64) -> u64 {
+    let coefs = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const f64, x.len() * 2) };
+    let mut chunks = coefs.chunks(4);
+    let mut carry: u128 = 0;
+
+    for elem in out.iter_mut() {
+        let chunk = chunks.next().unwrap();
+        let mut tot = carry;
+        for (i, c) in chunk.iter().enumerate() {
+            let val = unsafe { c.to_int_unchecked::<u64>() } as u128;
+            tot += val << (i * 16);
+        }
+        *elem = tot as u64;
+        carry = tot >> 64;
+    }
+
+    let chunk = chunks.next().unwrap();
+    let mut next_limb = carry;
+    for (i, c) in chunk.iter().enumerate() {
+        let val = unsafe { c.to_int_unchecked::<u64>() } as u128;
+        next_limb += val << (i * 16);
+    }
+
+    (next_limb as u64).wrapping_sub(next_col_lo)
+}
+
 pub fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     let sz = short.len();
     let (l_len, s_len, w) = (
@@ -3560,7 +3586,13 @@ pub fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
         bit16_length(short.len(), short.last().copied().unwrap()),
         4,
     );
-    let n = find_fft_size(l_len + s_len - (sz - 1) * w - 1);
+    let start_coef = (sz - 1) * w;
+    let end_coef = (2 * sz) * w;
+    let n = find_fft_size((l_len + s_len - start_coef - 1).max(end_coef));
+    let next_col_lo = {
+        let (mut acc0, mut acc1, mut acc2) = (0, 0, 0);
+        mul_elem(long, short, 2 * sz - 1, &mut acc0, &mut acc1, &mut acc2)
+    };
     let mut of = FFT_CACHE.with(|cell| {
         let fft_cache = &mut *cell.borrow_mut();
         let (fwd, bwd, tw, scratch_sz) = fft_cache.prep_mul(n);
@@ -3571,7 +3603,7 @@ pub fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
 
         decompose(long, short, x);
         fft_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
-        fft_accumulate(&x[(sz - 1) * w / 2..(2 * sz - 1) * w / 2], out)
+        fft_accumulate_mid(&x[start_coef / 2..end_coef / 2], out, next_col_lo)
     });
     let (c0, c1) = middle_correction(long, short);
     of += add_prim(out, c0) as u64;
