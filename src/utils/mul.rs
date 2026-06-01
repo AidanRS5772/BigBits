@@ -1107,16 +1107,16 @@ unsafe fn reduce_x86(t: u128, p: u64, p_inv: u64) -> u64 {
         "sub {tmp}, {p}",
         "cmovnc rdx, {tmp}",
 
-        m = lateout(reg) _,
-        tmp = lateout(reg) _,
+        m = out(reg) _,
+        tmp = out(reg) _,
 
         t_lo = in(reg) t_lo,
         t_hi = in(reg) t_hi,
         p = in(reg) p,
         p_inv = in(reg) p_inv,
 
-        lateout("rax") _,
-        lateout("rdx") val,
+        out("rax") _,
+        out("rdx") val,
 
         options(nostack, nomem, pure),
     );
@@ -1149,12 +1149,12 @@ unsafe fn reduce_aarch(t: u128, p: u64, p_inv: u64) -> u64 {
         "subs {tmp}, {val}, {p}",
         "csel {val}, {tmp}, {val}, hs",
 
-        m = lateout(reg) _,
-        mp_lo = lateout(reg) _,
-        mp_hi = lateout(reg) _,
-        tmp = lateout(reg) _,
+        m = out(reg) _,
+        mp_lo = out(reg) _,
+        mp_hi = out(reg) _,
+        tmp = out(reg) _,
 
-        val = lateout(reg) val,
+        val = out(reg) val,
 
         t_lo = in(reg) t_lo,
         t_hi = in(reg) t_hi,
@@ -1240,7 +1240,7 @@ unsafe fn mul_reduce_x86(a: u64, b: u64, p: u64, p_inv: u64) -> u64 {
         p = in(reg) p,
         p_inv = in(reg) p_inv,
 
-        lateout("rdx") val,
+        out("rdx") val,
 
         options(nostack, nomem, pure),
     );
@@ -1337,7 +1337,7 @@ unsafe fn add_mod_x86(mut a: u64, b: u64, p: u64) -> u64 {
         a = inout(reg) a,
         b = in(reg) b,
         p = in(reg) p,
-        tmp = lateout(reg) _,
+        tmp = out(reg) _,
         options(nostack, nomem, pure),
     );
     a
@@ -1353,7 +1353,7 @@ unsafe fn add_mod_aarch(mut a: u64, b: u64, p: u64) -> u64 {
         a = inout(reg) a,
         b = in(reg) b,
         p = in(reg) p,
-        tmp = lateout(reg) _,
+        tmp = out(reg) _,
         options(nostack, nomem, pure),
     );
     a
@@ -1395,7 +1395,7 @@ unsafe fn sub_mod_x86(mut a: u64, b: u64, p: u64) -> u64 {
         a = inout(reg) a,
         b = in(reg) b,
         p = in(reg) p,
-        tmp = lateout(reg) _,
+        tmp = out(reg) _,
         options(nostack, nomem, pure),
     );
     a
@@ -1411,7 +1411,7 @@ unsafe fn sub_mod_aarch(mut a: u64, b: u64, p: u64) -> u64 {
         a = inout(reg) a,
         b = in(reg) b,
         p = in(reg) p,
-        tmp = lateout(reg) _,
+        tmp = out(reg) _,
         options(nostack, nomem, pure),
     );
     a
@@ -1452,7 +1452,7 @@ unsafe fn neg_mod_x86(mut a: u64, p: u64) -> u64 {
         "cmovnz {a}, {tmp}",
         a = inout(reg) a,
         p = in(reg) p,
-        tmp = lateout(reg) _,
+        tmp = out(reg) _,
         options(nostack, nomem, pure),
     );
     a
@@ -1467,7 +1467,7 @@ unsafe fn neg_mod_aarch(mut a: u64, p: u64) -> u64 {
         "csel {a}, xzr, {tmp}, eq",
         a = inout(reg) a,
         p = in(reg) p,
-        tmp = lateout(reg) _,
+        tmp = out(reg) _,
         options(nostack, nomem, pure),
     );
     a
