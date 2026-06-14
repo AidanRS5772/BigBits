@@ -1,4 +1,5 @@
 use core::error;
+use std::{arch::asm, cmp};
 
 use rustfft::num_traits::zero;
 
@@ -7,56 +8,197 @@ use crate::utils::{
     FFT_KARATSUBA_CUTOFF, FFT_MID_CUTOFF, SHORT_MUL_CUTOFF,
 };
 
-pub fn div_prim(buf: &mut [u64], prim: u64) -> u64 {
-    let prim_u128 = prim as u128;
-    let mut rem: u128 = 0;
-    for e in buf.iter_mut().rev() {
-        let val = (rem << 64) | (*e as u128);
-        rem = val % prim_u128;
-        *e = (val / prim_u128) as u64;
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+unsafe fn div_rem_2_1_x86(q: &mut u64, r: &mut u64, d: u64) {
+    asm!(
+        "div rcx",
+        inout("rax") *q,
+        inout("rdx") *r,
+        in("rcx") d,
+        options(pure, nomem, nostack),
+    );
+}
+
+#[inline(always)]
+unsafe fn div_rem_2_1_asm(q: &mut u64, r: &mut u64, d: u64) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let val = ((*r as u128) << 64) | (*q as u128);
+        let d_u128 = d as u128;
+        *r = (val % d_u128) as u64;
+        *q = (val / d_u128) as u64;
     }
 
-    return rem as u64;
+    #[cfg(target_arch = "x86_64")]
+    {
+        div_rem_2_1_x86(q, r, d);
+    }
+}
+
+pub fn div_prim(buf: &mut [u64], prim: u64) -> u64 {
+    if prim == 0 {
+        panic!("Division by zero error")
+    }
+    if prim == 1 {
+        return 0;
+    }
+
+    let mut r = 0;
+    for q in buf.iter_mut().rev() {
+        unsafe {
+            div_rem_2_1_asm(q, &mut r, prim);
+        }
+    }
+
+    return r;
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sub_mul_of_aarch(win: *mut u64, of: *mut u64, d: *const u64, q: u64, len: usize) -> bool {
+    let overflow: u64;
+    asm!(
+        "mov {b}, xzr",
+        "mov {mc}, xzr",
+        "2:",
+        "ldr {w}, [{win}]",
+        "ldr {dv}, [{den}], #8",
+        "mul   {lo}, {dv}, {q}",
+        "umulh {hi}, {dv}, {q}",
+        "adds {lo}, {lo}, {mc}",
+        "adc  {mc}, {hi}, xzr",
+        "cmp xzr, {b}",
+        "sbcs {w}, {w}, {lo}",
+        "cset {b}, cc",
+        "str {w}, [{win}], #8",
+        "subs {len}, {len}, #1",
+        "cbnz {len}, 2b",
+        "ldr {w}, [{ofp}]",
+        "cmp xzr, {b}",
+        "sbcs {w}, {w}, {mc}",
+        "cset {overflow}, cc",
+        "str {w}, [{ofp}]",
+        win = inout(reg) win => _,
+        den = inout(reg) d => _,
+        ofp = in(reg) of,
+        q = in(reg) q,
+        len = inout(reg) len => _,
+        overflow = out(reg) overflow,
+        mc = out(reg) _,
+        b = out(reg) _,
+        w = out(reg) _,
+        dv = out(reg) _,
+        lo = out(reg) _,
+        hi = out(reg) _,
+        options(nostack),
+    );
+    overflow != 0
+}
+
+#[inline(always)]
+unsafe fn sub_mul_of_asm(win: *mut u64, of: *mut u64, d: *const u64, q: u64, len: usize) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        sub_mul_of_aarch(win, of, d, q, len)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut mul_carry: u64 = 0;
+        let mut borrow: u64 = 0;
+
+        for (w, &d) in win.iter_mut().zip(d) {
+            let prod = q_u128 * (d as u128) + mul_carry as u128;
+            mul_carry = (prod >> 64) as u64;
+            let prod_lo = prod as u64;
+
+            let (s1, b1) = w.overflowing_sub(prod_lo);
+            let (s2, b2) = s1.overflowing_sub(borrow);
+            *w = s2;
+            borrow = b1 as u64 + b2 as u64;
+        }
+
+        let (s1, b1) = of.overflowing_sub(mul_carry);
+        let (s2, b2) = s1.overflowing_sub(borrow);
+        *of = s2;
+
+        (b1 as u64 + b2 as u64) != 0
+    }
 }
 
 fn sub_mul_of(win: &mut [u64], of: &mut u64, d: &[u64], q: u64) -> bool {
-    let q_u128 = q as u128;
-    let mut mul_carry: u64 = 0;
-    let mut borrow: u64 = 0;
-
-    for (w, &d) in win.iter_mut().zip(d) {
-        let prod = q_u128 * (d as u128) + mul_carry as u128;
-        mul_carry = (prod >> 64) as u64;
-        let prod_lo = prod as u64;
-
-        let (s1, b1) = w.overflowing_sub(prod_lo);
-        let (s2, b2) = s1.overflowing_sub(borrow);
-        *w = s2;
-        borrow = b1 as u64 + b2 as u64;
-    }
-
-    let (s1, b1) = of.overflowing_sub(mul_carry);
-    let (s2, b2) = s1.overflowing_sub(borrow);
-    *of = s2;
-
-    (b1 as u64 + b2 as u64) != 0
+    unsafe { sub_mul_of_asm(win.as_mut_ptr(), of as *mut u64, d.as_ptr(), q, d.len()) }
 }
 
-fn knuth_est(win: &mut [u64], of: &mut u64, d: &[u64], d1: u128, d0: u128, dfull: u128) -> u64 {
-    let win_last = *win.last().unwrap() as u128;
-    let of_u128 = *of as u128;
-    let val = (of_u128 << 64) | win_last;
-    let (mut qhat, rhat) = if of_u128 >= d1 {
-        (u64::MAX, val - (u64::MAX as u128) * d1)
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn mul_u64_x86(a: u64, b: u64) -> (u64, u64) {
+    let lo: u64;
+    let hi: u64;
+    asm!(
+        "mul {tmp}",
+        tmp = in(reg) b,
+        inout("rax") a => lo,
+        out("rdx") hi,
+        options(nostack, nomem),
+    );
+    (hi, lo)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn mul_u64_aarch(a: u64, b: u64) -> (u64, u64) {
+    let lo: u64;
+    let hi: u64;
+    asm!(
+        "mul {lo}, {a}, {b}",
+        "umulh {hi}, {a}, {b}",
+        a = in(reg) a,
+        b = in(reg) b,
+        lo = out(reg) lo,
+        hi = out(reg) hi,
+        options(nostack, nomem),
+    );
+    (hi, lo)
+}
+
+#[inline(always)]
+unsafe fn mul_u64_asm(a: u64, b: u64) -> (u64, u64) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        mul_u64_aarch(a, b)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        mul_u64_x86(a, b)
+    }
+}
+
+fn knuth_est(win: &mut [u64], of: &mut u64, d: &[u64], d1: u64, d0: u64) -> u64 {
+    let (mut qhat, rhat_hi, rhat_lo) = if *of >= d1 {
+        let (rhat_lo, c) = win.last().unwrap().overflowing_add(d1);
+        (u64::MAX, *of - d1 + c as u64, rhat_lo)
     } else {
-        ((val / d1) as u64, val % d1)
+        let mut r = *of;
+        let mut q = *win.last().unwrap();
+        unsafe { div_rem_2_1_asm(&mut q, &mut r, d1) };
+        (q, 0, r)
     };
 
-    if rhat < (1u128 << 64) {
-        let a = (qhat as u128) * d0;
-        let b = (rhat << 64) | (win[win.len() - 2] as u128);
-        if a > b {
-            qhat -= if (a - b) > dfull { 2 } else { 1 };
+    if rhat_hi == 0 {
+        let u0 = win[win.len() - 2];
+        let (a_hi, a_lo) = unsafe { mul_u64_asm(qhat, d0) };
+        if a_hi > rhat_lo || (a_hi == rhat_lo && a_lo > u0) {
+            qhat -= 1;
+            let (r, carry) = rhat_lo.overflowing_add(d1);
+            if !carry {
+                let (a_lo, borrow) = a_lo.overflowing_sub(d0);
+                let a_hi = a_hi.wrapping_sub(borrow as u64);
+                if a_hi > r || (a_hi == r && a_lo > u0) {
+                    qhat -= 1;
+                }
+            }
         }
     }
 
@@ -66,6 +208,7 @@ fn knuth_est(win: &mut [u64], of: &mut u64, d: &[u64], d1: u128, d0: u128, dfull
             *of = of.wrapping_add(1);
         }
     }
+
     return qhat;
 }
 
@@ -74,17 +217,16 @@ pub fn div_buf_of(n: &mut [u64], of: &mut u64, d: &[u64], out: &mut [u64]) {
     let d_len = d.len();
     let n_len = n.len();
 
-    let d1 = d[d_len - 1] as u128;
-    let d0 = d[d_len - 2] as u128;
-    let dfull = ((d1 as u128) << 64) | (d0 as u128);
+    let d1 = d[d_len - 1];
+    let d0 = d[d_len - 2];
 
     let q_len = n_len - d_len;
     if out.len() > q_len {
-        out[q_len] = knuth_est(&mut n[q_len..], of, d, d1, d0, dfull);
+        out[q_len] = knuth_est(&mut n[q_len..], of, d, d1, d0);
     }
     for i in (0..q_len).rev() {
         let (win, of) = n[i..].split_at_mut(d_len);
-        out[i] = knuth_est(win, &mut of[0], d, d1, d0, dfull)
+        out[i] = knuth_est(win, &mut of[0], d, d1, d0)
     }
 }
 

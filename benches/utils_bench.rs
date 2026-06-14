@@ -20,6 +20,11 @@ fn random_sh() -> u8 {
     rng.gen_range(0..64)
 }
 
+fn random_div() -> u64 {
+    let mut rng = rand::thread_rng();
+    rng.gen()
+}
+
 const ARCH: &'static str = std::env::consts::ARCH;
 
 fn set_up_group(group: &mut BenchmarkGroup<'_, WallTime>) {
@@ -403,6 +408,26 @@ fn bench_mid_fft(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_div_prim(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("div_prim/{ARCH}"));
+    set_up_group(&mut group);
+    let sizes: Vec<usize> = vec![4, 16, 64, 256, 1024, 4096];
+    for &n in &sizes {
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
+            let mut buf = random_limbs(n);
+            let div = random_div();
+            bench.iter(|| {
+                div_prim(
+                    black_box(&mut buf),
+                    div
+                )
+            });
+        });
+    }
+    group.finish();
+}
+
 fn bench_knuth_div(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("knuth_div_buf/{ARCH}"));
     set_up_group(&mut group);
@@ -411,7 +436,7 @@ fn bench_knuth_div(c: &mut Criterion) {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
             let mut short = random_limbs(n - 1);
-            short.push(u64::MAX);
+            short.push(1 << 63);
             let mut long = random_limbs(2 * n);
             let mut out = vec![0; n + 1];
             bench.iter(|| {
@@ -449,6 +474,6 @@ fn bench_bz_div(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_bz_div);
+criterion_group!(benches, bench_knuth_div);
 
 criterion_main!(benches);

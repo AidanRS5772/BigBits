@@ -26,7 +26,7 @@ use std::arch::aarch64::*;
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn mul_prim_asm_x86(val: u64, prim: u64, carry: u64) -> (u64, u64) {
+unsafe fn mul_prim_carry_x86(val: u64, prim: u64, carry: u64) -> (u64, u64) {
     let lo: u64;
     let hi: u64;
     asm!(
@@ -44,15 +44,15 @@ unsafe fn mul_prim_asm_x86(val: u64, prim: u64, carry: u64) -> (u64, u64) {
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn mul_prim_asm_aarch(val: u64, prim: u64, carry: u64) -> (u64, u64) {
+unsafe fn mul_prim_carry_aarch(val: u64, prim: u64, carry: u64) -> (u64, u64) {
     let lo: u64;
     let hi: u64;
     asm!(
-        "mul {lo}, {a_val}, {prim}",
-        "umulh {hi}, {a_val}, {prim}",
+        "mul {lo}, {val}, {prim}",
+        "umulh {hi}, {val}, {prim}",
         "adds {lo}, {lo}, {carry}",
         "adc {hi}, {hi}, xzr",
-        a_val = in(reg) val,
+        val = in(reg) val,
         prim = in(reg) prim,
         carry = in(reg) carry,
         lo = out(reg) lo,
@@ -63,14 +63,14 @@ unsafe fn mul_prim_asm_aarch(val: u64, prim: u64, carry: u64) -> (u64, u64) {
 }
 
 #[inline(always)]
-unsafe fn mul_prim_asm(val: u64, prim: u64, carry: u64) -> (u64, u64) {
+unsafe fn mul_prim_carry_asm(val: u64, prim: u64, carry: u64) -> (u64, u64) {
     #[cfg(target_arch = "aarch64")]
     {
-        mul_prim_asm_aarch(val, prim, carry)
+        mul_prim_carry_aarch(val, prim, carry)
     }
     #[cfg(target_arch = "x86_64")]
     {
-        mul_prim_asm_x86(val, prim, carry)
+        mul_prim_carry_x86(val, prim, carry)
     }
 }
 
@@ -84,7 +84,7 @@ pub fn mul_prim(buf: &mut [u64], prim: u64) -> u64 {
     }
     let mut carry: u64 = 0;
     for e in buf {
-        let (lo, hi) = unsafe { mul_prim_asm(*e, prim, carry) };
+        let (lo, hi) = unsafe { mul_prim_carry_asm(*e, prim, carry) };
         *e = lo;
         carry = hi;
     }
