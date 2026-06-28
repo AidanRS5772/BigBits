@@ -30,6 +30,7 @@ pub const FFT_MID_CUTOFF: usize = 90;
 pub const NTT_MID_CUTOFF: usize = 200;
 
 pub const BZ_CUTOFF: usize = 88;
+pub const NR_DIRECT_SEED_CUTOFF: usize = 15;
 
 thread_local! {
     static SCRATCH_POOL: RefCell<Vec<Vec<u64>>> = RefCell::new(Vec::new());

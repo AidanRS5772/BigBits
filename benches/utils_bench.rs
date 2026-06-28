@@ -527,6 +527,6 @@ fn bench_nr_div(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_knuth_div, bench_nr_div);
+criterion_group!(benches, bench_nr_div);
 
 criterion_main!(benches);

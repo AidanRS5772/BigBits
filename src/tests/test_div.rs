@@ -357,6 +357,14 @@ fn test_burnikel_ziegler_varied_mul_sizes() {
 }
 
 #[test]
+fn test_newton_raphson_seed_plan_uses_cutoff_to_reduce_waste() {
+    assert_eq!(nr_rcp_seed_plan(1028, 15), (9, 576, 125));
+    assert_eq!(nr_rcp_seed_plan(1028, 127), (65, 520, 13));
+    assert_eq!(nr_rcp_seed_plan(1028, 511), (257, 514, 1));
+    assert_eq!(nr_rcp_seed_plan(20, usize::MAX), (10, 10, 1));
+}
+
+#[test]
 fn test_newton_raphson_div_dyn_varied_mul_sizes() {
     let cases = [(6usize, 4usize), (24, 16), (96, 72), (180, 140), (360, 320)];
 

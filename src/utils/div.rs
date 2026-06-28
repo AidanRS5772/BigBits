@@ -5,7 +5,7 @@ use rustfft::num_traits::zero;
 
 use crate::utils::{
     mul::*, utils::*, ScratchGuard, BZ_CUTOFF, FFT_16BIT_CUTOFF, FFT_CHUNKING_KARATSUBA_CUTOFF,
-    FFT_KARATSUBA_CUTOFF, FFT_MID_CUTOFF, SHORT_MUL_CUTOFF,
+    FFT_KARATSUBA_CUTOFF, FFT_MID_CUTOFF, NR_DIRECT_SEED_CUTOFF, SHORT_MUL_CUTOFF,
 };
 
 #[inline(always)]
@@ -470,19 +470,29 @@ fn end_mut(buf: &mut [u64], idx: usize) -> &mut [u64] {
     &mut buf[len.saturating_sub(idx)..]
 }
 
-fn find_start_p(rcp_len: usize) -> usize {
-    const MAX: usize = 15;
+#[inline]
+fn odd_part(n: usize) -> usize {
+    n >> n.trailing_zeros()
+}
+
+pub fn nr_rcp_seed_plan(rcp_len: usize, seed_cutoff: usize) -> (usize, usize, usize) {
+    let seed_cutoff = seed_cutoff.max(1);
     let target = rcp_len / 2;
     if target <= 1 {
-        return 1;
+        let final_p = 1;
+        return (1, final_p, (2 * final_p + 1).saturating_sub(rcp_len));
     }
 
     let mut final_p = target;
-    while final_p >> final_p.trailing_zeros() > MAX {
+    while odd_part(final_p) > seed_cutoff {
         final_p += 1;
     }
 
-    (final_p >> final_p.trailing_zeros()).max(1)
+    let mut start_p = final_p;
+    while start_p > seed_cutoff {
+        start_p >>= 1;
+    }
+    (start_p, final_p, 2 * final_p + 1 - rcp_len)
 }
 
 fn mid_mul_sign_ext(d: &[u64], x: &[u64], e: &mut [u64], p: usize) -> Option<(bool, usize)> {
@@ -501,7 +511,7 @@ fn mid_mul_sign_ext(d: &[u64], x: &[u64], e: &mut [u64], p: usize) -> Option<(bo
     Some((val == u64::MAX, e_idx))
 }
 
-fn bz_rcp_fallback_dyn(d: &[u64], rcp: &mut [u64]) {
+fn bz_rcp_seed_dyn(d: &[u64], rcp: &mut [u64]) {
     if rcp.is_empty() {
         return;
     }
@@ -522,51 +532,36 @@ fn bz_rcp_fallback_dyn(d: &[u64], rcp: &mut [u64]) {
     inc_buf(rcp);
 }
 
-pub fn nr_rcp_dyn(denom: &mut [u64], rcp: &mut [u64]) {
+pub fn nr_rcp_dyn_with_seed_cutoff(denom: &mut [u64], rcp: &mut [u64], seed_cutoff: usize) {
     rcp.fill(0);
     let sh = denom[denom.len() - 1].leading_zeros() as u8;
     shl_buf(denom, sh);
 
-    let start_p = find_start_p(rcp.len());
-    let final_p = {
-        let t = rcp.len() / 2;
-        let scale = (t + start_p - 1) / start_p;
-        let log2 = (scale - 1).ilog2() + 1;
-        start_p << log2
-    };
+    let (start_p, final_p, _) = nr_rcp_seed_plan(rcp.len(), seed_cutoff);
     let err_len = 2 * final_p + 1;
     let cor_len = rcp.len().max(err_len);
     let d_len = 2 * final_p + 1;
-    let zeros_len = 3 * start_p + 1;
 
     let mut scratch = ScratchGuard::acquire();
-    let (err, cor, zeros, d_work) = if d_len < denom.len() {
-        let [err, cor, zeros] = scratch.get_splits([err_len, cor_len, zeros_len]);
-        zeros.fill(0);
-        (err, cor, zeros, end_mut(denom, d_len))
+    let (err, cor, d_work) = if d_len < denom.len() {
+        let [err, cor] = scratch.get_splits([err_len, cor_len]);
+        (err, cor, end_mut(denom, d_len))
     } else {
-        let [err, cor, zeros, d_work] = scratch.get_splits([err_len, cor_len, zeros_len, d_len]);
-        zeros.fill(0);
+        let [err, cor, d_work] = scratch.get_splits([err_len, cor_len, d_len]);
         let d_idx = d_len - denom.len();
         d_work[..d_idx].fill(0);
         d_work[d_idx..].copy_from_slice(denom);
-        (err, cor, zeros, d_work)
+        (err, cor, d_work)
     };
 
-    div_buf_of(
-        zeros,
-        &mut 1,
-        end_ref(d_work, 2 * start_p + 1),
-        end_mut(rcp, start_p + 1),
-    );
-    inc_buf(end_mut(rcp, start_p + 1));
+    bz_rcp_seed_dyn(end_ref(d_work, 2 * start_p + 1), end_mut(rcp, start_p + 1));
     let mut p = start_p;
 
     while 2 * p + 1 < rcp.len() {
         let x = end_ref(rcp, p + 1);
         let Some((neg, e_len)) = mid_mul_sign_ext(end_ref(d_work, 2 * p + 1), x, err, p) else {
             p *= 2;
-            bz_rcp_fallback_dyn(end_ref(d_work, 2 * p + 1), end_mut(rcp, p + 1));
+            bz_rcp_seed_dyn(end_ref(d_work, 2 * p + 1), end_mut(rcp, p + 1));
             continue;
         };
         let extra = e_len - p - 1;
@@ -596,11 +591,15 @@ pub fn nr_rcp_dyn(denom: &mut [u64], rcp: &mut [u64]) {
             sub_buf(rcp, &mut c[skip..]);
         }
     } else {
-        bz_rcp_fallback_dyn(end_ref(d_work, 2 * p + 1), rcp);
+        bz_rcp_seed_dyn(end_ref(d_work, 2 * p + 1), rcp);
     }
 
     shr_buf(denom, sh);
     shl_buf(rcp, sh);
+}
+
+pub fn nr_rcp_dyn(denom: &mut [u64], rcp: &mut [u64]) {
+    nr_rcp_dyn_with_seed_cutoff(denom, rcp, NR_DIRECT_SEED_CUTOFF);
 }
 
 fn nr_rem_correction(n: &mut [u64], d: &mut [u64], q: &mut [u64], prod: &mut [u64]) {
@@ -615,11 +614,11 @@ fn nr_rem_correction(n: &mut [u64], d: &mut [u64], q: &mut [u64], prod: &mut [u6
     }
 }
 
-pub fn nr_div_dyn(n: &[u64], d: &mut [u64], q: &mut [u64]) {
+pub fn nr_div_dyn_with_seed_cutoff(n: &[u64], d: &mut [u64], q: &mut [u64], seed_cutoff: usize) {
     const GAURD: usize = 3;
     let mut scratch = ScratchGuard::acquire();
     let [rcp, gaurded_q] = scratch.get_splits([q.len() + GAURD + 1, q.len() + GAURD]);
-    nr_rcp_dyn(d, rcp);
+    nr_rcp_dyn_with_seed_cutoff(d, rcp, seed_cutoff);
     gaurded_q[q.len() + GAURD - 1] =
         short_mul_dyn(n, &rcp[1..], &mut gaurded_q[..q.len() + GAURD - 1]);
     let gaurd = &gaurded_q[..GAURD];
@@ -629,6 +628,10 @@ pub fn nr_div_dyn(n: &[u64], d: &mut [u64], q: &mut [u64]) {
         num.copy_from_slice(n);
         nr_rem_correction(num, d, q, prod);
     }
+}
+
+pub fn nr_div_dyn(n: &[u64], d: &mut [u64], q: &mut [u64]) {
+    nr_div_dyn_with_seed_cutoff(n, d, q, NR_DIRECT_SEED_CUTOFF);
 }
 
 // Dummy Functions for now as I change stuff

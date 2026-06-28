@@ -685,6 +685,294 @@ fn bench_sqr_school_to_fft(c: &mut Criterion) {
     });
 }
 
+const NR_SEED_CUTOFF_BOUNDARIES: [(usize, usize); 3] = [(1151, 1199), (1199, 1247), (1247, 1279)];
+const NR_SEED_RATIO_MAX_Q_LEN: usize = 8192;
+const NR_RCP_SEED_RATIO_CASES: usize = 24;
+const NR_DIV_SEED_RATIO_CASES: usize = 8;
+
+struct NrRcpSeedInput {
+    q_len: usize,
+    rcp_len: usize,
+    denom: Vec<u64>,
+}
+
+struct NrDivSeedInput {
+    q_len: usize,
+    n: Vec<u64>,
+    d: Vec<u64>,
+}
+
+fn nr_seed_changed_q_lens(low_cutoff: usize, high_cutoff: usize, max_cases: usize) -> Vec<usize> {
+    let mut changed = Vec::new();
+    for q_len in 4..=NR_SEED_RATIO_MAX_Q_LEN {
+        let rcp_len = q_len + 4;
+        if nr_rcp_seed_plan(rcp_len, low_cutoff) != nr_rcp_seed_plan(rcp_len, high_cutoff) {
+            changed.push(q_len);
+        }
+    }
+
+    if changed.len() <= max_cases {
+        return changed;
+    }
+
+    let mut sampled = Vec::with_capacity(max_cases);
+    let last = changed.len() - 1;
+    for i in 0..max_cases {
+        let idx = if max_cases == 1 {
+            0
+        } else {
+            i * last / (max_cases - 1)
+        };
+        sampled.push(changed[idx]);
+    }
+    sampled.dedup();
+    sampled
+}
+
+fn make_nr_rcp_seed_inputs(low_cutoff: usize, high_cutoff: usize) -> Vec<NrRcpSeedInput> {
+    let q_lens = nr_seed_changed_q_lens(low_cutoff, high_cutoff, NR_RCP_SEED_RATIO_CASES);
+    let mut rng = rand::thread_rng();
+    q_lens
+        .into_iter()
+        .map(|q_len| {
+            let d_len = q_len.saturating_sub(1).max(2);
+            NrRcpSeedInput {
+                q_len,
+                rcp_len: q_len + 4,
+                denom: random_normalized_limbs(d_len, &mut rng),
+            }
+        })
+        .collect()
+}
+
+fn make_nr_div_seed_inputs(low_cutoff: usize, high_cutoff: usize) -> Vec<NrDivSeedInput> {
+    let q_lens = nr_seed_changed_q_lens(low_cutoff, high_cutoff, NR_DIV_SEED_RATIO_CASES);
+    let mut rng = rand::thread_rng();
+    q_lens
+        .into_iter()
+        .map(|q_len| {
+            let d_len = q_len.saturating_sub(1).max(2);
+            let n_len = d_len + q_len - 1;
+            NrDivSeedInput {
+                q_len,
+                n: random_limbs(n_len, &mut rng),
+                d: random_normalized_limbs(d_len, &mut rng),
+            }
+        })
+        .collect()
+}
+
+fn avg_q_len_rcp(inputs: &[NrRcpSeedInput]) -> f64 {
+    inputs.iter().map(|input| input.q_len).sum::<usize>() as f64 / inputs.len() as f64
+}
+
+fn avg_q_len_div(inputs: &[NrDivSeedInput]) -> f64 {
+    inputs.iter().map(|input| input.q_len).sum::<usize>() as f64 / inputs.len() as f64
+}
+
+fn nr_rcp_seed_ratio_bench(
+    iters: u64,
+    inputs: &[NrRcpSeedInput],
+    low_cutoff: usize,
+    high_cutoff: usize,
+) -> Duration {
+    let mut rng = rand::thread_rng();
+    let mut ratio_sum = 0.0f64;
+    let mut count = 0u64;
+
+    for _ in 0..iters {
+        for input in inputs {
+            let mut d_low = input.denom.clone();
+            let mut d_high = input.denom.clone();
+            let mut rcp_low = vec![0u64; input.rcp_len];
+            let mut rcp_high = vec![0u64; input.rcp_len];
+
+            let (t_low, t_high) = if rng.gen::<bool>() {
+                let t_low = {
+                    let start = Instant::now();
+                    nr_rcp_dyn_with_seed_cutoff(
+                        black_box(d_low.as_mut_slice()),
+                        black_box(rcp_low.as_mut_slice()),
+                        black_box(low_cutoff),
+                    );
+                    start.elapsed()
+                };
+                let t_high = {
+                    let start = Instant::now();
+                    nr_rcp_dyn_with_seed_cutoff(
+                        black_box(d_high.as_mut_slice()),
+                        black_box(rcp_high.as_mut_slice()),
+                        black_box(high_cutoff),
+                    );
+                    start.elapsed()
+                };
+                (t_low, t_high)
+            } else {
+                let t_high = {
+                    let start = Instant::now();
+                    nr_rcp_dyn_with_seed_cutoff(
+                        black_box(d_high.as_mut_slice()),
+                        black_box(rcp_high.as_mut_slice()),
+                        black_box(high_cutoff),
+                    );
+                    start.elapsed()
+                };
+                let t_low = {
+                    let start = Instant::now();
+                    nr_rcp_dyn_with_seed_cutoff(
+                        black_box(d_low.as_mut_slice()),
+                        black_box(rcp_low.as_mut_slice()),
+                        black_box(low_cutoff),
+                    );
+                    start.elapsed()
+                };
+                (t_low, t_high)
+            };
+
+            ratio_sum += duration_ratio(t_high, t_low);
+            count += 1;
+        }
+    }
+
+    Duration::from_nanos((ratio_sum / count as f64 * 1_000_000.0) as u64)
+}
+
+fn nr_div_seed_ratio_bench(
+    iters: u64,
+    inputs: &[NrDivSeedInput],
+    low_cutoff: usize,
+    high_cutoff: usize,
+) -> Duration {
+    let mut rng = rand::thread_rng();
+    let mut ratio_sum = 0.0f64;
+    let mut count = 0u64;
+
+    for _ in 0..iters {
+        for input in inputs {
+            let mut d_low = input.d.clone();
+            let mut d_high = input.d.clone();
+            let mut q_low = vec![0u64; input.q_len];
+            let mut q_high = vec![0u64; input.q_len];
+
+            let (t_low, t_high) = if rng.gen::<bool>() {
+                let t_low = {
+                    let start = Instant::now();
+                    nr_div_dyn_with_seed_cutoff(
+                        black_box(input.n.as_slice()),
+                        black_box(d_low.as_mut_slice()),
+                        black_box(q_low.as_mut_slice()),
+                        black_box(low_cutoff),
+                    );
+                    start.elapsed()
+                };
+                let t_high = {
+                    let start = Instant::now();
+                    nr_div_dyn_with_seed_cutoff(
+                        black_box(input.n.as_slice()),
+                        black_box(d_high.as_mut_slice()),
+                        black_box(q_high.as_mut_slice()),
+                        black_box(high_cutoff),
+                    );
+                    start.elapsed()
+                };
+                (t_low, t_high)
+            } else {
+                let t_high = {
+                    let start = Instant::now();
+                    nr_div_dyn_with_seed_cutoff(
+                        black_box(input.n.as_slice()),
+                        black_box(d_high.as_mut_slice()),
+                        black_box(q_high.as_mut_slice()),
+                        black_box(high_cutoff),
+                    );
+                    start.elapsed()
+                };
+                let t_low = {
+                    let start = Instant::now();
+                    nr_div_dyn_with_seed_cutoff(
+                        black_box(input.n.as_slice()),
+                        black_box(d_low.as_mut_slice()),
+                        black_box(q_low.as_mut_slice()),
+                        black_box(low_cutoff),
+                    );
+                    start.elapsed()
+                };
+                (t_low, t_high)
+            };
+
+            ratio_sum += duration_ratio(t_high, t_low);
+            count += 1;
+        }
+    }
+
+    Duration::from_nanos((ratio_sum / count as f64 * 1_000_000.0) as u64)
+}
+
+fn bench_nr_rcp_seed_cutoff_ratio(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("nr_rcp_seed_cutoff_ratio/{ARCH}"));
+    group.sample_size(80);
+    group.warm_up_time(Duration::from_secs(2));
+    group.measurement_time(Duration::from_secs(5));
+
+    println!("NR_DIRECT_SEED_CUTOFF = {NR_DIRECT_SEED_CUTOFF}");
+    println!("Reported value is high_cutoff_runtime / low_cutoff_runtime.");
+    println!("Below 1.0 favors raising the cutoff; above 1.0 favors keeping it lower.");
+
+    for &(low_cutoff, high_cutoff) in &NR_SEED_CUTOFF_BOUNDARIES {
+        let inputs = make_nr_rcp_seed_inputs(low_cutoff, high_cutoff);
+        assert!(!inputs.is_empty(), "find NR reciprocal seed inputs failed");
+        println!(
+            "rcp {high_cutoff}/{low_cutoff}: inputs={} avg_q_len={:.1}",
+            inputs.len(),
+            avg_q_len_rcp(&inputs)
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("high_over_low", format!("{high_cutoff}_over_{low_cutoff}")),
+            &(low_cutoff, high_cutoff),
+            |bench, &(low_cutoff, high_cutoff)| {
+                bench.iter_custom(|iters| {
+                    nr_rcp_seed_ratio_bench(iters, &inputs, low_cutoff, high_cutoff)
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_nr_div_seed_cutoff_ratio(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("nr_div_seed_cutoff_ratio/{ARCH}"));
+    group.sample_size(50);
+    group.warm_up_time(Duration::from_secs(2));
+    group.measurement_time(Duration::from_secs(5));
+
+    println!("Reported value is high_cutoff_runtime / low_cutoff_runtime.");
+    println!("Below 1.0 favors raising the cutoff; above 1.0 favors keeping it lower.");
+
+    for &(low_cutoff, high_cutoff) in &NR_SEED_CUTOFF_BOUNDARIES {
+        let inputs = make_nr_div_seed_inputs(low_cutoff, high_cutoff);
+        assert!(!inputs.is_empty(), "find NR division seed inputs failed");
+        println!(
+            "div {high_cutoff}/{low_cutoff}: inputs={} avg_q_len={:.1}",
+            inputs.len(),
+            avg_q_len_div(&inputs)
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("high_over_low", format!("{high_cutoff}_over_{low_cutoff}")),
+            &(low_cutoff, high_cutoff),
+            |bench, &(low_cutoff, high_cutoff)| {
+                bench.iter_custom(|iters| {
+                    nr_div_seed_ratio_bench(iters, &inputs, low_cutoff, high_cutoff)
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
 // Criterion setup.
 
 fn cutoff_criterion() -> Criterion {
@@ -697,6 +985,6 @@ fn cutoff_criterion() -> Criterion {
 criterion_group! {
     name = benches;
     config = cutoff_criterion();
-    targets = bench_karatsuba_cutoff
+    targets = bench_nr_rcp_seed_cutoff_ratio
 }
 criterion_main!(benches);
