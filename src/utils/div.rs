@@ -230,7 +230,7 @@ pub fn div_buf_of(n: &mut [u64], of: &mut u64, d: &[u64], out: &mut [u64]) {
     }
 }
 
-fn div_3_2(
+pub fn div_3_2(
     n: &mut [u64],
     d: &[u64],
     d_lo_len: usize,
@@ -302,7 +302,23 @@ fn bz_div_alg(
     }
 }
 
-fn bz_div_init(n: &mut [u64], d: &mut [u64], out: &mut [u64]) -> Option<(usize, u8)> {
+fn use_bz_for_top_block(dlen: usize, qlen: usize) -> bool {
+    if dlen <= BZ_CUTOFF {
+        return false;
+    }
+
+    // TODO: Experimentally tune this as a 2D boundary over (dlen, qlen).
+    // The benchmark should include the multiplication algorithm transitions
+    // reached by the recursive div_2_1 calls.
+    qlen >= (dlen + 1) / 2
+}
+
+fn bz_div_init_static<const N: usize>(
+    n: &mut [u64],
+    d: &mut [u64],
+    out: &mut [u64],
+    scratch: &mut [u64; N],
+) -> Option<(usize, u8)> {
     let dlen = d.len();
     let nlen = n.len();
 
@@ -314,43 +330,130 @@ fn bz_div_init(n: &mut [u64], d: &mut [u64], out: &mut [u64]) -> Option<(usize, 
         return None;
     }
 
-    let last_lz = d[d.len() - 1].leading_zeros() as u8;
+    let last_lz = d[dlen - 1].leading_zeros() as u8;
     shl_buf(d, last_lz);
     let mut last_n = shl_buf(n, last_lz);
 
     let t = (nlen - dlen) / dlen;
     let init_idx = dlen * t;
-    div_buf_of(&mut n[init_idx..], &mut last_n, d, &mut out[init_idx..]);
-    return Some((t, last_lz));
+    let init_len = nlen - init_idx;
+    let init_qlen = init_len - dlen + 1;
+    if !use_bz_for_top_block(dlen, init_qlen) || dlen > N / 2 {
+        div_buf_of(&mut n[init_idx..], &mut last_n, d, &mut out[init_idx..]);
+    } else {
+        let mut top_n_storage = [0; N];
+        let top_n = &mut top_n_storage[..2 * dlen];
+        top_n[..init_len].copy_from_slice(&n[init_idx..]);
+        top_n[init_len] = last_n;
+
+        if out.len() >= dlen {
+            let q_tmp = &mut out[..dlen];
+            div_2_1(top_n, d, q_tmp, &mut scratch[..dlen], &mut |n, d, q| {
+                mul_static::<N>(n, d, q).unwrap();
+            });
+
+            out.copy_within(0..init_qlen, init_idx);
+            n[init_idx..].fill(0);
+            n[init_idx..init_idx + dlen].copy_from_slice(&top_n[..dlen]);
+        } else {
+            let (q_tmp, div_scratch) = scratch[..2 * dlen].split_at_mut(dlen);
+            div_2_1(top_n, d, q_tmp, div_scratch, &mut |n, d, q| {
+                mul_static::<N>(n, d, q).unwrap();
+            });
+
+            out.copy_from_slice(&q_tmp[..init_qlen]);
+            n.fill(0);
+            n[..dlen].copy_from_slice(&top_n[..dlen]);
+        }
+    }
+    if t == 0 {
+        shr_buf(n, last_lz);
+        shr_buf(d, last_lz);
+        None
+    } else {
+        Some((t, last_lz))
+    }
+}
+
+fn bz_div_init_dyn(n: &mut [u64], d: &mut [u64], out: &mut [u64]) -> Option<(usize, u8)> {
+    let dlen = d.len();
+    let nlen = n.len();
+
+    if dlen == 1 {
+        out[..nlen].copy_from_slice(n);
+        let rem = div_prim(out, d[0]);
+        n.fill(0);
+        n[0] = rem;
+        return None;
+    }
+
+    let last_lz = d[dlen - 1].leading_zeros() as u8;
+    shl_buf(d, last_lz);
+    let mut last_n = shl_buf(n, last_lz);
+
+    let t = (nlen - dlen) / dlen;
+    let init_idx = dlen * t;
+    let init_len = nlen - init_idx;
+    let init_qlen = init_len - dlen + 1;
+    if !use_bz_for_top_block(dlen, init_qlen) {
+        div_buf_of(&mut n[init_idx..], &mut last_n, d, &mut out[init_idx..]);
+    } else {
+        let mut scratch = ScratchGuard::acquire();
+        if out.len() >= dlen {
+            let [top_n, div_scratch] = scratch.get_splits([2 * dlen, dlen]);
+            top_n[..init_len].copy_from_slice(&n[init_idx..]);
+            top_n[init_len] = last_n;
+            top_n[init_len + 1..].fill(0);
+
+            let q_tmp = &mut out[..dlen];
+            div_2_1(top_n, d, q_tmp, div_scratch, &mut |n, d, q| {
+                mul_dyn(n, d, q);
+            });
+
+            out.copy_within(0..init_qlen, init_idx);
+            n[init_idx..].fill(0);
+            n[init_idx..init_idx + dlen].copy_from_slice(&top_n[..dlen]);
+        } else {
+            let [top_n, q_tmp, div_scratch] = scratch.get_splits([2 * dlen, dlen, dlen]);
+            top_n[..init_len].copy_from_slice(&n[init_idx..]);
+            top_n[init_len] = last_n;
+            top_n[init_len + 1..].fill(0);
+
+            div_2_1(top_n, d, q_tmp, div_scratch, &mut |n, d, q| {
+                mul_dyn(n, d, q);
+            });
+
+            out.copy_from_slice(&q_tmp[..init_qlen]);
+            n[..].fill(0);
+            n[..dlen].copy_from_slice(&top_n[..dlen]);
+        }
+    }
+    if t == 0 {
+        shr_buf(n, last_lz);
+        shr_buf(d, last_lz);
+        None
+    } else {
+        Some((t, last_lz))
+    }
 }
 
 pub fn bz_div_dyn(n: &mut [u64], d: &mut [u64], out: &mut [u64]) {
-    if let Some((t, sh)) = bz_div_init(n, d, out) {
-        if t > 0 {
-            let mut scratch_gaurd = ScratchGuard::acquire();
-            bz_div_alg(n, d, out, scratch_gaurd.get(d.len()), t, |n, d, q| {
-                mul_dyn(n, d, q);
-            });
-        }
+    if let Some((t, sh)) = bz_div_init_dyn(n, d, out) {
+        let mut scratch_gaurd = ScratchGuard::acquire();
+        bz_div_alg(n, d, out, scratch_gaurd.get(d.len()), t, |n, d, q| {
+            mul_dyn(n, d, q);
+        });
         shr_buf(n, sh);
         shr_buf(d, sh);
     }
 }
 
 pub fn bz_div_static<const N: usize>(n: &mut [u64], d: &mut [u64], out: &mut [u64]) {
-    if d.len() == 0 {
-        panic!("division by zero");
-    }
-    if n.len() < d.len() {
-        return;
-    }
-    if let Some((t, sh)) = bz_div_init(n, d, out) {
-        if t > 0 {
-            let mut scratch = [0; N];
-            bz_div_alg(n, d, out, &mut scratch, t, |n, d, q| {
-                mul_static::<N>(n, d, q).unwrap();
-            });
-        }
+    let mut scratch = [0; N];
+    if let Some((t, sh)) = bz_div_init_static::<N>(n, d, out, &mut scratch) {
+        bz_div_alg(n, d, out, &mut scratch, t, |n, d, q| {
+            mul_static::<N>(n, d, q).unwrap();
+        });
         shr_buf(n, sh);
         shr_buf(d, sh);
     }
@@ -382,6 +485,43 @@ fn find_start_p(rcp_len: usize) -> usize {
     (final_p >> final_p.trailing_zeros()).max(1)
 }
 
+fn mid_mul_sign_ext(d: &[u64], x: &[u64], e: &mut [u64], p: usize) -> Option<(bool, usize)> {
+    let mut e_idx = p + 1;
+    let (mut acc0, mut acc1) = mid_mul_dyn(d, x, &mut e[..e_idx]);
+    let mut acc2 = 0;
+    let mut val = mul_elem(d, x, p + e_idx, &mut acc0, &mut acc1, &mut acc2);
+    while val != 0 && val != u64::MAX {
+        e[e_idx] = val;
+        e_idx += 1;
+        if e_idx > 2 * p + 1 {
+            return None;
+        }
+        val = mul_elem(d, x, p + e_idx, &mut acc0, &mut acc1, &mut acc2);
+    }
+    Some((val == u64::MAX, e_idx))
+}
+
+fn bz_rcp_fallback_dyn(d: &[u64], rcp: &mut [u64]) {
+    if rcp.is_empty() {
+        return;
+    }
+
+    let n_len = d.len() + rcp.len();
+    let q_len = rcp.len() + 1;
+    let mut scratch = ScratchGuard::acquire();
+    let [n, d_work, q] = scratch.get_splits([n_len, d.len(), q_len]);
+
+    n.fill(0);
+    n[n_len - 1] = 1;
+    d_work.copy_from_slice(d);
+    q.fill(0);
+
+    bz_div_dyn(n, d_work, q);
+    debug_assert_eq!(q[rcp.len()], 0);
+    rcp.copy_from_slice(&q[..rcp.len()]);
+    inc_buf(rcp);
+}
+
 pub fn nr_rcp_dyn(denom: &mut [u64], rcp: &mut [u64]) {
     rcp.fill(0);
     let sh = denom[denom.len() - 1].leading_zeros() as u8;
@@ -394,8 +534,8 @@ pub fn nr_rcp_dyn(denom: &mut [u64], rcp: &mut [u64]) {
         let log2 = (scale - 1).ilog2() + 1;
         start_p << log2
     };
-    let err_len = final_p + 1;
-    let cor_len = (final_p + 2).max(rcp.len().saturating_sub(final_p));
+    let err_len = 2 * final_p + 1;
+    let cor_len = rcp.len().max(err_len);
     let d_len = 2 * final_p + 1;
     let zeros_len = 3 * start_p + 1;
 
@@ -423,69 +563,40 @@ pub fn nr_rcp_dyn(denom: &mut [u64], rcp: &mut [u64]) {
     let mut p = start_p;
 
     while 2 * p + 1 < rcp.len() {
-        let (x, d, e, c) = (
-            end_ref(rcp, p + 1),
-            end_ref(d_work, 2 * p + 1),
-            &mut err[..p + 1],
-            &mut cor[..2 * p + 2],
-        );
-        let of = mid_mul_dyn(d, x, e);
-        let neg = {
-            let (mut acc0, mut acc1, mut acc2) = (of, 0, 0);
-            let conv = mul_elem(d, x, 2 * p + 1, &mut acc0, &mut acc1, &mut acc2);
-            match conv {
-                0 => false,
-                u64::MAX => true,
-                _ => panic!("middle product is not sign-extended: p={p}, conv={conv}, acc0={acc0}, acc1={acc1}, acc2={acc2}"),
-            }
+        let x = end_ref(rcp, p + 1);
+        let Some((neg, e_len)) = mid_mul_sign_ext(end_ref(d_work, 2 * p + 1), x, err, p) else {
+            p *= 2;
+            bz_rcp_fallback_dyn(end_ref(d_work, 2 * p + 1), end_mut(rcp, p + 1));
+            continue;
         };
-        mul_dyn(x, e, c);
-        let hi_c = end_mut(c, p + 1);
+        let extra = e_len - p - 1;
+        let c = &mut cor[..e_len];
+        c[e_len - 1] = short_mul_dyn(end_ref(rcp, p + 1), &err[..e_len], &mut c[..e_len - 1]);
         if neg {
-            sub_buf(hi_c, x);
-            twos_comp(hi_c);
-            add_buf(end_mut(rcp, 2 * p + 1), hi_c);
+            sub_buf(&mut c[extra..], x);
+            twos_comp(c);
+            add_buf(end_mut(rcp, 2 * p + 1), c);
         } else {
-            sub_buf(end_mut(rcp, 2 * p + 1), hi_c);
+            sub_buf(end_mut(rcp, 2 * p + 1), c);
         }
         p *= 2;
     }
 
-    let (x, d, e) = (
-        end_ref(rcp, p + 1),
-        end_ref(d_work, 2 * p + 1),
-        &mut err[..p + 1],
-    );
-    let of = mid_mul_dyn(d, x, e);
-    let neg = {
-        let (mut acc0, mut acc1, mut acc2) = (of, 0, 0);
-        let conv = mul_elem(d, x, 2 * p + 1, &mut acc0, &mut acc1, &mut acc2);
-        match conv {
-            0 => false,
-            u64::MAX => true,
-            _ => {
-                let mut exact_e = vec![0u64; p + 1];
-                let exact_of = mid_mul_buf(d, x, &mut exact_e);
-                let (mut eacc0, mut eacc1, mut eacc2) = (exact_of, 0, 0);
-                let exact_conv = mul_elem(d, x, 2 * p + 1, &mut eacc0, &mut eacc1, &mut eacc2);
-                panic!(
-                    "middle product is not sign-extended: final p={p}, conv={conv}, acc0={acc0}, acc1={acc1}, acc2={acc2}; exact_conv={exact_conv}, exact_next=[{eacc0},{eacc1},{eacc2}], exact_of={exact_of}"
-                )
-            }
+    let x = end_ref(rcp, p + 1);
+    if let Some((neg, e_len)) = mid_mul_sign_ext(end_ref(d_work, 2 * p + 1), x, err, p) {
+        let extra = e_len - p - 1;
+        let skip = 2 * p + 1 - rcp.len();
+        let c = &mut cor[..e_len];
+        c[e_len - 1] = short_mul_dyn(end_ref(rcp, p + 1), &err[..e_len], &mut c[..e_len - 1]);
+        if neg {
+            sub_buf(&mut c[extra..], x);
+            twos_comp(c);
+            add_buf(rcp, &mut c[skip..]);
+        } else {
+            sub_buf(rcp, &mut c[skip..]);
         }
-    };
-
-    let final_c_len = rcp.len() - p;
-    let hi_c = &mut cor[..final_c_len];
-    hi_c[final_c_len - 1] = short_mul_dyn(x, e, &mut hi_c[..final_c_len - 1]);
-
-    if neg {
-        let hi_x = end_ref(x, final_c_len);
-        sub_buf(hi_c, hi_x);
-        twos_comp(hi_c);
-        add_buf(rcp, hi_c);
     } else {
-        sub_buf(rcp, hi_c);
+        bz_rcp_fallback_dyn(end_ref(d_work, 2 * p + 1), rcp);
     }
 
     shr_buf(denom, sh);

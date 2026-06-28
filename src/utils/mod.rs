@@ -5,7 +5,7 @@ pub mod mul;
 pub mod utils;
 
 pub const CHUNKING_KARATSUBA_CUTOFF: usize = 22;
-pub const KARATSUBA_CUTOFF: f64 = 19.5;
+pub const KARATSUBA_CUTOFF: f64 = 17.0;
 
 pub const FFT_CHUNKING_KARATSUBA_CUTOFF: f64 = 1.74;
 pub const FFT_KARATSUBA_CUTOFF: f64 = 1.92;
@@ -29,7 +29,7 @@ pub const SHORT_SQR_CUTOFF: usize = 128;
 pub const FFT_MID_CUTOFF: usize = 90;
 pub const NTT_MID_CUTOFF: usize = 200;
 
-pub const BZ_CUTOFF: usize = 120;
+pub const BZ_CUTOFF: usize = 88;
 
 thread_local! {
     static SCRATCH_POOL: RefCell<Vec<Vec<u64>>> = RefCell::new(Vec::new());

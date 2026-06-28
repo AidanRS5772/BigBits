@@ -249,6 +249,65 @@ fn test_burnikel_ziegler_direct_invariant() {
 }
 
 #[test]
+fn test_burnikel_ziegler_dynamic_top_block_shapes() {
+    let d_len = BZ_CUTOFF + 8;
+    let recursive_top_q = (d_len + 1) / 2;
+    let cases = [
+        ("t0_knuth", recursive_top_q - 1),
+        ("t0_scratch_q", recursive_top_q),
+        ("t0_out_q", d_len),
+        ("t1_reused_out_q", d_len + recursive_top_q),
+    ];
+
+    for (idx, &(name, q_len)) in cases.iter().enumerate() {
+        let n_len = d_len + q_len - 1;
+        let n = rand_nonzero_vec(n_len, 8700 + idx as u64);
+        let d = rand_nonzero_vec(d_len, 8800 + idx as u64);
+        let mut n_work = n.clone();
+        let mut d_work = d.clone();
+        let mut q = vec![0u64; q_len];
+
+        bz_div_dyn(&mut n_work, &mut d_work, &mut q);
+        assert_divmod_algorithm(name, &n, &d, &q, &n_work);
+    }
+}
+
+#[test]
+fn test_burnikel_ziegler_static_top_block_shapes() {
+    fn run<const N: usize>(name: &str, d_len: usize, q_len: usize, seed: u64) {
+        let n_len = d_len + q_len - 1;
+        assert!(n_len <= N);
+
+        let n = rand_nonzero_vec(n_len, seed);
+        let d = rand_nonzero_vec(d_len, seed + 100);
+        let mut n_work = [0u64; N];
+        let mut d_work = [0u64; N];
+        let mut q = [0u64; N];
+        n_work[..n_len].copy_from_slice(&n);
+        d_work[..d_len].copy_from_slice(&d);
+
+        bz_div_static::<N>(&mut n_work[..n_len], &mut d_work[..d_len], &mut q[..q_len]);
+        assert_divmod_algorithm(name, &n, &d, &q[..q_len], &n_work[..n_len]);
+    }
+
+    const FIT_N: usize = 512;
+    let d_len = BZ_CUTOFF + 8;
+    let recursive_top_q = (d_len + 1) / 2;
+    run::<FIT_N>("static t0 knuth", d_len, recursive_top_q - 1, 8900);
+    run::<FIT_N>("static t0 scratch q", d_len, recursive_top_q, 8901);
+    run::<FIT_N>("static t0 out q", d_len, d_len, 8902);
+    run::<FIT_N>(
+        "static t1 reused out q",
+        d_len,
+        d_len + recursive_top_q,
+        8903,
+    );
+
+    const LIMITED_N: usize = 250;
+    run::<LIMITED_N>("static capacity fallback", d_len, recursive_top_q, 8904);
+}
+
+#[test]
 fn test_burnikel_ziegler_varied_mul_sizes() {
     const STATIC_N: usize = 2048;
 
@@ -317,4 +376,18 @@ fn test_newton_raphson_div_dyn_varied_mul_sizes() {
             );
         }
     }
+}
+
+#[test]
+fn test_newton_raphson_div_dyn_bench_1024_regression() {
+    let d_len = 1024;
+    let n_len = 2 * d_len;
+    let q_len = d_len + 1;
+    let n = rand_nonzero_vec(n_len, 9000);
+    let mut d = rand_nonzero_vec(d_len, 9100);
+    d[d_len - 1] |= 1 << 63;
+    let mut q = vec![0u64; q_len];
+
+    nr_div_dyn(&n, &mut d, &mut q);
+    assert_quotient_algorithm("newton-raphson dyn bench size 1024", &n, &d, &q);
 }

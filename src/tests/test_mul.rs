@@ -75,7 +75,7 @@ fn mid_mul_ref(long: &[u64], short: &[u64]) -> Vec<u64> {
     }
 }
 
-fn mid_mul_school_carry(long: &[u64], short: &[u64]) -> u64 {
+fn mid_mul_school_carry(long: &[u64], short: &[u64]) -> (u64, u64) {
     let mut out = vec![0u64; short.len()];
     mid_mul_buf(long, short, &mut out)
 }
@@ -262,6 +262,38 @@ fn assert_approx_result(
         "{msg}: carry mismatch; got={got_carry:#018x}, expected={expected_carry:#018x}"
     );
     assert_approx_buf(got, expected, msg);
+}
+
+fn assert_approx_mid_result(
+    got: &[u64],
+    got_carry: (u64, u64),
+    expected: &[u64],
+    expected_carry: (u64, u64),
+    msg: &str,
+) {
+    assert_eq!(
+        got_carry, expected_carry,
+        "{msg}: carry mismatch; got=({:#018x}, {:#018x}), expected=({:#018x}, {:#018x})",
+        got_carry.0, got_carry.1, expected_carry.0, expected_carry.1
+    );
+    assert_approx_buf(got, expected, msg);
+}
+
+fn assert_eq_mid_result(
+    got: &[u64],
+    got_carry: (u64, u64),
+    expected: &[u64],
+    exp_carry: (u64, u64),
+    msg: &str,
+) {
+    if let Some(report) = diff_report(got, got_carry.0, expected, exp_carry.0, msg) {
+        panic!("{report}");
+    }
+    assert_eq!(
+        got_carry.1, exp_carry.1,
+        "{msg}: high carry mismatch; got={:#018x}, expected={:#018x}",
+        got_carry.1, exp_carry.1
+    );
 }
 
 // ─── Section 0: Exposed FFT/NTT Helper Paths ────────────────────────────────
@@ -834,6 +866,44 @@ fn test_fft_entry_unbalanced() {
     }
 }
 
+#[test]
+fn test_fft_entry_zero_and_trailing_zero_operands() {
+    let a = rand_nonzero_vec(300, 9600);
+    let zero = vec![0u64; 256];
+    let mut out = vec![u64::MAX; a.len() + zero.len() - 1];
+    let c = fft_entry(&a, &zero, &mut out);
+    assert_eq!(c, 0);
+    assert!(out.iter().all(|&limb| limb == 0));
+
+    let mut long = rand_nonzero_vec(300, 9601);
+    let mut short = rand_nonzero_vec(260, 9602);
+    long.resize(320, 0);
+    short.resize(280, 0);
+
+    let mut out = vec![u64::MAX; long.len() + short.len() - 1];
+    let c = fft_entry(&long, &short, &mut out);
+    let (exp_buf, exp_carry) = mul_ref_parts(&long, &short);
+    assert_eq_result(
+        &out,
+        c,
+        &exp_buf,
+        exp_carry,
+        "fft_entry trailing zero operands",
+    );
+}
+
+#[test]
+fn test_mul_dyn_fft_zero_operand() {
+    let zero = vec![0u64; 256];
+    let nonzero = rand_nonzero_vec(256, 9603);
+    let mut out = vec![u64::MAX; zero.len() + nonzero.len() - 1];
+
+    let c = mul_dyn(&zero, &nonzero, &mut out);
+
+    assert_eq!(c, 0);
+    assert!(out.iter().all(|&limb| limb == 0));
+}
+
 // --- 4c: NTT multiplication (ntt_entry_dyn) ---
 
 #[test]
@@ -1336,6 +1406,28 @@ fn test_fft_sqr_entry_medium() {
             &format!("fft_sqr_entry medium n={n} seed={seed}"),
         );
     }
+}
+
+#[test]
+fn test_fft_sqr_entry_zero_and_trailing_zero_operand() {
+    let zero = vec![0u64; 300];
+    let mut out = vec![u64::MAX; 2 * zero.len() - 1];
+    let c = fft_sqr_entry(&zero, &mut out);
+    assert_eq!(c, 0);
+    assert!(out.iter().all(|&limb| limb == 0));
+
+    let mut a = rand_nonzero_vec(300, 9604);
+    a.resize(320, 0);
+    let mut out = vec![u64::MAX; 2 * a.len() - 1];
+    let c = fft_sqr_entry(&a, &mut out);
+    let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+    assert_eq_result(
+        &out,
+        c,
+        &exp_buf,
+        exp_carry,
+        "fft_sqr_entry trailing zero operand",
+    );
 }
 
 // --- 7d: ntt_sqr_entry_dyn ---
@@ -1946,7 +2038,7 @@ fn test_mid_mul_buf_basic() {
     let mut out = vec![0u64; 2];
     let c = mid_mul_buf(&long, &short, &mut out);
     assert_eq!(out, vec![13, 22], "mid_mul_buf basic");
-    assert_eq!(c, 0);
+    assert_eq!(c, (0, 0));
 }
 
 #[test]
@@ -1956,7 +2048,7 @@ fn test_mid_mul_buf_single() {
     let mut out = vec![0u64; 1];
     let c = mid_mul_buf(&long, &short, &mut out);
     assert_eq!(out, vec![21], "mid_mul_buf single");
-    assert_eq!(c, 0);
+    assert_eq!(c, (0, 0));
 }
 
 #[test]
@@ -1972,7 +2064,7 @@ fn test_mid_mul_buf_matches_full_product() {
 
         let expected = mid_mul_ref(&long, &short);
         let expected_carry = mid_mul_school_carry(&long, &short);
-        assert_approx_result(
+        assert_approx_mid_result(
             &out,
             c,
             &expected,
@@ -1997,7 +2089,7 @@ fn test_mid_mul_dyn_school_path() {
 
         let expected = mid_mul_ref(&long, &short);
         let expected_carry = mid_mul_school_carry(&long, &short);
-        assert_approx_result(
+        assert_approx_mid_result(
             &out,
             c,
             &expected,
@@ -2022,7 +2114,7 @@ fn test_mid_mul_dyn_school_to_fft() {
 
             let expected = mid_mul_ref(&long, &short);
             let expected_carry = mid_mul_school_carry(&long, &short);
-            assert_approx_result(
+            assert_approx_mid_result(
                 &out,
                 c,
                 &expected,
@@ -2051,7 +2143,7 @@ fn test_mid_mul_dyn_fft_path() {
 
             let expected = mid_mul_ref(&long, &short);
             let expected_carry = mid_mul_school_carry(&long, &short);
-            assert_approx_result(
+            assert_approx_mid_result(
                 &out,
                 c,
                 &expected,
@@ -2072,7 +2164,7 @@ fn test_mid_mul_dyn_ntt_sparse_shift() {
     let mut out = vec![0u64; n];
     let c = mid_mul_dyn(&long, &short, &mut out);
 
-    assert_eq_result(&out, c, &short, 0, "mid_mul_dyn NTT sparse shift");
+    assert_eq_mid_result(&out, c, &short, (0, 0), "mid_mul_dyn NTT sparse shift");
 }
 
 #[test]
@@ -2087,7 +2179,7 @@ fn test_mid_mul_dyn_random_sweep() {
 
         let expected = mid_mul_ref(&long, &short);
         let expected_carry = mid_mul_school_carry(&long, &short);
-        assert_approx_result(
+        assert_approx_mid_result(
             &out,
             c,
             &expected,
@@ -2110,7 +2202,7 @@ fn test_mid_mul_static_matches_dyn() {
         let mut out_st = vec![0u64; n];
         let c_st = mid_mul_static::<64>(&long, &short, &mut out_st);
 
-        assert_eq_result(
+        assert_eq_mid_result(
             &out_dyn,
             c_dyn,
             &out_st,
@@ -2120,7 +2212,7 @@ fn test_mid_mul_static_matches_dyn() {
 
         let expected = mid_mul_ref(&long, &short);
         let expected_carry = mid_mul_school_carry(&long, &short);
-        assert_approx_result(
+        assert_approx_mid_result(
             &out_dyn,
             c_dyn,
             &expected,
@@ -2143,7 +2235,7 @@ fn test_ntt_mid_mul_static_direct_matches_dyn() {
         let mut out_st = vec![0u64; n];
         let c_st = ntt_mid_mul_static::<512>(&long, &short, &mut out_st);
 
-        assert_eq_result(
+        assert_eq_mid_result(
             &out_st,
             c_st,
             &out_dyn,
@@ -2153,7 +2245,7 @@ fn test_ntt_mid_mul_static_direct_matches_dyn() {
 
         let expected = mid_mul_ref(&long, &short);
         let expected_carry = mid_mul_school_carry(&long, &short);
-        assert_approx_result(
+        assert_approx_mid_result(
             &out_dyn,
             c_dyn,
             &expected,
@@ -2176,7 +2268,7 @@ fn test_ntt_mid_mul_static_split_matches_dyn() {
         let mut out_st = vec![0u64; n];
         let c_st = ntt_mid_mul_static::<98>(&long, &short, &mut out_st);
 
-        assert_eq_result(
+        assert_eq_mid_result(
             &out_st,
             c_st,
             &out_dyn,
@@ -2186,7 +2278,7 @@ fn test_ntt_mid_mul_static_split_matches_dyn() {
 
         let expected = mid_mul_ref(&long, &short);
         let expected_carry = mid_mul_school_carry(&long, &short);
-        assert_approx_result(
+        assert_approx_mid_result(
             &out_dyn,
             c_dyn,
             &expected,
@@ -2208,7 +2300,7 @@ fn test_ntt_mid_mul_dyn_matches_full_product_approximately() {
 
             let expected = mid_mul_ref(&long, &short);
             let expected_carry = mid_mul_school_carry(&long, &short);
-            assert_approx_result(
+            assert_approx_mid_result(
                 &out,
                 c,
                 &expected,
@@ -2232,7 +2324,7 @@ fn test_mid_mul_static_cutoff_approximately_matches_ntt() {
         let mut out_st = vec![0u64; n];
         let c_st = mid_mul_static::<256>(&long, &short, &mut out_st);
 
-        assert_approx_result(
+        assert_approx_mid_result(
             &out_st,
             c_st,
             &out_dyn,
@@ -2242,7 +2334,7 @@ fn test_mid_mul_static_cutoff_approximately_matches_ntt() {
 
         let expected = mid_mul_ref(&long, &short);
         let expected_carry = mid_mul_school_carry(&long, &short);
-        assert_approx_result(
+        assert_approx_mid_result(
             &out_dyn,
             c_dyn,
             &expected,

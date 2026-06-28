@@ -235,7 +235,7 @@ pub fn mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
 // Karatsuba: Omega(2l + 6log_2(l))
 // Chunking Karatsuba: Omega(4s + 6log_2(s))
 
-fn karatsuba_core(
+pub fn karatsuba_core(
     a: &[u64],
     b: &[u64],
     half: usize,       // (long + 1) / 2
@@ -898,30 +898,33 @@ fn decompose(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
     }
 }
 
+#[inline]
+fn fft_chunk_value(chunk: &[f64]) -> u128 {
+    let mut val = 0u128;
+    for (i, c) in chunk.iter().enumerate() {
+        val += (unsafe { c.to_int_unchecked::<u64>() } as u128) << (i * 16);
+    }
+    val
+}
+
+#[inline]
+fn fft_accumulate_limb(chunks: &mut std::slice::Chunks<'_, f64>, carry: &mut u128) -> u64 {
+    let total = *carry + fft_chunk_value(chunks.next().unwrap());
+    *carry = total >> 64;
+    total as u64
+}
+
 fn fft_accumulate(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
     let coefs = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const f64, x.len() * 2) };
     let mut chunks = coefs.chunks(4);
-    let mut carry: u128 = 0;
+    let mut carry = 0u128;
 
     for elem in out.iter_mut() {
-        let chunk = chunks.next().unwrap();
-        let mut tot = carry;
-        for (i, c) in chunk.iter().enumerate() {
-            let val = unsafe { c.to_int_unchecked::<u64>() } as u128;
-            tot += val << (i * 16);
-        }
-        *elem = tot as u64;
-        carry = tot >> 64;
+        *elem = fft_accumulate_limb(&mut chunks, &mut carry);
     }
-
-    // Drain any remaining chunk that didn't have a corresponding output limb
     for chunk in chunks {
-        for (i, c) in chunk.iter().enumerate() {
-            let val = unsafe { c.to_int_unchecked::<u64>() } as u128;
-            carry += val << (i * 16);
-        }
+        carry += fft_chunk_value(chunk);
     }
-
     carry as u64
 }
 
@@ -931,14 +934,32 @@ fn bit16_length(sz: usize, last: u64) -> usize {
 }
 
 pub fn fft_entry(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
-    let l_len = buf_len(&long);
-    let s_len = buf_len(&short);
+    let l_len = buf_len(long);
+    let s_len = buf_len(short);
+    if l_len == 0 || s_len == 0 {
+        out.fill(0);
+        return 0;
+    }
+
+    let long = &long[..l_len];
+    let short = &short[..s_len];
+    let (long, short) = if long.len() >= short.len() {
+        (long, short)
+    } else {
+        (short, long)
+    };
+    let out_len = long.len() + short.len() - 1;
+    debug_assert!(
+        out.len() >= out_len,
+        "out is not large enough for multiplication"
+    );
+    let (out_core, out_tail) = out.split_at_mut(out_len);
     let (l_len16, s_len16) = (
-        bit16_length(l_len, long[l_len - 1]),
-        bit16_length(s_len, short[s_len - 1]),
+        bit16_length(long.len(), long[long.len() - 1]),
+        bit16_length(short.len(), short[short.len() - 1]),
     );
     let n = find_fft_size(l_len16 + s_len16 - 1);
-    FFT_CACHE.with(|cell| {
+    let mut overflow = FFT_CACHE.with(|cell| {
         let fft_cache = &mut *cell.borrow_mut();
         let (fwd, bwd, tw, scratch_sz) = fft_cache.prep_mul(n);
         let mut scratch_gaurd = ScratchGuard::acquire();
@@ -948,8 +969,14 @@ pub fn fft_entry(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
 
         decompose(long, short, x);
         fft_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
-        fft_accumulate(&mut x[..n / 2], out)
-    })
+        fft_accumulate(&mut x[..n / 2], out_core)
+    });
+    if let Some((carry_limb, rest)) = out_tail.split_first_mut() {
+        *carry_limb = overflow;
+        rest.fill(0);
+        overflow = 0;
+    }
+    overflow
 }
 
 //NTT MULTIPLICATION
@@ -3035,10 +3062,23 @@ fn sqr_decompose(buf: &[u64], x: &mut [Complex<f64>]) {
 }
 
 pub fn fft_sqr_entry(buf: &[u64], out: &mut [u64]) -> u64 {
+    let len = buf_len(buf);
+    if len == 0 {
+        out.fill(0);
+        return 0;
+    }
+
+    let buf = &buf[..len];
+    let out_len = 2 * len - 1;
+    debug_assert!(
+        out.len() >= out_len,
+        "out is not large enough for multiplication"
+    );
+    let (out_core, out_tail) = out.split_at_mut(out_len);
     let bit_len = bit16_length(buf.len(), buf.last().copied().unwrap());
     let n = find_fft_size(2 * bit_len - 1);
     let m = n / 2;
-    FFT_CACHE.with(|cell| {
+    let mut overflow = FFT_CACHE.with(|cell| {
         let fft_cache = &mut *cell.borrow_mut();
         let (fwd, bwd, tw, scratch_sz) = fft_cache.prep_sqr(m);
         let mut scratch_gaurd = ScratchGuard::acquire();
@@ -3048,8 +3088,14 @@ pub fn fft_sqr_entry(buf: &[u64], out: &mut [u64]) -> u64 {
 
         sqr_decompose(buf, x);
         fft_sqr_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
-        fft_accumulate(x, out)
-    })
+        fft_accumulate(x, out_core)
+    });
+    if let Some((carry_limb, rest)) = out_tail.split_first_mut() {
+        *carry_limb = overflow;
+        rest.fill(0);
+        overflow = 0;
+    }
+    overflow
 }
 
 //NTT SQUARE
@@ -3519,67 +3565,66 @@ pub fn short_sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
 // gets the middle part n limbs of a n x 2n product
 // n: [0..n-1] x 2n-1: [0..2n-2] -> 3n-1: [0..3n-3] -> [n-1 .. 2n-2]
 
+#[inline]
+fn mul_column_parts(a: &[u64], b: &[u64], n: usize) -> (u64, u64, u64) {
+    let (mut acc0, mut acc1, mut acc2) = (0, 0, 0);
+    let out = mul_elem(a, b, n, &mut acc0, &mut acc1, &mut acc2);
+    (out, acc0, acc1)
+}
+
 pub fn middle_correction(long: &[u64], short: &[u64]) -> (u64, u64) {
     debug_assert!(long.len() == 2 * short.len() - 1);
     let n = short.len();
-    let (mut acc0, mut acc1, mut acc2) = (0, 0, 0);
-    mul_elem(
-        long,
-        short,
-        n.saturating_sub(3),
-        &mut acc0,
-        &mut acc1,
-        &mut acc2,
-    );
-    mul_elem(
-        long,
-        short,
-        n.saturating_sub(2),
-        &mut acc0,
-        &mut acc1,
-        &mut acc2,
-    );
+    let (_, acc0, acc1) = mul_column_parts(long, short, n.saturating_sub(2));
     return (acc0, acc1);
 }
 
-pub fn mid_mul_buf(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+pub fn mid_mul_buf(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
     // long (2n-1) , short (n)
     let (mut acc0, mut acc1) = middle_correction(long, short);
     let mut acc2: u64 = 0;
     let n = short.len();
-    for i in (n - 1)..=(2 * n - 2) {
-        out[i + 1 - n] = mul_elem(long, short, i, &mut acc0, &mut acc1, &mut acc2);
+    for (i, elem) in ((n - 1)..=(2 * n - 2)).zip(out) {
+        *elem = mul_elem(long, short, i, &mut acc0, &mut acc1, &mut acc2);
     }
-    return acc0;
+    return (acc0, acc1);
 }
 
-fn fft_accumulate_mid(x: &[Complex<f64>], out: &mut [u64], next_col_lo: u64) -> u64 {
+#[inline]
+fn add_mid_overflow(of: &mut (u64, u64), carry: bool) {
+    if carry {
+        let (lo, hi_carry) = of.0.overflowing_add(1);
+        of.0 = lo;
+        of.1 = of.1.wrapping_add(hi_carry as u64);
+    }
+}
+
+fn fft_accumulate_mid(
+    x: &[Complex<f64>],
+    out: &mut [u64],
+    next_col: (u64, u64),
+    next_next_col_lo: u64,
+) -> (u64, u64) {
     let coefs = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const f64, x.len() * 2) };
     let mut chunks = coefs.chunks(4);
     let mut carry: u128 = 0;
 
     for elem in out.iter_mut() {
-        let chunk = chunks.next().unwrap();
-        let mut tot = carry;
-        for (i, c) in chunk.iter().enumerate() {
-            let val = unsafe { c.to_int_unchecked::<u64>() } as u128;
-            tot += val << (i * 16);
-        }
-        *elem = tot as u64;
-        carry = tot >> 64;
+        *elem = fft_accumulate_limb(&mut chunks, &mut carry);
     }
 
-    let chunk = chunks.next().unwrap();
-    let mut next_limb = carry;
-    for (i, c) in chunk.iter().enumerate() {
-        let val = unsafe { c.to_int_unchecked::<u64>() } as u128;
-        next_limb += val << (i * 16);
-    }
+    let next_limb = fft_accumulate_limb(&mut chunks, &mut carry);
+    let next_next_limb = fft_accumulate_limb(&mut chunks, &mut carry);
 
-    (next_limb as u64).wrapping_sub(next_col_lo)
+    let (lo, carry_into_next) = next_limb.overflowing_sub(next_col.0);
+    let hi = next_next_limb
+        .wrapping_sub(next_next_col_lo)
+        .wrapping_sub(next_col.1)
+        .wrapping_sub(carry_into_next as u64);
+    (lo, hi)
 }
 
-pub fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+pub fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
     let sz = short.len();
     let (l_len, s_len, w) = (
         bit16_length(long.len(), long.last().copied().unwrap()),
@@ -3587,12 +3632,11 @@ pub fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
         4,
     );
     let start_coef = (sz - 1) * w;
-    let end_coef = (2 * sz) * w;
+    let end_coef = (2 * sz + 1) * w;
     let n = find_fft_size((l_len + s_len - start_coef - 1).max(end_coef));
-    let next_col_lo = {
-        let (mut acc0, mut acc1, mut acc2) = (0, 0, 0);
-        mul_elem(long, short, 2 * sz - 1, &mut acc0, &mut acc1, &mut acc2)
-    };
+    let (next_col_lo, next_col_hi, _) = mul_column_parts(long, short, 2 * sz - 1);
+    let (next_next_col_lo, _, _) = mul_column_parts(long, short, 2 * sz);
+    let next_col = (next_col_lo, next_col_hi);
     let mut of = FFT_CACHE.with(|cell| {
         let fft_cache = &mut *cell.borrow_mut();
         let (fwd, bwd, tw, scratch_sz) = fft_cache.prep_mul(n);
@@ -3603,22 +3647,17 @@ pub fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
 
         decompose(long, short, x);
         fft_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
-        fft_accumulate_mid(&x[start_coef / 2..end_coef / 2], out, next_col_lo)
+        fft_accumulate_mid(
+            &x[start_coef / 2..end_coef / 2],
+            out,
+            next_col,
+            next_next_col_lo,
+        )
     });
     let (c0, c1) = middle_correction(long, short);
-    of += add_prim(out, c0) as u64;
-    of += add_prim(&mut out[1..], c1) as u64;
+    add_mid_overflow(&mut of, add_prim(out, c0));
+    add_mid_overflow(&mut of, add_prim(&mut out[1..], c1));
     return of;
-}
-
-fn ntt_mid_accumulate(
-    res1: &mut [u64],
-    res2: &mut [u64],
-    res3: &mut [u64],
-    out: &mut [u64], // len == s
-    s: usize,
-) -> u64 {
-    ntt_mid_accumulate_scaled(res1, res2, res3, out, s, res1.len(), res2.len(), res3.len())
 }
 
 fn ntt_mid_accumulate_scaled(
@@ -3630,7 +3669,7 @@ fn ntt_mid_accumulate_scaled(
     n1: usize,
     n2: usize,
     n3: usize,
-) -> u64 {
+) -> (u64, u64) {
     let inv_n1 = Montgomery::to(n1 as u64).pow(P1::P - 2);
     let inv_n2 = Montgomery::to(n2 as u64).pow(P2::P - 2);
     let inv_n3 = Montgomery::to(n3 as u64).pow(P3::P - 2);
@@ -3652,7 +3691,8 @@ fn ntt_mid_accumulate_scaled(
     let of1 = add_buf(out, &res2[s - 2..2 * s - 2]) as u64;
     let of2 = add_buf(out, &res3[s - 3..2 * s - 3]) as u64;
 
-    res2[2 * s - 2] + res3[2 * s - 3] + of1 + of2
+    let lo = res2[2 * s - 2] as u128 + res3[2 * s - 3] as u128 + of1 as u128 + of2 as u128;
+    (lo as u64, res3[2 * s - 2].wrapping_add((lo >> 64) as u64))
 }
 
 fn acc_scaled_cyclic_convolution<const N: usize, P: NTTPrime>(
@@ -3742,7 +3782,7 @@ fn ntt_mid_static_convolution<const N: usize, P: NTTPrime>(
     }
 }
 
-pub fn ntt_mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+pub fn ntt_mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
     let sz = short.len();
     let n1 = find_ntt_size::<P1>(2 * sz - 1);
     let n2 = find_ntt_size::<P2>(2 * sz - 1);
@@ -3799,14 +3839,18 @@ pub fn ntt_mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
             conv3();
         }
     }
-    let mut of = ntt_mid_accumulate(res1, res2, res3, out, sz);
+    let mut of = ntt_mid_accumulate_scaled(res1, res2, res3, out, sz, n1, n2, n3);
     let (c0, c1) = middle_correction(long, short);
-    of += add_prim(out, c0) as u64;
-    of += add_prim(&mut out[1..], c1) as u64;
+    add_mid_overflow(&mut of, add_prim(out, c0));
+    add_mid_overflow(&mut of, add_prim(&mut out[1..], c1));
     return of;
 }
 
-pub fn ntt_mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+pub fn ntt_mid_mul_static<const N: usize>(
+    long: &[u64],
+    short: &[u64],
+    out: &mut [u64],
+) -> (u64, u64) {
     debug_assert_eq!(
         long.len(),
         2 * short.len() - 1,
@@ -3918,8 +3962,8 @@ pub fn ntt_mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut
         n3,
     );
     let (c0, c1) = middle_correction(long, short);
-    of += add_prim(out, c0) as u64;
-    of += add_prim(&mut out[1..], c1) as u64;
+    add_mid_overflow(&mut of, add_prim(out, c0));
+    add_mid_overflow(&mut of, add_prim(&mut out[1..], c1));
     return of;
 }
 
@@ -3939,7 +3983,7 @@ fn dyn_mid_dispatch(n: usize) -> DynMidDispatch {
     };
 }
 
-pub fn mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+pub fn mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
     debug_assert_eq!(
         long.len(),
         2 * short.len() - 1,
@@ -3957,7 +4001,7 @@ pub fn mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     }
 }
 
-pub fn mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+pub fn mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
     debug_assert_eq!(
         long.len(),
         2 * short.len() - 1,

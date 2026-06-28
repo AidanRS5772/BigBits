@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
-use big_bits::{utils::*, *};
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use big_bits::{utils::div::*, utils::*, *};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use rand::Rng;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -11,6 +11,30 @@ use std::{
 const ARCH: &'static str = std::env::consts::ARCH;
 
 pub type Point = (usize, usize);
+
+// Shared benchmark helpers.
+
+fn random_limbs(n: usize, rng: &mut impl Rng) -> Vec<u64> {
+    let mut limbs: Vec<u64> = (0..n).map(|_| rng.gen()).collect();
+    if let Some(last) = limbs.last_mut() {
+        *last |= 1;
+    }
+    limbs
+}
+
+fn random_normalized_limbs(n: usize, rng: &mut impl Rng) -> Vec<u64> {
+    let mut limbs = random_limbs(n, rng);
+    if let Some(last) = limbs.last_mut() {
+        *last |= 1 << 63;
+    }
+    limbs
+}
+
+fn duration_ratio(num: Duration, den: Duration) -> f64 {
+    num.as_nanos().max(1) as f64 / den.as_nanos().max(1) as f64
+}
+
+// Boundary search infrastructure.
 
 #[inline]
 fn neighbors(p: Point) -> impl Iterator<Item = Point> {
@@ -312,11 +336,7 @@ fn make_inputs(lengths: &Vec<(usize, usize)>) -> Vec<(Vec<u64>, Vec<u64>)> {
     let mut rng = rand::thread_rng();
     let mut inputs: Vec<(Vec<u64>, Vec<u64>)> = Vec::with_capacity(lengths.len());
     for (l, s) in lengths {
-        let input = (
-            (0..*l).map(|_| rng.gen()).collect(),
-            (0..*s).map(|_| rng.gen()).collect(),
-        );
-        inputs.push(input);
+        inputs.push((random_limbs(*l, &mut rng), random_limbs(*s, &mut rng)));
     }
     inputs
 }
@@ -331,8 +351,9 @@ fn ratio_bench(
     let mut ratio_sum = 0.0f64;
     for _ in 0..iters {
         for (l, s) in inputs.iter() {
-            let mut out_a = vec![0u64; l.len() + s.len()];
-            let mut out_b = vec![0u64; l.len() + s.len()];
+            let out_len = l.len() + s.len() - 1;
+            let mut out_a = vec![0u64; out_len];
+            let mut out_b = vec![0u64; out_len];
 
             let (t_a, t_b) = if rng.gen::<bool>() {
                 let t_a = {
@@ -360,7 +381,7 @@ fn ratio_bench(
                 (t_a, t_b)
             };
 
-            ratio_sum += t_a.as_nanos() as f64 / t_b.as_nanos() as f64;
+            ratio_sum += duration_ratio(t_a, t_b);
         }
     }
     let avg_ratio = ratio_sum / (inputs.len() as u64) as f64;
@@ -380,6 +401,8 @@ fn avg_input(lengths: &Vec<(usize, usize)>) -> (f64, f64) {
 
 const NUM_OF_LENGTHS: usize = 128;
 const GAP: u32 = 4;
+
+// Multiplication cutoff probes
 
 fn bench_school_to_chunking_karatsuba(c: &mut Criterion) {
     let lengths = BoundarySearch::new(|l, s| (s <= (l + 1) / 2) && (s > 2), |l, s| is_school(l, s))
@@ -421,6 +444,42 @@ fn bench_school_to_karatsuba(c: &mut Criterion) {
                 &inputs,
                 &mut |a, b, out| mul_buf(a, b, out),
                 &mut |a, b, out| karatsuba_entry_dyn(a, b, out),
+            )
+        })
+    });
+}
+
+fn karatsuba_mul_bench(a: &[u64], b: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
+    let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
+    let half = (long.len() + 1) / 2;
+    let (cross, rest) = scratch.split_at_mut(2 * half + 1);
+    karatsuba_core(long, short, half, out, cross, rest)
+}
+
+fn bench_karatsuba_cutoff(c: &mut Criterion) {
+    let lengths = BoundarySearch::new(
+        |l, s| (l >= s) && (s > (l + 1) / 2) && (s > 2),
+        |l, s| is_school(l, s),
+    )
+    .find((20, 18), NUM_OF_LENGTHS, GAP);
+    let inputs = make_inputs(&lengths);
+    assert!(!inputs.is_empty(), "find inputs failed");
+    println!("Average Input: {:?}", avg_input(&lengths));
+    println!("Number of Inputs: {}", inputs.len());
+    println!("KARATSUBA CUTOFF = {KARATSUBA_CUTOFF}");
+    let mut scratch = {
+        let (l, s) = avg_input(&lengths);
+        let sum = (l + s) as usize;
+        vec![0; 2 * sum]
+    };
+
+    c.bench_function(&format!("karatsuba_cutoff/{ARCH}"), |b| {
+        b.iter_custom(|iters| {
+            ratio_bench(
+                iters,
+                &inputs,
+                &mut |a, b, out| mul_buf(a, b, out),
+                &mut |a, b, out| karatsuba_mul_bench(a, b, out, &mut scratch),
             )
         })
     });
@@ -540,7 +599,7 @@ fn bench_static_karatsuba_to_ntt(c: &mut Criterion) {
     println!("NTT KARATSUBA CUTOFF = {NTT_KARATSUBA_CUTOFF}");
     let inputs = make_inputs(&lengths);
 
-    c.bench_function(&format!("static_chunking_karatsuba_to_ntt/{ARCH}"), |b| {
+    c.bench_function(&format!("static_karatsuba_to_ntt/{ARCH}"), |b| {
         b.iter_custom(|iters| {
             ratio_bench(
                 iters,
@@ -558,7 +617,7 @@ fn make_sqr_inputs(sz: usize, amt: usize) -> Vec<Vec<u64>> {
     let max = sz + amt / 2;
     let mut inputs: Vec<Vec<u64>> = Vec::with_capacity(amt);
     for i in min..max {
-        inputs.push((0..i).map(|_| rng.gen()).collect());
+        inputs.push(random_limbs(i, &mut rng));
     }
     return inputs;
 }
@@ -573,33 +632,35 @@ fn sqr_ratio_bench(
     let mut ratio_sum = 0.0f64;
     for _ in 0..iters {
         for buf in inputs.iter() {
-            let mut out = vec![0u64; 2 * buf.len()];
+            let out_len = 2 * buf.len() - 1;
+            let mut out_a = vec![0u64; out_len];
+            let mut out_b = vec![0u64; out_len];
             let (t_a, t_b) = if rng.gen::<bool>() {
                 let t_a = {
                     let start = Instant::now();
-                    func_a(black_box(buf), black_box(&mut out));
+                    func_a(black_box(buf), black_box(&mut out_a));
                     start.elapsed()
                 };
                 let t_b = {
                     let start = Instant::now();
-                    func_b(black_box(buf), black_box(&mut out));
+                    func_b(black_box(buf), black_box(&mut out_b));
                     start.elapsed()
                 };
                 (t_a, t_b)
             } else {
                 let t_b = {
                     let start = Instant::now();
-                    func_a(black_box(buf), black_box(&mut out));
+                    func_b(black_box(buf), black_box(&mut out_b));
                     start.elapsed()
                 };
                 let t_a = {
                     let start = Instant::now();
-                    func_b(black_box(buf), black_box(&mut out));
+                    func_a(black_box(buf), black_box(&mut out_a));
                     start.elapsed()
                 };
                 (t_a, t_b)
             };
-            ratio_sum += t_a.as_nanos().min(1) as f64 / t_b.as_nanos() as f64;
+            ratio_sum += duration_ratio(t_a, t_b);
         }
     }
     let avg_ratio = ratio_sum / (inputs.len() as u64) as f64;
@@ -624,16 +685,18 @@ fn bench_sqr_school_to_fft(c: &mut Criterion) {
     });
 }
 
+// Criterion setup.
+
 fn cutoff_criterion() -> Criterion {
     Criterion::default()
         .sample_size(250)
         .warm_up_time(Duration::from_secs(5))
-        .measurement_time(Duration::from_secs(90))
+        .measurement_time(Duration::from_secs(10))
 }
 
 criterion_group! {
     name = benches;
     config = cutoff_criterion();
-    targets = bench_static_karatsuba_to_ntt
+    targets = bench_karatsuba_cutoff
 }
 criterion_main!(benches);

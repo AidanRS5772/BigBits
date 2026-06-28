@@ -19,6 +19,8 @@ BigBits is a Rust 2021 crate for big integer and big float arithmetic. Core sour
 
 Use standard Rust formatting: run `cargo fmt` before submitting changes. Prefer `snake_case` for functions, modules, variables, and test names; use `UpperCamelCase` for types and traits; use `SCREAMING_SNAKE_CASE` for constants such as algorithm cutoffs. Keep performance-sensitive changes close to the existing utils-layer patterns, and avoid introducing heap allocation in static-number paths unless it is intentional and measured. Do not use `_bench_internals` outside benchmark code.
 
+Keep benchmark-only wrappers, forced-cutoff probes, and measurement helpers in `benches/` rather than production modules. If a benchmark needs access to an internal algorithm stage, prefer making the existing production function public over adding benchmark-specific code to `src/`.
+
 ## Testing Guidelines
 
 Add focused tests under `src/tests/`, grouped by module (`test_mul.rs`, `test_div.rs`, `test_utils.rs`). Use deterministic edge cases for carry, borrow, zero trimming, and boundary behavior, then add randomized checks where existing helpers such as `rand_vec`, `rand_nonzero_vec`, or `to_u128` fit. Run `cargo test` before opening a PR. For algorithm cutoff or performance work, also run the relevant Criterion benchmark alias.
