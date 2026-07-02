@@ -50,10 +50,15 @@ benches/         ← Criterion benchmarks
 
 All algorithms operate on `Vec<u64>` limb arrays (little-endian: index 0 is the least significant limb).
 
-- **`mul.rs`** — Multiplication with dynamic dispatch: schoolbook → Karatsuba → FFT (via `rustfft`) → NTT. Assembly primitives (`mul_prim_asm`, `mul_asm_x86`, `mul_asm_aarch`) handle 64×64→128-bit multiply.
-- **`div.rs`** — Knuth normalized division (`div_buf_of`), primitive single-limb divide (`div_prim`), Burnikel-Ziegler divide-and-conquer.
+- **`mul.rs`** — Multiplication with dynamic dispatch: schoolbook → Karatsuba → FFT (via `rustfft`) → NTT. Assembly primitives (`mul_prim_asm`, `mul_asm_x86`, `mul_asm_aarch`) handle 64×64→128-bit multiply. Also provides "short"/"middle-product" variants (`short_mul_buf/dyn/static`, `mid_mul_buf/dyn`) that compute only a limb-range of a full product — these back the Newton-Raphson reciprocal refinement in `div.rs`.
+- **`div.rs`** — Three division strategies, layered:
+  1. `div_buf_of` — Knuth normalized schoolbook division (with `div_prim` for single-limb divisors).
+  2. `div_2_1`/`div_3_2`/`bz_div_dyn`/`bz_div_static` — Burnikel-Ziegler divide-and-conquer, falling back to Knuth below `BZ_CUTOFF`.
+  3. `nr_div_dyn`/`nr_rcp_dyn` — Newton-Raphson reciprocal division: seeds a precision-1 reciprocal with a tiny Knuth division (`div_buf_of` on the top 3 limbs of `d`), then follows the backward ceiling-halving schedule from `nr_rcp_schedule` — each `nr_rcp_refine_step_dyn` either doubles precision or doubles-minus-one-limb (`trunc` flag), so the chain lands exactly on the requested precision with no oversized final iteration. Refinement uses the middle-product primitives from `mul.rs` (`bz_rcp_seed_dyn` remains only as the reseed fallback when a refine step bails), finishing with a guard-limb quotient correction (`nr_rem_correction`).
+
+  This is under active rework (see recent commits on the `nr_opt` branch). The top-level dispatch entry points `div_vec`/`div_arr` are currently dummy stubs (`Vec::new()`/`[0; N]`) — `UBitInt::div_rem` calls `div_vec` and will not produce correct results until dispatch is wired up. Exercise the algorithms directly (`div_buf_of`, `bz_div_dyn`, `nr_div_dyn`, etc.) as `src/tests/test_div.rs` does, not through the bit_nums layer.
 - **`utils.rs`** — Buffer helpers: `trim_lz`, `add_buf`, `sub_buf`, `cmp_buf`, `eq_buf`, `combine_u64`, etc.
-- **`mod.rs`** — Algorithm cutoff constants and `ScratchGuard`, a thread-local RAII scratch-buffer pool that reuses allocations across recursive calls. Key constants: `KARATSUBA_CUTOFF: f64 = 19.5`, `FFT_KARATSUBA_CUTOFF: f64 = 1.92`, `FFT_16BIT_CUTOFF: usize = 1<<16`, `NTT_PARALLEL_CUTOFF: usize = 320`, `BZ_CUTOFF: usize = 64`. Many NTT/squaring cutoffs are marked `// GUESS` and are candidates for tuning via `cutoffs_bench`.
+- **`mod.rs`** — Algorithm cutoff constants and `ScratchGuard`, a thread-local RAII scratch-buffer pool that reuses allocations across recursive calls (`get_splits` carves one acquired buffer into several disjoint mutable slices). Key constants: `KARATSUBA_CUTOFF: f64 = 17.0`, `FFT_KARATSUBA_CUTOFF: f64 = 1.92`, `FFT_16BIT_CUTOFF: usize = 1<<16`, `BZ_CUTOFF: usize = 88`. NTT parallelization has four separate cutoffs (`NTT_PAR_CUTOFF_NTT_CONV/_NTT/_NTT_3/_NTT_5`) for its different radix paths. Many NTT/squaring cutoffs are marked `// GUESS` and are candidates for tuning via `cutoffs_bench`.
 
 ### Algorithm dispatch in multiplication
 
@@ -99,16 +104,16 @@ NTT supports radix-2, radix-3, and radix-5 butterflies to handle transform sizes
 ### Test suite (`src/tests/`)
 
 - `mod.rs` — Shared helpers: `rand_vec`, `rand_nonzero_vec`, `to_u128`
-- `test_mul.rs` — Tests `mul_prim`, `mul_buf`, `mul_vec`, squaring; includes boundary-finder utilities for locating algorithm transition points
-- `test_div.rs` — Tests `div_prim`, `div_buf_of`, BZ division
+- `test_mul.rs` — Tests `mul_prim`, `mul_buf`, `mul_vec`, squaring, short/middle-product multiply; includes boundary-finder utilities for locating algorithm transition points
+- `test_div.rs` — Tests `div_prim`, `div_buf_of`, BZ division (including forced top-block path and cost-model monotonicity checks), and the Newton-Raphson reciprocal/division path
 - `test_utils.rs` — Tests all buffer utility functions
 
-**Known source bugs** (do not fix without explicit instruction): `sqr_arr` OOB, `sqr_buf` loop bound, `div_buf_of` OOB, `bz_div_init` formula, recursive BZ odd-length divisor. Tests that hit these are expected to fail at runtime; this documents real source bugs.
+**Known source bugs** (do not fix without explicit instruction):
+- `karatsuba_entry_dyn`'s chunking path panics (`lhs must be longer then rhs` from `add_buf`) for certain unbalanced long/short input sizes — see `test_karatsuba_entry_unbalanced` in `test_mul.rs` (currently failing).
+- `powi_vec(&[3], 1)` returns `[9]`; expected `[3]`. Suspected cause: `reverse_pow` encodes the exponent one step too high, so the powi core squares for exponent 1. Regression documented via `#[should_panic]` in `test_powi_non_identity_regression`.
+- `powi_vec(&[3], 0)` panics with an index-out-of-bounds write; expected `[1]`. Suspected cause: `powi_sz` returns max size `0`, so `powi_vec` allocates an empty output before `powi_dyn_entry` writes `out[0]`. Regression documented via `#[should_panic]` in `test_powi_vec_zero_regression`.
 
-Multiplication bug reports from coverage work:
-- `powi_vec(&[3], 1)` returns `[9]`; expected `[3]`. Suspected cause: `reverse_pow` encodes the exponent one step too high, so the powi core squares for exponent 1.
-- `powi_vec(&[3], 0)` panics with an index-out-of-bounds write; expected `[1]`. Suspected cause: `powi_sz` returns max size `0`, so `powi_vec` allocates an empty output before `powi_dyn_entry` writes `out[0]`.
-- `short_sqr_buf(&[1, 1], &mut [0; 3])` returns buffer `[1, 2, 0]` with carry `0`; expected `[1, 2, 1]` with carry `0`. Suspected cause: the loop stops before the final square column and returns the wrong final limb for full-product output.
+Run `cargo test --lib` to see current pass/fail status — as of this writing only `test_karatsuba_entry_unbalanced` fails unexpectedly; the powi issues are wrapped in `#[should_panic]` so they show as passing.
 
 ### Compile-time constraints
 

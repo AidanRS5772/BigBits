@@ -3,10 +3,7 @@ use std::{arch::asm, cmp};
 
 use rustfft::num_traits::zero;
 
-use crate::utils::{
-    mul::*, utils::*, ScratchGuard, BZ_CUTOFF, FFT_16BIT_CUTOFF, FFT_CHUNKING_KARATSUBA_CUTOFF,
-    FFT_KARATSUBA_CUTOFF, FFT_MID_CUTOFF, NR_DIRECT_SEED_CUTOFF, SHORT_MUL_CUTOFF,
-};
+use crate::utils::{mul::*, utils::*, ScratchGuard, BZ_CUTOFF, BZ_TOP_PADDED_COST_SCALE};
 
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
@@ -95,7 +92,7 @@ unsafe fn sub_mul_of_aarch(win: *mut u64, of: *mut u64, d: *const u64, q: u64, l
     );
     overflow != 0
 }
-
+// TODO: Need to impliment assembly version for x86
 #[inline(always)]
 unsafe fn sub_mul_of_asm(win: *mut u64, of: *mut u64, d: *const u64, q: u64, len: usize) -> bool {
     #[cfg(target_arch = "aarch64")]
@@ -260,7 +257,7 @@ pub fn div_3_2(
     }
 }
 
-fn div_2_1(
+pub fn div_2_1(
     n: &mut [u64],
     d: &[u64],
     q: &mut [u64],
@@ -302,15 +299,35 @@ fn bz_div_alg(
     }
 }
 
-fn use_bz_for_top_block(dlen: usize, qlen: usize) -> bool {
+pub fn bz_top_block_knuth_work(dlen: usize, qlen: usize) -> f64 {
+    (dlen as f64) * (qlen as f64)
+}
+
+pub fn bz_top_block_padded_work(d: usize) -> f64 {
+    const SCHOOL_TO_KARATSUBA: f64 = 3.394147384;
+    const KARATSUBA_TO_FFT: f64 = 2.733850808;
+    match dyn_dispatch(d, d) {
+        DynDispatch::Prim | DynDispatch::Prim2 | DynDispatch::School => d as f64 * d as f64,
+        DynDispatch::Karatsuba => SCHOOL_TO_KARATSUBA * (d as f64).powf(1.5849625007),
+        DynDispatch::FFT | DynDispatch::NTT => {
+            KARATSUBA_TO_FFT * (d as f64) * (d as f64).log2() * (d as f64).log2()
+        }
+    }
+}
+
+pub fn use_bz_for_top_block_with_scale(dlen: usize, qlen: usize, padded_cost_scale: f64) -> bool {
     if dlen <= BZ_CUTOFF {
         return false;
     }
+    if qlen == 0 {
+        return false;
+    }
 
-    // TODO: Experimentally tune this as a 2D boundary over (dlen, qlen).
-    // The benchmark should include the multiplication algorithm transitions
-    // reached by the recursive div_2_1 calls.
-    qlen >= (dlen + 1) / 2
+    padded_cost_scale * bz_top_block_padded_work(dlen) <= bz_top_block_knuth_work(dlen, qlen)
+}
+
+pub fn use_bz_for_top_block(dlen: usize, qlen: usize) -> bool {
+    use_bz_for_top_block_with_scale(dlen, qlen, BZ_TOP_PADDED_COST_SCALE)
 }
 
 fn bz_div_init_static<const N: usize>(
@@ -460,42 +477,32 @@ pub fn bz_div_static<const N: usize>(n: &mut [u64], d: &mut [u64], out: &mut [u6
 }
 
 #[inline(always)]
-fn end_ref(buf: &[u64], idx: usize) -> &[u64] {
+pub fn end_ref(buf: &[u64], idx: usize) -> &[u64] {
     &buf[buf.len().saturating_sub(idx)..]
 }
 
 #[inline(always)]
-fn end_mut(buf: &mut [u64], idx: usize) -> &mut [u64] {
+pub fn end_mut(buf: &mut [u64], idx: usize) -> &mut [u64] {
     let len = buf.len();
     &mut buf[len.saturating_sub(idx)..]
 }
 
-#[inline]
-fn odd_part(n: usize) -> usize {
-    n >> n.trailing_zeros()
+// Backward ceiling-halving schedule: sizes[0] = p_target, sizes[i+1] = ceil(sizes[i]/2),
+// stopping above precision 1. Walked in reverse every step is p -> 2p (even target)
+// or p -> 2p-1 (odd target, one truncated limb), so the chain lands exactly on
+// p_target with no oversized final iteration.
+pub fn nr_rcp_schedule(p_target: usize, sizes: &mut [usize; 64]) -> usize {
+    let mut steps = 0;
+    let mut q = p_target;
+    while q > 1 {
+        sizes[steps] = q;
+        steps += 1;
+        q = (q + 1) >> 1;
+    }
+    steps
 }
 
-pub fn nr_rcp_seed_plan(rcp_len: usize, seed_cutoff: usize) -> (usize, usize, usize) {
-    let seed_cutoff = seed_cutoff.max(1);
-    let target = rcp_len / 2;
-    if target <= 1 {
-        let final_p = 1;
-        return (1, final_p, (2 * final_p + 1).saturating_sub(rcp_len));
-    }
-
-    let mut final_p = target;
-    while odd_part(final_p) > seed_cutoff {
-        final_p += 1;
-    }
-
-    let mut start_p = final_p;
-    while start_p > seed_cutoff {
-        start_p >>= 1;
-    }
-    (start_p, final_p, 2 * final_p + 1 - rcp_len)
-}
-
-fn mid_mul_sign_ext(d: &[u64], x: &[u64], e: &mut [u64], p: usize) -> Option<(bool, usize)> {
+pub fn mid_mul_sign_ext(d: &[u64], x: &[u64], e: &mut [u64], p: usize) -> Option<(bool, usize)> {
     let mut e_idx = p + 1;
     let (mut acc0, mut acc1) = mid_mul_dyn(d, x, &mut e[..e_idx]);
     let mut acc2 = 0;
@@ -511,7 +518,7 @@ fn mid_mul_sign_ext(d: &[u64], x: &[u64], e: &mut [u64], p: usize) -> Option<(bo
     Some((val == u64::MAX, e_idx))
 }
 
-fn bz_rcp_seed_dyn(d: &[u64], rcp: &mut [u64]) {
+pub fn bz_rcp_seed_dyn(d: &[u64], rcp: &mut [u64]) {
     if rcp.is_empty() {
         return;
     }
@@ -532,74 +539,98 @@ fn bz_rcp_seed_dyn(d: &[u64], rcp: &mut [u64]) {
     inc_buf(rcp);
 }
 
-pub fn nr_rcp_dyn_with_seed_cutoff(denom: &mut [u64], rcp: &mut [u64], seed_cutoff: usize) {
+// Refines rcp from precision p to 2p (trunc = false) or 2p - 1 (trunc = true,
+// dropping the lowest limb of the correction).
+pub fn nr_rcp_refine_step_dyn(
+    d: &[u64],
+    rcp: &mut [u64],
+    err: &mut [u64],
+    cor: &mut [u64],
+    p: usize,
+    trunc: bool,
+) -> bool {
+    let skip = trunc as usize;
+    debug_assert!(rcp.len() + skip == 2 * p + 1);
+
+    let x = end_ref(rcp, p + 1);
+    let Some((neg, e_len)) = mid_mul_sign_ext(d, x, err, p) else {
+        return false;
+    };
+
+    let extra = e_len - p - 1;
+    let c = &mut cor[..e_len];
+    c[e_len - 1] = short_mul_dyn(x, &err[..e_len], &mut c[..e_len - 1]);
+    if neg {
+        sub_buf(&mut c[extra..], x);
+        twos_comp(c);
+        add_buf(rcp, &c[skip..]);
+    } else {
+        sub_buf(rcp, &c[skip..]);
+    }
+
+    true
+}
+
+pub fn nr_rcp_dyn(denom: &mut [u64], rcp: &mut [u64]) {
+    if rcp.is_empty() {
+        return;
+    }
+
     rcp.fill(0);
     let sh = denom[denom.len() - 1].leading_zeros() as u8;
     shl_buf(denom, sh);
 
-    let (start_p, final_p, _) = nr_rcp_seed_plan(rcp.len(), seed_cutoff);
-    let err_len = 2 * final_p + 1;
-    let cor_len = rcp.len().max(err_len);
-    let d_len = 2 * final_p + 1;
+    let mut sizes = [0usize; 64];
+    let steps = nr_rcp_schedule(rcp.len() - 1, &mut sizes);
+
+    // The widest step reads d at 2p+1 limbs for its input precision p, and
+    // mid_mul_sign_ext can write one limb past 2p+1 before bailing out. The seed
+    // numerator holds B^(seed_r + 2) for a seed_r limb quotient.
+    let pen_p = if steps >= 2 { sizes[1] } else { 1 };
+    let d_len = 2 * pen_p + 1;
+    let err_len = 2 * pen_p + 2;
+    let seed_r = rcp.len().min(2);
 
     let mut scratch = ScratchGuard::acquire();
-    let (err, cor, d_work) = if d_len < denom.len() {
-        let [err, cor] = scratch.get_splits([err_len, cor_len]);
-        (err, cor, end_mut(denom, d_len))
+    let (err, cor, seed_n, d_work) = if d_len < denom.len() {
+        let [err, cor, seed_n] = scratch.get_splits([err_len, err_len, seed_r + 2]);
+        (err, cor, seed_n, end_mut(denom, d_len))
     } else {
-        let [err, cor, d_work] = scratch.get_splits([err_len, cor_len, d_len]);
+        let [err, cor, seed_n, d_work] = scratch.get_splits([err_len, err_len, seed_r + 2, d_len]);
         let d_idx = d_len - denom.len();
         d_work[..d_idx].fill(0);
         d_work[d_idx..].copy_from_slice(denom);
-        (err, cor, d_work)
+        (err, cor, seed_n, d_work)
     };
 
-    bz_rcp_seed_dyn(end_ref(d_work, 2 * start_p + 1), end_mut(rcp, start_p + 1));
-    let mut p = start_p;
+    // Precision-1 seed: floor(B^(seed_r + 2) / top 3 limbs of d) + 1 by knuth division.
+    seed_n.fill(0);
+    let mut seed_of = 1;
+    div_buf_of(
+        seed_n,
+        &mut seed_of,
+        end_ref(d_work, 3),
+        end_mut(rcp, seed_r),
+    );
+    inc_buf(end_mut(rcp, seed_r));
 
-    while 2 * p + 1 < rcp.len() {
-        let x = end_ref(rcp, p + 1);
-        let Some((neg, e_len)) = mid_mul_sign_ext(end_ref(d_work, 2 * p + 1), x, err, p) else {
-            p *= 2;
-            bz_rcp_seed_dyn(end_ref(d_work, 2 * p + 1), end_mut(rcp, p + 1));
-            continue;
-        };
-        let extra = e_len - p - 1;
-        let c = &mut cor[..e_len];
-        c[e_len - 1] = short_mul_dyn(end_ref(rcp, p + 1), &err[..e_len], &mut c[..e_len - 1]);
-        if neg {
-            sub_buf(&mut c[extra..], x);
-            twos_comp(c);
-            add_buf(end_mut(rcp, 2 * p + 1), c);
-        } else {
-            sub_buf(end_mut(rcp, 2 * p + 1), c);
+    let mut p = 1;
+    for &q in sizes[..steps].iter().rev() {
+        if !nr_rcp_refine_step_dyn(
+            end_ref(d_work, 2 * p + 1),
+            end_mut(rcp, q + 1),
+            err,
+            cor,
+            p,
+            q & 1 == 1,
+        ) {
+            bz_rcp_seed_dyn(end_ref(d_work, (2 * q + 1).min(d_len)), end_mut(rcp, q + 1));
         }
-        p *= 2;
-    }
-
-    let x = end_ref(rcp, p + 1);
-    if let Some((neg, e_len)) = mid_mul_sign_ext(end_ref(d_work, 2 * p + 1), x, err, p) {
-        let extra = e_len - p - 1;
-        let skip = 2 * p + 1 - rcp.len();
-        let c = &mut cor[..e_len];
-        c[e_len - 1] = short_mul_dyn(end_ref(rcp, p + 1), &err[..e_len], &mut c[..e_len - 1]);
-        if neg {
-            sub_buf(&mut c[extra..], x);
-            twos_comp(c);
-            add_buf(rcp, &mut c[skip..]);
-        } else {
-            sub_buf(rcp, &mut c[skip..]);
-        }
-    } else {
-        bz_rcp_seed_dyn(end_ref(d_work, 2 * p + 1), rcp);
+        p = q;
     }
 
     shr_buf(denom, sh);
     shl_buf(rcp, sh);
-}
-
-pub fn nr_rcp_dyn(denom: &mut [u64], rcp: &mut [u64]) {
-    nr_rcp_dyn_with_seed_cutoff(denom, rcp, NR_DIRECT_SEED_CUTOFF);
 }
 
 fn nr_rem_correction(n: &mut [u64], d: &mut [u64], q: &mut [u64], prod: &mut [u64]) {
@@ -614,11 +645,11 @@ fn nr_rem_correction(n: &mut [u64], d: &mut [u64], q: &mut [u64], prod: &mut [u6
     }
 }
 
-pub fn nr_div_dyn_with_seed_cutoff(n: &[u64], d: &mut [u64], q: &mut [u64], seed_cutoff: usize) {
+pub fn nr_div_dyn(n: &[u64], d: &mut [u64], q: &mut [u64]) {
     const GAURD: usize = 3;
     let mut scratch = ScratchGuard::acquire();
     let [rcp, gaurded_q] = scratch.get_splits([q.len() + GAURD + 1, q.len() + GAURD]);
-    nr_rcp_dyn_with_seed_cutoff(d, rcp, seed_cutoff);
+    nr_rcp_dyn(d, rcp);
     gaurded_q[q.len() + GAURD - 1] =
         short_mul_dyn(n, &rcp[1..], &mut gaurded_q[..q.len() + GAURD - 1]);
     let gaurd = &gaurded_q[..GAURD];
@@ -628,10 +659,6 @@ pub fn nr_div_dyn_with_seed_cutoff(n: &[u64], d: &mut [u64], q: &mut [u64], seed
         num.copy_from_slice(n);
         nr_rem_correction(num, d, q, prod);
     }
-}
-
-pub fn nr_div_dyn(n: &[u64], d: &mut [u64], q: &mut [u64]) {
-    nr_div_dyn_with_seed_cutoff(n, d, q, NR_DIRECT_SEED_CUTOFF);
 }
 
 // Dummy Functions for now as I change stuff

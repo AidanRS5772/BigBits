@@ -2649,7 +2649,8 @@ pub fn is_karatsuba(l: usize, s: usize, chunk: f64, reg: f64) -> bool {
     }
 }
 
-enum DynDispatch {
+#[derive(Debug)]
+pub enum DynDispatch {
     Prim,
     Prim2,
     School,
@@ -2658,7 +2659,7 @@ enum DynDispatch {
     NTT,
 }
 
-fn dyn_dispatch(l: usize, s: usize) -> DynDispatch {
+pub fn dyn_dispatch(l: usize, s: usize) -> DynDispatch {
     if s == 1 {
         DynDispatch::Prim
     } else if s == 2 {

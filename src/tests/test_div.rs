@@ -1,7 +1,8 @@
 use super::{rand_nonzero_vec, to_u128, verify_divmod};
 use crate::utils::div::*;
+use crate::utils::mul::mul_dyn;
 use crate::utils::utils::{cmp_buf, shl_buf, shr_buf, sub_buf, trim_lz};
-use crate::utils::BZ_CUTOFF;
+use crate::utils::{ScratchGuard, BZ_CUTOFF, BZ_TOP_PADDED_COST_SCALE};
 
 // ─── div_prim ───────────────────────────────────────────────────────────────
 
@@ -121,6 +122,30 @@ fn run_knuth_div_buf_of(n: &[u64], d: &[u64]) -> (Vec<u64>, Vec<u64>) {
     shr_buf(&mut n_work, sh);
 
     (q, n_work)
+}
+
+fn run_bz_top_block_knuth(n: &mut [u64], d: &[u64], out: &mut [u64]) {
+    let mut of = 0;
+    div_buf_of(n, &mut of, d, out);
+    assert_eq!(of, 0, "top-block Knuth overflow limb should be zero");
+}
+
+fn run_bz_top_block_padded(n: &mut [u64], d: &[u64], out: &mut [u64]) {
+    let dlen = d.len();
+    let qlen = out.len();
+    let mut scratch = ScratchGuard::acquire();
+    let [top_n, q_tmp, div_scratch] = scratch.get_splits([2 * dlen, dlen, dlen]);
+
+    top_n[..n.len()].copy_from_slice(n);
+    top_n[n.len()..].fill(0);
+
+    div_2_1(top_n, d, q_tmp, div_scratch, &mut |n, d, q| {
+        mul_dyn(n, d, q);
+    });
+
+    out.copy_from_slice(&q_tmp[..qlen]);
+    n.fill(0);
+    n[..dlen].copy_from_slice(&top_n[..dlen]);
 }
 
 fn assert_quotient_algorithm(name: &str, n: &[u64], d: &[u64], q: &[u64]) {
@@ -308,6 +333,68 @@ fn test_burnikel_ziegler_static_top_block_shapes() {
 }
 
 #[test]
+fn test_burnikel_ziegler_top_block_cost_model_is_monotone() {
+    for d_len in [BZ_CUTOFF, BZ_CUTOFF + 8, 192, 512, 1024] {
+        assert!(!use_bz_for_top_block(d_len, 0));
+        if d_len <= BZ_CUTOFF {
+            assert!(!use_bz_for_top_block(d_len, d_len));
+            continue;
+        }
+
+        let mut seen_bz = false;
+        for q_len in 1..=d_len {
+            let use_bz = use_bz_for_top_block(d_len, q_len);
+            assert_eq!(
+                use_bz,
+                BZ_TOP_PADDED_COST_SCALE * bz_top_block_padded_work(d_len)
+                    <= bz_top_block_knuth_work(d_len, q_len)
+            );
+            assert!(
+                !seen_bz || use_bz,
+                "BZ top-block dispatch should stay true after d_len={d_len}, q_len={q_len}"
+            );
+            seen_bz |= use_bz;
+        }
+    }
+}
+
+#[test]
+fn test_burnikel_ziegler_forced_top_block_paths_match() {
+    let cases = [
+        (BZ_CUTOFF + 8, 1usize),
+        (BZ_CUTOFF + 8, (BZ_CUTOFF + 8) / 2),
+        (BZ_CUTOFF + 8, BZ_CUTOFF + 8),
+        (192, 17),
+        (384, 192),
+    ];
+
+    for (idx, &(d_len, q_len)) in cases.iter().enumerate() {
+        let n_len = d_len + q_len - 1;
+        let n = rand_nonzero_vec(n_len, 9000 + idx as u64);
+        let mut d = rand_nonzero_vec(d_len, 9100 + idx as u64);
+        d[d_len - 1] |= 1 << 63;
+
+        let mut n_knuth = n.clone();
+        let mut n_bz = n.clone();
+        let mut q_knuth = vec![0u64; q_len];
+        let mut q_bz = vec![0u64; q_len];
+
+        run_bz_top_block_knuth(&mut n_knuth, &d, &mut q_knuth);
+        run_bz_top_block_padded(&mut n_bz, &d, &mut q_bz);
+
+        assert_eq!(q_bz, q_knuth, "forced top quotient mismatch");
+        assert_eq!(n_bz, n_knuth, "forced top remainder mismatch");
+        assert_divmod_algorithm(
+            &format!("forced top block d_len={d_len} q_len={q_len}"),
+            &n,
+            &d,
+            &q_bz,
+            &n_bz,
+        );
+    }
+}
+
+#[test]
 fn test_burnikel_ziegler_varied_mul_sizes() {
     const STATIC_N: usize = 2048;
 
@@ -357,11 +444,73 @@ fn test_burnikel_ziegler_varied_mul_sizes() {
 }
 
 #[test]
-fn test_newton_raphson_seed_plan_uses_cutoff_to_reduce_waste() {
-    assert_eq!(nr_rcp_seed_plan(1028, 15), (9, 576, 125));
-    assert_eq!(nr_rcp_seed_plan(1028, 127), (65, 520, 13));
-    assert_eq!(nr_rcp_seed_plan(1028, 511), (257, 514, 1));
-    assert_eq!(nr_rcp_seed_plan(20, usize::MAX), (10, 10, 1));
+fn test_newton_raphson_schedule_lands_exactly_on_target() {
+    let mut sizes = [0usize; 64];
+
+    let steps = nr_rcp_schedule(12, &mut sizes);
+    assert_eq!(&sizes[..steps], &[12, 6, 3, 2]);
+
+    let steps = nr_rcp_schedule(1027, &mut sizes);
+    assert_eq!(&sizes[..steps], &[1027, 514, 257, 129, 65, 33, 17, 9, 5, 3, 2]);
+
+    assert_eq!(nr_rcp_schedule(0, &mut sizes), 0);
+    assert_eq!(nr_rcp_schedule(1, &mut sizes), 0);
+
+    // Forward from precision 1, every step must double or double-minus-one-limb
+    // and the chain must land exactly on the target.
+    for p_target in 2usize..=600 {
+        let steps = nr_rcp_schedule(p_target, &mut sizes);
+        assert_eq!(sizes[0], p_target);
+        let mut p = 1;
+        for &q in sizes[..steps].iter().rev() {
+            assert!(
+                q == 2 * p || q == 2 * p - 1,
+                "p_target={p_target} p={p} q={q}"
+            );
+            p = q;
+        }
+        assert_eq!(p, p_target);
+    }
+}
+
+#[test]
+fn test_newton_raphson_div_dyn_trim_schedule_sweep() {
+    // Contiguous q_len sweep hits every trim pattern in the reciprocal schedule
+    // (p_target = q_len + 3), with both the padded and sliced d_work paths.
+    for q_len in 2usize..=34 {
+        for (case, d_len) in [(0u64, q_len + 3), (1, 2 * q_len + 8)] {
+            let n_len = d_len + q_len - 1;
+            let n = rand_nonzero_vec(n_len, 9300 + 7 * q_len as u64 + case);
+            let mut d = rand_nonzero_vec(d_len, 9400 + 7 * q_len as u64 + case);
+            let mut q = vec![0u64; q_len];
+
+            nr_div_dyn(&n, &mut d, &mut q);
+            assert_quotient_algorithm(
+                &format!("newton-raphson trim sweep d_len={d_len} q_len={q_len}"),
+                &n,
+                &d,
+                &q,
+            );
+        }
+    }
+
+    // Reciprocal targets on and just above powers of two, where the old blind
+    // doubling wasted the most work and the new schedule is trim-heavy.
+    for q_len in [59usize, 60, 61, 62, 124, 125, 126, 127, 251, 252, 253] {
+        let d_len = q_len + 3;
+        let n_len = d_len + q_len - 1;
+        let n = rand_nonzero_vec(n_len, 9500 + 7 * q_len as u64);
+        let mut d = rand_nonzero_vec(d_len, 9600 + 7 * q_len as u64);
+        let mut q = vec![0u64; q_len];
+
+        nr_div_dyn(&n, &mut d, &mut q);
+        assert_quotient_algorithm(
+            &format!("newton-raphson trim sweep large d_len={d_len} q_len={q_len}"),
+            &n,
+            &d,
+            &q,
+        );
+    }
 }
 
 #[test]
