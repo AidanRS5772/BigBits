@@ -215,7 +215,43 @@ unsafe fn sub_mul_of_aarch(win: *mut u64, of: *mut u64, d: *const u64, q: u64, l
     overflow != 0
 }
 
-// TODO: Need to impliment assembly version for x86
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn sub_mul_of_x86(win: *mut u64, of: *mut u64, d: *const u64, q: u64, len: usize) -> bool {
+    let mut borrow: u8 = 0;
+    asm!(
+        "mov {mc}, 0",
+        "mov {b}, 0",
+        "2:",
+        "mov rax, [{den}]",
+        "mul {q}",
+        "add rax, {mc}",
+        "adc rdx, 0",
+        "mov {mc}, rdx",
+        "neg {b}",
+        "sbb QWORD PTR [{win}], rax",
+        "setc {b}",
+        "lea {win}, [{win} + 8]",
+        "lea {den}, [{den} + 8]",
+        "dec {len}",
+        "jnz 2b",
+        "neg {b}",
+        "sbb QWORD PTR [{ofp}], {mc}",
+        "setc {b}",
+        win = inout(reg) win => _,
+        den = inout(reg) d => _,
+        len = in(reg) len,
+        ofp = in(reg) of,
+        q = in(reg) q,
+        b = inout(reg_byte) borrow,
+        mc = out(reg) _,
+        out("rax") _,
+        out("rdx") _,
+        options(nostack),
+    );
+    return borrow != 0;
+}
+
 #[inline(always)]
 unsafe fn sub_mul_of_asm(win: *mut u64, of: *mut u64, d: *const u64, q: u64, len: usize) -> bool {
     #[cfg(target_arch = "aarch64")]
@@ -225,29 +261,7 @@ unsafe fn sub_mul_of_asm(win: *mut u64, of: *mut u64, d: *const u64, q: u64, len
 
     #[cfg(target_arch = "x86_64")]
     {
-        let win = unsafe { std::slice::from_raw_parts_mut(win, len) };
-        let d = unsafe { std::slice::from_raw_parts(d, len) };
-        let of = unsafe { &mut *of };
-        let q_u128 = q as u128;
-        let mut mul_carry: u64 = 0;
-        let mut borrow: u64 = 0;
-
-        for (w, &d) in win.iter_mut().zip(d) {
-            let prod = q_u128 * (d as u128) + mul_carry as u128;
-            mul_carry = (prod >> 64) as u64;
-            let prod_lo = prod as u64;
-
-            let (s1, b1) = w.overflowing_sub(prod_lo);
-            let (s2, b2) = s1.overflowing_sub(borrow);
-            *w = s2;
-            borrow = b1 as u64 + b2 as u64;
-        }
-
-        let (s1, b1) = of.overflowing_sub(mul_carry);
-        let (s2, b2) = s1.overflowing_sub(borrow);
-        *of = s2;
-
-        (b1 as u64 + b2 as u64) != 0
+        sub_mul_of_x86(win, of, d, q, len)
     }
 }
 
