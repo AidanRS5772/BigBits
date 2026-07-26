@@ -276,11 +276,27 @@ pub fn karatsuba_core(
     if overflow > 0 {
         sub_prim(&mut cross[z2_len..], overflow);
     }
-    if add_buf(&mut out[half..], &cross) {
-        overflow += 1;
+    let out_cross = &mut out[half..];
+    if out_cross.len() >= cross.len() {
+        if add_buf(out_cross, cross) {
+            overflow += 1;
+        }
+        return overflow;
     }
 
-    return overflow;
+    // At the exact Recurse/Chunking boundary the standard product buffer can
+    // be one or two limbs shorter than the shifted cross buffer. Add the part
+    // that fits, then fold its carry and the first omitted limb into the one
+    // legitimate product overflow limb. Any higher omitted limbs must be zero
+    // by the a.len()+b.len() product-size bound.
+    let fit = out_cross.len();
+    let carry = add_buf(out_cross, &cross[..fit]) as u64;
+    let omitted = cross[fit];
+    debug_assert_eq!(buf_len(&cross[fit + 1..]), 0);
+    let (overflow, of1) = overflow.overflowing_add(omitted);
+    let (overflow, of2) = overflow.overflowing_add(carry);
+    debug_assert!(!of1 && !of2);
+    overflow
 }
 
 fn chunking_karatsuba(long: &[u64], short: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
@@ -306,6 +322,69 @@ fn chunking_karatsuba(long: &[u64], short: &[u64], out: &mut [u64], scratch: &mu
         overflow += 1;
     }
     return overflow;
+}
+
+fn chunking_karatsuba_static<const N: usize>(
+    long: &[u64],
+    short: &[u64],
+    out: &mut [u64],
+    val: &mut [u64; N],
+) -> u64 {
+    out.fill(0);
+    let s = short.len();
+    let l = long.len();
+    let chunks = (l - s + 1) / s;
+    let full_len = 2 * s;
+    debug_assert!(full_len <= N);
+    let mut work = [0; N];
+    let mut cross = [0; N];
+
+    for i in 0..chunks {
+        let offset = s * i;
+        let overflow = karatsuba_nonchunk_static::<N>(
+            &long[offset..offset + s],
+            short,
+            &mut val[..full_len],
+            &mut work,
+            &mut cross,
+        );
+        debug_assert_eq!(overflow, 0);
+        let carry = add_buf(&mut out[offset..], &val[..full_len]);
+        debug_assert!(!carry);
+    }
+
+    let offset = chunks * s;
+    let last_chunk = &long[offset..];
+    let last_len = last_chunk.len() + s - 1;
+    let mut overflow = karatsuba_nonchunk_static::<N>(
+        last_chunk,
+        short,
+        &mut val[..last_len],
+        &mut work,
+        &mut cross,
+    );
+    if add_buf(&mut out[offset..], &val[..last_len]) {
+        overflow += 1;
+    }
+    overflow
+}
+
+fn karatsuba_nonchunk_static<const N: usize>(
+    a: &[u64],
+    b: &[u64],
+    out: &mut [u64],
+    scratch: &mut [u64; N],
+    cross: &mut [u64; N],
+) -> u64 {
+    let scratch_sz = find_karatsuba_scratch(a.len(), b.len());
+    if scratch_sz <= N {
+        return karatsuba_mul(a, b, out, scratch);
+    }
+
+    let (long, short) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+    let half = (long.len() + 1) / 2;
+    debug_assert!(short.len() > half);
+    karatsuba_core(long, short, half, out, &mut cross[..2 * half + 1], scratch)
 }
 
 enum KDispatch {
@@ -346,12 +425,38 @@ fn karatsuba_mul(a: &[u64], b: &[u64], out: &mut [u64], scratch: &mut [u64]) -> 
     let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
     match kdispatch(long.len(), short.len()) {
         KDispatch::Prim => {
+            // mul_prim processes exactly the slice it's given, so out must be
+            // truncated to long.len() before the call — any wider out (a
+            // legitimate case: a scratch-backed buffer sized beyond the
+            // strict a.len()+b.len()-1 convention) would otherwise feed
+            // whatever garbage is beyond long.len() into the multiply as if
+            // it were part of the multiplicand.
             out[..long.len()].copy_from_slice(long);
-            return mul_prim(out, short[0]);
+            let of = mul_prim(&mut out[..long.len()], short[0]);
+            if out.len() > long.len() {
+                out[long.len()] = of;
+                out[long.len() + 1..].fill(0);
+                return 0;
+            }
+            return of;
         }
         KDispatch::Prim2 => {
+            // Same reasoning as Prim: mul_prim2 walks the full slice it's
+            // given, so out must be truncated to long.len() first; its u128
+            // return is the (up to) 2 legitimate overflow limbs beyond that.
             out[..long.len()].copy_from_slice(long);
-            return mul_prim2(out, combine_u64(short[0], short[1])) as u64;
+            let of = mul_prim2(&mut out[..long.len()], combine_u64(short[0], short[1]));
+            let (of_lo, of_hi) = (of as u64, (of >> 64) as u64);
+            if out.len() > long.len() {
+                out[long.len()] = of_lo;
+                if out.len() > long.len() + 1 {
+                    out[long.len() + 1] = of_hi;
+                    out[long.len() + 2..].fill(0);
+                    return 0;
+                }
+                return of_hi;
+            }
+            return of_lo;
         }
         KDispatch::School => {
             return mul_buf(long, short, out);
@@ -400,19 +505,25 @@ pub fn karatsuba_entry_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 
 pub fn karatsuba_entry_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     let scratch_sz = find_karatsuba_scratch(long.len(), short.len());
     let mut scratch = [0; N];
-    if scratch_sz < N {
+    if scratch_sz <= N {
         karatsuba_mul(long, short, out, &mut scratch)
     } else {
-        let mut cross = [0; N];
-        let half = (long.len() + 1) / 2;
-        karatsuba_core(
-            long,
-            short,
-            half,
-            out,
-            &mut cross[..2 * half + 1],
-            &mut scratch,
-        )
+        match kdispatch(long.len(), short.len()) {
+            KDispatch::Chunking => chunking_karatsuba_static::<N>(long, short, out, &mut scratch),
+            KDispatch::Recurse => {
+                let mut cross = [0; N];
+                let half = (long.len() + 1) / 2;
+                karatsuba_core(
+                    long,
+                    short,
+                    half,
+                    out,
+                    &mut cross[..2 * half + 1],
+                    &mut scratch,
+                )
+            }
+            _ => karatsuba_mul(long, short, out, &mut scratch),
+        }
     }
 }
 
@@ -902,7 +1013,7 @@ fn decompose(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
 fn fft_chunk_value(chunk: &[f64]) -> u128 {
     let mut val = 0u128;
     for (i, c) in chunk.iter().enumerate() {
-        val += (unsafe { c.to_int_unchecked::<u64>() } as u128) << (i * 16);
+        val += (*c as u64 as u128) << (i * 16);
     }
     val
 }
@@ -2289,14 +2400,30 @@ impl<P1: NTTPrime, P2: NTTPrime, P3: NTTPrime> CRT<P1, P2, P3> {
 
 static CRT: LazyLock<CRT<P1, P2, P3>> = LazyLock::new(|| CRT::<P1, P2, P3>::new());
 
+#[inline]
+fn absorb_overflow(out_tail: &mut [u64], overflow: u64) -> u64 {
+    if let Some((carry_limb, rest)) = out_tail.split_first_mut() {
+        *carry_limb = overflow;
+        rest.fill(0);
+        0
+    } else {
+        overflow
+    }
+}
+
+// n1/n2/n3 are the declared transform sizes the residues are scaled by; the
+// res slices may be shorter (clamped to a static buffer) as long as they cover
+// out_len.
 fn ntt_accumulate(
     res1: &mut [u64],
     res2: &mut [u64],
     res3: &mut [u64],
     out: &mut [u64],
     out_len: usize,
+    n1: usize,
+    n2: usize,
+    n3: usize,
 ) -> u64 {
-    let (n1, n2, n3) = (res1.len(), res2.len(), res3.len());
     let inv_n1 = Montgomery::to(n1 as u64).pow(P1::P - 2);
     let inv_n2 = Montgomery::to(n2 as u64).pow(P2::P - 2);
     let inv_n3 = Montgomery::to(n3 as u64).pow(P3::P - 2);
@@ -2311,14 +2438,34 @@ fn ntt_accumulate(
         );
     }
 
-    let len1 = n1.min(out.len());
+    let len1 = res1.len().min(out.len());
     out[..len1].copy_from_slice(&res1[..len1]);
-    let len2 = n2.min(out.len() - 1);
-    let of1 = add_buf(&mut out[1..], &res2[..len2]) as u64;
-    let len3 = n3.min(out.len() - 2);
-    let of2 = add_buf(&mut out[2..], &res3[..len3]) as u64;
+    let len2 = res2.len().min(out.len().saturating_sub(1));
+    let of1 = if len2 == 0 {
+        0
+    } else {
+        add_buf(&mut out[1..], &res2[..len2]) as u64
+    };
+    let len3 = res3.len().min(out.len().saturating_sub(2));
+    let of2 = if len3 == 0 {
+        0
+    } else {
+        add_buf(&mut out[2..], &res3[..len3]) as u64
+    };
 
-    res2.get(len2).copied().unwrap_or(0) + res3.get(len3).copied().unwrap_or(0) + of1 + of2
+    let res2_carry = out
+        .len()
+        .checked_sub(1)
+        .and_then(|i| res2.get(i))
+        .copied()
+        .unwrap_or(0);
+    let res3_carry = out
+        .len()
+        .checked_sub(2)
+        .and_then(|i| res3.get(i))
+        .copied()
+        .unwrap_or(0);
+    res2_carry + res3_carry + of1 + of2
 }
 
 fn ntt_log_prime_search(
@@ -2370,7 +2517,14 @@ pub fn find_max_ntt_size(n: usize) -> usize {
 }
 
 pub fn ntt_entry_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
     let out_len = a.len() + b.len() - 1;
+    assert!(
+        out.len() >= out_len,
+        "out is not large enough for multiplication"
+    );
     let n1 = find_ntt_size::<P1>(out_len);
     let n2 = find_ntt_size::<P2>(out_len);
     let n3 = find_ntt_size::<P3>(out_len);
@@ -2427,7 +2581,9 @@ pub fn ntt_entry_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
         }
     }
 
-    ntt_accumulate(res1, res2, res3, out, out_len)
+    let (out_core, out_tail) = out.split_at_mut(out_len);
+    let overflow = ntt_accumulate(res1, res2, res3, out_core, out_len, n1, n2, n3);
+    absorb_overflow(out_tail, overflow)
 }
 
 fn ntt_log_prime_search_for_split(
@@ -2484,28 +2640,44 @@ where
     }
 }
 
-fn ntt_split_convolution<const N: usize, P: NTTPrime>(
+// Emulates a declared size-n cyclic convolution inside res (clamped to
+// res.len()) by chunking long into pieces whose transforms fit N; every chunk
+// is rescaled so the accumulated values carry the size-n scale.
+fn ntt_chunked_convolution<const N: usize, P: NTTPrime>(
     long: &[u64],
     short: &[u64],
     res: &mut [u64],
+    n: usize,
     buf_scratch: &mut [u64],
     ntt_scratch: &mut [u64],
 ) {
-    let n = find_ntt_size_for_split::<N, P>();
-    let split = n + 1 - short.len();
-    let (long_lo, long_hi) = long.split_at(split);
-    let mut tw = StaticNTTTwidles::<N, P>::build(n);
-    ntt_convolution::<P>(
-        long_lo,
-        short,
-        &mut res[..n],
-        &mut tw,
-        &mut buf_scratch[..n],
-        &mut ntt_scratch[..ntt_convolution_scratch_len(n)],
-    );
-    acc_convolution::<P, _>(short, long_hi, &mut res[split..], |a, b| {
-        Montgomery::fuse_mul_to(a, b)
-    });
+    let (long, short) = if long.len() >= short.len() {
+        (long, short)
+    } else {
+        (short, long)
+    };
+
+    res.fill(0);
+    let split_n = find_ntt_size_for_split::<N, P>();
+    let chunk_len = split_n + 1 - short.len();
+    debug_assert!(chunk_len > 0);
+
+    let mut tmp = [0; N];
+    let mut offset = 0;
+    while offset < long.len() {
+        let end = (offset + chunk_len).min(long.len());
+        acc_scaled_cyclic_convolution::<N, P>(
+            &long[offset..end],
+            short,
+            offset,
+            n,
+            res,
+            &mut tmp,
+            buf_scratch,
+            ntt_scratch,
+        );
+        offset = end;
+    }
 }
 
 fn ntt_static_convolution<const N: usize, P: NTTPrime>(
@@ -2527,12 +2699,19 @@ fn ntt_static_convolution<const N: usize, P: NTTPrime>(
             &mut ntt_scratch[..ntt_scratch_len(n)],
         );
     } else {
-        ntt_split_convolution::<N, P>(long, short, res, buf_scratch, ntt_scratch);
+        ntt_chunked_convolution::<N, P>(long, short, res, n, buf_scratch, ntt_scratch);
     }
 }
 
 pub fn ntt_entry_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+    if long.is_empty() || short.is_empty() {
+        return 0;
+    }
     let out_len = long.len() + short.len() - 1;
+    assert!(
+        out_len <= N && out.len() >= out_len,
+        "inputs exceed static capacity"
+    );
     let mut res1 = [0; N];
     let mut res2 = [0; N];
     let mut res3 = [0; N];
@@ -2610,13 +2789,18 @@ pub fn ntt_entry_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [
             &mut ntt_scratch,
         );
     }
-    ntt_accumulate(
-        &mut res1[..n1],
-        &mut res2[..n2],
-        &mut res3[..n3],
-        out,
+    let (out_core, out_tail) = out.split_at_mut(out_len);
+    let overflow = ntt_accumulate(
+        &mut res1[..n1.min(N)],
+        &mut res2[..n2.min(N)],
+        &mut res3[..n3.min(N)],
+        out_core,
         out_len,
-    )
+        n1,
+        n2,
+        n3,
+    );
+    absorb_overflow(out_tail, overflow)
 }
 
 //END NTT MULTIPLICATION
@@ -2650,7 +2834,7 @@ pub fn is_karatsuba(l: usize, s: usize, chunk: f64, reg: f64) -> bool {
 }
 
 #[derive(Debug)]
-pub enum DynDispatch {
+pub enum MulDynDispatch {
     Prim,
     Prim2,
     School,
@@ -2659,19 +2843,19 @@ pub enum DynDispatch {
     NTT,
 }
 
-pub fn dyn_dispatch(l: usize, s: usize) -> DynDispatch {
+pub fn dyn_dispatch(l: usize, s: usize) -> MulDynDispatch {
     if s == 1 {
-        DynDispatch::Prim
+        MulDynDispatch::Prim
     } else if s == 2 {
-        DynDispatch::Prim2
+        MulDynDispatch::Prim2
     } else if is_school(l, s) {
-        DynDispatch::School
+        MulDynDispatch::School
     } else if is_karatsuba(l, s, FFT_CHUNKING_KARATSUBA_CUTOFF, FFT_KARATSUBA_CUTOFF) {
-        DynDispatch::Karatsuba
+        MulDynDispatch::Karatsuba
     } else if (l + s - 1) <= FFT_16BIT_CUTOFF {
-        DynDispatch::FFT
+        MulDynDispatch::FFT
     } else {
-        DynDispatch::NTT
+        MulDynDispatch::NTT
     }
 }
 
@@ -2687,19 +2871,19 @@ pub fn mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
     let out_core = &mut out[..out_len];
     let overflow = match dyn_dispatch(long.len(), short.len()) {
-        DynDispatch::Prim => {
+        MulDynDispatch::Prim => {
             out_core[..long.len()].copy_from_slice(long);
             mul_prim(out_core, short[0])
         }
-        DynDispatch::Prim2 => {
+        MulDynDispatch::Prim2 => {
             out_core[..long.len()].copy_from_slice(long);
             out_core[long.len()] = 0;
             mul_prim2(out_core, combine_u64(short[0], short[1])) as u64
         }
-        DynDispatch::School => mul_buf(long, short, out_core),
-        DynDispatch::Karatsuba => karatsuba_entry_dyn(long, short, out_core),
-        DynDispatch::FFT => fft_entry(long, short, out_core),
-        DynDispatch::NTT => ntt_entry_dyn(long, short, out_core),
+        MulDynDispatch::School => mul_buf(long, short, out_core),
+        MulDynDispatch::Karatsuba => karatsuba_entry_dyn(long, short, out_core),
+        MulDynDispatch::FFT => fft_entry(long, short, out_core),
+        MulDynDispatch::NTT => ntt_entry_dyn(long, short, out_core),
     };
     if out.len() > out_len {
         out[out_len] = overflow;
@@ -2711,6 +2895,9 @@ pub fn mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
 }
 
 pub fn mul_vec(a: &[u64], b: &[u64]) -> (Vec<u64>, u64) {
+    if a.is_empty() || b.is_empty() {
+        return (Vec::new(), 0);
+    }
     let mut out = vec![0; a.len() + b.len() - 1];
     let of = mul_dyn(a, b, &mut out);
     (out, of)
@@ -3043,8 +3230,8 @@ pub fn sqr_decompose_16_standard(buf: &[u64], x: &mut [Complex<f64>]) {
         coefs[idx + 3] = (b >> 48) as f64;
         idx += 4;
     }
-    if idx < x.len() {
-        x[idx..].fill(Complex::zero());
+    if idx < coefs.len() {
+        coefs[idx..].fill(0.0);
     }
 }
 
@@ -3053,7 +3240,7 @@ fn sqr_decompose(buf: &[u64], x: &mut [Complex<f64>]) {
     if is_x86_feature_detected!("avx2") {
         unsafe { sqr_decompose_16_x86(buf, x) }
     } else {
-        sqr_decompose(buf, x);
+        sqr_decompose_16_standard(buf, x);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -3125,7 +3312,14 @@ fn ntt_sqr_convolution<P: NTTPrime>(
 }
 
 pub fn ntt_sqr_entry_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
+    if buf.is_empty() {
+        return 0;
+    }
     let out_len = 2 * buf.len() - 1;
+    assert!(
+        out.len() >= out_len,
+        "out is not large enough for multiplication"
+    );
     let n1 = find_ntt_size::<P1>(out_len);
     let n2 = find_ntt_size::<P2>(out_len);
     let n3 = find_ntt_size::<P3>(out_len);
@@ -3181,37 +3375,16 @@ pub fn ntt_sqr_entry_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
             conv3();
         }
     }
-    ntt_accumulate(res1, res2, res3, out, out_len)
-}
-
-fn ntt_split_sqr_convolution<const N: usize, P: NTTPrime>(
-    buf: &[u64],
-    res: &mut [u64],
-    ntt_scratch: &mut [u64],
-) {
-    let n = find_ntt_size_for_split::<N, P>();
-    let split = (n + 1) / 2;
-    let (buf_lo, buf_hi) = buf.split_at(split);
-    let mut tw = StaticNTTTwidles::<N, P>::build(n);
-    ntt_sqr_convolution::<P>(
-        buf_lo,
-        &mut res[..n],
-        &mut tw,
-        &mut ntt_scratch[..ntt_scratch_len(n)],
-    );
-    acc_convolution::<P, _>(buf_lo, buf_hi, &mut res[split..], |a, b| {
-        let val = Montgomery::fuse_mul_to(a, b);
-        val + val
-    });
-    acc_convolution::<P, _>(buf_hi, buf_hi, &mut res[2 * split..], |a, b| {
-        Montgomery::fuse_mul_to(a, b)
-    });
+    let (out_core, out_tail) = out.split_at_mut(out_len);
+    let overflow = ntt_accumulate(res1, res2, res3, out_core, out_len, n1, n2, n3);
+    absorb_overflow(out_tail, overflow)
 }
 
 fn ntt_static_sqr_convolution<const N: usize, P: NTTPrime>(
     buf: &[u64],
     res: &mut [u64],
     n: usize,
+    buf_scratch: &mut [u64],
     ntt_scratch: &mut [u64],
 ) {
     if n <= N {
@@ -3223,12 +3396,19 @@ fn ntt_static_sqr_convolution<const N: usize, P: NTTPrime>(
             &mut ntt_scratch[..ntt_scratch_len(n)],
         );
     } else {
-        ntt_split_sqr_convolution::<N, P>(buf, res, ntt_scratch);
+        ntt_chunked_convolution::<N, P>(buf, buf, res, n, buf_scratch, ntt_scratch);
     }
 }
 
 pub fn ntt_sqr_entry_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
+    if buf.is_empty() {
+        return 0;
+    }
     let out_len = 2 * buf.len() - 1;
+    assert!(
+        out_len <= N && out.len() >= out_len,
+        "inputs exceed static capacity"
+    );
     let mut res1 = [0; N];
     let mut res2 = [0; N];
     let mut res3 = [0; N];
@@ -3238,34 +3418,61 @@ pub fn ntt_sqr_entry_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64
 
     if out_len > NTT_PAR_CUTOFF_NTT_CONV {
         let conv1 = || {
+            let mut buf_scratch = [0; N];
             let mut ntt_scratch = [0; N];
-            ntt_static_sqr_convolution::<N, P1>(buf, &mut res1, n1, &mut ntt_scratch);
+            ntt_static_sqr_convolution::<N, P1>(
+                buf,
+                &mut res1,
+                n1,
+                &mut buf_scratch,
+                &mut ntt_scratch,
+            );
         };
 
         let conv2 = || {
+            let mut buf_scratch = [0; N];
             let mut ntt_scratch = [0; N];
-            ntt_static_sqr_convolution::<N, P2>(buf, &mut res2, n2, &mut ntt_scratch);
+            ntt_static_sqr_convolution::<N, P2>(
+                buf,
+                &mut res2,
+                n2,
+                &mut buf_scratch,
+                &mut ntt_scratch,
+            );
         };
 
         let conv3 = || {
+            let mut buf_scratch = [0; N];
             let mut ntt_scratch = [0; N];
-            ntt_static_sqr_convolution::<N, P3>(buf, &mut res3, n3, &mut ntt_scratch);
+            ntt_static_sqr_convolution::<N, P3>(
+                buf,
+                &mut res3,
+                n3,
+                &mut buf_scratch,
+                &mut ntt_scratch,
+            );
         };
 
         rayon::join(conv1, || rayon::join(conv2, conv3));
     } else {
+        let mut buf_scratch = [0; N];
         let mut ntt_scratch = [0; N];
-        ntt_static_sqr_convolution::<N, P1>(buf, &mut res1, n1, &mut ntt_scratch);
-        ntt_static_sqr_convolution::<N, P2>(buf, &mut res2, n2, &mut ntt_scratch);
-        ntt_static_sqr_convolution::<N, P3>(buf, &mut res3, n3, &mut ntt_scratch);
+        ntt_static_sqr_convolution::<N, P1>(buf, &mut res1, n1, &mut buf_scratch, &mut ntt_scratch);
+        ntt_static_sqr_convolution::<N, P2>(buf, &mut res2, n2, &mut buf_scratch, &mut ntt_scratch);
+        ntt_static_sqr_convolution::<N, P3>(buf, &mut res3, n3, &mut buf_scratch, &mut ntt_scratch);
     }
-    ntt_accumulate(
-        &mut res1[..n1],
-        &mut res2[..n2],
-        &mut res3[..n3],
-        out,
+    let (out_core, out_tail) = out.split_at_mut(out_len);
+    let overflow = ntt_accumulate(
+        &mut res1[..n1.min(N)],
+        &mut res2[..n2.min(N)],
+        &mut res3[..n3.min(N)],
+        out_core,
         out_len,
-    )
+        n1,
+        n2,
+        n3,
+    );
+    absorb_overflow(out_tail, overflow)
 }
 
 //END NTT SQUARE
@@ -3287,18 +3494,27 @@ fn dyn_sqr_dispatch(n: usize) -> DynSqrDispatch {
 }
 
 pub fn sqr_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
-    debug_assert!(
-        2 * buf.len() - 1 <= out.len(),
+    if buf.is_empty() {
+        return 0;
+    }
+    let out_len = 2 * buf.len() - 1;
+    assert!(
+        out_len <= out.len(),
         "out is not large enough for multiplication"
     );
-    match dyn_sqr_dispatch(buf.len()) {
-        DynSqrDispatch::School => sqr_buf(buf, out),
-        DynSqrDispatch::FFT => fft_sqr_entry(buf, out),
-        DynSqrDispatch::NTT => ntt_sqr_entry_dyn(buf, out),
-    }
+    let (out_core, out_tail) = out.split_at_mut(out_len);
+    let overflow = match dyn_sqr_dispatch(buf.len()) {
+        DynSqrDispatch::School => sqr_buf(buf, out_core),
+        DynSqrDispatch::FFT => fft_sqr_entry(buf, out_core),
+        DynSqrDispatch::NTT => ntt_sqr_entry_dyn(buf, out_core),
+    };
+    absorb_overflow(out_tail, overflow)
 }
 
 pub fn sqr_vec(buf: &[u64]) -> (Vec<u64>, u64) {
+    if buf.is_empty() {
+        return (Vec::new(), 0);
+    }
     let mut out = vec![0; 2 * buf.len() - 1];
     let of = sqr_dyn(buf, &mut out);
     (out, of)
@@ -3321,14 +3537,20 @@ fn static_sqr_dispatch(n: usize) -> StaticSqrDispatch {
 }
 
 pub fn sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> Result<u64, ()> {
-    if 2 * buf.len() - 1 > N {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let out_len = 2 * buf.len() - 1;
+    if out_len > N || out_len > out.len() {
         return Err(());
     }
-    Ok(match static_sqr_dispatch(buf.len()) {
-        StaticSqrDispatch::School => sqr_buf(buf, out),
-        StaticSqrDispatch::Karatsubaa => karatsuba_sqr_entry_static::<N>(buf, out),
-        StaticSqrDispatch::NTT => ntt_sqr_entry_static::<N>(buf, out),
-    })
+    let (out_core, out_tail) = out.split_at_mut(out_len);
+    let overflow = match static_sqr_dispatch(buf.len()) {
+        StaticSqrDispatch::School => sqr_buf(buf, out_core),
+        StaticSqrDispatch::Karatsubaa => karatsuba_sqr_entry_static::<N>(buf, out_core),
+        StaticSqrDispatch::NTT => ntt_sqr_entry_static::<N>(buf, out_core),
+    };
+    Ok(absorb_overflow(out_tail, overflow))
 }
 
 pub fn sqr_arr<const N: usize>(buf: &[u64]) -> Result<([u64; N], u64), ()> {
@@ -3361,6 +3583,9 @@ pub fn short_mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
 }
 
 pub fn short_mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
     if a.len() + b.len() - 1 <= out.len() {
         return mul_dyn(a, b, out);
     }
@@ -3378,6 +3603,9 @@ pub fn short_mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
 }
 
 pub fn short_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
     debug_assert!(a.len() <= N);
     debug_assert!(b.len() <= N);
     debug_assert!(
@@ -3476,6 +3704,9 @@ pub fn short_sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
 }
 
 pub fn short_sqr_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
+    if buf.is_empty() {
+        return 0;
+    }
     if 2 * buf.len() - 1 <= out.len() {
         return sqr_dyn(buf, out);
     }
@@ -3492,6 +3723,9 @@ pub fn short_sqr_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
 }
 
 pub fn short_sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
+    if buf.is_empty() {
+        return 0;
+    }
     debug_assert!(buf.len() <= N);
     debug_assert!(
         out.len() <= N,
@@ -3574,19 +3808,29 @@ fn mul_column_parts(a: &[u64], b: &[u64], n: usize) -> (u64, u64, u64) {
 }
 
 pub fn middle_correction(long: &[u64], short: &[u64]) -> (u64, u64) {
-    debug_assert!(long.len() == 2 * short.len() - 1);
+    debug_assert!(long.len() <= 2 * short.len() - 1);
     let n = short.len();
-    let (_, acc0, acc1) = mul_column_parts(long, short, n.saturating_sub(2));
+    let z = 2 * n - 1 - long.len();
+    if n < z + 2 {
+        return (0, 0);
+    }
+    let (_, acc0, acc1) = mul_column_parts(long, short, n - 2 - z);
     return (acc0, acc1);
 }
 
+// long is the top of a virtual 2n-1 limb operand (implicit low zero limbs when
+// shorter); the band stays columns n-1..2n-2 of the virtual product.
 pub fn mid_mul_buf(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
-    // long (2n-1) , short (n)
     let (mut acc0, mut acc1) = middle_correction(long, short);
     let mut acc2: u64 = 0;
     let n = short.len();
+    let z = 2 * n - 1 - long.len();
     for (i, elem) in ((n - 1)..=(2 * n - 2)).zip(out) {
-        *elem = mul_elem(long, short, i, &mut acc0, &mut acc1, &mut acc2);
+        *elem = if i >= z {
+            mul_elem(long, short, i - z, &mut acc0, &mut acc1, &mut acc2)
+        } else {
+            0
+        };
     }
     return (acc0, acc1);
 }
@@ -3627,16 +3871,27 @@ fn fft_accumulate_mid(
 
 pub fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
     let sz = short.len();
+    let z = 2 * sz - 1 - long.len();
+    if z >= sz {
+        // The band starts below the actual product; materialize the virtual pad.
+        let mut scratch = ScratchGuard::acquire();
+        let full = scratch.get(2 * sz - 1);
+        full[..z].fill(0);
+        full[z..].copy_from_slice(long);
+        return fft_mid_mul(full, short, out);
+    }
+    // Inputs may carry zero top limbs (quotient-refinement operands are not
+    // normalized); treating them as one 16-bit digit only over-sizes the fft.
     let (l_len, s_len, w) = (
-        bit16_length(long.len(), long.last().copied().unwrap()),
-        bit16_length(short.len(), short.last().copied().unwrap()),
+        bit16_length(long.len(), long.last().copied().unwrap().max(1)),
+        bit16_length(short.len(), short.last().copied().unwrap().max(1)),
         4,
     );
-    let start_coef = (sz - 1) * w;
-    let end_coef = (2 * sz + 1) * w;
+    let start_coef = (sz - 1 - z) * w;
+    let end_coef = (2 * sz + 1 - z) * w;
     let n = find_fft_size((l_len + s_len - start_coef - 1).max(end_coef));
-    let (next_col_lo, next_col_hi, _) = mul_column_parts(long, short, 2 * sz - 1);
-    let (next_next_col_lo, _, _) = mul_column_parts(long, short, 2 * sz);
+    let (next_col_lo, next_col_hi, _) = mul_column_parts(long, short, 2 * sz - 1 - z);
+    let (next_next_col_lo, _, _) = mul_column_parts(long, short, 2 * sz - z);
     let next_col = (next_col_lo, next_col_hi);
     let mut of = FFT_CACHE.with(|cell| {
         let fft_cache = &mut *cell.borrow_mut();
@@ -3667,6 +3922,7 @@ fn ntt_mid_accumulate_scaled(
     res3: &mut [u64],
     out: &mut [u64], // len == s
     s: usize,
+    shift: usize,
     n1: usize,
     n2: usize,
     n3: usize,
@@ -3675,8 +3931,9 @@ fn ntt_mid_accumulate_scaled(
     let inv_n2 = Montgomery::to(n2 as u64).pow(P2::P - 2);
     let inv_n3 = Montgomery::to(n3 as u64).pow(P3::P - 2);
 
-    let crt_start = s - 3;
-    let crt_end = 2 * s - 1;
+    debug_assert!(shift <= s - 3);
+    let crt_start = s - 3 - shift;
+    let crt_end = 2 * s - 1 - shift;
     for i in crt_start..crt_end {
         CRT.crt(
             &mut res1[i],
@@ -3688,12 +3945,18 @@ fn ntt_mid_accumulate_scaled(
         );
     }
 
-    out.copy_from_slice(&res1[s - 1..2 * s - 1]);
-    let of1 = add_buf(out, &res2[s - 2..2 * s - 2]) as u64;
-    let of2 = add_buf(out, &res3[s - 3..2 * s - 3]) as u64;
+    out.copy_from_slice(&res1[s - 1 - shift..2 * s - 1 - shift]);
+    let of1 = add_buf(out, &res2[s - 2 - shift..2 * s - 2 - shift]) as u64;
+    let of2 = add_buf(out, &res3[s - 3 - shift..2 * s - 3 - shift]) as u64;
 
-    let lo = res2[2 * s - 2] as u128 + res3[2 * s - 3] as u128 + of1 as u128 + of2 as u128;
-    (lo as u64, res3[2 * s - 2].wrapping_add((lo >> 64) as u64))
+    let lo = res2[2 * s - 2 - shift] as u128
+        + res3[2 * s - 3 - shift] as u128
+        + of1 as u128
+        + of2 as u128;
+    (
+        lo as u64,
+        res3[2 * s - 2 - shift].wrapping_add((lo >> 64) as u64),
+    )
 }
 
 fn acc_scaled_cyclic_convolution<const N: usize, P: NTTPrime>(
@@ -3760,27 +4023,7 @@ fn ntt_mid_static_convolution<const N: usize, P: NTTPrime>(
         return;
     }
 
-    res.fill(0);
-    let split_n = find_ntt_size_for_split::<N, P>();
-    let chunk_len = split_n + 1 - short.len();
-    debug_assert!(chunk_len > 0);
-
-    let mut tmp = [0; N];
-    let mut offset = 0;
-    while offset < long.len() {
-        let end = (offset + chunk_len).min(long.len());
-        acc_scaled_cyclic_convolution::<N, P>(
-            &long[offset..end],
-            short,
-            offset,
-            n,
-            res,
-            &mut tmp,
-            buf_scratch,
-            ntt_scratch,
-        );
-        offset = end;
-    }
+    ntt_chunked_convolution::<N, P>(long, short, res, n, buf_scratch, ntt_scratch);
 }
 
 pub fn ntt_mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
@@ -3840,7 +4083,7 @@ pub fn ntt_mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u6
             conv3();
         }
     }
-    let mut of = ntt_mid_accumulate_scaled(res1, res2, res3, out, sz, n1, n2, n3);
+    let mut of = ntt_mid_accumulate_scaled(res1, res2, res3, out, sz, 0, n1, n2, n3);
     let (c0, c1) = middle_correction(long, short);
     add_mid_overflow(&mut of, add_prim(out, c0));
     add_mid_overflow(&mut of, add_prim(&mut out[1..], c1));
@@ -3852,10 +4095,9 @@ pub fn ntt_mid_mul_static<const N: usize>(
     short: &[u64],
     out: &mut [u64],
 ) -> (u64, u64) {
-    debug_assert_eq!(
-        long.len(),
-        2 * short.len() - 1,
-        "incorrect size of long compared to short for middle product"
+    debug_assert!(
+        long.len() <= 2 * short.len() - 1,
+        "long must be at most 2*short-1 limbs for middle product (top-aligned when shorter)"
     );
     debug_assert_eq!(
         out.len(),
@@ -3871,6 +4113,15 @@ pub fn ntt_mid_mul_static<const N: usize>(
     }
 
     let sz = short.len();
+    let shift = 2 * sz - 1 - long.len();
+    // Multiplying the unpadded operand rotates every cyclic-convolution
+    // coefficient left by `shift`.  All coefficients needed below are
+    // available directly while the CRT window stays above index zero; wrapped
+    // indices may lie beyond a clamped static residue buffer, so keep that rare
+    // shape on the allocation-free school path.
+    if shift > sz - 3 {
+        return mid_mul_buf(long, short, out);
+    }
     let n1 = find_ntt_size::<P1>(2 * sz - 1);
     let n2 = find_ntt_size::<P2>(2 * sz - 1);
     let n3 = find_ntt_size::<P3>(2 * sz - 1);
@@ -3958,6 +4209,7 @@ pub fn ntt_mid_mul_static<const N: usize>(
         &mut res3[..res3_len],
         out,
         sz,
+        shift,
         n1,
         n2,
         n3,
@@ -3985,10 +4237,9 @@ fn dyn_mid_dispatch(n: usize) -> DynMidDispatch {
 }
 
 pub fn mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
-    debug_assert_eq!(
-        long.len(),
-        2 * short.len() - 1,
-        "incorrect size of long compared to short for middle product"
+    debug_assert!(
+        long.len() <= 2 * short.len() - 1,
+        "long must be at most 2*short-1 limbs for middle product (top-aligned when shorter)"
     );
     debug_assert_eq!(
         out.len(),
@@ -3998,15 +4249,25 @@ pub fn mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
     match dyn_mid_dispatch(short.len()) {
         DynMidDispatch::School => mid_mul_buf(long, short, out),
         DynMidDispatch::FFT => fft_mid_mul(long, short, out),
-        DynMidDispatch::NTT => ntt_mid_mul_dyn(long, short, out),
+        DynMidDispatch::NTT => {
+            if long.len() < 2 * short.len() - 1 {
+                let z = 2 * short.len() - 1 - long.len();
+                let mut scratch = ScratchGuard::acquire();
+                let full = scratch.get(2 * short.len() - 1);
+                full[..z].fill(0);
+                full[z..].copy_from_slice(long);
+                ntt_mid_mul_dyn(full, short, out)
+            } else {
+                ntt_mid_mul_dyn(long, short, out)
+            }
+        }
     }
 }
 
 pub fn mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
-    debug_assert_eq!(
-        long.len(),
-        2 * short.len() - 1,
-        "incorrect size of long compared to short for middle product"
+    debug_assert!(
+        long.len() <= 2 * short.len() - 1,
+        "long must be at most 2*short-1 limbs for middle product (top-aligned when shorter)"
     );
     debug_assert_eq!(
         out.len(),
@@ -4022,17 +4283,39 @@ pub fn mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u6
 
 //FAST EXPONENTIATION
 // does an integer powers via log(n) squaring s
+//
+// pow's binary form is `1 r_{k-1} ... r_0` (k = pow.ilog2() rest bits below
+// the leading one). reverse_pow packs those rest bits in reverse (bit i holds
+// r_{k-1-i}, the order powi_dyn_core/powi_static_core consume them in via
+// repeated `& 1` then `>> 1`) with a sentinel 1-bit at position k so the
+// recursion's `reverse_pow == 1` check fires exactly once all k rest bits are
+// consumed.
 fn reverse_pow(pow: usize) -> usize {
-    debug_assert!(pow < (1 << 63), "Bro this was a bad idea anyway");
-    let marked_pow = (pow << 1) + 1;
-    (marked_pow << marked_pow.leading_zeros()).reverse_bits()
+    let k = pow.ilog2() as usize;
+    if k == 0 {
+        return 1;
+    }
+    let rest = pow - (1 << k);
+    let reversed_rest = rest.reverse_bits() >> (usize::BITS as usize - k);
+    reversed_rest | (1 << k)
 }
 
 pub fn powi_sz(buf: &[u64], pow: usize) -> (usize, usize) {
-    let bit_length = (buf.len() - 1) * 64 + buf.last().copied().unwrap().ilog2() as usize;
+    if pow == 0 {
+        // x^0 = 1 always needs exactly one limb, independent of buf's size.
+        return (1, 1);
+    }
+    let len = buf_len(buf);
+    if len == 0 {
+        return (0, 0);
+    }
+    let bit_length = (len - 1) * 64 + buf[len - 1].ilog2() as usize;
     (
-        (bit_length * pow + 63) / 64,
-        ((bit_length + 1) * pow + 63) / 64,
+        bit_length.saturating_mul(pow).div_ceil(64),
+        bit_length
+            .saturating_add(1)
+            .saturating_mul(pow)
+            .div_ceil(64),
     )
 }
 
@@ -4052,15 +4335,27 @@ fn powi_dyn_core(buf: &[u64], reverse_pow: usize, src: &mut [u64], dst: &mut [u6
 }
 
 pub fn powi_dyn_entry(buf: &[u64], pow: usize, out: &mut [u64]) {
+    out.fill(0);
     if pow == 0 {
+        assert!(!out.is_empty(), "output is not large enough for x^0");
         out[0] = 1;
+        return;
+    }
+    let buf = &buf[..buf_len(buf)];
+    if buf.is_empty() {
         return;
     }
     let reverse_pow = reverse_pow(pow);
     let mut scratch = ScratchGuard::acquire();
     let tmp = scratch.get(out.len());
     tmp.fill(0);
-    if (pow.ilog2() + pow.count_ones()) % 2 == 0 {
+    // powi_*_core leaves the running result in its `src` argument once
+    // reverse_pow's k rest-bits are consumed (each 0 bit swaps src/dst, each
+    // 1 bit keeps the same src). The number of swaps is
+    // k - rest.count_ones() = pow.ilog2() - (pow.count_ones() - 1), which is
+    // even iff pow.ilog2() + pow.count_ones() is odd — that's when `out`
+    // needs to start in the src slot for the result to land back in `out`.
+    if (pow.ilog2() + pow.count_ones()) % 2 == 1 {
         out[..buf.len()].copy_from_slice(buf);
         powi_dyn_core(buf, reverse_pow, out, tmp);
     } else {
@@ -4101,13 +4396,22 @@ pub fn powi_static_entry<const N: usize>(
     pow: usize,
     out: &mut [u64],
 ) -> Result<(), ()> {
+    out.fill(0);
     if pow == 0 {
+        if out.is_empty() {
+            return Err(());
+        }
         out[0] = 1;
+        return Ok(());
+    }
+    let buf = &buf[..buf_len(buf)];
+    if buf.is_empty() {
         return Ok(());
     }
     let reverse_pow = reverse_pow(pow);
     let mut tmp = [0; N];
-    if (pow.ilog2() + pow.count_ones()) % 2 == 0 {
+    // See the parity comment in powi_dyn_entry.
+    if (pow.ilog2() + pow.count_ones()) % 2 == 1 {
         out[..buf.len()].copy_from_slice(buf);
         powi_static_core::<N>(buf, reverse_pow, out, &mut tmp)
     } else {

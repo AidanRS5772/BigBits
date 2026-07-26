@@ -2,9 +2,10 @@
 
 use big_bits::{utils::div::*, utils::*, *};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use rand::Rng;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    env,
     time::{Duration, Instant},
 };
 
@@ -13,6 +14,54 @@ const ARCH: &'static str = std::env::consts::ARCH;
 pub type Point = (usize, usize);
 
 // Shared benchmark helpers.
+
+fn bz_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) {
+    if let Some(request) = division_preflight(n, d, q) {
+        bz_div_wrapper_dyn(n, d, q, request);
+    }
+}
+
+fn nr_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) {
+    if let Some(request) = division_preflight(n, d, q) {
+        nr_div_wrapper_dyn(n, d, q, request);
+    }
+}
+
+fn bz_div_rem_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) {
+    if let Some(request) = division_preflight(n, d, q) {
+        bz_div_rem_wrapper_dyn(n, d, q, request);
+    }
+}
+
+fn nr_div_rem_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) {
+    if let Some(request) = division_preflight(n, d, q) {
+        nr_div_rem_wrapper_dyn(n, d, q, request);
+    }
+}
+
+fn bz_div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) {
+    if let Some(request) = division_preflight(n, d, q) {
+        bz_div_wrapper_static::<N>(n, d, q, request);
+    }
+}
+
+fn nr_div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) {
+    if let Some(request) = division_preflight(n, d, q) {
+        nr_div_wrapper_static::<N>(n, d, q, request);
+    }
+}
+
+fn bz_div_rem_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) {
+    if let Some(request) = division_preflight(n, d, q) {
+        bz_div_rem_wrapper_static::<N>(n, d, q, request);
+    }
+}
+
+fn nr_div_rem_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) {
+    if let Some(request) = division_preflight(n, d, q) {
+        nr_div_rem_wrapper_static::<N>(n, d, q, request);
+    }
+}
 
 fn random_limbs(n: usize, rng: &mut impl Rng) -> Vec<u64> {
     let mut limbs: Vec<u64> = (0..n).map(|_| rng.gen()).collect();
@@ -150,7 +199,7 @@ where
         let mut crossings = self.find_soft_crossings(&hard_true_cells, &soft_vals, &hard_dist);
 
         // Sort: nearest to hard boundary first.
-        crossings.sort_unstable_by_key(|c| c.hard_dist);
+        crossings.sort_unstable_by_key(|c| (c.hard_dist, c.soft_true_side, c.soft_false_side));
 
         // Phase 4: Optionally expand crossings, then flatten into (usize, usize) output.
         let bracket_count = (count + 1) / 2; // each bracket yields 2 points
@@ -707,6 +756,12 @@ const BZ_TOP_RATIO_SEARCH_BUDGET: usize = 50_000;
 const BZ_TOP_RATIO_CASES_PER_WINDOW: usize = 16;
 const BZ_TOP_RATIO_SCALES: [f64; 3] = [0.292, 0.295, 0.298];
 
+fn use_bz_for_top_block_with_scale(d_len: usize, q_len: usize, padded_cost_scale: f64) -> bool {
+    d_len > BZ_CUTOFF
+        && q_len != 0
+        && padded_cost_scale * bz_2_1_cost(d_len) <= bz_top_block_knuth_work(d_len, q_len)
+}
+
 struct BzTopInput {
     d_len: usize,
     q_len: usize,
@@ -715,7 +770,7 @@ struct BzTopInput {
 }
 
 fn bz_top_q_center(d_len: usize, padded_cost_scale: f64) -> usize {
-    (padded_cost_scale * bz_top_block_padded_work(d_len) / d_len as f64)
+    (padded_cost_scale * bz_2_1_cost(d_len) / d_len as f64)
         .ceil()
         .max(1.0) as usize
 }
@@ -889,14 +944,23 @@ fn run_nr_prior_seed_plus_step(d: &[u64], rcp: &mut [u64], prior_p: usize) {
     debug_assert!(rcp.len() <= 2 * prior_p + 1);
 
     rcp.fill(0);
-    bz_rcp_seed_dyn(end_ref(d, 2 * prior_p + 1), end_mut(rcp, prior_p + 1));
+    knuth_div_rcp_seed_dyn(end_ref(d, 2 * prior_p + 1), end_mut(rcp, prior_p + 1));
 
     let err_len = 2 * prior_p + 2;
     let mut scratch = ScratchGuard::acquire();
     let [err, cor] = scratch.get_splits([err_len, err_len]);
     let trunc = rcp.len() != 2 * prior_p + 1;
-    if !nr_rcp_refine_step_dyn(end_ref(d, 2 * prior_p + 1), rcp, err, cor, prior_p, trunc) {
-        bz_rcp_seed_dyn(d, rcp);
+    if !nr_refine_rcp(
+        end_ref(d, 2 * prior_p + 1),
+        rcp,
+        err,
+        cor,
+        prior_p,
+        trunc,
+        &mut |a, b, o| mid_mul_dyn(a, b, o),
+        &mut |a, b, o| short_mul_dyn(a, b, o),
+    ) {
+        knuth_div_rcp_seed_dyn(d, rcp);
     }
 }
 
@@ -925,7 +989,7 @@ fn nr_seed_tradeoff_ratio_bench(iters: u64, inputs: &[NrSeedTradeoffInput], p: u
                 );
             },
             || {
-                bz_rcp_seed_dyn(
+                knuth_div_rcp_seed_dyn(
                     black_box(input.denom.as_slice()),
                     black_box(direct.as_mut_slice()),
                 );
@@ -963,6 +1027,749 @@ fn bench_nr_seed_start_precision_ratio(c: &mut Criterion) {
     group.finish();
 }
 
+// Division BZ/NR cost-model tuning.
+//
+// Set:
+//   DIV_TUNE_REGIME=karatsuba|transform|transition|dispatch|reciprocal
+//   DIV_TUNE_FAMILY=dyn_div|dyn_rem|static_div|static_rem|dyn_rcp|static_rcp
+//   DIV_TUNE_VALUES=comma-separated candidate ratios or reciprocal precisions
+// For transition scans, also set DIV_TUNE_KARATSUBA_RATIO and
+// DIV_TUNE_TRANSFORM_RATIO. Boundary and transition durations encode
+// NR_runtime / BZ_runtime, with 1.000 ms as the break-even point. Dispatch
+// durations encode tuned_runtime / original_guessed_runtime. Reciprocal
+// durations encode NR_runtime / Knuth_runtime.
+
+const DIV_TUNE_STATIC_CAPACITY: usize = 16_384;
+const DIV_TUNE_CASES_PER_SCALE: usize = 8;
+const DIV_TUNE_SEARCH_BUDGET: usize = 20_000;
+const DIV_TUNE_KARATSUBA_D_CENTERS: [usize; 7] = [96, 128, 192, 256, 384, 512, 768];
+const DIV_TUNE_TRANSFORM_D_CENTERS: [usize; 5] = [1024, 1280, 1536, 1792, 2048];
+const DIV_TUNE_TRANSITION_SCALES: [usize; 12] = [
+    256, 384, 512, 640, 768, 896, 1024, 1280, 1536, 2048, 3072, 4096,
+];
+
+#[derive(Clone, Copy, Debug)]
+enum DivisionTuneFamily {
+    DynDiv,
+    DynRem,
+    StaticDiv,
+    StaticRem,
+    DynRcp,
+    StaticRcp,
+}
+
+impl DivisionTuneFamily {
+    fn from_env() -> Self {
+        match env::var("DIV_TUNE_FAMILY").as_deref() {
+            Ok("dyn_rem") => Self::DynRem,
+            Ok("static_div") => Self::StaticDiv,
+            Ok("static_rem") => Self::StaticRem,
+            Ok("dyn_rcp") => Self::DynRcp,
+            Ok("static_rcp") => Self::StaticRcp,
+            Ok("dyn_div") | Err(_) => Self::DynDiv,
+            Ok(other) => panic!("unknown DIV_TUNE_FAMILY={other}"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::DynDiv => "dyn_div",
+            Self::DynRem => "dyn_rem",
+            Self::StaticDiv => "static_div",
+            Self::StaticRem => "static_rem",
+            Self::DynRcp => "dyn_rcp",
+            Self::StaticRcp => "static_rcp",
+        }
+    }
+
+    fn is_reciprocal(self) -> bool {
+        matches!(self, Self::DynRcp | Self::StaticRcp)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DivisionCostRegime {
+    Karatsuba,
+    Transform,
+}
+
+impl DivisionCostRegime {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Karatsuba => "karatsuba",
+            Self::Transform => "transform",
+        }
+    }
+
+    fn selects_bz(self, q_len: usize, d_len: usize, parameter: f64) -> bool {
+        match self {
+            Self::Karatsuba => (q_len as f64) * parameter > d_len as f64,
+            Self::Transform => (q_len as f64).log2() * parameter > (d_len as f64).log2().powi(2),
+        }
+    }
+
+    fn q_center(self, d_len: usize, parameter: f64) -> Option<usize> {
+        let q = match self {
+            Self::Karatsuba => d_len as f64 / parameter,
+            Self::Transform => {
+                let log_d = (d_len as f64).log2();
+                2.0f64.powf(log_d * log_d / parameter)
+            }
+        };
+        if !q.is_finite() || q < 8.0 || q > usize::MAX as f64 {
+            None
+        } else {
+            Some(q.round() as usize)
+        }
+    }
+}
+
+struct DivisionTuneInput {
+    q_len: usize,
+    d_len: usize,
+    n: Vec<u64>,
+    d: Vec<u64>,
+}
+
+fn env_f64(name: &str, default: f64) -> f64 {
+    env::var(name).map_or(default, |value| {
+        value
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} must be an f64, got {value}"))
+    })
+}
+
+fn env_f64_values(default: &[f64]) -> Vec<f64> {
+    env::var("DIV_TUNE_VALUES").map_or_else(
+        |_| default.to_vec(),
+        |values| {
+            values
+                .split(',')
+                .map(|value| {
+                    value
+                        .trim()
+                        .parse()
+                        .unwrap_or_else(|_| panic!("invalid DIV_TUNE_VALUES entry {value}"))
+                })
+                .collect()
+        },
+    )
+}
+
+fn env_usize_values(name: &str, default: &[usize]) -> Vec<usize> {
+    env::var(name).map_or_else(
+        |_| default.to_vec(),
+        |values| {
+            values
+                .split(',')
+                .map(|value| {
+                    value
+                        .trim()
+                        .parse()
+                        .unwrap_or_else(|_| panic!("invalid {name} entry {value}"))
+                })
+                .collect()
+        },
+    )
+}
+
+fn division_boundary_lengths_at(
+    regime: DivisionCostRegime,
+    parameter: f64,
+    d_center: usize,
+) -> Vec<(usize, usize)> {
+    assert!(parameter.is_finite() && parameter > 0.0);
+    let Some(q_center) = regime.q_center(d_center, parameter) else {
+        return Vec::new();
+    };
+    if q_center + d_center - 1 > DIV_TUNE_STATIC_CAPACITY {
+        return Vec::new();
+    }
+
+    let d_radius = 8;
+    let q_radius = (q_center / 32).clamp(8, 256);
+    let d_min = d_center.saturating_sub(d_radius).max(BZ_CUTOFF + 1);
+    let d_max = d_center + d_radius;
+    let q_min = q_center.saturating_sub(q_radius).max(8);
+    let q_max = q_center.saturating_add(q_radius);
+    let hard = |q_len: usize, d_len: usize| {
+        (q_min..=q_max).contains(&q_len)
+            && (d_min..=d_max).contains(&d_len)
+            && q_len + d_len - 1 <= DIV_TUNE_STATIC_CAPACITY
+    };
+
+    BoundarySearch::new(hard, |q_len, d_len| {
+        regime.selects_bz(q_len, d_len, parameter)
+    })
+    .with_budget(DIV_TUNE_SEARCH_BUDGET)
+    .find((q_center, d_center), DIV_TUNE_CASES_PER_SCALE, GAP)
+}
+
+fn division_boundary_lengths(regime: DivisionCostRegime, parameter: f64) -> Vec<(usize, usize)> {
+    let centers: &[usize] = match regime {
+        DivisionCostRegime::Karatsuba => &DIV_TUNE_KARATSUBA_D_CENTERS,
+        DivisionCostRegime::Transform => &DIV_TUNE_TRANSFORM_D_CENTERS,
+    };
+    let mut lengths = Vec::new();
+    for &d_center in centers {
+        lengths.extend(division_boundary_lengths_at(regime, parameter, d_center));
+    }
+    lengths.sort_unstable();
+    lengths.dedup();
+    lengths
+}
+
+fn division_boundary_lengths_at_scale(
+    regime: DivisionCostRegime,
+    parameter: f64,
+    scale: usize,
+) -> Vec<(usize, usize)> {
+    assert!(parameter.is_finite() && parameter > 0.0);
+    let (q_center, d_center) = match regime {
+        DivisionCostRegime::Karatsuba if parameter <= 1.0 => {
+            (scale, (scale as f64 * parameter).round() as usize)
+        }
+        DivisionCostRegime::Karatsuba => ((scale as f64 / parameter).round() as usize, scale),
+        DivisionCostRegime::Transform => {
+            let log_q = (scale as f64).log2();
+            let d_at_q_scale = 2.0f64.powf((parameter * log_q).sqrt()).round() as usize;
+            if d_at_q_scale <= scale {
+                (scale, d_at_q_scale)
+            } else {
+                let q_at_d_scale = regime.q_center(scale, parameter).unwrap();
+                (q_at_d_scale, scale)
+            }
+        }
+    };
+    if d_center <= BZ_CUTOFF || q_center + d_center - 1 > DIV_TUNE_STATIC_CAPACITY {
+        return Vec::new();
+    }
+
+    let q_radius = (q_center / 128).clamp(4, 64);
+    let d_radius = (d_center / 128).clamp(4, 64);
+    let q_min = q_center.saturating_sub(q_radius).max(8);
+    let q_max = q_center.saturating_add(q_radius);
+    let d_min = d_center.saturating_sub(d_radius).max(BZ_CUTOFF + 1);
+    let d_max = d_center.saturating_add(d_radius);
+    let hard = |q_len: usize, d_len: usize| {
+        (q_min..=q_max).contains(&q_len)
+            && (d_min..=d_max).contains(&d_len)
+            && q_len.max(d_len).abs_diff(scale) <= q_radius
+            && q_len + d_len - 1 <= DIV_TUNE_STATIC_CAPACITY
+    };
+
+    BoundarySearch::new(hard, |q_len, d_len| {
+        regime.selects_bz(q_len, d_len, parameter)
+    })
+    .with_budget(DIV_TUNE_SEARCH_BUDGET)
+    .find((q_center, d_center), DIV_TUNE_CASES_PER_SCALE, GAP)
+}
+
+fn make_division_tuning_inputs(lengths: &[(usize, usize)], seed: u64) -> Vec<DivisionTuneInput> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    lengths
+        .iter()
+        .map(|&(q_len, d_len)| DivisionTuneInput {
+            q_len,
+            d_len,
+            n: random_limbs(d_len + q_len - 1, &mut rng),
+            d: random_limbs(d_len, &mut rng),
+        })
+        .collect()
+}
+
+fn avg_division_tuning_input(inputs: &[DivisionTuneInput]) -> (f64, f64) {
+    let count = inputs.len() as f64;
+    let q_sum = inputs.iter().map(|input| input.q_len).sum::<usize>();
+    let d_sum = inputs.iter().map(|input| input.d_len).sum::<usize>();
+    (q_sum as f64 / count, d_sum as f64 / count)
+}
+
+fn division_tuning_ratio_bench(
+    iters: u64,
+    inputs: &[DivisionTuneInput],
+    family: DivisionTuneFamily,
+) -> Duration {
+    alternating_ratio_bench(iters, inputs, |input, nr_first| {
+        let mut q_nr = vec![0u64; input.q_len];
+        let mut q_bz = vec![0u64; input.q_len];
+
+        match family {
+            DivisionTuneFamily::DynDiv => time_pair_alternating(
+                nr_first,
+                || {
+                    nr_div_dyn(
+                        black_box(input.n.as_slice()),
+                        black_box(input.d.as_slice()),
+                        black_box(q_nr.as_mut_slice()),
+                    );
+                },
+                || {
+                    bz_div_dyn(
+                        black_box(input.n.as_slice()),
+                        black_box(input.d.as_slice()),
+                        black_box(q_bz.as_mut_slice()),
+                    );
+                },
+            ),
+            DivisionTuneFamily::DynRem => {
+                let mut n_nr = input.n.clone();
+                let mut n_bz = input.n.clone();
+                time_pair_alternating(
+                    nr_first,
+                    || {
+                        nr_div_rem_dyn(
+                            black_box(n_nr.as_mut_slice()),
+                            black_box(input.d.as_slice()),
+                            black_box(q_nr.as_mut_slice()),
+                        );
+                    },
+                    || {
+                        bz_div_rem_dyn(
+                            black_box(n_bz.as_mut_slice()),
+                            black_box(input.d.as_slice()),
+                            black_box(q_bz.as_mut_slice()),
+                        );
+                    },
+                )
+            }
+            DivisionTuneFamily::StaticDiv => time_pair_alternating(
+                nr_first,
+                || {
+                    nr_div_static::<DIV_TUNE_STATIC_CAPACITY>(
+                        black_box(input.n.as_slice()),
+                        black_box(input.d.as_slice()),
+                        black_box(q_nr.as_mut_slice()),
+                    );
+                },
+                || {
+                    bz_div_static::<DIV_TUNE_STATIC_CAPACITY>(
+                        black_box(input.n.as_slice()),
+                        black_box(input.d.as_slice()),
+                        black_box(q_bz.as_mut_slice()),
+                    );
+                },
+            ),
+            DivisionTuneFamily::StaticRem => {
+                let mut n_nr = input.n.clone();
+                let mut n_bz = input.n.clone();
+                time_pair_alternating(
+                    nr_first,
+                    || {
+                        nr_div_rem_static::<DIV_TUNE_STATIC_CAPACITY>(
+                            black_box(n_nr.as_mut_slice()),
+                            black_box(input.d.as_slice()),
+                            black_box(q_nr.as_mut_slice()),
+                        );
+                    },
+                    || {
+                        bz_div_rem_static::<DIV_TUNE_STATIC_CAPACITY>(
+                            black_box(n_bz.as_mut_slice()),
+                            black_box(input.d.as_slice()),
+                            black_box(q_bz.as_mut_slice()),
+                        );
+                    },
+                )
+            }
+            DivisionTuneFamily::DynRcp | DivisionTuneFamily::StaticRcp => {
+                unreachable!("reciprocal family used for division tuning")
+            }
+        }
+    })
+}
+
+fn register_division_boundary_candidates(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    family: DivisionTuneFamily,
+    regime: DivisionCostRegime,
+    candidates: &[f64],
+) {
+    for &candidate in candidates {
+        let lengths = division_boundary_lengths(regime, candidate);
+        assert!(
+            !lengths.is_empty(),
+            "no boundary inputs for {} candidate {candidate}",
+            regime.label()
+        );
+        let inputs = make_division_tuning_inputs(
+            &lengths,
+            candidate.to_bits() ^ (family as u64).wrapping_mul(0x9e37_79b9),
+        );
+        let (avg_q, avg_d) = avg_division_tuning_input(&inputs);
+        println!(
+            "{} {} candidate={candidate:.4}: inputs={} avg_q={avg_q:.1} avg_d={avg_d:.1}",
+            family.label(),
+            regime.label(),
+            inputs.len()
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new(
+                format!("{}/{}", family.label(), regime.label()),
+                format!("{candidate:.4}"),
+            ),
+            &candidate,
+            |bench, _| {
+                bench.iter_custom(|iters| division_tuning_ratio_bench(iters, &inputs, family))
+            },
+        );
+    }
+}
+
+fn register_division_transition_scan(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    family: DivisionTuneFamily,
+) {
+    let karatsuba_ratio = env_f64("DIV_TUNE_KARATSUBA_RATIO", 1.0);
+    let transform_ratio = env_f64("DIV_TUNE_TRANSFORM_RATIO", 10.0);
+    let scales = env_usize_values("DIV_TUNE_SCALES", &DIV_TUNE_TRANSITION_SCALES);
+
+    println!(
+        "{} transition scan: karatsuba_ratio={karatsuba_ratio:.4} transform_ratio={transform_ratio:.4}",
+        family.label()
+    );
+    for scale in scales {
+        for (regime, parameter) in [
+            (DivisionCostRegime::Karatsuba, karatsuba_ratio),
+            (DivisionCostRegime::Transform, transform_ratio),
+        ] {
+            let lengths = division_boundary_lengths_at_scale(regime, parameter, scale);
+            if lengths.is_empty() {
+                continue;
+            }
+            let inputs = make_division_tuning_inputs(
+                &lengths,
+                (scale as u64) ^ parameter.to_bits() ^ (family as u64).wrapping_mul(0x9e37_79b9),
+            );
+            let (avg_q, avg_d) = avg_division_tuning_input(&inputs);
+            println!(
+                "{} transition {} scale={scale}: inputs={} avg_q={avg_q:.1} avg_d={avg_d:.1}",
+                family.label(),
+                regime.label(),
+                inputs.len()
+            );
+            group.bench_with_input(
+                BenchmarkId::new(
+                    format!("{}/transition/{}", family.label(), regime.label()),
+                    scale,
+                ),
+                &scale,
+                |bench, _| {
+                    bench.iter_custom(|iters| division_tuning_ratio_bench(iters, &inputs, family))
+                },
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DivisionTuneCutoffs {
+    karatsuba_transform: usize,
+    karatsuba_ratio: f64,
+    transform_ratio: f64,
+}
+
+fn tuned_division_cutoffs(family: DivisionTuneFamily) -> DivisionTuneCutoffs {
+    match family {
+        DivisionTuneFamily::DynDiv => DivisionTuneCutoffs {
+            karatsuba_transform: DYN_DIV_KARATSUBA_FFT_NR_BZ_CUTOFF,
+            karatsuba_ratio: DYN_DIV_KARATSUBA_NR_BZ_CUTOFF,
+            transform_ratio: DYN_DIV_FFT_NR_BZ_CUTOFF,
+        },
+        DivisionTuneFamily::DynRem => DivisionTuneCutoffs {
+            karatsuba_transform: DYN_DIV_REM_KARATSUBA_FFT_NR_BZ_CUTOFF,
+            karatsuba_ratio: DYN_DIV_REM_KARATSUBA_NR_BZ_CUTOFF,
+            transform_ratio: DYN_DIV_REM_FFT_NR_BZ_CUTOFF,
+        },
+        DivisionTuneFamily::StaticDiv => DivisionTuneCutoffs {
+            karatsuba_transform: STATIC_DIV_KARATSUBA_NTT_NR_BZ_CUTOFF,
+            karatsuba_ratio: STATIC_DIV_KARATSUBA_NR_BZ_CUTOFF,
+            transform_ratio: STATIC_DIV_NTT_NR_BZ_CUTOFF,
+        },
+        DivisionTuneFamily::StaticRem => DivisionTuneCutoffs {
+            karatsuba_transform: STATIC_DIV_REM_KARATSUBA_NTT_NR_BZ_CUTOFF,
+            karatsuba_ratio: STATIC_DIV_REM_KARATSUBA_NR_BZ_CUTOFF,
+            transform_ratio: STATIC_DIV_REM_NTT_NR_BZ_CUTOFF,
+        },
+        DivisionTuneFamily::DynRcp | DivisionTuneFamily::StaticRcp => unreachable!(),
+    }
+}
+
+fn cost_model_selects_bz(q_len: usize, d_len: usize, tuning: DivisionTuneCutoffs) -> bool {
+    if q_len.max(d_len) < tuning.karatsuba_transform {
+        (q_len as f64) * tuning.karatsuba_ratio > d_len as f64
+    } else {
+        (q_len as f64).log2() * tuning.transform_ratio > (d_len as f64).log2().powi(2)
+    }
+}
+
+fn run_division_choice(
+    family: DivisionTuneFamily,
+    use_bz: bool,
+    n: &mut [u64],
+    d: &[u64],
+    q: &mut [u64],
+) {
+    match (family, use_bz) {
+        (DivisionTuneFamily::DynDiv, true) => bz_div_dyn(n, d, q),
+        (DivisionTuneFamily::DynDiv, false) => nr_div_dyn(n, d, q),
+        (DivisionTuneFamily::DynRem, true) => bz_div_rem_dyn(n, d, q),
+        (DivisionTuneFamily::DynRem, false) => nr_div_rem_dyn(n, d, q),
+        (DivisionTuneFamily::StaticDiv, true) => bz_div_static::<DIV_TUNE_STATIC_CAPACITY>(n, d, q),
+        (DivisionTuneFamily::StaticDiv, false) => {
+            nr_div_static::<DIV_TUNE_STATIC_CAPACITY>(n, d, q)
+        }
+        (DivisionTuneFamily::StaticRem, true) => {
+            bz_div_rem_static::<DIV_TUNE_STATIC_CAPACITY>(n, d, q)
+        }
+        (DivisionTuneFamily::StaticRem, false) => {
+            nr_div_rem_static::<DIV_TUNE_STATIC_CAPACITY>(n, d, q)
+        }
+        (DivisionTuneFamily::DynRcp | DivisionTuneFamily::StaticRcp, _) => unreachable!(),
+    }
+}
+
+fn dispatch_comparison_ratio_bench(
+    iters: u64,
+    inputs: &[DivisionTuneInput],
+    family: DivisionTuneFamily,
+) -> Duration {
+    let tuned = tuned_division_cutoffs(family);
+    let guessed = DivisionTuneCutoffs {
+        karatsuba_transform: 1000,
+        karatsuba_ratio: 1.0,
+        transform_ratio: 1.0,
+    };
+    alternating_ratio_bench(iters, inputs, |input, tuned_first| {
+        let tuned_bz = cost_model_selects_bz(input.q_len, input.d_len, tuned);
+        let guessed_bz = cost_model_selects_bz(input.q_len, input.d_len, guessed);
+        debug_assert_ne!(tuned_bz, guessed_bz);
+
+        let mut n_tuned = input.n.clone();
+        let mut n_guessed = input.n.clone();
+        let mut q_tuned = vec![0u64; input.q_len];
+        let mut q_guessed = vec![0u64; input.q_len];
+        time_pair_alternating(
+            tuned_first,
+            || {
+                run_division_choice(
+                    family,
+                    tuned_bz,
+                    black_box(&mut n_tuned),
+                    black_box(&input.d),
+                    black_box(&mut q_tuned),
+                )
+            },
+            || {
+                run_division_choice(
+                    family,
+                    guessed_bz,
+                    black_box(&mut n_guessed),
+                    black_box(&input.d),
+                    black_box(&mut q_guessed),
+                )
+            },
+        )
+    })
+}
+
+fn register_dispatch_comparison(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    family: DivisionTuneFamily,
+) {
+    let tuned = tuned_division_cutoffs(family);
+    let guessed = DivisionTuneCutoffs {
+        karatsuba_transform: 1000,
+        karatsuba_ratio: 1.0,
+        transform_ratio: 1.0,
+    };
+    let d_centers = env_usize_values("DIV_TUNE_SCALES", &[128, 256, 512, 768, 1024, 1536, 2048]);
+    let q_over_d = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0];
+
+    for d_len in d_centers {
+        let mut lengths = q_over_d
+            .iter()
+            .map(|ratio| ((d_len as f64 * ratio).round().max(8.0) as usize, d_len))
+            .filter(|&(q_len, d_len)| {
+                q_len + d_len - 1 <= DIV_TUNE_STATIC_CAPACITY
+                    && cost_model_selects_bz(q_len, d_len, tuned)
+                        != cost_model_selects_bz(q_len, d_len, guessed)
+            })
+            .collect::<Vec<_>>();
+        lengths.sort_unstable();
+        lengths.dedup();
+        if lengths.is_empty() {
+            continue;
+        }
+        println!(
+            "{} tuned-vs-guess d_len={d_len}: differing_shapes={} {lengths:?}",
+            family.label(),
+            lengths.len()
+        );
+        for &(q_len, d_len) in &lengths {
+            let inputs = make_division_tuning_inputs(
+                &[(q_len, d_len)],
+                (q_len as u64).rotate_left(17)
+                    ^ d_len as u64
+                    ^ (family as u64).wrapping_mul(0x9e37_79b9),
+            );
+            group.bench_with_input(
+                BenchmarkId::new(
+                    format!("{}/tuned_over_guess", family.label()),
+                    format!("d{d_len}_q{q_len}"),
+                ),
+                &(q_len, d_len),
+                |bench, _| {
+                    bench.iter_custom(|iters| {
+                        dispatch_comparison_ratio_bench(iters, &inputs, family)
+                    })
+                },
+            );
+        }
+    }
+}
+
+struct ReciprocalTuneInput {
+    d: Vec<u64>,
+    precision: usize,
+}
+
+fn reciprocal_tuning_ratio_bench(
+    iters: u64,
+    inputs: &[ReciprocalTuneInput],
+    family: DivisionTuneFamily,
+) -> Duration {
+    alternating_ratio_bench(iters, inputs, |input, nr_first| {
+        let mut nr = vec![0u64; input.precision];
+        let mut knuth = vec![0u64; input.precision];
+        let inner_repetitions = (512 / input.precision.max(1)).clamp(1, 256);
+        time_pair_alternating(
+            nr_first,
+            || {
+                for _ in 0..inner_repetitions {
+                    match family {
+                        DivisionTuneFamily::DynRcp => {
+                            nr_rcp_wrapper_dyn(black_box(&input.d), black_box(&mut nr))
+                        }
+                        DivisionTuneFamily::StaticRcp => nr_rcp_wrapper_static::<
+                            DIV_TUNE_STATIC_CAPACITY,
+                        >(
+                            black_box(&input.d), black_box(&mut nr)
+                        ),
+                        _ => unreachable!(),
+                    }
+                }
+            },
+            || {
+                for _ in 0..inner_repetitions {
+                    match family {
+                        DivisionTuneFamily::DynRcp => {
+                            knuth_rcp_wrapper_dyn(black_box(&input.d), black_box(&mut knuth))
+                        }
+                        DivisionTuneFamily::StaticRcp => {
+                            knuth_rcp_wrapper_static::<DIV_TUNE_STATIC_CAPACITY>(
+                                black_box(&input.d),
+                                black_box(&mut knuth),
+                            )
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            },
+        )
+    })
+}
+
+fn register_reciprocal_scan(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    family: DivisionTuneFamily,
+) {
+    assert!(family.is_reciprocal());
+    let defaults: &[usize] = match family {
+        DivisionTuneFamily::DynRcp => &[1, 2, 4, 5, 6, 7, 8, 9, 12, 16, 32, 64],
+        DivisionTuneFamily::StaticRcp => &[64, 80, 96, 100, 101, 102, 104, 112, 128, 192, 256],
+        _ => unreachable!(),
+    };
+    let precisions = env_usize_values("DIV_TUNE_VALUES", defaults);
+    for precision in precisions {
+        assert!(precision <= DIV_TUNE_STATIC_CAPACITY);
+        let mut rng =
+            StdRng::seed_from_u64((precision as u64) ^ (family as u64).wrapping_mul(0x9e37_79b9));
+        let inputs = (0..4)
+            .map(|_| ReciprocalTuneInput {
+                d: random_limbs(precision + 1, &mut rng),
+                precision,
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{} precision={precision} inputs={}",
+            family.label(),
+            inputs.len()
+        );
+        group.bench_with_input(
+            BenchmarkId::new(family.label(), precision),
+            &precision,
+            |bench, _| {
+                bench.iter_custom(|iters| reciprocal_tuning_ratio_bench(iters, &inputs, family))
+            },
+        );
+    }
+}
+
+fn bench_division_tuning(c: &mut Criterion) {
+    let family = DivisionTuneFamily::from_env();
+    let regime = env::var("DIV_TUNE_REGIME").unwrap_or_else(|_| "karatsuba".to_owned());
+    let mut group = c.benchmark_group(format!("division_tuning/{ARCH}"));
+    group.sample_size(30);
+    group.warm_up_time(Duration::from_millis(750));
+    group.measurement_time(Duration::from_secs(2));
+    group.noise_threshold(0.02);
+
+    if regime == "dispatch" {
+        println!("Reported value is tuned_runtime / guessed_runtime.");
+        println!("Below 1.000 ms favors the tuned dispatch.");
+    } else if regime == "reciprocal" {
+        println!("Reported value is NR_runtime / Knuth_runtime; 1.000 ms is break-even.");
+        println!("Below 1.000 ms favors NR; above 1.000 ms favors Knuth.");
+    } else {
+        println!("Reported value is NR_runtime / BZ_runtime; 1.000 ms is break-even.");
+        println!("Below 1.000 ms favors NR; above 1.000 ms favors BZ.");
+    }
+    match regime.as_str() {
+        "karatsuba" => {
+            assert!(!family.is_reciprocal());
+            let candidates = env_f64_values(&[0.30, 0.40, 0.50, 0.60, 0.75, 0.90, 1.05]);
+            register_division_boundary_candidates(
+                &mut group,
+                family,
+                DivisionCostRegime::Karatsuba,
+                &candidates,
+            );
+        }
+        "transform" => {
+            assert!(!family.is_reciprocal());
+            let candidates = env_f64_values(&[9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0]);
+            register_division_boundary_candidates(
+                &mut group,
+                family,
+                DivisionCostRegime::Transform,
+                &candidates,
+            );
+        }
+        "transition" => {
+            assert!(!family.is_reciprocal());
+            register_division_transition_scan(&mut group, family);
+        }
+        "dispatch" => {
+            assert!(!family.is_reciprocal());
+            register_dispatch_comparison(&mut group, family);
+        }
+        "reciprocal" => register_reciprocal_scan(&mut group, family),
+        other => panic!("unknown DIV_TUNE_REGIME={other}"),
+    }
+    group.finish();
+}
+
 // Criterion setup.
 
 fn cutoff_criterion() -> Criterion {
@@ -975,6 +1782,6 @@ fn cutoff_criterion() -> Criterion {
 criterion_group! {
     name = benches;
     config = cutoff_criterion();
-    targets = bench_nr_seed_start_precision_ratio
+    targets = bench_division_tuning
 }
 criterion_main!(benches);

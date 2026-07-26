@@ -94,29 +94,31 @@ pub fn cmp_buf(lhs: &[u64], rhs: &[u64]) -> std::cmp::Ordering {
 
 #[inline]
 pub fn signed_shl(val: u64, sh: i32) -> u64 {
-    return if sh < 0 {
-        val >> sh.unsigned_abs()
+    if sh < 0 {
+        val.checked_shr(sh.unsigned_abs()).unwrap_or(0)
     } else {
-        val << sh.unsigned_abs()
-    };
+        val.checked_shl(sh.unsigned_abs()).unwrap_or(0)
+    }
 }
 
 #[inline]
 pub fn signed_shr(val: u64, sh: i32) -> u64 {
-    return if sh < 0 {
-        val << sh.unsigned_abs()
+    if sh < 0 {
+        val.checked_shl(sh.unsigned_abs()).unwrap_or(0)
     } else {
-        val >> sh.unsigned_abs()
-    };
+        val.checked_shr(sh.unsigned_abs()).unwrap_or(0)
+    }
 }
 
 #[inline]
 pub fn lsb(val: u64, sh: i32) -> u64 {
-    return if sh <= 0 {
+    if sh <= 0 {
         0
+    } else if sh >= 64 {
+        val
     } else {
         val & ((1 << sh.unsigned_abs()) - 1)
-    };
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -366,7 +368,7 @@ unsafe fn dec_asm(buf: *mut u64, len: usize) -> bool {
 pub fn add_buf(lhs: &mut [u64], rhs: &[u64]) -> bool {
     let rhs_len = rhs.len();
     let lhs_len = lhs.len();
-    debug_assert!(lhs_len >= rhs_len, "lhs must be longer then rhs");
+    assert!(lhs_len >= rhs_len, "lhs must be longer then rhs");
     if rhs_len == 0 {
         return false;
     }
@@ -386,7 +388,7 @@ pub fn add_buf(lhs: &mut [u64], rhs: &[u64]) -> bool {
 pub fn sub_buf(lhs: &mut [u64], rhs: &[u64]) -> bool {
     let rhs_len = rhs.len();
     let lhs_len = lhs.len();
-    debug_assert!(lhs_len >= rhs_len, "lhs must be longer then rhs");
+    assert!(lhs_len >= rhs_len, "lhs must be longer then rhs");
     if rhs_len == 0 {
         return false;
     }
@@ -437,10 +439,10 @@ pub fn add_prim(buf: &mut [u64], prim: u64) -> bool {
     }
     let (res, c) = buf[0].overflowing_add(prim);
     buf[0] = res;
-    return if c {
-        unsafe { inc_asm(buf.as_mut_ptr().add(1), buf_len) }
+    return if c && buf_len > 1 {
+        unsafe { inc_asm(buf.as_mut_ptr().add(1), buf_len - 1) }
     } else {
-        false
+        c
     };
 }
 
@@ -455,10 +457,10 @@ pub fn sub_prim(buf: &mut [u64], prim: u64) -> bool {
     }
     let (res, c) = buf[0].overflowing_sub(prim);
     buf[0] = res;
-    return if c {
-        unsafe { dec_asm(buf.as_mut_ptr().add(1), buf_len) }
+    return if c && buf_len > 1 {
+        unsafe { dec_asm(buf.as_mut_ptr().add(1), buf_len - 1) }
     } else {
-        false
+        c
     };
 }
 
@@ -492,10 +494,10 @@ unsafe fn shr_asm(dst: &mut u64, src: u64, sh: u8) {
 }
 
 pub fn shr_buf(buf: &mut [u64], sh: u8) -> u64 {
+    assert!(sh < 64, "shift right must be less then 64");
     if sh == 0 || buf.is_empty() {
         return 0;
     }
-    debug_assert!(sh < 64, "shift right must be less then 64");
     let carry = buf[0] << (64 - sh);
     for i in 0..buf.len() - 1 {
         let src = buf[i + 1];
@@ -530,10 +532,10 @@ unsafe fn shl_asm(dst: &mut u64, src: u64, sh: u8) {
 }
 
 pub fn shl_buf(buf: &mut [u64], sh: u8) -> u64 {
+    assert!(sh < 64, "shift left must be less then 64");
     if sh == 0 || buf.is_empty() {
         return 0;
     }
-    debug_assert!(sh < 64, "shift left must be less then 64");
     let carry = *buf.last().unwrap() >> (64 - sh);
     for i in (1..buf.len()).rev() {
         let src = buf[i - 1];

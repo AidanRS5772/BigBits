@@ -615,8 +615,9 @@ impl ShrAssign<usize> for UBitInt {
     }
 }
 
-fn div_rem_ubi(mut n: UBitInt, d: &mut [u64]) -> (UBitInt, UBitInt) {
-    let mut q = div_vec(&mut n.data, d);
+fn div_rem_ubi(mut n: UBitInt, d: &[u64]) -> (UBitInt, UBitInt) {
+    let mut q = vec![0; div_quotient_len(n.data.len(), d.len())];
+    div_rem_dyn(&mut n.data, d, &mut q);
     trim_lz(&mut n.data);
     trim_lz(&mut q);
     (UBitInt { data: q }, n)
@@ -626,8 +627,7 @@ impl DivRem for UBitInt {
     type Q = UBitInt;
     type R = UBitInt;
     fn div_rem(self, rhs: Self) -> (UBitInt, UBitInt) {
-        let mut d = rhs.data;
-        div_rem_ubi(self, &mut d)
+        div_rem_ubi(self, &rhs.data)
     }
 }
 
@@ -635,8 +635,7 @@ impl DivRem for &UBitInt {
     type Q = UBitInt;
     type R = UBitInt;
     fn div_rem(self, rhs: Self) -> (UBitInt, UBitInt) {
-        let mut d = rhs.data.clone();
-        div_rem_ubi(self.clone(), &mut d)
+        div_rem_ubi(self.clone(), &rhs.data)
     }
 }
 
@@ -644,8 +643,7 @@ impl DivRem<&UBitInt> for UBitInt {
     type Q = UBitInt;
     type R = UBitInt;
     fn div_rem(self, rhs: &UBitInt) -> (Self::Q, Self::R) {
-        let mut d = rhs.data.clone();
-        div_rem_ubi(self, &mut d)
+        div_rem_ubi(self, &rhs.data)
     }
 }
 
@@ -653,8 +651,7 @@ impl DivRem<UBitInt> for &UBitInt {
     type Q = UBitInt;
     type R = UBitInt;
     fn div_rem(self, rhs: UBitInt) -> (Self::Q, Self::R) {
-        let mut d = rhs.data;
-        div_rem_ubi(self.clone(), &mut d)
+        div_rem_ubi(self.clone(), &rhs.data)
     }
 }
 
@@ -662,7 +659,7 @@ impl DivRem<u128> for UBitInt {
     type Q = UBitInt;
     type R = u128;
     fn div_rem(self, rhs: u128) -> (Self::Q, Self::R) {
-        let (q, r) = div_rem_ubi(self, &mut SmallBuf::from(rhs));
+        let (q, r) = div_rem_ubi(self, &SmallBuf::from(rhs));
         (q, r.try_into().unwrap())
     }
 }
@@ -671,7 +668,7 @@ impl DivRem<u128> for &UBitInt {
     type Q = UBitInt;
     type R = u128;
     fn div_rem(self, rhs: u128) -> (Self::Q, Self::R) {
-        let (q, r) = div_rem_ubi(self.clone(), &mut SmallBuf::from(rhs));
+        let (q, r) = div_rem_ubi(self.clone(), &SmallBuf::from(rhs));
         (q, r.try_into().unwrap())
     }
 }
@@ -779,16 +776,16 @@ where
 
 impl RemAssign for UBitInt {
     fn rem_assign(&mut self, rhs: Self) {
-        let mut d = rhs.data;
-        div_vec(&mut self.data, &mut d);
+        let mut q = vec![0; div_quotient_len(self.data.len(), rhs.data.len())];
+        div_rem_dyn(&mut self.data, &rhs.data, &mut q);
         trim_lz(&mut self.data);
     }
 }
 
 impl RemAssign<&UBitInt> for UBitInt {
     fn rem_assign(&mut self, rhs: &UBitInt) {
-        let mut d = rhs.data.clone();
-        div_vec(&mut self.data, &mut d);
+        let mut q = vec![0; div_quotient_len(self.data.len(), rhs.data.len())];
+        div_rem_dyn(&mut self.data, &rhs.data, &mut q);
         trim_lz(&mut self.data);
     }
 }

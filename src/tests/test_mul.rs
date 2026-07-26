@@ -360,11 +360,16 @@ fn test_fft_decompose_standard_helpers() {
     assert_eq!(&x[..expected.len()], &expected);
     assert!(x[8..].iter().all(|c| c.is_zero()));
 
-    let mut sqr = vec![Complex::zero(); 8];
+    let poison = Complex::new(-1.0, -2.0);
+    let mut sqr = vec![poison; 8];
     sqr_decompose_16_standard(&[0x4444_3333_2222_1111], &mut sqr);
     assert_eq!(sqr[0], Complex::new(0x1111 as f64, 0x2222 as f64));
     assert_eq!(sqr[1], Complex::new(0x3333 as f64, 0x4444 as f64));
-    assert!(sqr[4..].iter().all(|c| c.is_zero()));
+    assert!(
+        sqr[2..].iter().all(|c| c.is_zero()),
+        "scalar square decomposition left a poisoned coefficient tail: {:?}",
+        &sqr[2..]
+    );
 }
 
 #[test]
@@ -458,7 +463,22 @@ fn test_empty_input_public_paths() {
     let mut empty_out = [];
     assert_eq!(mul_dyn(&[], &[3], &mut empty_out), 0);
     assert_eq!(mul_static::<1>(&[], &[3], &mut empty_out).unwrap(), 0);
+    assert_eq!(mul_vec(&[], &[3]), (Vec::new(), 0));
+    assert_eq!(mul_arr::<1>(&[], &[3]).unwrap(), ([0], 0));
     assert_eq!(short_mul_dyn(&[], &[3], &mut empty_out), 0);
+    assert_eq!(short_mul_dyn(&[], &[], &mut empty_out), 0);
+    assert_eq!(short_mul_static::<1>(&[], &[], &mut empty_out), 0);
+
+    assert_eq!(sqr_dyn(&[], &mut empty_out), 0);
+    assert_eq!(sqr_static::<1>(&[], &mut empty_out).unwrap(), 0);
+    assert_eq!(sqr_vec(&[]), (Vec::new(), 0));
+    assert_eq!(sqr_arr::<1>(&[]).unwrap(), ([0], 0));
+    assert_eq!(short_sqr_dyn(&[], &mut empty_out), 0);
+    assert_eq!(short_sqr_static::<1>(&[], &mut empty_out), 0);
+
+    assert_eq!(powi_sz(&[], 3), (0, 0));
+    assert!(powi_vec(&[], 3).is_empty());
+    assert_eq!(powi_arr::<1>(&[], 3).unwrap(), [0]);
 
     let mut untouched = [123u64, 456];
     assert_eq!(short_sqr_buf(&[], &mut untouched), 0);
@@ -786,6 +806,92 @@ fn test_karatsuba_entry_unbalanced() {
 }
 
 #[test]
+fn test_karatsuba_core_recurse_boundary_sizing() {
+    // karatsuba_core's cross-term reconstruction needs out.len() >= 3*half+1,
+    // which exceeds the standard a.len()+b.len()-1 convention whenever
+    // b.len() sits just above half of a.len() (the exact Chunking/Recurse
+    // dispatch boundary). chunking_karatsuba's last chunk (length in
+    // [s-1, 2s-2]) can land exactly there, so directly engineer l to place
+    // last_chunk.len() at its extremes for many s and chunk counts, on both
+    // parities of last_chunk.len() — this is a differential-fuzz regression
+    // test for a real, previously-panicking bug (not a synthetic edge case).
+    let mut trials = 0usize;
+    for s in [
+        KARA_CUTOFF,
+        KARA_CUTOFF + 1,
+        KARA_CUTOFF + 5,
+        40,
+        41,
+        75,
+        76,
+    ] {
+        if s <= 2 {
+            continue;
+        }
+        for chunks in [1usize, 2, 3, 5] {
+            for last_len_target in [s.saturating_sub(1), s, 2 * s - 3, 2 * s - 2] {
+                if last_len_target == 0 {
+                    continue;
+                }
+                let l = chunks * s + last_len_target;
+                if is_school(l, s) || s > (l + 1) / 2 {
+                    continue; // doesn't reach the chunking path for this shape
+                }
+                let actual_chunks = (l - s + 1) / s;
+                let actual_last_len = l - actual_chunks * s;
+                assert_eq!(actual_last_len, last_len_target);
+
+                for seed in 0u64..3 {
+                    trials += 1;
+                    let long = rand_nonzero_vec(l, 90_000 + seed + l as u64 * 7 + s as u64 * 13);
+                    let short = rand_nonzero_vec(s, 91_000 + seed + l as u64 * 7 + s as u64 * 13);
+                    let mut out = vec![0u64; l + s - 1];
+                    let c = karatsuba_entry_dyn(&long, &short, &mut out);
+                    let (exp_buf, exp_carry) = mul_ref_parts(&long, &short);
+                    assert_eq_result(
+                        &out,
+                        c,
+                        &exp_buf,
+                        exp_carry,
+                        &format!(
+                            "karatsuba boundary l={l} s={s} last_len={actual_last_len} seed={seed}"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        trials > 50,
+        "sweep should exercise many shapes, got {trials}"
+    );
+}
+
+#[test]
+fn test_karatsuba_entry_unbalanced_random_sweep() {
+    // Broad, non-engineered sweep over unbalanced (l, s) shapes and seeds, as
+    // a differential fuzz check against the reference multiply.
+    let mut seed = 500_000u64;
+    for l in (KARA_CUTOFF..300).step_by(7) {
+        for s in (2..l).step_by(11) {
+            seed += 1;
+            let long = rand_nonzero_vec(l, seed);
+            let short = rand_nonzero_vec(s, seed + 1_000_000);
+            let mut out = vec![0u64; l + s - 1];
+            let c = karatsuba_entry_dyn(&long, &short, &mut out);
+            let (exp_buf, exp_carry) = mul_ref_parts(&long, &short);
+            assert_eq_result(
+                &out,
+                c,
+                &exp_buf,
+                exp_carry,
+                &format!("karatsuba random unbalanced l={l} s={s} seed={seed}"),
+            );
+        }
+    }
+}
+
+#[test]
 fn test_karatsuba_entry_sweep() {
     // Sweep across a range of sizes
     for seed in 0u64..30 {
@@ -924,6 +1030,41 @@ fn test_ntt_entry_small() {
             &format!("ntt_entry small n={n} seed={seed}"),
         );
     }
+}
+
+#[test]
+fn test_ntt_single_limb_and_oversized_outputs() {
+    let a = [u64::MAX];
+
+    let mut exact = [0u64; 1];
+    let carry = ntt_entry_dyn(&a, &a, &mut exact);
+    assert_eq!(exact, [1]);
+    assert_eq!(carry, u64::MAX - 1);
+
+    let mut oversized = [9u64; 4];
+    let carry = ntt_entry_dyn(&a, &a, &mut oversized);
+    assert_eq!(oversized, [1, u64::MAX - 1, 0, 0]);
+    assert_eq!(carry, 0);
+
+    let mut static_out = [9u64; 4];
+    let carry = ntt_entry_static::<4>(&a, &a, &mut static_out);
+    assert_eq!(static_out, oversized);
+    assert_eq!(carry, 0);
+
+    let mut sqr_exact = [0u64; 1];
+    let carry = ntt_sqr_entry_dyn(&a, &mut sqr_exact);
+    assert_eq!(sqr_exact, [1]);
+    assert_eq!(carry, u64::MAX - 1);
+
+    let mut sqr_oversized = [9u64; 4];
+    let carry = ntt_sqr_entry_dyn(&a, &mut sqr_oversized);
+    assert_eq!(sqr_oversized, [1, u64::MAX - 1, 0, 0]);
+    assert_eq!(carry, 0);
+
+    let mut sqr_static = [9u64; 4];
+    let carry = ntt_sqr_entry_static::<4>(&a, &mut sqr_static);
+    assert_eq!(sqr_static, sqr_oversized);
+    assert_eq!(carry, 0);
 }
 
 #[test]
@@ -1630,6 +1771,15 @@ fn test_sqr_static_err_on_overflow() {
     let mut out = [0u64; 1];
     let result = sqr_static::<1>(&[1, 1], &mut out);
     assert!(result.is_err(), "expected Err for sqr_static overflow");
+
+    let result = sqr_static::<8>(&[1, 1], &mut out);
+    assert!(result.is_err(), "expected Err for a short output slice");
+}
+
+#[test]
+#[should_panic(expected = "out is not large enough for multiplication")]
+fn test_sqr_dyn_rejects_short_output() {
+    sqr_dyn(&[1, 1], &mut [0]);
 }
 
 #[test]
@@ -2398,16 +2548,65 @@ fn test_powi_zero_entry_paths() {
 }
 
 #[test]
-#[should_panic]
-fn test_powi_non_identity_regression() {
+fn test_powi_zero_value_and_poisoned_output_paths() {
+    assert_eq!(powi_sz(&[0, 0], 7), (0, 0));
+    assert!(powi_vec(&[0, 0], 7).is_empty());
+    assert_eq!(powi_arr::<4>(&[0, 0], 7).unwrap(), [0; 4]);
+
+    let mut dyn_out = [9u64; 4];
+    powi_dyn_entry(&[3, 0], 1, &mut dyn_out);
+    assert_eq!(dyn_out, [3, 0, 0, 0]);
+
+    let mut static_out = [9u64; 4];
+    powi_static_entry::<4>(&[3, 0], 1, &mut static_out).unwrap();
+    assert_eq!(static_out, [3, 0, 0, 0]);
+
+    let mut dyn_identity = [9u64; 4];
+    powi_dyn_entry(&[3], 0, &mut dyn_identity);
+    assert_eq!(dyn_identity, [1, 0, 0, 0]);
+
+    assert_eq!(
+        powi_sz(&[2], usize::MAX),
+        (usize::MAX.div_ceil(64), usize::MAX.div_ceil(64))
+    );
+}
+
+#[test]
+fn test_powi_non_identity() {
     assert_eq!(powi_vec(&[3], 1), vec![3]);
     assert_eq!(powi_vec(&[3], 2), vec![9]);
 }
 
 #[test]
-#[should_panic]
-fn test_powi_vec_zero_regression() {
+fn test_powi_vec_zero() {
     assert_eq!(powi_vec(&[3], 0), vec![1]);
+}
+
+#[test]
+fn test_powi_vec_small_exponents_exhaustive() {
+    // Exercises reverse_pow's bit construction and the src/dst parity
+    // bookkeeping across every exponent shape (bit lengths and popcounts) up
+    // to 20, against a plain repeated-multiplication oracle.
+    fn to_limbs(v: u128) -> Vec<u64> {
+        if v == 0 {
+            return vec![0];
+        }
+        let mut out = vec![v as u64, (v >> 64) as u64];
+        trim_lz(&mut out);
+        out
+    }
+
+    for &(base, max_pow) in &[(2u64, 20usize), (3, 20), (5, 20), (200, 14)] {
+        let mut expected: u128 = 1;
+        for pow in 0..=max_pow {
+            assert_eq!(
+                powi_vec(&[base], pow),
+                to_limbs(expected),
+                "base={base} pow={pow}"
+            );
+            expected *= base as u128;
+        }
+    }
 }
 
 // ─── Section 13: sqr_arr + Static NTT Sqr ──────────────────────────────────
@@ -2468,9 +2667,8 @@ fn test_mul_static_ntt_split() {
         }
     }
 
-    // Known source bug: ntt_entry_static with small N (e.g., N=24, n=12) hits the
-    // split convolution path which returns all zeros. The split path doesn't work
-    // correctly when N is too small relative to the required NTT size.
+    // The over-N split path (find_ntt_size(out_len) > N, only reachable for
+    // non-5-smooth N) is covered by test_ntt_static_split_regression.
 }
 
 #[test]
@@ -2493,13 +2691,36 @@ fn test_mul_static_ntt_dispatch() {
 
 #[test]
 fn test_ntt_static_split_regression() {
+    // N = 24 is 5-smooth: out_len 23 stays on the direct transform path.
     let n = 12usize;
     let a = rand_nonzero_vec(n, 8450);
     let b = rand_nonzero_vec(n, 8460);
     let mut out = vec![0u64; 2 * n - 1];
     let c = ntt_entry_static::<24>(&a, &b, &mut out);
     let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
-    assert_eq_result(&out, c, &exp_buf, exp_carry, "ntt static split");
+    assert_eq_result(&out, c, &exp_buf, exp_carry, "ntt static direct");
+
+    // N = 23 is not 5-smooth: find_ntt_size(out_len) > N forces the chunked
+    // split path, balanced and unbalanced.
+    let a = rand_nonzero_vec(12, 8470);
+    let b = rand_nonzero_vec(12, 8480);
+    let mut out = vec![0u64; 23];
+    let c = ntt_entry_static::<23>(&a, &b, &mut out);
+    let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+    assert_eq_result(&out, c, &exp_buf, exp_carry, "ntt static split balanced");
+
+    let a = rand_nonzero_vec(15, 8490);
+    let b = rand_nonzero_vec(8, 8500);
+    let mut out = vec![0u64; 22];
+    let c = ntt_entry_static::<23>(&a, &b, &mut out);
+    let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+    assert_eq_result(&out, c, &exp_buf, exp_carry, "ntt static split unbalanced");
+
+    let buf = rand_nonzero_vec(12, 8510);
+    let mut out = vec![0u64; 23];
+    let c = ntt_sqr_entry_static::<23>(&buf, &mut out);
+    let (exp_buf, exp_carry) = sqr_ref_parts(&buf);
+    assert_eq_result(&out, c, &exp_buf, exp_carry, "ntt static split sqr");
 }
 
 // ─── Section 15: NTT Radix-3 Coverage ────────────────────────────────────────
@@ -2661,7 +2882,118 @@ fn test_karatsuba_static_fallback_scratch() {
     );
 }
 
+#[test]
+fn test_karatsuba_static_chunking_scratch_fallback() {
+    fn check<const N: usize>(l: usize, s: usize, seed: u64, label: &str) {
+        assert!(s <= (l + 1) / 2, "case must use chunking Karatsuba");
+        assert!(!is_school(l, s), "case must not use schoolbook");
+
+        let long = rand_nonzero_vec(l, seed);
+        let short = rand_nonzero_vec(s, seed + 1);
+        let mut out = vec![0u64; l + s - 1];
+        let carry = karatsuba_entry_static::<N>(&long, &short, &mut out);
+        let (expected, expected_carry) = mul_ref_parts(&long, &short);
+        assert_eq_result(&out, carry, &expected, expected_carry, label);
+    }
+
+    // Exact scratch capacity must use the ordinary chunking path, not the
+    // separate-cross fallback intended for balanced recursion.
+    assert_eq!(find_karatsuba_scratch(52, 23), 82);
+    check::<82>(52, 23, 12_000, "static chunking exact scratch capacity");
+
+    // The old fallback called karatsuba_core directly with half > short.len(),
+    // panicking while splitting the short operand.
+    assert!(find_karatsuba_scratch(47, 23) > 69);
+    check::<69>(47, 23, 12_100, "static chunking fallback boundary");
+
+    // Exercise more than one full short-sized chunk before the remainder.
+    assert!(find_karatsuba_scratch(150, 50) > 199);
+    check::<199>(150, 50, 12_200, "static chunking fallback multiple chunks");
+}
+
 // ─── Section 17: mid_mul_static Larger Sizes ─────────────────────────────────
+
+#[test]
+fn test_ntt_mid_mul_static_implicit_padding_shift() {
+    fn check<const N: usize>(n: usize, z: usize, seed: u64) {
+        let long_len = 2 * n - 1 - z;
+        assert!(z <= n - 3, "the shifted CRT window must not wrap");
+        assert!(long_len <= N);
+
+        let long = rand_nonzero_vec(long_len, seed);
+        let short = rand_nonzero_vec(n, seed + 100);
+        let mut padded = vec![0u64; 2 * n - 1];
+        padded[z..].copy_from_slice(&long);
+
+        let mut expected = vec![0u64; n];
+        let expected_carry = ntt_mid_mul_dyn(&padded, &short, &mut expected);
+        let mut got = vec![u64::MAX; n];
+        let got_carry = ntt_mid_mul_static::<N>(&long, &short, &mut got);
+
+        assert_eq_mid_result(
+            &got,
+            got_carry,
+            &expected,
+            expected_carry,
+            &format!("implicit static NTT pad N={N} n={n} z={z}"),
+        );
+    }
+
+    // Both cases require a declared transform larger than the static buffer.
+    // The second lands on the last shift whose CRT extraction does not wrap.
+    check::<24>(17, 9, 15_000);
+    check::<19>(17, 14, 15_100);
+}
+
+#[test]
+fn test_mid_mul_static_tight_ntt_capacity() {
+    const S: usize = NTT_MID_CUTOFF;
+    const N: usize = S + 20;
+    const Z: usize = 2 * S - 1 - N;
+    assert!(Z <= S - 3);
+
+    let long = rand_nonzero_vec(N, 15_200);
+    let short = rand_nonzero_vec(S, 15_300);
+    let mut padded = vec![0u64; 2 * S - 1];
+    padded[Z..].copy_from_slice(&long);
+
+    let mut expected = vec![0u64; S];
+    let expected_carry = ntt_mid_mul_dyn(&padded, &short, &mut expected);
+    let mut got = vec![u64::MAX; S];
+    let got_carry = mid_mul_static::<N>(&long, &short, &mut got);
+
+    assert_eq_mid_result(
+        &got,
+        got_carry,
+        &expected,
+        expected_carry,
+        "tight static middle product uses implicit-padding NTT",
+    );
+}
+
+#[test]
+fn test_ntt_mid_mul_static_wrapped_shift_boundary() {
+    const S: usize = 17;
+    const Z: usize = S - 2;
+    const N: usize = 2 * S - 1 - Z;
+
+    let long = rand_nonzero_vec(N, 15_400);
+    let short = rand_nonzero_vec(S, 15_500);
+    let mut padded = vec![0u64; 2 * S - 1];
+    padded[Z..].copy_from_slice(&long);
+    let expected = mid_mul_ref(&padded, &short);
+    let expected_carry = mid_mul_school_carry(&long, &short);
+
+    let mut got = vec![u64::MAX; S];
+    let got_carry = ntt_mid_mul_static::<N>(&long, &short, &mut got);
+    assert_approx_mid_result(
+        &got,
+        got_carry,
+        &expected,
+        expected_carry,
+        "wrapped shifted CRT window",
+    );
+}
 
 // ─── Section 18: short_mul_static Above Cutoff ──────────────────────────────
 
@@ -2846,5 +3178,53 @@ mod fft_cutoff {
                 }
             });
         }
+    }
+}
+
+#[test]
+fn test_karatsuba_mul_prim_dispatch_ignores_stale_out_tail() {
+    // karatsuba_mul's Prim/Prim2 dispatch used to call mul_prim/mul_prim2 on
+    // the FULL out slice, even when out is wider than the standard
+    // long.len()+short.len()-1 convention (a legitimate case once
+    // karatsuba_core's Recurse-boundary sizing fix can hand nested Prim/Prim2
+    // sub-calls a scratch-backed buffer wider than that) — silently
+    // multiplying whatever garbage sat beyond long.len() as if it were part
+    // of the multiplicand. Poison out's tail explicitly and confirm the
+    // dispatch ignores it, for both arms, calling karatsuba_entry_dyn
+    // directly with an over-sized out (bypassing karatsuba_core entirely).
+    let long = rand_nonzero_vec(20, 1);
+    let poison = 0xDEADBEEFDEADBEEFu64;
+    let extra = 5;
+
+    for short in [vec![7u64], vec![7u64, 9u64]] {
+        let standard_len = long.len() + short.len() - 1;
+        let mut out = vec![poison; standard_len + extra];
+        let carry = karatsuba_entry_dyn(&long, &short, &mut out);
+
+        let (exp_buf, exp_carry) = mul_ref_parts(&long, &short);
+        assert_eq!(
+            carry,
+            0,
+            "short.len()={}: overflow should fold into out, not the return",
+            short.len()
+        );
+        assert_eq!(
+            &out[..standard_len],
+            &exp_buf[..],
+            "short.len()={}: product mismatch",
+            short.len()
+        );
+        assert_eq!(
+            out[standard_len],
+            exp_carry,
+            "short.len()={}: overflow limb wrong (likely poisoned)",
+            short.len()
+        );
+        assert!(
+            out[standard_len + 1..].iter().all(|&x| x == 0),
+            "short.len()={}: tail beyond the legitimate overflow limb must be zero, got {:?}",
+            short.len(),
+            &out[standard_len + 1..]
+        );
     }
 }

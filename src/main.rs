@@ -1,5 +1,4 @@
 #![allow(unused_imports, dead_code)]
-use big_bits::utils::div::nr_rcp_dyn;
 use big_bits::utils::mul::{dyn_dispatch, mul_dyn, mul_vec};
 use criterion::black_box;
 use rand::rngs::StdRng;

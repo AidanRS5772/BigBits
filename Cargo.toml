@@ -44,3 +44,7 @@ required-features = ["_bench_internals"]
 name = "cutoffs_bench"
 harness = false
 required-features = ["_bench_internals"]
+
+[[bench]]
+name = "div_profile"
+harness = false

@@ -691,8 +691,9 @@ impl ShrAssign<usize> for BitInt {
     }
 }
 
-fn div_rem_bi(mut n: BitInt, d: &mut [u64], d_sign: bool) -> (BitInt, BitInt) {
-    let mut q = div_vec(&mut n.data, d);
+fn div_rem_bi(mut n: BitInt, d: &[u64], d_sign: bool) -> (BitInt, BitInt) {
+    let mut q = vec![0; div_quotient_len(n.data.len(), d.len())];
+    div_rem_dyn(&mut n.data, d, &mut q);
     trim_lz(&mut q);
     trim_lz(&mut n.data);
     (
@@ -708,8 +709,7 @@ impl DivRem for BitInt {
     type Q = BitInt;
     type R = BitInt;
     fn div_rem(self, rhs: Self) -> (Self::Q, Self::R) {
-        let mut d = rhs.data;
-        div_rem_bi(self, &mut d, rhs.sign)
+        div_rem_bi(self, &rhs.data, rhs.sign)
     }
 }
 
@@ -717,8 +717,7 @@ impl DivRem for &BitInt {
     type Q = BitInt;
     type R = BitInt;
     fn div_rem(self, rhs: Self) -> (Self::Q, Self::R) {
-        let mut d = rhs.data.clone();
-        div_rem_bi(self.clone(), &mut d, rhs.sign)
+        div_rem_bi(self.clone(), &rhs.data, rhs.sign)
     }
 }
 
@@ -726,8 +725,7 @@ impl DivRem<&BitInt> for BitInt {
     type Q = BitInt;
     type R = BitInt;
     fn div_rem(self, rhs: &BitInt) -> (Self::Q, Self::R) {
-        let mut d = rhs.data.clone();
-        div_rem_bi(self, &mut d, rhs.sign)
+        div_rem_bi(self, &rhs.data, rhs.sign)
     }
 }
 
@@ -735,8 +733,7 @@ impl DivRem<BitInt> for &BitInt {
     type Q = BitInt;
     type R = BitInt;
     fn div_rem(self, rhs: BitInt) -> (Self::Q, Self::R) {
-        let mut d = rhs.data.clone();
-        div_rem_bi(self.clone(), &mut d, rhs.sign)
+        div_rem_bi(self.clone(), &rhs.data, rhs.sign)
     }
 }
 
@@ -744,8 +741,8 @@ impl DivRem<i128> for BitInt {
     type Q = BitInt;
     type R = i128;
     fn div_rem(self, rhs: i128) -> (Self::Q, Self::R) {
-        let mut d = SmallBuf::from(rhs.unsigned_abs());
-        let (q, r) = div_rem_bi(self, &mut d, rhs < 0);
+        let d = SmallBuf::from(rhs.unsigned_abs());
+        let (q, r) = div_rem_bi(self, &d, rhs < 0);
         (q, r.try_into().unwrap())
     }
 }
@@ -754,8 +751,8 @@ impl DivRem<i128> for &BitInt {
     type Q = BitInt;
     type R = i128;
     fn div_rem(self, rhs: i128) -> (Self::Q, Self::R) {
-        let mut d = SmallBuf::from(rhs.unsigned_abs());
-        let (q, r) = div_rem_bi(self.clone(), &mut d, rhs < 0);
+        let d = SmallBuf::from(rhs.unsigned_abs());
+        let (q, r) = div_rem_bi(self.clone(), &d, rhs < 0);
         (q, r.try_into().unwrap())
     }
 }

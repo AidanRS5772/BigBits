@@ -32,6 +32,26 @@ pub const NTT_MID_CUTOFF: usize = 200;
 pub const BZ_CUTOFF: usize = 88;
 pub const BZ_TOP_PADDED_COST_SCALE: f64 = 0.295;
 
+pub const DYN_DIV_KARATSUBA_FFT_NR_BZ_CUTOFF: usize = 1568;
+pub const DYN_DIV_KARATSUBA_NR_BZ_CUTOFF: f64 = 0.31;
+pub const DYN_DIV_FFT_NR_BZ_CUTOFF: f64 = 7.84;
+
+pub const DYN_DIV_REM_KARATSUBA_FFT_NR_BZ_CUTOFF: usize = 1280;
+pub const DYN_DIV_REM_KARATSUBA_NR_BZ_CUTOFF: f64 = 0.58;
+pub const DYN_DIV_REM_FFT_NR_BZ_CUTOFF: f64 = 8.70;
+
+pub const DYN_RCP_KNUTH_NR_CUTOFF: usize = 8;
+
+pub const STATIC_DIV_KARATSUBA_NTT_NR_BZ_CUTOFF: usize = 1664;
+pub const STATIC_DIV_KARATSUBA_NR_BZ_CUTOFF: f64 = 0.65;
+pub const STATIC_DIV_NTT_NR_BZ_CUTOFF: f64 = 9.485;
+
+pub const STATIC_DIV_REM_KARATSUBA_NTT_NR_BZ_CUTOFF: usize = 3328;
+pub const STATIC_DIV_REM_KARATSUBA_NR_BZ_CUTOFF: f64 = 0.82;
+pub const STATIC_DIV_REM_NTT_NR_BZ_CUTOFF: f64 = 10.5;
+
+pub const STATIC_RCP_KNUTH_NR_CUTOFF: usize = 100;
+
 thread_local! {
     static SCRATCH_POOL: RefCell<Vec<Vec<u64>>> = RefCell::new(Vec::new());
 }
@@ -54,7 +74,10 @@ impl ScratchGuard {
     }
 
     pub fn get_splits<const N: usize>(&mut self, sizes: [usize; N]) -> [&mut [u64]; N] {
-        let tot: usize = sizes.iter().sum();
+        let tot = sizes
+            .iter()
+            .try_fold(0usize, |sum, &size| sum.checked_add(size))
+            .expect("scratch split size overflow");
         if self.buf.len() < tot {
             self.buf.resize(tot, 0);
         }

@@ -351,8 +351,9 @@ impl<const N: usize> DivRem for UBitIntStatic<N> {
         let n_len = buf_len(&self.data);
         let mut n = self.data;
         let d_len = buf_len(&rhs.data);
-        let mut d = rhs.data;
-        let q = div_arr(&mut n[..n_len], &mut d[..d_len]);
+        let mut q = [0; N];
+        let q_len = div_quotient_len(n_len, d_len);
+        div_rem_static::<N>(&mut n[..n_len], &rhs.data[..d_len], &mut q[..q_len]);
         (UBitIntStatic { data: q }, UBitIntStatic { data: n })
     }
 }
@@ -363,7 +364,10 @@ impl<const N: usize> DivRem<u128> for UBitIntStatic<N> {
     fn div_rem(self, rhs: u128) -> (Self::Q, Self::R) {
         let n_len = buf_len(&self.data);
         let mut n = self.data;
-        let q = div_arr(&mut n[..n_len], &mut SmallBuf::from(rhs));
+        let d = SmallBuf::from(rhs);
+        let mut q = [0; N];
+        let q_len = div_quotient_len(n_len, d.len());
+        div_rem_static::<N>(&mut n[..n_len], &d, &mut q[..q_len]);
         (
             UBitIntStatic { data: q },
             SmallBuf::try_from(&n[..2]).unwrap().into(),
@@ -430,8 +434,9 @@ impl<const N: usize> RemAssign for UBitIntStatic<N> {
     fn rem_assign(&mut self, rhs: Self) {
         let n_len = buf_len(&self.data);
         let d_len = buf_len(&rhs.data);
-        let mut d = rhs.data;
-        div_arr::<N>(&mut self.data[..n_len], &mut d[..d_len]);
+        let mut q = [0; N];
+        let q_len = div_quotient_len(n_len, d_len);
+        div_rem_static::<N>(&mut self.data[..n_len], &rhs.data[..d_len], &mut q[..q_len]);
     }
 }
 

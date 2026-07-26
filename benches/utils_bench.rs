@@ -20,6 +20,14 @@ fn random_normalized_limbs(n: usize) -> Vec<u64> {
     limbs
 }
 
+fn random_unnormalized_limbs(n: usize) -> Vec<u64> {
+    let mut limbs = random_limbs(n);
+    if let Some(last) = limbs.last_mut() {
+        *last = (*last & ((1 << 48) - 1)) | (1 << 47);
+    }
+    limbs
+}
+
 fn random_sh() -> u8 {
     let mut rng = rand::thread_rng();
     rng.gen_range(1..64)
@@ -31,6 +39,36 @@ fn random_div() -> u64 {
 }
 
 const ARCH: &'static str = std::env::consts::ARCH;
+
+fn bz_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) {
+    if let Some(request) = division_preflight(n, d, q) {
+        bz_div_wrapper_dyn(n, d, q, request);
+    }
+}
+
+fn nr_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) {
+    if let Some(request) = division_preflight(n, d, q) {
+        nr_div_wrapper_dyn(n, d, q, request);
+    }
+}
+
+fn nr_div_rem_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) {
+    if let Some(request) = division_preflight(n, d, q) {
+        nr_div_rem_wrapper_dyn(n, d, q, request);
+    }
+}
+
+fn nr_rcp_dyn(d: &[u64], rcp: &mut [u64]) {
+    if reciprocal_preflight(d, rcp) {
+        nr_rcp_wrapper_dyn(d, rcp);
+    }
+}
+
+fn knuth_rcp_dyn(d: &[u64], rcp: &mut [u64]) {
+    if reciprocal_preflight(d, rcp) {
+        knuth_rcp_wrapper_dyn(d, rcp);
+    }
+}
 
 fn set_up_group(group: &mut BenchmarkGroup<'_, WallTime>) {
     group.sample_size(250); // default is 100
@@ -481,22 +519,25 @@ fn bench_bz_div(c: &mut Criterion) {
     let sizes: Vec<usize> = vec![4, 16, 64, 256, 1024, 4096];
     for &n in &sizes {
         group.throughput(Throughput::Elements(n as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
-            let short = random_normalized_limbs(n);
+        for (normalization, short) in [
+            ("normalized", random_normalized_limbs(n)),
+            ("unnormalized", random_unnormalized_limbs(n)),
+        ] {
             let long = random_limbs(2 * n);
-            bench.iter_batched_ref(
-                || (long.clone(), short.clone(), vec![0; n + 1]),
-                |data| {
-                    let (long, short, out) = data;
-                    bz_div_dyn(
-                        black_box(long.as_mut_slice()),
-                        black_box(short.as_mut_slice()),
-                        black_box(out.as_mut_slice()),
-                    )
-                },
-                BatchSize::LargeInput,
-            );
-        });
+            group.bench_with_input(BenchmarkId::new(normalization, n), &n, |bench, &_| {
+                bench.iter_batched_ref(
+                    || vec![0; n + 1],
+                    |out| {
+                        bz_div_dyn(
+                            black_box(long.as_slice()),
+                            black_box(short.as_slice()),
+                            black_box(out.as_mut_slice()),
+                        )
+                    },
+                    BatchSize::LargeInput,
+                );
+            });
+        }
     }
     group.finish();
 }
@@ -504,29 +545,104 @@ fn bench_bz_div(c: &mut Criterion) {
 fn bench_nr_div(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("nr_div_buf/{ARCH}"));
     set_up_group(&mut group);
-    let sizes: Vec<usize> = vec![4, 16, 64, 256, 1024, 4096];
+    let sizes: Vec<usize> = vec![16, 64, 256, 1024, 4096];
     for &n in &sizes {
         group.throughput(Throughput::Elements(n as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
-            let short = random_normalized_limbs(n);
+        for (normalization, short) in [
+            ("normalized", random_normalized_limbs(n)),
+            ("unnormalized", random_unnormalized_limbs(n)),
+        ] {
             let long = random_limbs(2 * n);
-            bench.iter_batched_ref(
-                || (short.clone(), vec![0; n + 1]),
-                |data| {
-                    let (short, out) = data;
-                    nr_div_dyn(
-                        black_box(long.as_slice()),
-                        black_box(short.as_mut_slice()),
-                        black_box(out.as_mut_slice()),
-                    )
-                },
-                BatchSize::LargeInput,
-            );
-        });
+            group.bench_with_input(BenchmarkId::new(normalization, n), &n, |bench, &_| {
+                bench.iter_batched_ref(
+                    || vec![0; n + 1],
+                    |out| {
+                        nr_div_dyn(
+                            black_box(long.as_slice()),
+                            black_box(short.as_slice()),
+                            black_box(out.as_mut_slice()),
+                        )
+                    },
+                    BatchSize::LargeInput,
+                );
+            });
+        }
     }
     group.finish();
 }
 
-criterion_group!(benches, bench_nr_div);
+fn bench_nr_div_rem(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("nr_div_rem_buf/{ARCH}"));
+    set_up_group(&mut group);
+    let sizes: Vec<usize> = vec![16, 64, 256, 1024, 4096];
+    for &n in &sizes {
+        group.throughput(Throughput::Elements(n as u64));
+        for (normalization, short) in [
+            ("normalized", random_normalized_limbs(n)),
+            ("unnormalized", random_unnormalized_limbs(n)),
+        ] {
+            let long = random_limbs(2 * n);
+            group.bench_with_input(BenchmarkId::new(normalization, n), &n, |bench, &_| {
+                bench.iter_batched_ref(
+                    || (long.clone(), vec![0; n + 1]),
+                    |data| {
+                        let (num, out) = data;
+                        nr_div_rem_dyn(
+                            black_box(num.as_mut_slice()),
+                            black_box(short.as_slice()),
+                            black_box(out.as_mut_slice()),
+                        )
+                    },
+                    BatchSize::LargeInput,
+                );
+            });
+        }
+    }
+    group.finish();
+}
+
+fn bench_rcp_setup(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("rcp_setup/{ARCH}"));
+    set_up_group(&mut group);
+    let sizes: Vec<usize> = vec![16, 64, 256, 1024, 4096];
+    for &n in &sizes {
+        group.throughput(Throughput::Elements(n as u64));
+        for (algorithm, reciprocal) in [
+            ("knuth", knuth_rcp_dyn as fn(&[u64], &mut [u64])),
+            ("nr", nr_rcp_dyn as fn(&[u64], &mut [u64])),
+        ] {
+            for (normalization, input) in [
+                ("normalized", random_normalized_limbs(n)),
+                ("unnormalized", random_unnormalized_limbs(n)),
+            ] {
+                group.bench_with_input(
+                    BenchmarkId::new(format!("{algorithm}_{normalization}"), n),
+                    &n,
+                    |bench, &_| {
+                        bench.iter_batched_ref(
+                            || vec![0; n + 1],
+                            |out| {
+                                reciprocal(
+                                    black_box(input.as_slice()),
+                                    black_box(out.as_mut_slice()),
+                                )
+                            },
+                            BatchSize::LargeInput,
+                        );
+                    },
+                );
+            }
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_bz_div,
+    bench_nr_div,
+    bench_nr_div_rem,
+    bench_rcp_setup
+);
 
 criterion_main!(benches);
