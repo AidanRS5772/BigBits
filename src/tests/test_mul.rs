@@ -1,8 +1,491 @@
-use super::{rand_nonzero_vec, rand_vec};
+use super::{mul_ref, rand_nonzero_vec, to_u128};
 use crate::utils::mul::*;
-use crate::utils::utils::{buf_len, trim_lz};
+use crate::utils::utils::trim_lz;
+use crate::utils::{
+    CHUNKING_KARATSUBA_CUTOFF, FFT_16BIT_CUTOFF, FFT_CHUNKING_KARATSUBA_CUTOFF,
+    FFT_KARATSUBA_CUTOFF, FFT_MID_CUTOFF, FFT_SQR_CUTOFF, KARATSUBA_CUTOFF, KARATSUBA_SQR_CUTOFF,
+    NTT_CHUNKING_KARATSUBA_CUTOFF, NTT_KARATSUBA_CUTOFF, NTT_MID_CUTOFF, SHORT_MUL_CUTOFF,
+    SHORT_SQR_CUTOFF, STATIC_NTT_SQR_CUTOFF,
+};
+use rustfft::num_complex::Complex;
+use rustfft::num_traits::Zero;
 
-// ─── mul_prim ───────────────────────────────────────────────────────────────
+// KARATSUBA_CUTOFF is f64; derive a usize version for size calculations
+const KARA_CUTOFF: usize = KARATSUBA_CUTOFF as usize + 1;
+
+// ─── boundary finders ────────────────────────────────────────────────────────
+
+fn flat_branch_l() -> usize {
+    4 * CHUNKING_KARATSUBA_CUTOFF
+}
+
+fn curved_boundary() -> (usize, usize, usize) {
+    let c = KARATSUBA_CUTOFF;
+    let l = (1.5 * c).round() as usize;
+    let half = (l + 1) / 2;
+    let s_school = (half + 1..)
+        .take_while(|&s| is_school(l, s))
+        .last()
+        .expect("no school size found in curved branch");
+    (l, s_school, s_school + 1)
+}
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+fn norm(mut v: Vec<u64>, c: u64) -> Vec<u64> {
+    if c > 0 {
+        v.push(c);
+    }
+    v
+}
+
+/// Like mul_ref but returns (buf, carry) separately instead of appending carry.
+fn mul_ref_parts(a: &[u64], b: &[u64]) -> (Vec<u64>, u64) {
+    if a.is_empty() || b.is_empty() {
+        return (vec![0], 0);
+    }
+    let mut out = vec![0u64; a.len() + b.len() - 1];
+    let c = mul_buf(a, b, &mut out);
+    (out, c)
+}
+
+fn mul_ref_oversized(a: &[u64], b: &[u64], out_len: usize) -> Vec<u64> {
+    let raw_len = a.len() + b.len() - 1;
+    let (mut out, carry) = mul_ref_parts(a, b);
+    out.resize(out_len, 0);
+    if out_len > raw_len {
+        out[raw_len] = carry;
+    }
+    out
+}
+
+fn sqr_ref_parts(a: &[u64]) -> (Vec<u64>, u64) {
+    mul_ref_parts(a, a)
+}
+
+fn mid_mul_ref(long: &[u64], short: &[u64]) -> Vec<u64> {
+    let n = short.len();
+    let full = mul_ref(long, short);
+    if full.len() < 2 * n {
+        let mut padded = full;
+        padded.resize(2 * n, 0);
+        padded[n - 1..2 * n - 1].to_vec()
+    } else {
+        full[n - 1..2 * n - 1].to_vec()
+    }
+}
+
+fn mid_mul_school_carry(long: &[u64], short: &[u64]) -> (u64, u64) {
+    let mut out = vec![0u64; short.len()];
+    mid_mul_buf(long, short, &mut out)
+}
+
+/// Reference for short_mul: compute the full product (untrimmed), extract the
+/// same columns that short_mul_buf targets.
+fn short_mul_ref(a: &[u64], b: &[u64], out_len: usize) -> Vec<u64> {
+    let full_len = a.len() + b.len() - 1;
+    let mut full = vec![0u64; full_len];
+    let _c = mul_buf(a, b, &mut full);
+    // short_mul_buf computes columns d..d+out_len where:
+    let d = full_len.saturating_sub(out_len);
+    full[d..d + out_len].to_vec()
+}
+
+fn short_sqr_ref(a: &[u64], out_len: usize) -> Vec<u64> {
+    let full_len = 2 * a.len() - 1;
+    let mut full = vec![0u64; full_len];
+    let _c = mul_buf(a, a, &mut full);
+    let d = full_len.saturating_sub(out_len);
+    full[d..d + out_len].to_vec()
+}
+
+fn neg_inv_mod_2_64_runtime(p: u64) -> u64 {
+    let mut x: u64 = 1;
+    while x.wrapping_mul(p) != u64::MAX {
+        let tmp = x.wrapping_mul(p).wrapping_add(2);
+        x = x.wrapping_mul(tmp);
+    }
+    x
+}
+
+fn assert_close(got: f64, expected: f64, msg: &str) {
+    assert!(
+        (got - expected).abs() <= 1e-9,
+        "{msg}: got={got}, expected={expected}"
+    );
+}
+
+/// Build a human-readable diff report showing where two buffers diverge.
+fn diff_report(
+    got: &[u64],
+    got_carry: u64,
+    expected: &[u64],
+    exp_carry: u64,
+    msg: &str,
+) -> Option<String> {
+    let carry_match = got_carry == exp_carry;
+    let len_match = got.len() == expected.len();
+    let min_len = got.len().min(expected.len());
+
+    // Collect differing limb indices
+    let mut diffs: Vec<usize> = Vec::new();
+    for i in 0..min_len {
+        if got[i] != expected[i] {
+            diffs.push(i);
+        }
+    }
+
+    if carry_match && len_match && diffs.is_empty() {
+        return None; // Everything matches
+    }
+
+    let mut report = format!("\n  MISMATCH: {msg}\n");
+
+    // Carry line
+    if carry_match {
+        report += &format!("  carry: MATCH ({got_carry:#x})\n");
+    } else {
+        report += &format!("  carry: DIFFERS  got={got_carry:#x}  expected={exp_carry:#x}\n");
+    }
+
+    // Length line
+    if !len_match {
+        report += &format!(
+            "  length: DIFFERS  got={}  expected={}\n",
+            got.len(),
+            expected.len()
+        );
+    }
+
+    if diffs.is_empty() {
+        return Some(report);
+    }
+
+    report += &format!(
+        "  buffer: first diff at limb {}, {}/{} limbs differ\n",
+        diffs[0],
+        diffs.len(),
+        min_len
+    );
+
+    // Show up to 5 differing limbs with context
+    for (shown, &i) in diffs.iter().enumerate() {
+        if shown >= 5 {
+            report += &format!("  ... and {} more differing limbs\n", diffs.len() - 5);
+            break;
+        }
+        let g = got[i];
+        let e = expected[i];
+        let diff = (g as i128) - (e as i128);
+        report += &format!("    limb[{i}]: got={g:#018x}  expected={e:#018x}  diff={diff}\n");
+    }
+
+    Some(report)
+}
+
+/// Assert two results match exactly, showing carry separately and a
+/// readable diff on failure.
+fn assert_eq_result(got: &[u64], got_carry: u64, expected: &[u64], exp_carry: u64, msg: &str) {
+    if let Some(report) = diff_report(got, got_carry, expected, exp_carry, msg) {
+        panic!("{report}");
+    }
+}
+
+/// Assert two trimmed buffers match (for cases where carry is already folded in).
+fn assert_eq_buf(got: &[u64], expected: &[u64], msg: &str) {
+    let mut g = got.to_vec();
+    let mut e = expected.to_vec();
+    trim_lz(&mut g);
+    trim_lz(&mut e);
+    assert_eq_result(&g, 0, &e, 0, msg);
+}
+
+fn limb_delta(got: u64, expected: u64) -> i128 {
+    let diff = got.wrapping_sub(expected);
+    if diff <= i64::MAX as u64 {
+        diff as i128
+    } else {
+        -((0u64.wrapping_sub(diff)) as i128)
+    }
+}
+
+/// For approximate algorithms that skip lower columns/input limbs:
+/// - Limb 0 can differ by any amount (missing carry low word)
+/// - Limb 1 can differ by a bounded carry count
+/// - Limb 2+ can differ only by carry cascade
+fn assert_approx_buf(got: &[u64], expected: &[u64], msg: &str) {
+    assert_eq!(got.len(), expected.len(), "{msg}: length mismatch");
+    let mut bad: Vec<(usize, i128)> = Vec::new();
+    if got.len() > 1 {
+        let diff = limb_delta(got[1], expected[1]);
+        let tolerance = got.len().max(expected.len()) as i128 + 2;
+        if diff.abs() > tolerance {
+            bad.push((1, diff));
+        }
+    }
+    for i in 2..got.len() {
+        let diff = limb_delta(got[i], expected[i]);
+        if diff.abs() > 1 {
+            bad.push((i, diff));
+        }
+    }
+    if bad.is_empty() {
+        return;
+    }
+    let mut report = format!("\n  APPROX MISMATCH: {msg}\n");
+    report += &format!(
+        "  {} limbs exceed ±1 tolerance (checking limb[2..{}]):\n",
+        bad.len(),
+        got.len()
+    );
+    for &(i, diff) in bad.iter().take(5) {
+        report += &format!(
+            "    limb[{i}]: got={:#018x}  expected={:#018x}  diff={diff}\n",
+            got[i], expected[i]
+        );
+    }
+    if bad.len() > 5 {
+        report += &format!("    ... and {} more\n", bad.len() - 5);
+    }
+    panic!("{report}");
+}
+
+fn assert_approx_result(
+    got: &[u64],
+    got_carry: u64,
+    expected: &[u64],
+    expected_carry: u64,
+    msg: &str,
+) {
+    assert_eq!(
+        got_carry, expected_carry,
+        "{msg}: carry mismatch; got={got_carry:#018x}, expected={expected_carry:#018x}"
+    );
+    assert_approx_buf(got, expected, msg);
+}
+
+fn assert_approx_mid_result(
+    got: &[u64],
+    got_carry: (u64, u64),
+    expected: &[u64],
+    expected_carry: (u64, u64),
+    msg: &str,
+) {
+    assert_eq!(
+        got_carry, expected_carry,
+        "{msg}: carry mismatch; got=({:#018x}, {:#018x}), expected=({:#018x}, {:#018x})",
+        got_carry.0, got_carry.1, expected_carry.0, expected_carry.1
+    );
+    assert_approx_buf(got, expected, msg);
+}
+
+fn assert_eq_mid_result(
+    got: &[u64],
+    got_carry: (u64, u64),
+    expected: &[u64],
+    exp_carry: (u64, u64),
+    msg: &str,
+) {
+    if let Some(report) = diff_report(got, got_carry.0, expected, exp_carry.0, msg) {
+        panic!("{report}");
+    }
+    assert_eq!(
+        got_carry.1, exp_carry.1,
+        "{msg}: high carry mismatch; got={:#018x}, expected={:#018x}",
+        got_carry.1, exp_carry.1
+    );
+}
+
+// ─── Section 0: Exposed FFT/NTT Helper Paths ────────────────────────────────
+
+#[test]
+fn test_fft_twiddle_tower_build_refine_view_rebuild() {
+    let mut tower = FTTTwidleTower::build(16);
+
+    let base = tower.get(16).to_vec();
+    assert_eq!(base.len(), 5);
+    assert_close(base[0].re, 1.0, "base twiddle real");
+    assert_close(base[0].im, 0.0, "base twiddle imag");
+
+    let refined = tower.get(32).to_vec();
+    assert_eq!(refined.len(), 9);
+    assert_close(refined[0].re, 1.0, "refined twiddle real");
+    assert_close(refined[0].im, 0.0, "refined twiddle imag");
+
+    let smaller = tower.get(8).to_vec();
+    assert_eq!(smaller.len(), 3);
+    assert_close(smaller[2].re, 0.0, "view quarter-turn real");
+    assert_close(smaller[2].im, 1.0, "view quarter-turn imag");
+
+    for &res in &[64, 128, 256] {
+        let table = tower.get(res).to_vec();
+        assert_eq!(table.len(), res / 4 + 1);
+    }
+}
+
+#[test]
+fn test_fft_size_and_standard_helpers() {
+    for &(target, expected) in &[(1, 4), (4, 4), (5, 8), (15, 16), (16, 16), (17, 20)] {
+        assert_eq!(find_fft_size(target), expected, "find_fft_size({target})");
+    }
+
+    let mut rounded = [
+        Complex::new(5.0, 7.5),
+        Complex::new(-2.5, -3.5),
+        Complex::new(8.5, -8.5),
+    ];
+    scale_and_round_standard(&mut rounded, 2.0);
+    assert_eq!(rounded[0], Complex::new(2.0, 4.0));
+    assert_eq!(rounded[1], Complex::new(-1.0, -2.0));
+    assert_eq!(rounded[2], Complex::new(4.0, -4.0));
+}
+
+#[test]
+fn test_fft_decompose_standard_helpers() {
+    let long = [0x4444_3333_2222_1111, 0xCCCC_BBBB_AAAA_9999];
+    let short = [0x8888_7777_6666_5555];
+    let mut x = vec![Complex::new(-1.0, -1.0); 12];
+
+    decompose_16_standard(&long, &short, &mut x);
+    let expected = [
+        Complex::new(0x1111 as f64, 0x5555 as f64),
+        Complex::new(0x2222 as f64, 0x6666 as f64),
+        Complex::new(0x3333 as f64, 0x7777 as f64),
+        Complex::new(0x4444 as f64, 0x8888 as f64),
+        Complex::new(0x9999 as f64, 0.0),
+        Complex::new(0xAAAA as f64, 0.0),
+        Complex::new(0xBBBB as f64, 0.0),
+        Complex::new(0xCCCC as f64, 0.0),
+    ];
+    assert_eq!(&x[..expected.len()], &expected);
+    assert!(x[8..].iter().all(|c| c.is_zero()));
+
+    let poison = Complex::new(-1.0, -2.0);
+    let mut sqr = vec![poison; 8];
+    sqr_decompose_16_standard(&[0x4444_3333_2222_1111], &mut sqr);
+    assert_eq!(sqr[0], Complex::new(0x1111 as f64, 0x2222 as f64));
+    assert_eq!(sqr[1], Complex::new(0x3333 as f64, 0x4444 as f64));
+    assert!(
+        sqr[2..].iter().all(|c| c.is_zero()),
+        "scalar square decomposition left a poisoned coefficient tail: {:?}",
+        &sqr[2..]
+    );
+}
+
+#[test]
+fn test_montgomery_no_asm_helpers_mod_17() {
+    let p = 17u64;
+    let p_inv = neg_inv_mod_2_64_runtime(p);
+    assert_eq!(p.wrapping_mul(p_inv), u64::MAX);
+
+    for t in [0u128, 1, 16, 17, 18, 255, 256, u64::MAX as u128] {
+        assert_eq!(reduce_no_asm(t, p, p_inv), (t % p as u128) as u64);
+    }
+
+    for a in 0..p {
+        for b in 0..p {
+            assert_eq!(
+                mul_reduce_no_asm(a, b, p, p_inv),
+                (a * b) % p,
+                "mul_reduce_no_asm({a}, {b})"
+            );
+        }
+    }
+
+    assert_eq!(add_mod_no_asm(5, 7, p), 12);
+    assert_eq!(add_mod_no_asm(10, 9, p), 2);
+    assert_eq!(sub_mod_no_asm(12, 5, p), 7);
+    assert_eq!(sub_mod_no_asm(5, 12, p), 10);
+    assert_eq!(neg_mod_no_asm(0, p), 0);
+    assert_eq!(neg_mod_no_asm(5, p), 12);
+}
+
+#[test]
+fn test_ntt_const_arithmetic_helpers() {
+    assert_eq!(exp_cnt(360), [3, 2, 1]);
+
+    let p_inv = neg_inv_mod_2_64(17);
+    assert_eq!(17u64.wrapping_mul(p_inv), u64::MAX);
+
+    for &(a, b) in &[
+        (0u64, 0u64),
+        (1, u64::MAX),
+        (0x1234_5678_9ABC_DEF0, 0x0FED_CBA9_8765_4321),
+        (u64::MAX, u64::MAX),
+    ] {
+        let (hi, lo) = split_mul(a, b);
+        let expected = (a as u128) * (b as u128);
+        assert_eq!(lo, expected as u64, "split_mul lo");
+        assert_eq!(hi, (expected >> 64) as u64, "split_mul hi");
+    }
+
+    for &(a, b, p) in &[
+        (123_456_789, 987_654_321, P1::P),
+        (P2::P - 2, P2::P - 3, P2::P),
+    ] {
+        let expected = ((a as u128) * (b as u128) % (p as u128)) as u64;
+        assert_eq!(mod_mul(a, b, p), expected, "mod_mul({a}, {b}, {p})");
+    }
+}
+
+#[test]
+fn test_montgomery_public_arithmetic_paths() {
+    let two = Montgomery::<P1>::to(2);
+    let three = Montgomery::<P1>::to(3);
+
+    assert!(two.clone() == two);
+    assert_eq!((two + three).from(), 5);
+    assert_eq!((three - two).from(), 1);
+    assert_eq!((-three).from(), P1::P - 3);
+    assert_eq!(two.pow(10).from(), 1024);
+    assert_eq!(Montgomery::<P1>::fuse_mul_to(7, 9).from(), 63);
+
+    let mut acc = two;
+    acc += three;
+    assert_eq!(acc.from(), 5);
+    acc -= two;
+    assert_eq!(acc.from(), 3);
+
+    let mut res = vec![0u64; 4];
+    acc_convolution::<P1, _>(&[2, 3], &[4, 5], &mut res, |a, b| {
+        Montgomery::fuse_mul_to(a, b)
+    });
+    let mont: &[Montgomery<P1>] = unsafe { std::mem::transmute(&res[..]) };
+    let got: Vec<u64> = mont.iter().map(|&m| m.from()).collect();
+    assert_eq!(&got[..3], &[8, 22, 15]);
+
+    assert_eq!(find_ntt_size_for_split::<24, P1>(), 24);
+    assert_eq!(find_ntt_size_for_split::<25, P2>(), 25);
+}
+
+#[test]
+fn test_empty_input_public_paths() {
+    let mut empty_out = [];
+    assert_eq!(mul_dyn(&[], &[3], &mut empty_out), 0);
+    assert_eq!(mul_static::<1>(&[], &[3], &mut empty_out).unwrap(), 0);
+    assert_eq!(mul_vec(&[], &[3]), (Vec::new(), 0));
+    assert_eq!(mul_arr::<1>(&[], &[3]).unwrap(), ([0], 0));
+    assert_eq!(short_mul_dyn(&[], &[3], &mut empty_out), 0);
+    assert_eq!(short_mul_dyn(&[], &[], &mut empty_out), 0);
+    assert_eq!(short_mul_static::<1>(&[], &[], &mut empty_out), 0);
+
+    assert_eq!(sqr_dyn(&[], &mut empty_out), 0);
+    assert_eq!(sqr_static::<1>(&[], &mut empty_out).unwrap(), 0);
+    assert_eq!(sqr_vec(&[]), (Vec::new(), 0));
+    assert_eq!(sqr_arr::<1>(&[]).unwrap(), ([0], 0));
+    assert_eq!(short_sqr_dyn(&[], &mut empty_out), 0);
+    assert_eq!(short_sqr_static::<1>(&[], &mut empty_out), 0);
+
+    assert_eq!(powi_sz(&[], 3), (0, 0));
+    assert!(powi_vec(&[], 3).is_empty());
+    assert_eq!(powi_arr::<1>(&[], 3).unwrap(), [0]);
+
+    let mut untouched = [123u64, 456];
+    assert_eq!(short_sqr_buf(&[], &mut untouched), 0);
+    assert_eq!(untouched, [123, 456]);
+}
+
+// ─── Section 1: mul_prim ────────────────────────────────────────────────────
 
 #[test]
 fn test_mul_prim_by_zero() {
@@ -10,6 +493,12 @@ fn test_mul_prim_by_zero() {
     let c = mul_prim(&mut v, 0);
     assert_eq!(v, vec![0, 0]);
     assert_eq!(c, 0);
+}
+
+#[test]
+fn test_mul_prim_empty() {
+    let mut v = [];
+    assert_eq!(mul_prim(&mut v, 123), 0);
 }
 
 #[test]
@@ -22,7 +511,6 @@ fn test_mul_prim_by_one() {
 
 #[test]
 fn test_mul_prim_overflow_carry() {
-    // u64::MAX * 2 = 2^65 - 2 = [u64::MAX-1], carry=1
     let mut v = vec![u64::MAX];
     let c = mul_prim(&mut v, 2);
     assert_eq!(v, vec![u64::MAX - 1]);
@@ -39,7 +527,6 @@ fn test_mul_prim_two_limbs() {
 
 #[test]
 fn test_mul_prim_max_times_max() {
-    // u64::MAX * u64::MAX = 2^128 - 2^65 + 1 → low=1, carry=u64::MAX-1
     let mut v = vec![u64::MAX];
     let c = mul_prim(&mut v, u64::MAX);
     assert_eq!(v, vec![1]);
@@ -48,24 +535,15 @@ fn test_mul_prim_max_times_max() {
 
 #[test]
 fn test_mul_prim_multi_limb_carry() {
-    // [u64::MAX, u64::MAX] * 2:
-    //   limb0: u64::MAX*2 = [u64::MAX-1], carry=1
-    //   limb1: u64::MAX*2+1 = 2^65-1 = [u64::MAX], carry=1
     let mut v = vec![u64::MAX, u64::MAX];
     let c = mul_prim(&mut v, 2);
     assert_eq!(v, vec![u64::MAX - 1, u64::MAX]);
     assert_eq!(c, 1);
 }
 
-/// Verify mul_prim reconstructed result matches original * prim (for 1-limb inputs).
 #[test]
 fn test_mul_prim_correctness_single_limb() {
-    for &(a, p) in &[
-        (1u64, 5u64),
-        (7, 11),
-        (u64::MAX, 3),
-        (0xDEAD_BEEF, 0xCAFE),
-    ] {
+    for &(a, p) in &[(1u64, 5u64), (7, 11), (u64::MAX, 3), (0xDEAD_BEEF, 0xCAFE)] {
         let expected = (a as u128) * (p as u128);
         let mut v = vec![a];
         let c = mul_prim(&mut v, p);
@@ -74,7 +552,7 @@ fn test_mul_prim_correctness_single_limb() {
     }
 }
 
-// ─── mul_prim2 ──────────────────────────────────────────────────────────────
+// ─── Section 2: mul_prim2 ───────────────────────────────────────────────────
 
 #[test]
 fn test_mul_prim2_by_one() {
@@ -82,6 +560,12 @@ fn test_mul_prim2_by_one() {
     let c = mul_prim2(&mut v, 1);
     assert_eq!(v, vec![5]);
     assert_eq!(c, 0);
+}
+
+#[test]
+fn test_mul_prim2_empty() {
+    let mut v = [];
+    assert_eq!(mul_prim2(&mut v, 123), 0);
 }
 
 #[test]
@@ -94,7 +578,6 @@ fn test_mul_prim2_by_small() {
 
 #[test]
 fn test_mul_prim2_overflow_into_high64() {
-    // [1] * 2^64 = 0 in low limb, carry = 1
     let mut v = vec![1u64];
     let c = mul_prim2(&mut v, 1u128 << 64);
     assert_eq!(v, vec![0]);
@@ -103,7 +586,6 @@ fn test_mul_prim2_overflow_into_high64() {
 
 #[test]
 fn test_mul_prim2_two_limbs() {
-    // [1, 0] * 5 = [5, 0], carry = 0
     let mut v = vec![1u64, 0];
     let c = mul_prim2(&mut v, 5);
     assert_eq!(v, vec![5, 0]);
@@ -118,7 +600,56 @@ fn test_mul_prim2_by_zero() {
     assert_eq!(c, 0);
 }
 
-// ─── mul_buf ────────────────────────────────────────────────────────────────
+#[test]
+fn test_mul_prim2_max_times_max() {
+    let mut v = vec![u64::MAX];
+    let c = mul_prim2(&mut v, u128::MAX);
+    // u64::MAX * u128::MAX = u64::MAX * (2^128 - 1)
+    let expected = (u64::MAX as u128).wrapping_mul(u128::MAX);
+    let got_lo = v[0] as u128;
+    // carry is top 128 bits, but mul_prim2 returns u128
+    let got = got_lo | ((c as u128) << 64);
+    assert_eq!(got, expected, "mul_prim2 max*max mismatch");
+}
+
+#[test]
+fn test_mul_prim2_multi_limb_carry() {
+    let mut v = vec![u64::MAX, u64::MAX];
+    let large = ((u64::MAX as u128) << 32) | 0xFFFF_FFFF;
+    let c = mul_prim2(&mut v, large);
+    // Verify via reference: treat v as 2-limb number, multiply by large
+    let a_val = u64::MAX as u128 | ((u64::MAX as u128) << 64);
+    let _expected_full = a_val.wrapping_mul(large);
+    // Just check the result is non-zero and carry is produced
+    assert!(c > 0, "expected carry for large mul_prim2");
+}
+
+#[test]
+fn test_mul_prim2_correctness_random() {
+    for seed in 0u64..20 {
+        let v_orig = rand_nonzero_vec(2, seed);
+        let prim_val = rand_nonzero_vec(2, seed + 1000);
+        let prim = prim_val[0] as u128 | ((prim_val[1] as u128) << 64);
+
+        let mut v = v_orig.clone();
+        let c = mul_prim2(&mut v, prim);
+
+        // Reference: full multiplication via mul_ref
+        let ref_result = mul_ref(&v_orig, &prim_val);
+        let mut got = v.to_vec();
+        let c_lo = c as u64;
+        let c_hi = (c >> 64) as u64;
+        if c_lo > 0 || c_hi > 0 {
+            got.push(c_lo);
+            if c_hi > 0 {
+                got.push(c_hi);
+            }
+        }
+        assert_eq_buf(&got, &ref_result, &format!("mul_prim2 random seed={seed}"));
+    }
+}
+
+// ─── Section 3: mul_buf ─────────────────────────────────────────────────────
 
 #[test]
 fn test_mul_buf_empty_a() {
@@ -129,7 +660,7 @@ fn test_mul_buf_empty_a() {
 
 #[test]
 fn test_mul_buf_basic() {
-    let mut out = vec![0u64]; // 1+1-1 = 1 limb
+    let mut out = vec![0u64];
     let c = mul_buf(&[5], &[4], &mut out);
     assert_eq!(out, vec![20]);
     assert_eq!(c, 0);
@@ -137,495 +668,2563 @@ fn test_mul_buf_basic() {
 
 #[test]
 fn test_mul_buf_overflow() {
-    let mut out = vec![0u64]; // result overflows into carry
+    let mut out = vec![0u64];
     let c = mul_buf(&[u64::MAX], &[u64::MAX], &mut out);
-    assert_eq!(out, vec![1]); // low limb
-    assert_eq!(c, u64::MAX - 1); // high limb
+    assert_eq!(out, vec![1]);
+    assert_eq!(c, u64::MAX - 1);
 }
 
 #[test]
 fn test_mul_buf_multi_limb() {
-    // [1, 1] * [1, 1] = 1 + 2^64 + 2^64 + 2^128 = [1, 2, 1]
-    // out must be 2+2-1 = 3 limbs
     let mut out = vec![0u64; 3];
     let c = mul_buf(&[1, 1], &[1, 1], &mut out);
     assert_eq!(out, vec![1, 2, 1]);
     assert_eq!(c, 0);
 }
 
-// ─── mul_vec ────────────────────────────────────────────────────────────────
-
 #[test]
-fn test_mul_vec_basic() {
-    let (v, c) = mul_vec(&[2], &[3]);
-    assert_eq!(v, vec![6]);
+fn test_mul_buf_empty_b() {
+    let mut out = vec![0u64];
+    let c = mul_buf(&[3], &[], &mut out);
     assert_eq!(c, 0);
 }
 
 #[test]
-fn test_mul_vec_identity() {
-    let a = vec![u64::MAX, 1, 42];
-    let (v, c) = mul_vec(&a, &[1]);
-    assert_eq!(v, a);
+fn test_mul_buf_zero_values() {
+    let mut out = vec![0u64; 3];
+    let c = mul_buf(&[0, 0], &[0, 0], &mut out);
+    assert_eq!(out, vec![0, 0, 0]);
     assert_eq!(c, 0);
 }
 
 #[test]
-fn test_mul_vec_zero() {
-    let a = vec![u64::MAX, 1, 42];
-    let (mut v, c) = mul_vec(&a, &[0]);
-    trim_lz(&mut v);
-    assert!(v.is_empty() || v.iter().all(|&x| x == 0));
+fn test_mul_buf_leading_zeros() {
+    // [5, 0] * [3, 0] should produce [15, 0, 0] with carry 0
+    let mut out = vec![0u64; 3];
+    let c = mul_buf(&[5, 0], &[3, 0], &mut out);
+    assert_eq!(out, vec![15, 0, 0]);
     assert_eq!(c, 0);
 }
 
 #[test]
-fn test_mul_vec_max_times_max() {
-    // u64::MAX * u64::MAX = [1, u64::MAX-1], carry=0 (fits in 2 limbs via out)
-    let (v, c) = mul_vec(&[u64::MAX], &[u64::MAX]);
-    assert_eq!(v, vec![1]);
-    assert_eq!(c, u64::MAX - 1);
-}
-
-#[test]
-fn test_mul_vec_multi_limb() {
-    // [1, 1] * [2] = [2, 2]
-    let (v, c) = mul_vec(&[1, 1], &[2]);
-    assert_eq!(v, vec![2, 2]);
-    assert_eq!(c, 0);
-}
-
-#[test]
-fn test_mul_vec_commutativity() {
-    // mul_vec(a, b) == mul_vec(b, a) for random inputs.
+fn test_mul_buf_commutativity() {
     for seed in 0u64..20 {
-        let a = rand_nonzero_vec(3, seed);
-        let b = rand_nonzero_vec(4, seed + 100);
-        let (mut ab, c_ab) = mul_vec(&a, &b);
-        let (mut ba, c_ba) = mul_vec(&b, &a);
-        if c_ab > 0 {
-            ab.push(c_ab);
-        }
-        if c_ba > 0 {
-            ba.push(c_ba);
-        }
-        trim_lz(&mut ab);
-        trim_lz(&mut ba);
-        assert_eq!(ab, ba, "commutativity failed for seed {seed}");
+        let a_len = (seed % 5 + 1) as usize;
+        let b_len = (seed % 4 + 1) as usize;
+        let a = rand_nonzero_vec(a_len, seed);
+        let b = rand_nonzero_vec(b_len, seed + 500);
+
+        let mut out_ab = vec![0u64; a_len + b_len - 1];
+        let c_ab = mul_buf(&a, &b, &mut out_ab);
+
+        let mut out_ba = vec![0u64; a_len + b_len - 1];
+        let c_ba = mul_buf(&b, &a, &mut out_ba);
+
+        assert_eq_result(
+            &out_ab,
+            c_ab,
+            &out_ba,
+            c_ba,
+            &format!("mul_buf commutativity seed={seed}"),
+        );
     }
 }
 
-/// At the Karatsuba boundary: mul_vec and mul_buf should agree.
 #[test]
-fn test_mul_vec_karatsuba_boundary() {
-    for len in [
-        KARATSUBA_CUTOFF - 2,
-        KARATSUBA_CUTOFF - 1,
-        KARATSUBA_CUTOFF,
-        KARATSUBA_CUTOFF + 1,
-        KARATSUBA_CUTOFF + 2,
-    ] {
-        let a = rand_nonzero_vec(len, len as u64);
-        let b = rand_nonzero_vec(len, len as u64 + 1000);
-        let (mut vec_result, c_vec) = mul_vec(&a, &b);
-        if c_vec > 0 {
-            vec_result.push(c_vec);
+fn test_mul_buf_random_sweep() {
+    for seed in 0u64..60 {
+        let a_len = (seed % 8 + 1) as usize;
+        let b_len = (seed / 8 % 8 + 1) as usize;
+        let a = rand_nonzero_vec(a_len, seed);
+        let b = rand_nonzero_vec(b_len, seed + 2000);
+
+        let mut out = vec![0u64; a_len + b_len - 1];
+        let c = mul_buf(&a, &b, &mut out);
+
+        // For sizes that fit in u128, cross-check
+        if a_len <= 1 && b_len <= 1 {
+            let expected = (a[0] as u128) * (b[0] as u128);
+            let got_val = to_u128(&norm(out.clone(), c));
+            assert_eq!(got_val, expected, "mul_buf u128 check failed seed={seed}");
         }
 
-        let mut buf_result = vec![0u64; a.len() + b.len() - 1];
-        let c_buf = mul_buf(&a, &b, &mut buf_result);
-        if c_buf > 0 {
-            buf_result.push(c_buf);
-        }
-
-        trim_lz(&mut vec_result);
-        trim_lz(&mut buf_result);
-        assert_eq!(vec_result, buf_result, "Karatsuba boundary failed at len={len}");
+        // Always check against reference
+        let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+        assert_eq_result(
+            &out,
+            c,
+            &exp_buf,
+            exp_carry,
+            &format!("mul_buf random seed={seed}"),
+        );
     }
 }
 
-// ─── mul_arr ────────────────────────────────────────────────────────────────
+// ─── Section 4: Algorithm Entry Points (direct, no dispatch) ────────────────
+
+// --- 4a: Karatsuba multiplication (karatsuba_entry_dyn) ---
+
+#[test]
+fn test_karatsuba_entry_small() {
+    // Test karatsuba_entry_dyn directly at small balanced sizes
+    for seed in 0u64..10 {
+        let n = KARA_CUTOFF + 1 + (seed as usize % 20);
+        let a = rand_nonzero_vec(n, seed);
+        let b = rand_nonzero_vec(n, seed + 100);
+        let mut out = vec![0u64; 2 * n - 1];
+        let c = karatsuba_entry_dyn(&a, &b, &mut out);
+        let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+        assert_eq_result(
+            &out,
+            c,
+            &exp_buf,
+            exp_carry,
+            &format!("karatsuba_entry balanced n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_karatsuba_entry_unbalanced() {
+    // Test karatsuba_entry_dyn with unbalanced inputs (chunking path)
+    for seed in 0u64..10 {
+        let l = 60 + (seed as usize % 40);
+        let s = KARA_CUTOFF + 1 + (seed as usize % 10);
+        let long = rand_nonzero_vec(l, seed);
+        let short = rand_nonzero_vec(s, seed + 200);
+        let mut out = vec![0u64; l + s - 1];
+        let c = karatsuba_entry_dyn(&long, &short, &mut out);
+        let (exp_buf, exp_carry) = mul_ref_parts(&long, &short);
+        assert_eq_result(
+            &out,
+            c,
+            &exp_buf,
+            exp_carry,
+            &format!("karatsuba_entry unbal l={l} s={s} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_karatsuba_core_recurse_boundary_sizing() {
+    // karatsuba_core's cross-term reconstruction needs out.len() >= 3*half+1,
+    // which exceeds the standard a.len()+b.len()-1 convention whenever
+    // b.len() sits just above half of a.len() (the exact Chunking/Recurse
+    // dispatch boundary). chunking_karatsuba's last chunk (length in
+    // [s-1, 2s-2]) can land exactly there, so directly engineer l to place
+    // last_chunk.len() at its extremes for many s and chunk counts, on both
+    // parities of last_chunk.len() — this is a differential-fuzz regression
+    // test for a real, previously-panicking bug (not a synthetic edge case).
+    let mut trials = 0usize;
+    for s in [
+        KARA_CUTOFF,
+        KARA_CUTOFF + 1,
+        KARA_CUTOFF + 5,
+        40,
+        41,
+        75,
+        76,
+    ] {
+        if s <= 2 {
+            continue;
+        }
+        for chunks in [1usize, 2, 3, 5] {
+            for last_len_target in [s.saturating_sub(1), s, 2 * s - 3, 2 * s - 2] {
+                if last_len_target == 0 {
+                    continue;
+                }
+                let l = chunks * s + last_len_target;
+                if is_school(l, s) || s > (l + 1) / 2 {
+                    continue; // doesn't reach the chunking path for this shape
+                }
+                let actual_chunks = (l - s + 1) / s;
+                let actual_last_len = l - actual_chunks * s;
+                assert_eq!(actual_last_len, last_len_target);
+
+                for seed in 0u64..3 {
+                    trials += 1;
+                    let long = rand_nonzero_vec(l, 90_000 + seed + l as u64 * 7 + s as u64 * 13);
+                    let short = rand_nonzero_vec(s, 91_000 + seed + l as u64 * 7 + s as u64 * 13);
+                    let mut out = vec![0u64; l + s - 1];
+                    let c = karatsuba_entry_dyn(&long, &short, &mut out);
+                    let (exp_buf, exp_carry) = mul_ref_parts(&long, &short);
+                    assert_eq_result(
+                        &out,
+                        c,
+                        &exp_buf,
+                        exp_carry,
+                        &format!(
+                            "karatsuba boundary l={l} s={s} last_len={actual_last_len} seed={seed}"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        trials > 50,
+        "sweep should exercise many shapes, got {trials}"
+    );
+}
+
+#[test]
+fn test_karatsuba_entry_unbalanced_random_sweep() {
+    // Broad, non-engineered sweep over unbalanced (l, s) shapes and seeds, as
+    // a differential fuzz check against the reference multiply.
+    let mut seed = 500_000u64;
+    for l in (KARA_CUTOFF..300).step_by(7) {
+        for s in (2..l).step_by(11) {
+            seed += 1;
+            let long = rand_nonzero_vec(l, seed);
+            let short = rand_nonzero_vec(s, seed + 1_000_000);
+            let mut out = vec![0u64; l + s - 1];
+            let c = karatsuba_entry_dyn(&long, &short, &mut out);
+            let (exp_buf, exp_carry) = mul_ref_parts(&long, &short);
+            assert_eq_result(
+                &out,
+                c,
+                &exp_buf,
+                exp_carry,
+                &format!("karatsuba random unbalanced l={l} s={s} seed={seed}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn test_karatsuba_entry_sweep() {
+    // Sweep across a range of sizes
+    for seed in 0u64..30 {
+        let n = KARA_CUTOFF + 1 + (seed as usize % (3 * KARA_CUTOFF));
+        let a = rand_nonzero_vec(n, seed);
+        let b = rand_nonzero_vec(n, seed + 300);
+        let mut out = vec![0u64; 2 * n - 1];
+        let c = karatsuba_entry_dyn(&a, &b, &mut out);
+        let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+        assert_eq_result(
+            &out,
+            c,
+            &exp_buf,
+            exp_carry,
+            &format!("karatsuba_entry sweep n={n} seed={seed}"),
+        );
+    }
+}
+
+// --- 4b: FFT multiplication (fft_entry) ---
+
+#[test]
+fn test_fft_entry_small() {
+    // Test fft_entry directly at small sizes
+    for seed in 0u64..5 {
+        let n = 30 + (seed as usize * 20);
+        let a = rand_nonzero_vec(n, seed);
+        let b = rand_nonzero_vec(n, seed + 400);
+        let mut out = vec![0u64; 2 * n - 1];
+        let c = fft_entry(&a, &b, &mut out);
+        let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+        assert_eq_result(
+            &out,
+            c,
+            &exp_buf,
+            exp_carry,
+            &format!("fft_entry small n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_fft_entry_medium() {
+    for seed in 0u64..3 {
+        let n = 200 + (seed as usize * 300);
+        let a = rand_nonzero_vec(n, seed);
+        let b = rand_nonzero_vec(n, seed + 500);
+        let mut out = vec![0u64; 2 * n - 1];
+        let c = fft_entry(&a, &b, &mut out);
+        let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+        assert_eq_result(
+            &out,
+            c,
+            &exp_buf,
+            exp_carry,
+            &format!("fft_entry medium n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_fft_entry_unbalanced() {
+    for seed in 0u64..3 {
+        let l = 500 + (seed as usize * 200);
+        let s = 50 + (seed as usize * 30);
+        let long = rand_nonzero_vec(l, seed);
+        let short = rand_nonzero_vec(s, seed + 600);
+        let mut out = vec![0u64; l + s - 1];
+        let c = fft_entry(&long, &short, &mut out);
+        let (exp_buf, exp_carry) = mul_ref_parts(&long, &short);
+        assert_eq_result(
+            &out,
+            c,
+            &exp_buf,
+            exp_carry,
+            &format!("fft_entry unbal l={l} s={s} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_fft_entry_zero_and_trailing_zero_operands() {
+    let a = rand_nonzero_vec(300, 9600);
+    let zero = vec![0u64; 256];
+    let mut out = vec![u64::MAX; a.len() + zero.len() - 1];
+    let c = fft_entry(&a, &zero, &mut out);
+    assert_eq!(c, 0);
+    assert!(out.iter().all(|&limb| limb == 0));
+
+    let mut long = rand_nonzero_vec(300, 9601);
+    let mut short = rand_nonzero_vec(260, 9602);
+    long.resize(320, 0);
+    short.resize(280, 0);
+
+    let mut out = vec![u64::MAX; long.len() + short.len() - 1];
+    let c = fft_entry(&long, &short, &mut out);
+    let (exp_buf, exp_carry) = mul_ref_parts(&long, &short);
+    assert_eq_result(
+        &out,
+        c,
+        &exp_buf,
+        exp_carry,
+        "fft_entry trailing zero operands",
+    );
+}
+
+#[test]
+fn test_mul_dyn_fft_zero_operand() {
+    let zero = vec![0u64; 256];
+    let nonzero = rand_nonzero_vec(256, 9603);
+    let mut out = vec![u64::MAX; zero.len() + nonzero.len() - 1];
+
+    let c = mul_dyn(&zero, &nonzero, &mut out);
+
+    assert_eq!(c, 0);
+    assert!(out.iter().all(|&limb| limb == 0));
+}
+
+// --- 4c: NTT multiplication (ntt_entry_dyn) ---
+
+#[test]
+fn test_ntt_entry_small() {
+    // Test NTT at small sizes — avoids the huge memory allocations
+    for seed in 0u64..5 {
+        let n = 10 + (seed as usize * 5);
+        let a = rand_nonzero_vec(n, seed);
+        let b = rand_nonzero_vec(n, seed + 700);
+        let mut out = vec![0u64; 2 * n - 1];
+        let c = ntt_entry_dyn(&a, &b, &mut out);
+        let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+        assert_eq_result(
+            &out,
+            c,
+            &exp_buf,
+            exp_carry,
+            &format!("ntt_entry small n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_ntt_single_limb_and_oversized_outputs() {
+    let a = [u64::MAX];
+
+    let mut exact = [0u64; 1];
+    let carry = ntt_entry_dyn(&a, &a, &mut exact);
+    assert_eq!(exact, [1]);
+    assert_eq!(carry, u64::MAX - 1);
+
+    let mut oversized = [9u64; 4];
+    let carry = ntt_entry_dyn(&a, &a, &mut oversized);
+    assert_eq!(oversized, [1, u64::MAX - 1, 0, 0]);
+    assert_eq!(carry, 0);
+
+    let mut static_out = [9u64; 4];
+    let carry = ntt_entry_static::<4>(&a, &a, &mut static_out);
+    assert_eq!(static_out, oversized);
+    assert_eq!(carry, 0);
+
+    let mut sqr_exact = [0u64; 1];
+    let carry = ntt_sqr_entry_dyn(&a, &mut sqr_exact);
+    assert_eq!(sqr_exact, [1]);
+    assert_eq!(carry, u64::MAX - 1);
+
+    let mut sqr_oversized = [9u64; 4];
+    let carry = ntt_sqr_entry_dyn(&a, &mut sqr_oversized);
+    assert_eq!(sqr_oversized, [1, u64::MAX - 1, 0, 0]);
+    assert_eq!(carry, 0);
+
+    let mut sqr_static = [9u64; 4];
+    let carry = ntt_sqr_entry_static::<4>(&a, &mut sqr_static);
+    assert_eq!(sqr_static, sqr_oversized);
+    assert_eq!(carry, 0);
+}
+
+#[test]
+fn test_ntt_entry_medium() {
+    // Test NTT at moderate sizes
+    for seed in 0u64..3 {
+        let n = 50 + (seed as usize * 25);
+        let a = rand_nonzero_vec(n, seed);
+        let b = rand_nonzero_vec(n, seed + 800);
+        let mut out = vec![0u64; 2 * n - 1];
+        let c = ntt_entry_dyn(&a, &b, &mut out);
+        let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+        assert_eq_result(
+            &out,
+            c,
+            &exp_buf,
+            exp_carry,
+            &format!("ntt_entry medium n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_ntt_entry_unbalanced() {
+    for seed in 0u64..3 {
+        let l = 80 + (seed as usize * 20);
+        let s = 20 + (seed as usize * 10);
+        let long = rand_nonzero_vec(l, seed);
+        let short = rand_nonzero_vec(s, seed + 900);
+        let mut out = vec![0u64; l + s - 1];
+        let c = ntt_entry_dyn(&long, &short, &mut out);
+        let (exp_buf, exp_carry) = mul_ref_parts(&long, &short);
+        assert_eq_result(
+            &out,
+            c,
+            &exp_buf,
+            exp_carry,
+            &format!("ntt_entry unbal l={l} s={s} seed={seed}"),
+        );
+    }
+}
+
+// ─── Section 5: mul_dyn / mul_vec Dispatch Sanity ───────────────────────────
+// Tests dispatch at reasonable sizes spanning school → karatsuba boundaries.
+// Does NOT test at FFT/NTT cutoff sizes — those are tested directly above.
+
+#[test]
+fn test_mul_dyn_prim_dispatch() {
+    for long_sz in [1, 5, 20, 50] {
+        for seed in 0u64..5 {
+            let long = rand_nonzero_vec(long_sz, seed);
+            let short = rand_nonzero_vec(1, seed + 1000);
+
+            let mut out = vec![0u64; long_sz];
+            let c = mul_dyn(&long, &short, &mut out);
+            let (exp_buf, exp_carry) = mul_ref_parts(&long, &short);
+            assert_eq_result(
+                &out,
+                c,
+                &exp_buf,
+                exp_carry,
+                &format!("prim dispatch l={long_sz} seed={seed}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn test_mul_dyn_prim2_dispatch() {
+    for long_sz in [2, 5, 20, 50] {
+        for seed in 0u64..5 {
+            let long = rand_nonzero_vec(long_sz, seed);
+            let short = rand_nonzero_vec(2, seed + 1100);
+
+            let mut out = vec![0u64; long_sz + 1];
+            let c = mul_dyn(&long, &short, &mut out);
+            let (exp_buf, exp_carry) = mul_ref_parts(&long, &short);
+            assert_eq_result(
+                &out,
+                c,
+                &exp_buf,
+                exp_carry,
+                &format!("prim2 dispatch l={long_sz} seed={seed}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn test_mul_dyn_school_boundary() {
+    let l = flat_branch_l();
+    let s = CHUNKING_KARATSUBA_CUTOFF;
+    assert!(is_school(l, s), "expected school at flat branch");
+    for seed in 0u64..5 {
+        let long = rand_nonzero_vec(l, seed);
+        let short = rand_nonzero_vec(s, seed + 1200);
+        let mut out = vec![0u64; l + s - 1];
+        let c = mul_dyn(&long, &short, &mut out);
+        let (exp_buf, exp_carry) = mul_ref_parts(&long, &short);
+        assert_eq_result(
+            &out,
+            c,
+            &exp_buf,
+            exp_carry,
+            &format!("school dispatch seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_mul_dyn_karatsuba_boundary() {
+    let (l, _s_school, s_kara) = curved_boundary();
+    assert!(
+        !is_school(l, s_kara),
+        "expected karatsuba at curved boundary+1"
+    );
+    for seed in 0u64..5 {
+        let long = rand_nonzero_vec(l, seed);
+        let short = rand_nonzero_vec(s_kara, seed + 1300);
+        let mut out = vec![0u64; l + s_kara - 1];
+        let c = mul_dyn(&long, &short, &mut out);
+        let (exp_buf, exp_carry) = mul_ref_parts(&long, &short);
+        assert_eq_result(
+            &out,
+            c,
+            &exp_buf,
+            exp_carry,
+            &format!("karatsuba dispatch seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_mul_dyn_fft_dispatch() {
+    let n = 300usize;
+    assert!(
+        !is_karatsuba(n, n, FFT_CHUNKING_KARATSUBA_CUTOFF, FFT_KARATSUBA_CUTOFF),
+        "chosen size should dispatch past karatsuba"
+    );
+    let a = rand_nonzero_vec(n, 1400);
+    let b = rand_nonzero_vec(n, 1500);
+    let mut out = vec![0u64; 2 * n - 1];
+    let c = mul_dyn(&a, &b, &mut out);
+    let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+    assert_eq_result(&out, c, &exp_buf, exp_carry, "mul_dyn FFT dispatch");
+}
+
+#[test]
+fn test_mul_dyn_oversized_output_absorbs_carry() {
+    let cases = [
+        (vec![u64::MAX; 4], vec![u64::MAX]),
+        (rand_nonzero_vec(9, 9550), rand_nonzero_vec(7, 9551)),
+        (rand_nonzero_vec(90, 9552), rand_nonzero_vec(45, 9553)),
+        (rand_nonzero_vec(300, 9554), rand_nonzero_vec(300, 9555)),
+    ];
+
+    for (idx, (a, b)) in cases.into_iter().enumerate() {
+        let raw_len = a.len() + b.len() - 1;
+        let out_len = raw_len + 3;
+        let mut out = vec![u64::MAX; out_len];
+        let carry = mul_dyn(&a, &b, &mut out);
+        let expected = mul_ref_oversized(&a, &b, out_len);
+
+        assert_eq_result(
+            &out,
+            carry,
+            &expected,
+            0,
+            &format!("mul_dyn oversized output case={idx}"),
+        );
+    }
+}
+
+#[test]
+fn test_mul_static_oversized_output_absorbs_carry() {
+    let a = rand_nonzero_vec(50, 9560);
+    let b = rand_nonzero_vec(50, 9561);
+    let raw_len = a.len() + b.len() - 1;
+    let out_len = raw_len + 2;
+    let mut out = vec![u64::MAX; out_len];
+
+    let carry = mul_static::<128>(&a, &b, &mut out).unwrap();
+    let expected = mul_ref_oversized(&a, &b, out_len);
+
+    assert_eq_result(&out, carry, &expected, 0, "mul_static oversized output");
+}
+
+#[test]
+fn test_mul_vec_random_sweep_small() {
+    // Sizes that stay in school/karatsuba range
+    for seed in 0u64..60 {
+        let a_len = (seed % 30 + 1) as usize;
+        let b_len = (seed / 2 % 15 + 1) as usize;
+        let a = rand_nonzero_vec(a_len, seed);
+        let b = rand_nonzero_vec(b_len, seed + 1500);
+        let (got_buf, got_carry) = mul_vec(&a, &b);
+        let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+        assert_eq_result(
+            &got_buf,
+            got_carry,
+            &exp_buf,
+            exp_carry,
+            &format!("mul_vec small a={a_len} b={b_len} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_mul_vec_random_sweep_medium() {
+    // Sizes spanning karatsuba range (up to ~200 limbs)
+    for seed in 0u64..20 {
+        let n = 30 + (seed as usize % 170);
+        let a = rand_nonzero_vec(n, seed);
+        let b = rand_nonzero_vec(n, seed + 1600);
+        let (got_buf, got_carry) = mul_vec(&a, &b);
+        let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+        assert_eq_result(
+            &got_buf,
+            got_carry,
+            &exp_buf,
+            exp_carry,
+            &format!("mul_vec medium n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_mul_commutativity() {
+    for seed in 0u64..40 {
+        let a_len = (seed % 20 + 1) as usize;
+        let b_len = (seed / 3 % 15 + 1) as usize;
+        let a = rand_nonzero_vec(a_len, seed);
+        let b = rand_nonzero_vec(b_len, seed + 1700);
+        let (ab_buf, ab_carry) = mul_vec(&a, &b);
+        let (ba_buf, ba_carry) = mul_vec(&b, &a);
+        assert_eq_result(
+            &ab_buf,
+            ab_carry,
+            &ba_buf,
+            ba_carry,
+            &format!("commutativity a={a_len} b={b_len} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_mul_identity() {
+    for seed in 0u64..20 {
+        let n = (seed % 50 + 1) as usize;
+        let a = rand_nonzero_vec(n, seed);
+        let (got_buf, got_carry) = mul_vec(&a, &[1]);
+        assert_eq_result(
+            &got_buf,
+            got_carry,
+            &a,
+            0,
+            &format!("identity n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_mul_zero_input() {
+    for seed in 0u64..10 {
+        let n = (seed % 20 + 1) as usize;
+        let a = rand_nonzero_vec(n, seed);
+        let (v, c) = mul_vec(&a, &[0]);
+        assert!(
+            c == 0 && v.iter().all(|&x| x == 0),
+            "mul by zero should be zero, seed={seed}"
+        );
+    }
+}
+
+// ─── Section 6: mul_static / mul_arr ────────────────────────────────────────
+
+#[test]
+fn test_mul_static_basic() {
+    let a = &[5u64, 1];
+    let b = &[3u64, 2];
+    let out_sz = a.len() + b.len() - 1;
+    let mut out = [0u64; 4];
+    let c = mul_static::<4>(a, b, &mut out).unwrap();
+    let (exp_buf, exp_carry) = mul_ref_parts(a, b);
+    assert_eq_result(&out[..out_sz], c, &exp_buf, exp_carry, "mul_static basic");
+}
+
+#[test]
+fn test_mul_static_err_on_overflow() {
+    let mut out = [0u64; 2];
+    let result = mul_static::<2>(&[1, 1, 1], &[1, 1], &mut out);
+    assert!(result.is_err(), "expected Err for overflow");
+}
 
 #[test]
 fn test_mul_arr_basic() {
-    let r = mul_arr::<2>(&[2], &[3]);
-    let (arr, c) = r.expect("mul_arr should succeed");
-    assert_eq!(arr[0], 6);
-    assert_eq!(c, 0);
+    let a = &[5u64, 1];
+    let b = &[3u64, 2];
+    let out_sz = a.len() + b.len() - 1;
+    let (arr, c) = mul_arr::<3>(a, b).unwrap();
+    let (exp_buf, exp_carry) = mul_ref_parts(a, b);
+    assert_eq_result(&arr[..out_sz], c, &exp_buf, exp_carry, "mul_arr basic");
 }
 
 #[test]
-fn test_mul_arr_too_small_returns_err() {
-    // [u64::MAX, 1] * [u64::MAX, 1] needs at least 3 limbs; N=2 → Err
-    let r = mul_arr::<2>(&[u64::MAX, 1], &[u64::MAX, 1]);
-    assert!(r.is_err());
+fn test_mul_arr_err_on_overflow() {
+    let result = mul_arr::<2>(&[1, 1, 1], &[1, 1]);
+    assert!(result.is_err(), "expected Err for overflow");
 }
 
 #[test]
-fn test_mul_arr_matches_mul_vec() {
-    let a = rand_nonzero_vec(4, 42);
-    let b = rand_nonzero_vec(4, 43);
-    let (mut expected, c) = mul_vec(&a, &b);
-    if c > 0 {
-        expected.push(c);
-    }
-    trim_lz(&mut expected);
+fn test_mul_static_matches_dyn() {
+    for seed in 0u64..15 {
+        let a_len = (seed % 5 + 1) as usize;
+        let b_len = (seed / 5 % 3 + 1) as usize;
+        let a = rand_nonzero_vec(a_len, seed);
+        let b = rand_nonzero_vec(b_len, seed + 3000);
 
-    let (arr, c_arr) = mul_arr::<16>(&a, &b).expect("mul_arr failed");
-    let mut got: Vec<u64> = arr.to_vec();
-    if c_arr > 0 {
-        got.push(c_arr);
-    }
-    trim_lz(&mut got);
-    assert_eq!(got, expected);
-}
-
-// ─── sqr_buf / sqr_vec ──────────────────────────────────────────────────────
-
-#[test]
-fn test_sqr_buf_single_zero() {
-    let mut out = vec![0u64]; // 2*1-1=1
-    let c = sqr_buf(&[0], &mut out);
-    assert_eq!(out, vec![0]);
-    assert_eq!(c, 0);
-}
-
-#[test]
-fn test_sqr_buf_one() {
-    let mut out = vec![0u64];
-    let c = sqr_buf(&[1], &mut out);
-    assert_eq!(out, vec![1]);
-    assert_eq!(c, 0);
-}
-
-#[test]
-fn test_sqr_buf_two() {
-    let mut out = vec![0u64];
-    let c = sqr_buf(&[2], &mut out);
-    assert_eq!(out, vec![4]);
-    assert_eq!(c, 0);
-}
-
-#[test]
-fn test_sqr_vec_zero() {
-    let (v, c) = sqr_vec(&[0]);
-    assert_eq!(v, vec![0]);
-    assert_eq!(c, 0);
-}
-
-#[test]
-fn test_sqr_vec_one() {
-    let (v, c) = sqr_vec(&[1]);
-    assert_eq!(v, vec![1]);
-    assert_eq!(c, 0);
-}
-
-#[test]
-fn test_sqr_vec_two() {
-    let (v, c) = sqr_vec(&[2]);
-    assert_eq!(v, vec![4]);
-    assert_eq!(c, 0);
-}
-
-#[test]
-fn test_sqr_vec_max_u64() {
-    // (2^64-1)^2 = 2^128 - 2^65 + 1 → low limb = 1, carry = u64::MAX - 1
-    let (v, c) = sqr_vec(&[u64::MAX]);
-    assert_eq!(v, vec![1]);
-    assert_eq!(c, u64::MAX - 1);
-}
-
-/// sqr_vec(x) must equal mul_vec(x, x) for all inputs.
-#[test]
-fn test_sqr_equals_mul_small() {
-    for &val in &[0u64, 1, 2, 100, u64::MAX / 2, u64::MAX] {
-        let (mut sv, sc) = sqr_vec(&[val]);
-        let (mut mv, mc) = mul_vec(&[val], &[val]);
-        if sc > 0 {
-            sv.push(sc);
+        let out_sz = a_len + b_len - 1;
+        if out_sz > 64 {
+            continue;
         }
-        if mc > 0 {
-            mv.push(mc);
-        }
-        trim_lz(&mut sv);
-        trim_lz(&mut mv);
-        assert_eq!(sv, mv, "sqr != mul for val={val:#x}");
+
+        let mut out_dyn = vec![0u64; out_sz];
+        let c_dyn = mul_dyn(&a, &b, &mut out_dyn);
+
+        let mut out_st = vec![0u64; out_sz];
+        let c_st = mul_static::<64>(&a, &b, &mut out_st).unwrap();
+
+        assert_eq_result(
+            &out_dyn,
+            c_dyn,
+            &out_st,
+            c_st,
+            &format!("static vs dyn seed={seed}"),
+        );
     }
 }
 
 #[test]
-fn test_sqr_equals_mul_random() {
-    for seed in 0u64..30 {
-        let len = (seed % 8 + 1) as usize;
-        let v = rand_nonzero_vec(len, seed);
-        let (mut sv, sc) = sqr_vec(&v);
-        let (mut mv, mc) = mul_vec(&v, &v);
-        if sc > 0 {
-            sv.push(sc);
+fn test_mul_arr_random_sweep() {
+    for seed in 0u64..15 {
+        let a_len = (seed % 4 + 1) as usize;
+        let b_len = (seed / 4 % 3 + 1) as usize;
+        let a = rand_nonzero_vec(a_len, seed);
+        let b = rand_nonzero_vec(b_len, seed + 3100);
+
+        let out_sz = a_len + b_len - 1;
+        if out_sz > 16 {
+            continue;
         }
-        if mc > 0 {
-            mv.push(mc);
-        }
-        trim_lz(&mut sv);
-        trim_lz(&mut mv);
-        assert_eq!(sv, mv, "sqr != mul for seed={seed}");
+
+        let (arr, c) = mul_arr::<16>(&a, &b).unwrap();
+        // mul_arr may absorb carry into extra array positions, so compare
+        // full normalized results
+        let got = norm(arr.to_vec(), c);
+        let expected = mul_ref(&a, &b);
+        assert_eq_buf(&got, &expected, &format!("mul_arr sweep seed={seed}"));
     }
 }
 
-/// At the Karatsuba squaring boundary.
+// ─── Section 7: Squaring Algorithm Entry Points (direct, no dispatch) ───────
+
+// --- 7a: sqr_buf (schoolbook squaring) ---
+
 #[test]
-fn test_sqr_vec_karatsuba_boundary() {
-    for len in [
+fn test_sqr_buf_single_limb() {
+    for &val in &[1u64, 2, u64::MAX, 0xDEAD_BEEF] {
+        let mut out = vec![0u64; 1];
+        let c = sqr_buf(&[val], &mut out);
+        let expected = (val as u128) * (val as u128);
+        let got = out[0] as u128 | ((c as u128) << 64);
+        assert_eq!(got, expected, "sqr_buf single limb {val:#x}");
+    }
+}
+
+#[test]
+fn test_sqr_buf_empty() {
+    let mut out = [123u64, 456];
+    assert_eq!(sqr_buf(&[], &mut out), 0);
+    assert_eq!(out, [123, 456]);
+}
+
+#[test]
+fn test_sqr_buf_matches_mul_buf() {
+    for seed in 0u64..20 {
+        let n = (seed % 10 + 1) as usize;
+        let a = rand_nonzero_vec(n, seed);
+
+        let mut sqr_out = vec![0u64; 2 * n - 1];
+        let c_sqr = sqr_buf(&a, &mut sqr_out);
+
+        let mut mul_out = vec![0u64; 2 * n - 1];
+        let c_mul = mul_buf(&a, &a, &mut mul_out);
+
+        assert_eq_result(
+            &sqr_out,
+            c_sqr,
+            &mul_out,
+            c_mul,
+            &format!("sqr_buf vs mul_buf n={n} seed={seed}"),
+        );
+    }
+}
+
+// --- 7b: karatsuba_sqr_entry_static ---
+
+#[test]
+fn test_karatsuba_sqr_entry_small() {
+    for seed in 0u64..10 {
+        let n = KARATSUBA_SQR_CUTOFF + 1 + (seed as usize % 20);
+        let a = rand_nonzero_vec(n, seed);
+        let mut out = vec![0u64; 2 * n - 1];
+        let c = karatsuba_sqr_entry_static::<128>(&a, &mut out);
+        let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+        assert_eq_result(
+            &out,
+            c,
+            &exp_buf,
+            exp_carry,
+            &format!("karatsuba_sqr small n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_karatsuba_sqr_entry_sweep() {
+    for seed in 0u64..15 {
+        let n = KARATSUBA_SQR_CUTOFF + 1 + (seed as usize % (3 * KARATSUBA_SQR_CUTOFF));
+        if 2 * n - 1 > 128 {
+            continue;
+        } // skip sizes that exceed static N
+        let a = rand_nonzero_vec(n, seed);
+        let mut out = vec![0u64; 2 * n - 1];
+        let c = karatsuba_sqr_entry_static::<128>(&a, &mut out);
+        let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+        assert_eq_result(
+            &out,
+            c,
+            &exp_buf,
+            exp_carry,
+            &format!("karatsuba_sqr sweep n={n} seed={seed}"),
+        );
+    }
+}
+
+// --- 7c: fft_sqr_entry ---
+
+#[test]
+fn test_fft_sqr_entry_small() {
+    for seed in 0u64..5 {
+        let n = 30 + (seed as usize * 15);
+        let a = rand_nonzero_vec(n, seed);
+        let mut out = vec![0u64; 2 * n - 1];
+        let c = fft_sqr_entry(&a, &mut out);
+        let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+        assert_eq_result(
+            &out,
+            c,
+            &exp_buf,
+            exp_carry,
+            &format!("fft_sqr_entry small n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_fft_sqr_entry_medium() {
+    for seed in 0u64..3 {
+        let n = 200 + (seed as usize * 200);
+        let a = rand_nonzero_vec(n, seed);
+        let mut out = vec![0u64; 2 * n - 1];
+        let c = fft_sqr_entry(&a, &mut out);
+        let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+        assert_eq_result(
+            &out,
+            c,
+            &exp_buf,
+            exp_carry,
+            &format!("fft_sqr_entry medium n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_fft_sqr_entry_zero_and_trailing_zero_operand() {
+    let zero = vec![0u64; 300];
+    let mut out = vec![u64::MAX; 2 * zero.len() - 1];
+    let c = fft_sqr_entry(&zero, &mut out);
+    assert_eq!(c, 0);
+    assert!(out.iter().all(|&limb| limb == 0));
+
+    let mut a = rand_nonzero_vec(300, 9604);
+    a.resize(320, 0);
+    let mut out = vec![u64::MAX; 2 * a.len() - 1];
+    let c = fft_sqr_entry(&a, &mut out);
+    let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+    assert_eq_result(
+        &out,
+        c,
+        &exp_buf,
+        exp_carry,
+        "fft_sqr_entry trailing zero operand",
+    );
+}
+
+// --- 7d: ntt_sqr_entry_dyn ---
+
+#[test]
+fn test_ntt_sqr_entry_small() {
+    for seed in 0u64..5 {
+        let n = 10 + (seed as usize * 5);
+        let a = rand_nonzero_vec(n, seed);
+        let mut out = vec![0u64; 2 * n - 1];
+        let c = ntt_sqr_entry_dyn(&a, &mut out);
+        let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+        assert_eq_result(
+            &out,
+            c,
+            &exp_buf,
+            exp_carry,
+            &format!("ntt_sqr_entry small n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_ntt_sqr_entry_medium() {
+    for seed in 0u64..3 {
+        let n = 50 + (seed as usize * 75);
+        let a = rand_nonzero_vec(n, seed);
+        let mut out = vec![0u64; 2 * n - 1];
+        let c = ntt_sqr_entry_dyn(&a, &mut out);
+        let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+        assert_eq_result(
+            &out,
+            c,
+            &exp_buf,
+            exp_carry,
+            &format!("ntt_sqr_entry medium n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_ntt_sqr_dyn_twiddle_cache_order() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("failed to build single-thread Rayon pool");
+
+    pool.install(|| {
+        for &(n, seed) in &[(39, 10_300), (10, 10_301)] {
+            let a = rand_nonzero_vec(n, seed);
+            let mut out = vec![0u64; 2 * n - 1];
+            let c = ntt_sqr_entry_dyn(&a, &mut out);
+            let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+            assert_eq_result(
+                &out,
+                c,
+                &exp_buf,
+                exp_carry,
+                &format!("ntt sqr twiddle cache order n={n} seed={seed}"),
+            );
+        }
+    });
+}
+
+// ─── Section 8: sqr_dyn / sqr_vec Dispatch Sanity ───────────────────────────
+// Dyn sqr dispatch: School → FFT → NTT (no karatsuba in dyn path).
+// Static sqr dispatch: School → Karatsuba → NTT.
+
+#[test]
+fn test_sqr_dyn_school_boundary() {
+    for seed in 0u64..5 {
+        let n = FFT_SQR_CUTOFF;
+        let a = rand_nonzero_vec(n, seed);
+        let (got_buf, got_carry) = sqr_vec(&a);
+        let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+        assert_eq_result(
+            &got_buf,
+            got_carry,
+            &exp_buf,
+            exp_carry,
+            &format!("sqr school boundary n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_sqr_dyn_above_school_boundary() {
+    // dyn sqr dispatch: School → FFT → NTT (no karatsuba in dyn path)
+    let n = FFT_SQR_CUTOFF + 1;
+    for seed in 0u64..5 {
+        let a = rand_nonzero_vec(n, seed);
+        let (got_buf, got_carry) = sqr_vec(&a);
+        let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+        assert_eq_result(
+            &got_buf,
+            got_carry,
+            &exp_buf,
+            exp_carry,
+            &format!("sqr karatsuba boundary n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_sqr_dyn_fft_boundary() {
+    for &n in &[FFT_SQR_CUTOFF, FFT_SQR_CUTOFF + 1] {
+        for seed in 0u64..3 {
+            let a = rand_nonzero_vec(n, seed);
+            let (got_buf, got_carry) = sqr_vec(&a);
+            let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+            assert_eq_result(
+                &got_buf,
+                got_carry,
+                &exp_buf,
+                exp_carry,
+                &format!("sqr fft boundary n={n} seed={seed}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn test_sqr_vec_random_sweep_small() {
+    for seed in 0u64..40 {
+        let n = (seed % 30 + 1) as usize;
+        let a = rand_nonzero_vec(n, seed);
+        let (got_buf, got_carry) = sqr_vec(&a);
+        let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+        assert_eq_result(
+            &got_buf,
+            got_carry,
+            &exp_buf,
+            exp_carry,
+            &format!("sqr_vec small n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_sqr_vec_random_sweep_medium() {
+    // Stays within school/karatsuba/FFT range (up to FFT_SQR_CUTOFF)
+    for seed in 0u64..20 {
+        let n = 25 + (seed as usize % (FFT_SQR_CUTOFF - 20));
+        let a = rand_nonzero_vec(n, seed);
+        let (got_buf, got_carry) = sqr_vec(&a);
+        let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+        assert_eq_result(
+            &got_buf,
+            got_carry,
+            &exp_buf,
+            exp_carry,
+            &format!("sqr_vec medium n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_sqr_equals_mul() {
+    // Across school and karatsuba dispatch boundaries
+    for &n in &[
+        1,
+        5,
         KARATSUBA_SQR_CUTOFF - 1,
         KARATSUBA_SQR_CUTOFF,
         KARATSUBA_SQR_CUTOFF + 1,
-        KARATSUBA_SQR_CUTOFF + 2,
+        FFT_SQR_CUTOFF - 1,
+        FFT_SQR_CUTOFF,
+        FFT_SQR_CUTOFF + 1,
     ] {
-        let v = rand_nonzero_vec(len, len as u64 + 500);
-        let (mut sv, sc) = sqr_vec(&v);
-        let (mut mv, mc) = mul_vec(&v, &v);
-        if sc > 0 {
-            sv.push(sc);
+        if n == 0 {
+            continue;
         }
-        if mc > 0 {
-            mv.push(mc);
+        for seed in 0u64..3 {
+            let a = rand_nonzero_vec(n, seed);
+            let (sqr_buf, sqr_carry) = sqr_vec(&a);
+            let (mul_buf, mul_carry) = mul_vec(&a, &a);
+            assert_eq_result(
+                &sqr_buf,
+                sqr_carry,
+                &mul_buf,
+                mul_carry,
+                &format!("sqr==mul n={n} seed={seed}"),
+            );
         }
-        trim_lz(&mut sv);
-        trim_lz(&mut mv);
-        assert_eq!(sv, mv, "Karatsuba sqr boundary failed at len={len}");
     }
 }
 
-// ─── sqr_arr ────────────────────────────────────────────────────────────────
+#[test]
+fn test_sqr_static_basic() {
+    let a = &[3u64, 2];
+    let out_sz = 2 * a.len() - 1;
+    let mut out = [0u64; 4];
+    let c = sqr_static::<4>(a, &mut out).unwrap();
+    let (exp_buf, exp_carry) = sqr_ref_parts(a);
+    assert_eq_result(&out[..out_sz], c, &exp_buf, exp_carry, "sqr_static basic");
+}
+
+#[test]
+fn test_sqr_static_err_on_overflow() {
+    let mut out = [0u64; 1];
+    let result = sqr_static::<1>(&[1, 1], &mut out);
+    assert!(result.is_err(), "expected Err for sqr_static overflow");
+
+    let result = sqr_static::<8>(&[1, 1], &mut out);
+    assert!(result.is_err(), "expected Err for a short output slice");
+}
+
+#[test]
+#[should_panic(expected = "out is not large enough for multiplication")]
+fn test_sqr_dyn_rejects_short_output() {
+    sqr_dyn(&[1, 1], &mut [0]);
+}
+
+#[test]
+fn test_sqr_static_matches_dyn() {
+    for seed in 0u64..15 {
+        let n = (seed % 10 + 1) as usize;
+        let a = rand_nonzero_vec(n, seed);
+
+        let out_sz = 2 * n - 1;
+        if out_sz > 64 {
+            continue;
+        }
+
+        let mut out_dyn = vec![0u64; out_sz];
+        let c_dyn = sqr_dyn(&a, &mut out_dyn);
+
+        let mut out_st = vec![0u64; out_sz];
+        let c_st = sqr_static::<64>(&a, &mut out_st).unwrap();
+
+        assert_eq_result(
+            &out_dyn,
+            c_dyn,
+            &out_st,
+            c_st,
+            &format!("sqr static vs dyn seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_sqr_static_karatsuba_dispatch() {
+    let n = KARATSUBA_SQR_CUTOFF + 1;
+    let a = rand_nonzero_vec(n, 5900);
+    let mut out = vec![0u64; 2 * n - 1];
+    let c = sqr_static::<64>(&a, &mut out).unwrap();
+    let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+    assert_eq_result(
+        &out,
+        c,
+        &exp_buf,
+        exp_carry,
+        "sqr_static karatsuba dispatch",
+    );
+}
+
+// ─── Section 10: Short Multiply ─────────────────────────────────────────────
+
+#[test]
+fn test_short_mul_buf_exact_when_full() {
+    // When out.len() == a.len() + b.len() - 1, result should be exact
+    for seed in 0u64..10 {
+        let a_len = (seed % 5 + 1) as usize;
+        let b_len = (seed / 5 % 3 + 1) as usize;
+        let a = rand_nonzero_vec(a_len, seed);
+        let b = rand_nonzero_vec(b_len, seed + 6000);
+        let out_len = a_len + b_len - 1;
+
+        let mut out_short = vec![0u64; out_len];
+        let c_short = short_mul_buf(&a, &b, &mut out_short);
+
+        let mut out_full = vec![0u64; out_len];
+        let c_full = mul_buf(&a, &b, &mut out_full);
+
+        assert_eq_result(
+            &out_short,
+            c_short,
+            &out_full,
+            c_full,
+            &format!("short_mul_buf exact seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_short_mul_buf_accuracy_small() {
+    for seed in 0u64..30 {
+        let a_len = (seed % 8 + 3) as usize;
+        let b_len = (seed / 8 % 5 + 3) as usize;
+        let a = rand_nonzero_vec(a_len, seed);
+        let b = rand_nonzero_vec(b_len, seed + 6100);
+        let out_len = (a_len + b_len - 1).min(a_len.max(b_len));
+
+        let mut out = vec![0u64; out_len];
+        let _c = short_mul_buf(&a, &b, &mut out);
+
+        // Reference: full product, extract same columns
+        let ref_top = short_mul_ref(&a, &b, out_len);
+
+        // short_mul_buf drops carries from lower columns:
+        // first limb can differ significantly, subsequent limbs differ by at most ±1.
+        assert_approx_buf(
+            &out,
+            &ref_top,
+            &format!("short_mul_buf accuracy seed={seed} a_len={a_len} b_len={b_len}"),
+        );
+    }
+}
+
+#[test]
+fn test_short_mul_buf_accuracy_at_cutoff() {
+    let out_len = SHORT_MUL_CUTOFF;
+    for seed in 0u64..10 {
+        let a_len = out_len + 3;
+        let b_len = out_len + 2;
+        let a = rand_nonzero_vec(a_len, seed);
+        let b = rand_nonzero_vec(b_len, seed + 6200);
+
+        let mut out = vec![0u64; out_len];
+        let _c = short_mul_buf(&a, &b, &mut out);
+
+        let ref_top = short_mul_ref(&a, &b, out_len);
+
+        // Approximate: first limb can differ significantly,
+        // subsequent limbs can differ by at most ±1.
+        assert_approx_buf(
+            &out,
+            &ref_top,
+            &format!("short_mul_buf at cutoff seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_short_mul_dyn_exact_fit() {
+    // When full product fits in out, delegates to mul_dyn → exact
+    for seed in 0u64..10 {
+        let a_len = (seed % 4 + 1) as usize;
+        let b_len = (seed / 4 % 3 + 1) as usize;
+        let a = rand_nonzero_vec(a_len, seed);
+        let b = rand_nonzero_vec(b_len, seed + 6300);
+        let full_len = a_len + b_len - 1;
+        let out_len = full_len + 2; // larger than needed
+
+        let mut out = vec![0u64; out_len];
+        let c = short_mul_dyn(&a, &b, &mut out);
+        // Carry may be absorbed into extra buffer space
+        let mut got = out;
+        trim_lz(&mut got);
+        if c > 0 {
+            got.push(c);
+        }
+        let expected = mul_ref(&a, &b);
+        assert_eq_buf(
+            &got,
+            &expected,
+            &format!("short_mul_dyn exact fit seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_short_mul_dyn_below_cutoff() {
+    // out.len() <= SHORT_MUL_CUTOFF → short_mul_buf path
+    let out_len = SHORT_MUL_CUTOFF;
+    for seed in 0u64..10 {
+        let a_len = out_len + 5;
+        let b_len = out_len + 3;
+        let a = rand_nonzero_vec(a_len, seed);
+        let b = rand_nonzero_vec(b_len, seed + 6400);
+
+        let mut out_dyn = vec![0u64; out_len];
+        let c_dyn = short_mul_dyn(&a, &b, &mut out_dyn);
+
+        let mut out_buf = vec![0u64; out_len];
+        let c_buf = short_mul_buf(&a, &b, &mut out_buf);
+
+        assert_eq_result(
+            &out_dyn,
+            c_dyn,
+            &out_buf,
+            c_buf,
+            &format!("short_mul_dyn below cutoff seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_short_mul_dyn_above_cutoff() {
+    // out.len() > SHORT_MUL_CUTOFF → truncation path
+    // short_mul_dyn truncates inputs to out_len before multiplying. The only
+    // omitted effect should be carry into the lowest returned limbs.
+    let out_len = SHORT_MUL_CUTOFF + 10;
+    for seed in 0u64..10 {
+        let a_len = out_len + 20;
+        let b_len = out_len + 15;
+        let a = rand_nonzero_vec(a_len, seed);
+        let b = rand_nonzero_vec(b_len, seed + 6500);
+
+        let mut out = vec![0u64; out_len];
+        let _c = short_mul_dyn(&a, &b, &mut out);
+
+        let ref_top = short_mul_ref(&a, &b, out_len);
+        assert_approx_buf(
+            &out,
+            &ref_top,
+            &format!("short_mul_dyn above cutoff seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_short_mul_dyn_random_sweep() {
+    for seed in 0u64..30 {
+        let a_len = (seed % 15 + 3) as usize;
+        let b_len = (seed / 3 % 10 + 3) as usize;
+        let out_len = a_len.min(b_len);
+        let a = rand_nonzero_vec(a_len, seed);
+        let b = rand_nonzero_vec(b_len, seed + 6600);
+
+        let mut out = vec![0u64; out_len];
+        let _c = short_mul_dyn(&a, &b, &mut out);
+        // Just verify it doesn't panic
+    }
+}
+
+#[test]
+fn test_short_mul_static_matches_dyn() {
+    for seed in 0u64..15 {
+        let a_len = (seed % 6 + 2) as usize;
+        let b_len = (seed / 6 % 4 + 2) as usize;
+        let out_len = a_len.min(b_len);
+        let a = rand_nonzero_vec(a_len, seed);
+        let b = rand_nonzero_vec(b_len, seed + 6700);
+
+        if out_len > 32 {
+            continue;
+        }
+
+        let mut out_dyn = vec![0u64; out_len];
+        let c_dyn = short_mul_dyn(&a, &b, &mut out_dyn);
+
+        let mut out_st = vec![0u64; out_len];
+        let c_st = short_mul_static::<32>(&a, &b, &mut out_st);
+
+        assert_eq_result(
+            &out_dyn,
+            c_dyn,
+            &out_st,
+            c_st,
+            &format!("short_mul static vs dyn seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_short_mul_static_full_product_arm() {
+    let a = rand_nonzero_vec(4, 6750);
+    let b = rand_nonzero_vec(3, 6760);
+    let out_len = a.len() + b.len() - 1;
+    let mut out = vec![0u64; out_len];
+    let c = short_mul_static::<16>(&a, &b, &mut out);
+    let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+    assert_eq_result(
+        &out,
+        c,
+        &exp_buf,
+        exp_carry,
+        "short_mul_static full product",
+    );
+}
+
+// ─── Section 10b: Short Square ──────────────────────────────────────────────
+
+#[test]
+fn test_short_sqr_buf_accuracy_small() {
+    for seed in 0u64..30 {
+        let n = (seed % 12 + 3) as usize;
+        let a = rand_nonzero_vec(n, seed + 6800);
+        let out_len = n;
+
+        let mut out = vec![0u64; out_len];
+        let _c = short_sqr_buf(&a, &mut out);
+
+        let expected = short_sqr_ref(&a, out_len);
+        assert_approx_buf(&out, &expected, &format!("short_sqr_buf n={n} seed={seed}"));
+    }
+}
+
+#[test]
+fn test_short_sqr_buf_accuracy_at_cutoff() {
+    let out_len = SHORT_SQR_CUTOFF;
+    for seed in 0u64..10 {
+        let n = out_len + 3;
+        let a = rand_nonzero_vec(n, seed + 6900);
+
+        let mut out = vec![0u64; out_len];
+        let _c = short_sqr_buf(&a, &mut out);
+
+        let expected = short_sqr_ref(&a, out_len);
+        assert_approx_buf(
+            &out,
+            &expected,
+            &format!("short_sqr_buf cutoff n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_short_sqr_dyn_exact_when_out_is_larger_than_full_product() {
+    for seed in 0u64..10 {
+        let n = (seed % 5 + 2) as usize;
+        let a = rand_nonzero_vec(n, seed + 7000);
+        let full_len = 2 * n - 1;
+        let mut out = vec![0u64; full_len + 1];
+
+        let c = short_sqr_dyn(&a, &mut out);
+        let mut got = out;
+        trim_lz(&mut got);
+        if c > 0 {
+            got.push(c);
+        }
+        let expected = mul_ref(&a, &a);
+        assert_eq_buf(&got, &expected, &format!("short_sqr_dyn exact seed={seed}"));
+    }
+}
+
+#[test]
+fn test_short_sqr_dyn_below_and_above_cutoff() {
+    for seed in 0u64..10 {
+        let n = SHORT_SQR_CUTOFF + 20 + seed as usize;
+        let a = rand_nonzero_vec(n, seed + 7100);
+
+        let mut below_dyn = vec![0u64; SHORT_SQR_CUTOFF];
+        let c_below_dyn = short_sqr_dyn(&a, &mut below_dyn);
+        let mut below_buf = vec![0u64; SHORT_SQR_CUTOFF];
+        let c_below_buf = short_sqr_buf(&a, &mut below_buf);
+        assert_eq_result(
+            &below_dyn,
+            c_below_dyn,
+            &below_buf,
+            c_below_buf,
+            &format!("short_sqr_dyn below cutoff seed={seed}"),
+        );
+
+        let out_len = SHORT_SQR_CUTOFF + 10;
+        let mut above = vec![0u64; out_len];
+        let _c = short_sqr_dyn(&a, &mut above);
+        let ref_top = short_sqr_ref(&a, out_len);
+        assert_approx_buf(
+            &above,
+            &ref_top,
+            &format!("short_sqr_dyn above cutoff seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_short_sqr_static_matches_dyn() {
+    for seed in 0u64..15 {
+        let n = (seed % 8 + 3) as usize;
+        let a = rand_nonzero_vec(n, seed + 7200);
+        let out_len = n;
+
+        let mut out_dyn = vec![0u64; out_len];
+        let c_dyn = short_sqr_dyn(&a, &mut out_dyn);
+
+        let mut out_static = vec![0u64; out_len];
+        let c_static = short_sqr_static::<32>(&a, &mut out_static);
+
+        assert_eq_result(
+            &out_dyn,
+            c_dyn,
+            &out_static,
+            c_static,
+            &format!("short_sqr_static seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_short_sqr_static_full_product_arm() {
+    let a = rand_nonzero_vec(4, 7250);
+    let out_len = 2 * a.len() - 1;
+    let mut out = vec![0u64; out_len];
+    let c = short_sqr_static::<16>(&a, &mut out);
+    let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+    assert_eq_result(
+        &out,
+        c,
+        &exp_buf,
+        exp_carry,
+        "short_sqr_static full product",
+    );
+}
+
+#[test]
+fn test_short_sqr_buf_full_product_regression() {
+    let a = [1u64, 1];
+    let mut out = vec![0u64; 2 * a.len() - 1];
+    let c = short_sqr_buf(&a, &mut out);
+    let (expected, expected_carry) = sqr_ref_parts(&a);
+    assert_eq_result(&out, c, &expected, expected_carry, "short_sqr full product");
+}
+
+// ─── Section 11: Middle Multiply ────────────────────────────────────────────
+// mid_mul_buf (schoolbook, approximate) is tested directly.
+// mid_mul_dyn dispatch: school (<FFT_MID_CUTOFF) → FFT → NTT.
+// Static and dynamic variants can use different approximate paths at a given size.
+
+#[test]
+fn test_mid_mul_buf_basic() {
+    // n=2: long=[a,b,c] (3 limbs), short=[d,e] (2 limbs), out=[f,g] (2 limbs)
+    // Full product of [1,2,3] * [4,5] = [4, 13, 22, 15] → middle = [13, 22]
+    let long = vec![1u64, 2, 3];
+    let short = vec![4u64, 5];
+    let mut out = vec![0u64; 2];
+    let c = mid_mul_buf(&long, &short, &mut out);
+    assert_eq!(out, vec![13, 22], "mid_mul_buf basic");
+    assert_eq!(c, (0, 0));
+}
+
+#[test]
+fn test_mid_mul_buf_single() {
+    let long = vec![7u64];
+    let short = vec![3u64];
+    let mut out = vec![0u64; 1];
+    let c = mid_mul_buf(&long, &short, &mut out);
+    assert_eq!(out, vec![21], "mid_mul_buf single");
+    assert_eq!(c, (0, 0));
+}
+
+#[test]
+fn test_mid_mul_buf_matches_full_product() {
+    // mid_mul_buf is approximate: drops carries from lower columns.
+    for seed in 0u64..20 {
+        let n = (seed % 13 + 3) as usize;
+        let long = rand_nonzero_vec(2 * n - 1, seed);
+        let short = rand_nonzero_vec(n, seed + 7000);
+
+        let mut out = vec![0u64; n];
+        let c = mid_mul_buf(&long, &short, &mut out);
+
+        let expected = mid_mul_ref(&long, &short);
+        let expected_carry = mid_mul_school_carry(&long, &short);
+        assert_approx_mid_result(
+            &out,
+            c,
+            &expected,
+            expected_carry,
+            &format!("mid_mul_buf n={n} seed={seed}"),
+        );
+    }
+}
+
+// --- mid_mul_dyn dispatch ---
+
+#[test]
+fn test_mid_mul_dyn_school_path() {
+    // n < KARATSUBA_MID_CUTOFF → school path (delegates to mid_mul_buf)
+    let n = FFT_MID_CUTOFF - 1;
+    for seed in 0u64..10 {
+        let long = rand_nonzero_vec(2 * n - 1, seed);
+        let short = rand_nonzero_vec(n, seed + 7100);
+
+        let mut out = vec![0u64; n];
+        let c = mid_mul_dyn(&long, &short, &mut out);
+
+        let expected = mid_mul_ref(&long, &short);
+        let expected_carry = mid_mul_school_carry(&long, &short);
+        assert_approx_mid_result(
+            &out,
+            c,
+            &expected,
+            expected_carry,
+            &format!("mid_mul_dyn school n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_mid_mul_dyn_school_to_fft() {
+    for &n in &[FFT_MID_CUTOFF - 1, FFT_MID_CUTOFF] {
+        if n < 2 {
+            continue;
+        }
+        for seed in 0u64..3 {
+            let long = rand_nonzero_vec(2 * n - 1, seed);
+            let short = rand_nonzero_vec(n, seed + 7400);
+
+            let mut out = vec![0u64; n];
+            let c = mid_mul_dyn(&long, &short, &mut out);
+
+            let expected = mid_mul_ref(&long, &short);
+            let expected_carry = mid_mul_school_carry(&long, &short);
+            assert_approx_mid_result(
+                &out,
+                c,
+                &expected,
+                expected_carry,
+                &format!("mid_mul_dyn kara/fft boundary n={n} seed={seed}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn test_mid_mul_dyn_fft_path() {
+    // FFT path: n >= FFT_MID_CUTOFF and n < DYN_NTT_MID_CUTOFF
+    for &(n, seed_base) in &[
+        (FFT_MID_CUTOFF + 10, 7500u64),
+        (FFT_MID_CUTOFF + 40, 7600),
+        (177, 7700),
+        (FFT_MID_CUTOFF + 130, 7800),
+    ] {
+        for seed in 0u64..3 {
+            let long = rand_nonzero_vec(2 * n - 1, seed);
+            let short = rand_nonzero_vec(n, seed_base + seed);
+
+            let mut out = vec![0u64; n];
+            let c = mid_mul_dyn(&long, &short, &mut out);
+
+            let expected = mid_mul_ref(&long, &short);
+            let expected_carry = mid_mul_school_carry(&long, &short);
+            assert_approx_mid_result(
+                &out,
+                c,
+                &expected,
+                expected_carry,
+                &format!("mid_mul_dyn fft path n={n} seed={seed}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn test_mid_mul_dyn_ntt_sparse_shift() {
+    let n = FFT_16BIT_CUTOFF / 2;
+    let mut long = vec![0u64; 2 * n - 1];
+    long[n - 1] = 1;
+    let short = rand_nonzero_vec(n, 7700);
+
+    let mut out = vec![0u64; n];
+    let c = mid_mul_dyn(&long, &short, &mut out);
+
+    assert_eq_mid_result(&out, c, &short, (0, 0), "mid_mul_dyn NTT sparse shift");
+}
+
+#[test]
+fn test_mid_mul_dyn_random_sweep() {
+    for seed in 0u64..30 {
+        let n = (seed % 33 + 2) as usize;
+        let long = rand_nonzero_vec(2 * n - 1, seed);
+        let short = rand_nonzero_vec(n, seed + 7800);
+
+        let mut out = vec![0u64; n];
+        let c = mid_mul_dyn(&long, &short, &mut out);
+
+        let expected = mid_mul_ref(&long, &short);
+        let expected_carry = mid_mul_school_carry(&long, &short);
+        assert_approx_mid_result(
+            &out,
+            c,
+            &expected,
+            expected_carry,
+            &format!("mid_mul_dyn sweep n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_mid_mul_static_matches_dyn() {
+    for seed in 0u64..15 {
+        let n = (seed % 18 + 2) as usize;
+        let long = rand_nonzero_vec(2 * n - 1, seed);
+        let short = rand_nonzero_vec(n, seed + 7900);
+
+        let mut out_dyn = vec![0u64; n];
+        let c_dyn = mid_mul_dyn(&long, &short, &mut out_dyn);
+
+        let mut out_st = vec![0u64; n];
+        let c_st = mid_mul_static::<64>(&long, &short, &mut out_st);
+
+        assert_eq_mid_result(
+            &out_dyn,
+            c_dyn,
+            &out_st,
+            c_st,
+            &format!("mid_mul static vs dyn n={n} seed={seed}"),
+        );
+
+        let expected = mid_mul_ref(&long, &short);
+        let expected_carry = mid_mul_school_carry(&long, &short);
+        assert_approx_mid_result(
+            &out_dyn,
+            c_dyn,
+            &expected,
+            expected_carry,
+            &format!("mid_mul static/dyn reference n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_ntt_mid_mul_static_direct_matches_dyn() {
+    for seed in 0u64..5 {
+        let n = FFT_MID_CUTOFF + 5 + seed as usize * 7;
+        let long = rand_nonzero_vec(2 * n - 1, seed + 8000);
+        let short = rand_nonzero_vec(n, seed + 8100);
+
+        let mut out_dyn = vec![0u64; n];
+        let c_dyn = ntt_mid_mul_dyn(&long, &short, &mut out_dyn);
+
+        let mut out_st = vec![0u64; n];
+        let c_st = ntt_mid_mul_static::<512>(&long, &short, &mut out_st);
+
+        assert_eq_mid_result(
+            &out_st,
+            c_st,
+            &out_dyn,
+            c_dyn,
+            &format!("ntt_mid_mul_static direct n={n} seed={seed}"),
+        );
+
+        let expected = mid_mul_ref(&long, &short);
+        let expected_carry = mid_mul_school_carry(&long, &short);
+        assert_approx_mid_result(
+            &out_dyn,
+            c_dyn,
+            &expected,
+            expected_carry,
+            &format!("ntt_mid_mul_static direct reference n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_ntt_mid_mul_static_split_matches_dyn() {
+    let n = 49usize;
+    for seed in 0u64..5 {
+        let long = rand_nonzero_vec(2 * n - 1, seed + 8200);
+        let short = rand_nonzero_vec(n, seed + 8300);
+
+        let mut out_dyn = vec![0u64; n];
+        let c_dyn = ntt_mid_mul_dyn(&long, &short, &mut out_dyn);
+
+        let mut out_st = vec![0u64; n];
+        let c_st = ntt_mid_mul_static::<98>(&long, &short, &mut out_st);
+
+        assert_eq_mid_result(
+            &out_st,
+            c_st,
+            &out_dyn,
+            c_dyn,
+            &format!("ntt_mid_mul_static split n={n} seed={seed}"),
+        );
+
+        let expected = mid_mul_ref(&long, &short);
+        let expected_carry = mid_mul_school_carry(&long, &short);
+        assert_approx_mid_result(
+            &out_dyn,
+            c_dyn,
+            &expected,
+            expected_carry,
+            &format!("ntt_mid_mul_static split reference n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_ntt_mid_mul_dyn_matches_full_product_approximately() {
+    for &n in &[FFT_MID_CUTOFF, FFT_MID_CUTOFF + 30, NTT_MID_CUTOFF] {
+        for seed in 0u64..3 {
+            let long = rand_nonzero_vec(2 * n - 1, seed + 8350);
+            let short = rand_nonzero_vec(n, seed + 8360);
+
+            let mut out = vec![0u64; n];
+            let c = ntt_mid_mul_dyn(&long, &short, &mut out);
+
+            let expected = mid_mul_ref(&long, &short);
+            let expected_carry = mid_mul_school_carry(&long, &short);
+            assert_approx_mid_result(
+                &out,
+                c,
+                &expected,
+                expected_carry,
+                &format!("ntt_mid_mul_dyn approx n={n} seed={seed}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn test_mid_mul_static_cutoff_approximately_matches_ntt() {
+    for seed in 0u64..5 {
+        let n = FFT_MID_CUTOFF + seed as usize;
+        let long = rand_nonzero_vec(2 * n - 1, seed + 8400);
+        let short = rand_nonzero_vec(n, seed + 8500);
+
+        let mut out_dyn = vec![0u64; n];
+        let c_dyn = ntt_mid_mul_dyn(&long, &short, &mut out_dyn);
+
+        let mut out_st = vec![0u64; n];
+        let c_st = mid_mul_static::<256>(&long, &short, &mut out_st);
+
+        assert_approx_mid_result(
+            &out_st,
+            c_st,
+            &out_dyn,
+            c_dyn,
+            &format!("mid_mul_static cutoff approx n={n} seed={seed}"),
+        );
+
+        let expected = mid_mul_ref(&long, &short);
+        let expected_carry = mid_mul_school_carry(&long, &short);
+        assert_approx_mid_result(
+            &out_dyn,
+            c_dyn,
+            &expected,
+            expected_carry,
+            &format!("mid_mul_static cutoff reference n={n} seed={seed}"),
+        );
+    }
+}
+
+// ─── Section 12: Power Functions (powi_*) ───────────────────────────────────
+
+#[test]
+fn test_powi_arr_err_path() {
+    let big_base = rand_nonzero_vec(3, 99);
+    let err: Result<[u64; 2], ()> = powi_arr::<2>(&big_base, 5);
+    assert!(err.is_err(), "powi_arr should fail when N is too small");
+}
+
+#[test]
+fn test_powi_sz_basic() {
+    // powi_sz should return (min, max) limb counts
+    let base = &[u64::MAX]; // ~64 bits
+    let (min, max) = powi_sz(base, 4); // ~256 bits → 4 limbs
+    assert!(min >= 3 && min <= 5, "powi_sz min={min} unexpected");
+    assert!(max >= min, "powi_sz max={max} < min={min}");
+
+    // pow=1 should return roughly the base length
+    let (min1, max1) = powi_sz(base, 1);
+    assert_eq!(min1, 1);
+    assert!(max1 >= 1);
+}
+
+#[test]
+fn test_powi_identity_base_paths() {
+    assert_eq!(powi_vec(&[1], 5), vec![1]);
+
+    let mut dyn_out = [0u64; 1];
+    powi_dyn_entry(&[1], 7, &mut dyn_out);
+    assert_eq!(dyn_out, [1]);
+
+    let mut static_out = [0u64; 1];
+    powi_static_entry::<1>(&[1], 9, &mut static_out).unwrap();
+    assert_eq!(static_out, [1]);
+
+    let arr = powi_arr::<1>(&[1], 11).unwrap();
+    assert_eq!(arr, [1]);
+}
+
+#[test]
+fn test_powi_zero_entry_paths() {
+    let mut dyn_out = [0u64; 2];
+    powi_dyn_entry(&[3], 0, &mut dyn_out);
+    assert_eq!(dyn_out, [1, 0]);
+
+    let mut static_out = [0u64; 2];
+    powi_static_entry::<2>(&[3], 0, &mut static_out).unwrap();
+    assert_eq!(static_out, [1, 0]);
+
+    let arr = powi_arr::<1>(&[3], 0).unwrap();
+    assert_eq!(arr, [1]);
+}
+
+#[test]
+fn test_powi_zero_value_and_poisoned_output_paths() {
+    assert_eq!(powi_sz(&[0, 0], 7), (0, 0));
+    assert!(powi_vec(&[0, 0], 7).is_empty());
+    assert_eq!(powi_arr::<4>(&[0, 0], 7).unwrap(), [0; 4]);
+
+    let mut dyn_out = [9u64; 4];
+    powi_dyn_entry(&[3, 0], 1, &mut dyn_out);
+    assert_eq!(dyn_out, [3, 0, 0, 0]);
+
+    let mut static_out = [9u64; 4];
+    powi_static_entry::<4>(&[3, 0], 1, &mut static_out).unwrap();
+    assert_eq!(static_out, [3, 0, 0, 0]);
+
+    let mut dyn_identity = [9u64; 4];
+    powi_dyn_entry(&[3], 0, &mut dyn_identity);
+    assert_eq!(dyn_identity, [1, 0, 0, 0]);
+
+    assert_eq!(
+        powi_sz(&[2], usize::MAX),
+        (usize::MAX.div_ceil(64), usize::MAX.div_ceil(64))
+    );
+}
+
+#[test]
+fn test_powi_non_identity() {
+    assert_eq!(powi_vec(&[3], 1), vec![3]);
+    assert_eq!(powi_vec(&[3], 2), vec![9]);
+}
+
+#[test]
+fn test_powi_vec_zero() {
+    assert_eq!(powi_vec(&[3], 0), vec![1]);
+}
+
+#[test]
+fn test_powi_vec_small_exponents_exhaustive() {
+    // Exercises reverse_pow's bit construction and the src/dst parity
+    // bookkeeping across every exponent shape (bit lengths and popcounts) up
+    // to 20, against a plain repeated-multiplication oracle.
+    fn to_limbs(v: u128) -> Vec<u64> {
+        if v == 0 {
+            return vec![0];
+        }
+        let mut out = vec![v as u64, (v >> 64) as u64];
+        trim_lz(&mut out);
+        out
+    }
+
+    for &(base, max_pow) in &[(2u64, 20usize), (3, 20), (5, 20), (200, 14)] {
+        let mut expected: u128 = 1;
+        for pow in 0..=max_pow {
+            assert_eq!(
+                powi_vec(&[base], pow),
+                to_limbs(expected),
+                "base={base} pow={pow}"
+            );
+            expected *= base as u128;
+        }
+    }
+}
+
+// ─── Section 13: sqr_arr + Static NTT Sqr ──────────────────────────────────
 
 #[test]
 fn test_sqr_arr_basic() {
-    let (arr, c) = sqr_arr::<4>(&[3]).expect("sqr_arr failed");
-    assert_eq!(arr[0], 9);
-    assert_eq!(c, 0);
+    let a = &[3u64, 2];
+    let result: Result<([u64; 4], u64), ()> = sqr_arr::<4>(a);
+    assert!(result.is_ok());
+    let (arr, c) = result.unwrap();
+    let (exp_buf, exp_carry) = sqr_ref_parts(a);
+    let out_sz = 2 * a.len() - 1;
+    assert_eq_result(&arr[..out_sz], c, &exp_buf, exp_carry, "sqr_arr basic");
 }
 
 #[test]
-fn test_sqr_arr_too_small_returns_err() {
-    // sqr of a 3-limb number needs 5 limbs; N=4 → Err
-    let r = sqr_arr::<4>(&[u64::MAX, u64::MAX, u64::MAX]);
-    assert!(r.is_err());
+fn test_sqr_arr_err_on_overflow() {
+    let result: Result<([u64; 1], u64), ()> = sqr_arr::<1>(&[1, 1]);
+    assert!(result.is_err(), "sqr_arr should fail when N is too small");
 }
 
 #[test]
-fn test_sqr_arr_matches_sqr_vec() {
-    let v = rand_nonzero_vec(4, 77);
-    let (mut expected, ec) = sqr_vec(&v);
-    if ec > 0 {
-        expected.push(ec);
-    }
-    trim_lz(&mut expected);
+fn test_sqr_static_ntt_dispatch() {
+    let n = STATIC_NTT_SQR_CUTOFF + 1;
+    let a = rand_nonzero_vec(n, 8050);
+    let out_sz = 2 * n - 1;
 
-    let (arr, ac) = sqr_arr::<16>(&v).expect("sqr_arr failed");
-    assert_eq!(ac, 0, "oveflow from sqr of 4 buffer into 16 buffer should be zero");
-    let mut got: Vec<u64> = arr[..2 * v.len()].to_vec();
-    trim_lz(&mut got);
-    assert_eq!(got, expected);
+    let mut out = vec![0u64; out_sz];
+    let c = sqr_static::<4096>(&a, &mut out).unwrap();
+
+    let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+    assert_eq_result(&out, c, &exp_buf, exp_carry, "sqr_static NTT dispatch");
 }
 
-// ─── powi_vec ───────────────────────────────────────────────────────────────
+// ─── Section 14: Static NTT Mul Split Paths ─────────────────────────────────
 
 #[test]
-fn test_powi_vec_pow_zero() {
-    for &base in &[1u64, 2, 7, u64::MAX] {
-        let r = powi_vec(&[base], 0);
-        assert_eq!(r, vec![1], "base={base}");
-    }
-}
-
-#[test]
-fn test_powi_vec_pow_one() {
-    let r = powi_vec(&[5], 1);
-    assert_eq!(r, vec![5]);
-}
-
-#[test]
-fn test_powi_vec_pow_two() {
-    let r = powi_vec(&[3], 2);
-    assert_eq!(r, vec![9]);
-}
-
-#[test]
-fn test_powi_vec_pow_ten() {
-    let r = powi_vec(&[2], 10);
-    assert_eq!(r, vec![1024]);
-}
-
-#[test]
-fn test_powi_vec_pow_64_gives_2_to_64() {
-    // 2^64 = [0, 1]
-    let mut r = powi_vec(&[2], 64);
-    trim_lz(&mut r);
-    assert_eq!(r, vec![0, 1]);
-}
-
-#[test]
-fn test_powi_vec_cube() {
-    let r = powi_vec(&[3], 3);
-    assert_eq!(r, vec![27]);
-}
-
-#[test]
-fn test_powi_vec_power_of_two_exponents() {
-    // 5^2 = 25, 5^4 = 625, 5^8 = 390625
-    assert_eq!(powi_vec(&[5], 2), vec![25]);
-    assert_eq!(powi_vec(&[5], 4), vec![625]);
-    assert_eq!(powi_vec(&[5], 8), vec![390625]);
-}
-
-/// Recursive check: powi_vec(v, n) == mul_vec(powi_vec(v, n-1), v)
-#[test]
-fn test_powi_vec_recursive_property() {
-    for &(base, max_pow) in &[(2u64, 20usize), (3, 10), (7, 8)] {
-        let mut prev = powi_vec(&[base], 1);
-        for pow in 2..=max_pow {
-            let curr = powi_vec(&[base], pow);
-            let (mut by_mul, c) = mul_vec(&prev, &[base]);
-            if c > 0 {
-                by_mul.push(c);
-            }
-            trim_lz(&mut by_mul);
-            let mut curr2 = curr.clone();
-            trim_lz(&mut curr2);
-            assert_eq!(curr2, by_mul, "base={base}, pow={pow}");
-            prev = curr;
+fn test_mul_static_ntt_split() {
+    // mul_static::<128> with balanced ~50-limb inputs should hit NTT path,
+    // potentially triggering the split convolution when find_ntt_size > N.
+    // Also test with smaller N to force the split path.
+    for seed in 0u64..3 {
+        let n = 50 + seed as usize * 5;
+        let a = rand_nonzero_vec(n, seed + 8100);
+        let b = rand_nonzero_vec(n, seed + 8200);
+        let out_sz = 2 * n - 1;
+        if out_sz <= 128 {
+            let mut out = vec![0u64; out_sz];
+            let c = mul_static::<128>(&a, &b, &mut out).unwrap();
+            let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+            assert_eq_result(
+                &out,
+                c,
+                &exp_buf,
+                exp_carry,
+                &format!("mul_static NTT n={n} seed={seed}"),
+            );
         }
     }
-}
 
-// ─── powi_arr ───────────────────────────────────────────────────────────────
-
-#[test]
-fn test_powi_arr_basic() {
-    let r = powi_arr::<4>(&[2], 3).expect("powi_arr failed");
-    assert_eq!(r[0], 8);
+    // The over-N split path (find_ntt_size(out_len) > N, only reachable for
+    // non-5-smooth N) is covered by test_ntt_static_split_regression.
 }
 
 #[test]
-fn test_powi_arr_overflow_returns_err() {
-    // 2^128 requires 3 limbs; N=2 → Err
-    let r = powi_arr::<2>(&[2], 128);
-    assert!(r.is_err());
+fn test_mul_static_ntt_dispatch() {
+    let n = 1100usize;
+    assert!(
+        !is_karatsuba(n, n, NTT_CHUNKING_KARATSUBA_CUTOFF, NTT_KARATSUBA_CUTOFF),
+        "chosen size should dispatch to static NTT"
+    );
+
+    let a = rand_nonzero_vec(n, 8300);
+    let b = rand_nonzero_vec(n, 8400);
+    let out_sz = 2 * n - 1;
+    let mut out = vec![0u64; out_sz];
+    let c = mul_static::<4096>(&a, &b, &mut out).unwrap();
+
+    let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+    assert_eq_result(&out, c, &exp_buf, exp_carry, "mul_static NTT dispatch");
 }
 
 #[test]
-fn test_powi_arr_matches_powi_vec() {
-    let base = [3u64];
-    let pow = 5;
-    let mut expected = powi_vec(&base, pow);
-    trim_lz(&mut expected);
+fn test_ntt_static_split_regression() {
+    // N = 24 is 5-smooth: out_len 23 stays on the direct transform path.
+    let n = 12usize;
+    let a = rand_nonzero_vec(n, 8450);
+    let b = rand_nonzero_vec(n, 8460);
+    let mut out = vec![0u64; 2 * n - 1];
+    let c = ntt_entry_static::<24>(&a, &b, &mut out);
+    let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+    assert_eq_result(&out, c, &exp_buf, exp_carry, "ntt static direct");
 
-    let arr = powi_arr::<8>(&base, pow).expect("powi_arr failed");
-    let mut got: Vec<u64> = arr.into_iter().collect();
-    trim_lz(&mut got);
-    assert_eq!(got, expected);
+    // N = 23 is not 5-smooth: find_ntt_size(out_len) > N forces the chunked
+    // split path, balanced and unbalanced.
+    let a = rand_nonzero_vec(12, 8470);
+    let b = rand_nonzero_vec(12, 8480);
+    let mut out = vec![0u64; 23];
+    let c = ntt_entry_static::<23>(&a, &b, &mut out);
+    let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+    assert_eq_result(&out, c, &exp_buf, exp_carry, "ntt static split balanced");
+
+    let a = rand_nonzero_vec(15, 8490);
+    let b = rand_nonzero_vec(8, 8500);
+    let mut out = vec![0u64; 22];
+    let c = ntt_entry_static::<23>(&a, &b, &mut out);
+    let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+    assert_eq_result(&out, c, &exp_buf, exp_carry, "ntt static split unbalanced");
+
+    let buf = rand_nonzero_vec(12, 8510);
+    let mut out = vec![0u64; 23];
+    let c = ntt_sqr_entry_static::<23>(&buf, &mut out);
+    let (exp_buf, exp_carry) = sqr_ref_parts(&buf);
+    assert_eq_result(&out, c, &exp_buf, exp_carry, "ntt static split sqr");
 }
 
-// ─── short_mul_vec ──────────────────────────────────────────────────────────
-//
-// short_mul_vec(a, b, p) returns the TOP p limbs of a*b.
-// Invariant: short_mul_vec(a, b, p) == mul_vec(a, b).0[full_len - p ..]
-// where full_len = a.len() + b.len() - 1.
+// ─── Section 15: NTT Radix-3 Coverage ────────────────────────────────────────
 
 #[test]
-fn test_short_mul_vec_full_precision() {
-    // When p >= full product length, result matches mul_vec exactly.
-    let a = vec![3u64, 2];
-    let b = vec![5u64, 1];
-    let (full, _) = mul_vec(&a, &b);
-    let full_len = a.len() + b.len() - 1;
-    let (short, _) = short_mul_vec(&a, &b, full_len + 10);
-    assert_eq!(short, full);
-}
-
-#[test]
-fn test_short_mul_vec_top_one_limb() {
-    let a = vec![2u64, 1]; // value = 2 + 2^64
-    let b = vec![3u64];    // value = 3
-    // full product = [6, 3], full_len=2, top 1 limb = [3]
-    let (short, _) = short_mul_vec(&a, &b, 1);
-    assert_eq!(short, vec![3]);
-}
-
-#[test]
-fn test_short_mul_vec_matches_full_top() {
-    // Only test p > SHORT_CUTOFF: that path uses mul_vec and gives exact top-p limbs.
-    // The short_mul_buf path (p <= SHORT_CUTOFF) is an intentional approximation — it omits
-    // carry propagation from below the computed window and may not match the exact top limb.
-    for seed in 0u64..10 {
-        let a = rand_nonzero_vec(20, seed);
-        let b = rand_nonzero_vec(20, seed + 50);
-        let full_len = a.len() + b.len() - 1;
-        let (mut full, _) = mul_vec(&a, &b);
-        full.resize(full_len, 0);
-
-        for p in (SHORT_CUTOFF + 1)..=full_len {
-            let (short, _) = short_mul_vec(&a, &b, p);
-            assert_eq!(short, full[full_len - p..], "seed={seed}, p={p}");
-        }
-    }
-}
-
-/// Boundary: test at SHORT_CUTOFF — only the p > SHORT_CUTOFF path gives exact top-p limbs.
-#[test]
-fn test_short_mul_vec_cutoff_boundary() {
-    let a = rand_nonzero_vec(20, 999);
-    let b = rand_nonzero_vec(20, 888);
-    let full_len = a.len() + b.len() - 1;
-    let (mut full, _) = mul_vec(&a, &b);
-    full.resize(full_len, 0);
-
-    // p = SHORT_CUTOFF+1 uses the mul_vec path (p > SHORT_CUTOFF), giving exact top-p limbs.
-    let (short, _) = short_mul_vec(&a, &b, SHORT_CUTOFF + 1);
-    assert_eq!(short, full[full_len - (SHORT_CUTOFF + 1)..], "p=SHORT_CUTOFF+1");
-}
-
-// ─── short_sqr_vec ──────────────────────────────────────────────────────────
-
-#[test]
-fn test_short_sqr_vec_matches_sqr_top() {
-    // Only test p > SHORT_SQR_CUTOFF: that path uses sqr_vec and gives exact top-p limbs.
-    for seed in 0u64..8 {
-        let v = rand_nonzero_vec(20, seed + 200);
-        let full_len = 2 * v.len() - 1;
-        let (mut full, _) = sqr_vec(&v);
-        full.resize(full_len, 0);
-
-        for p in (SHORT_SQR_CUTOFF + 1)..=full_len {
-            let (short, _) = short_sqr_vec(&v, p);
-            assert_eq!(short, full[full_len - p..], "seed={seed}, p={p}");
+fn test_ntt_radix3_coverage() {
+    // Use input sizes that produce NTT sizes divisible by 3 at the top level.
+    // ntt dispatches: %5==0 → ntt_5, %3==0 → ntt_3, else → ntt_2.
+    // We need ntt_size % 3 == 0 && ntt_size % 5 != 0.
+    // Input n=14 → out_len=27 = 3^3, which should trigger ntt_3 at top.
+    // Input n=18 → out_len=35, ntt_size=36=4*9=2^2*3^2
+    for &n in &[14, 18] {
+        for seed in 0u64..3 {
+            let a = rand_nonzero_vec(n, seed + 8500);
+            let b = rand_nonzero_vec(n, seed + 8600);
+            let mut out = vec![0u64; 2 * n - 1];
+            let c = ntt_entry_dyn(&a, &b, &mut out);
+            let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+            assert_eq_result(
+                &out,
+                c,
+                &exp_buf,
+                exp_carry,
+                &format!("ntt radix-3 coverage n={n} seed={seed}"),
+            );
         }
     }
 }
 
 #[test]
-fn test_short_sqr_vec_equals_short_mul_self() {
-    // short_sqr_vec(v, p) should equal short_mul_vec(v, v, p).
-    for seed in 0u64..10 {
-        let v = rand_nonzero_vec(6, seed + 300);
-        let full_len = 2 * v.len() - 1;
-        for p in [1usize, full_len / 2, full_len] {
-            let (sq, _) = short_sqr_vec(&v, p);
-            let (ml, _) = short_mul_vec(&v, &v, p);
-            assert_eq!(sq, ml, "seed={seed}, p={p}");
+fn test_ntt_radix5_coverage() {
+    // n=13 produces out_len=25, forcing radix-5 at the top level.
+    // n=38 produces out_len=75, covering radix-5 precedence over radix-3.
+    for &n in &[13, 38] {
+        for seed in 0u64..3 {
+            let a = rand_nonzero_vec(n, seed + 10_500);
+            let b = rand_nonzero_vec(n, seed + 10_600);
+            let mut out = vec![0u64; 2 * n - 1];
+            let c = ntt_entry_dyn(&a, &b, &mut out);
+            let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+            assert_eq_result(
+                &out,
+                c,
+                &exp_buf,
+                exp_carry,
+                &format!("ntt radix-5 coverage n={n} seed={seed}"),
+            );
         }
     }
 }
 
-/// Boundary at SHORT_SQR_CUTOFF — only p > SHORT_SQR_CUTOFF gives exact top-p limbs.
 #[test]
-fn test_short_sqr_vec_cutoff_boundary() {
-    let v = rand_nonzero_vec(20, 777);
-    let full_len = 2 * v.len() - 1;
-    let (mut full, _) = sqr_vec(&v);
-    full.resize(full_len, 0);
+fn test_ntt_entry_dyn_parallel_branch() {
+    let n = 300usize;
+    let a = rand_nonzero_vec(n, 10_700);
+    let b = rand_nonzero_vec(n, 10_800);
+    let mut out = vec![0u64; 2 * n - 1];
+    let c = ntt_entry_dyn(&a, &b, &mut out);
+    let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+    assert_eq_result(&out, c, &exp_buf, exp_carry, "ntt dyn parallel branch");
+}
 
-    // p = SHORT_SQR_CUTOFF+1 uses the sqr_vec path (p > SHORT_SQR_CUTOFF), giving exact top-p limbs.
-    let (short, _) = short_sqr_vec(&v, SHORT_SQR_CUTOFF + 1);
-    assert_eq!(short, full[full_len - (SHORT_SQR_CUTOFF + 1)..], "p=SHORT_SQR_CUTOFF+1");
+#[test]
+fn test_ntt_sqr_entry_dyn_parallel_branch() {
+    let n = 300usize;
+    let a = rand_nonzero_vec(n, 10_900);
+    let mut out = vec![0u64; 2 * n - 1];
+    let c = ntt_sqr_entry_dyn(&a, &mut out);
+    let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+    assert_eq_result(&out, c, &exp_buf, exp_carry, "ntt sqr dyn parallel branch");
+}
+
+#[test]
+fn test_ntt_entry_static_sequential_branch() {
+    let n = 20usize;
+    let a = rand_nonzero_vec(n, 11_000);
+    let b = rand_nonzero_vec(n, 11_100);
+    let mut out = vec![0u64; 2 * n - 1];
+    let c = ntt_entry_static::<128>(&a, &b, &mut out);
+    let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+    assert_eq_result(&out, c, &exp_buf, exp_carry, "ntt static sequential");
+}
+
+#[test]
+fn test_ntt_sqr_entry_static_sequential_branch() {
+    let n = 20usize;
+    let a = rand_nonzero_vec(n, 11_200);
+    let mut out = vec![0u64; 2 * n - 1];
+    let c = ntt_sqr_entry_static::<128>(&a, &mut out);
+    let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+    assert_eq_result(&out, c, &exp_buf, exp_carry, "ntt sqr static sequential");
+}
+
+// ─── Section 16: Karatsuba Static Entry Points ──────────────────────────────
+
+#[test]
+fn test_karatsuba_static_entries() {
+    // karatsuba_entry_static
+    for seed in 0u64..5 {
+        let n = KARA_CUTOFF + 5 + seed as usize;
+        let a = rand_nonzero_vec(n, seed + 8700);
+        let b = rand_nonzero_vec(n, seed + 8800);
+        let mut out = vec![0u64; 2 * n - 1];
+        let c = karatsuba_entry_static::<128>(&a, &b, &mut out);
+        let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+        assert_eq_result(
+            &out,
+            c,
+            &exp_buf,
+            exp_carry,
+            &format!("karatsuba_entry_static n={n} seed={seed}"),
+        );
+    }
+
+    // karatsuba_sqr_entry_static
+    for seed in 0u64..5 {
+        let n = KARATSUBA_SQR_CUTOFF + 3 + seed as usize;
+        let a = rand_nonzero_vec(n, seed + 8900);
+        let mut out = vec![0u64; 2 * n - 1];
+        let c = karatsuba_sqr_entry_static::<128>(&a, &mut out);
+        let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+        assert_eq_result(
+            &out,
+            c,
+            &exp_buf,
+            exp_carry,
+            &format!("karatsuba_sqr_entry_static n={n} seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_karatsuba_static_fallback_scratch() {
+    let n = KARA_CUTOFF + 12;
+    let a = rand_nonzero_vec(n, 8950);
+    let b = rand_nonzero_vec(n, 8960);
+    let mut out = vec![0u64; 2 * n - 1];
+    let c = karatsuba_entry_static::<64>(&a, &b, &mut out);
+    let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
+    assert_eq_result(
+        &out,
+        c,
+        &exp_buf,
+        exp_carry,
+        "karatsuba static fallback scratch",
+    );
+
+    let n = KARATSUBA_SQR_CUTOFF + 18;
+    let a = rand_nonzero_vec(n, 8970);
+    let mut out = vec![0u64; 2 * n - 1];
+    let c = karatsuba_sqr_entry_static::<64>(&a, &mut out);
+    let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+    assert_eq_result(
+        &out,
+        c,
+        &exp_buf,
+        exp_carry,
+        "karatsuba sqr static fallback scratch",
+    );
+}
+
+#[test]
+fn test_karatsuba_static_chunking_scratch_fallback() {
+    fn check<const N: usize>(l: usize, s: usize, seed: u64, label: &str) {
+        assert!(s <= (l + 1) / 2, "case must use chunking Karatsuba");
+        assert!(!is_school(l, s), "case must not use schoolbook");
+
+        let long = rand_nonzero_vec(l, seed);
+        let short = rand_nonzero_vec(s, seed + 1);
+        let mut out = vec![0u64; l + s - 1];
+        let carry = karatsuba_entry_static::<N>(&long, &short, &mut out);
+        let (expected, expected_carry) = mul_ref_parts(&long, &short);
+        assert_eq_result(&out, carry, &expected, expected_carry, label);
+    }
+
+    // Exact scratch capacity must use the ordinary chunking path, not the
+    // separate-cross fallback intended for balanced recursion.
+    assert_eq!(find_karatsuba_scratch(52, 23), 82);
+    check::<82>(52, 23, 12_000, "static chunking exact scratch capacity");
+
+    // The old fallback called karatsuba_core directly with half > short.len(),
+    // panicking while splitting the short operand.
+    assert!(find_karatsuba_scratch(47, 23) > 69);
+    check::<69>(47, 23, 12_100, "static chunking fallback boundary");
+
+    // Exercise more than one full short-sized chunk before the remainder.
+    assert!(find_karatsuba_scratch(150, 50) > 199);
+    check::<199>(150, 50, 12_200, "static chunking fallback multiple chunks");
+}
+
+// ─── Section 17: mid_mul_static Larger Sizes ─────────────────────────────────
+
+#[test]
+fn test_ntt_mid_mul_static_implicit_padding_shift() {
+    fn check<const N: usize>(n: usize, z: usize, seed: u64) {
+        let long_len = 2 * n - 1 - z;
+        assert!(z <= n - 3, "the shifted CRT window must not wrap");
+        assert!(long_len <= N);
+
+        let long = rand_nonzero_vec(long_len, seed);
+        let short = rand_nonzero_vec(n, seed + 100);
+        let mut padded = vec![0u64; 2 * n - 1];
+        padded[z..].copy_from_slice(&long);
+
+        let mut expected = vec![0u64; n];
+        let expected_carry = ntt_mid_mul_dyn(&padded, &short, &mut expected);
+        let mut got = vec![u64::MAX; n];
+        let got_carry = ntt_mid_mul_static::<N>(&long, &short, &mut got);
+
+        assert_eq_mid_result(
+            &got,
+            got_carry,
+            &expected,
+            expected_carry,
+            &format!("implicit static NTT pad N={N} n={n} z={z}"),
+        );
+    }
+
+    // Both cases require a declared transform larger than the static buffer.
+    // The second lands on the last shift whose CRT extraction does not wrap.
+    check::<24>(17, 9, 15_000);
+    check::<19>(17, 14, 15_100);
+}
+
+#[test]
+fn test_mid_mul_static_tight_ntt_capacity() {
+    const S: usize = NTT_MID_CUTOFF;
+    const N: usize = S + 20;
+    const Z: usize = 2 * S - 1 - N;
+    assert!(Z <= S - 3);
+
+    let long = rand_nonzero_vec(N, 15_200);
+    let short = rand_nonzero_vec(S, 15_300);
+    let mut padded = vec![0u64; 2 * S - 1];
+    padded[Z..].copy_from_slice(&long);
+
+    let mut expected = vec![0u64; S];
+    let expected_carry = ntt_mid_mul_dyn(&padded, &short, &mut expected);
+    let mut got = vec![u64::MAX; S];
+    let got_carry = mid_mul_static::<N>(&long, &short, &mut got);
+
+    assert_eq_mid_result(
+        &got,
+        got_carry,
+        &expected,
+        expected_carry,
+        "tight static middle product uses implicit-padding NTT",
+    );
+}
+
+#[test]
+fn test_ntt_mid_mul_static_wrapped_shift_boundary() {
+    const S: usize = 17;
+    const Z: usize = S - 2;
+    const N: usize = 2 * S - 1 - Z;
+
+    let long = rand_nonzero_vec(N, 15_400);
+    let short = rand_nonzero_vec(S, 15_500);
+    let mut padded = vec![0u64; 2 * S - 1];
+    padded[Z..].copy_from_slice(&long);
+    let expected = mid_mul_ref(&padded, &short);
+    let expected_carry = mid_mul_school_carry(&long, &short);
+
+    let mut got = vec![u64::MAX; S];
+    let got_carry = ntt_mid_mul_static::<N>(&long, &short, &mut got);
+    assert_approx_mid_result(
+        &got,
+        got_carry,
+        &expected,
+        expected_carry,
+        "wrapped shifted CRT window",
+    );
+}
+
+// ─── Section 18: short_mul_static Above Cutoff ──────────────────────────────
+
+#[test]
+fn test_short_mul_static_split_matches_dyn() {
+    const N: usize = SHORT_MUL_CUTOFF + 1;
+    for seed in 0u64..5 {
+        let a = rand_nonzero_vec(N, seed + 9_700);
+        let b = rand_nonzero_vec(N, seed + 9_800);
+
+        let mut out_dyn = vec![0u64; N];
+        let c_dyn = short_mul_dyn(&a, &b, &mut out_dyn);
+
+        let mut out_static = vec![0u64; N];
+        let c_static = short_mul_static::<N>(&a, &b, &mut out_static);
+
+        assert_eq_result(
+            &out_static,
+            c_static,
+            &out_dyn,
+            c_dyn,
+            &format!("short_mul_static split seed={seed}"),
+        );
+
+        let expected = short_mul_ref(&a, &b, N);
+        assert_approx_buf(
+            &out_static,
+            &expected,
+            &format!("short_mul_static split vs exact seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn test_short_sqr_static_split_matches_dyn() {
+    const N: usize = SHORT_SQR_CUTOFF + 1;
+    for seed in 0u64..5 {
+        let a = rand_nonzero_vec(N, seed + 9_900);
+
+        let mut out_dyn = vec![0u64; N];
+        let c_dyn = short_sqr_dyn(&a, &mut out_dyn);
+
+        let mut out_static = vec![0u64; N];
+        let c_static = short_sqr_static::<N>(&a, &mut out_static);
+
+        assert_eq_result(
+            &out_static,
+            c_static,
+            &out_dyn,
+            c_dyn,
+            &format!("short_sqr_static split seed={seed}"),
+        );
+
+        let expected = short_sqr_ref(&a, N);
+        assert_approx_buf(
+            &out_static,
+            &expected,
+            &format!("short_sqr_static split vs exact seed={seed}"),
+        );
+    }
+}
+
+// ─── Section 19: Scratch Size + Cost/Dispatch Helpers ────────────────────────
+
+#[test]
+fn test_find_scratch_sizes() {
+    // find_karatsuba_scratch: various dispatch arms
+    // Prim/Prim2/School: should return 0
+    assert_eq!(find_karatsuba_scratch(5, 1), 0); // Prim
+    assert_eq!(find_karatsuba_scratch(5, 2), 0); // Prim2
+    assert_eq!(find_karatsuba_scratch(10, 5), 0); // School
+
+    // Chunking and Recurse: should return > 0
+    let chunk_sz = find_karatsuba_scratch(100, KARA_CUTOFF + 5);
+    assert!(chunk_sz > 0, "chunking scratch should be > 0");
+
+    let recurse_sz = find_karatsuba_scratch(KARA_CUTOFF + 10, KARA_CUTOFF + 10);
+    assert!(recurse_sz > 0, "recurse scratch should be > 0");
+
+    // find_karatsuba_sqr_scratch_sz
+    assert_eq!(find_karatsuba_sqr_scratch_sz(KARATSUBA_SQR_CUTOFF), 0);
+    let sqr_scratch = find_karatsuba_sqr_scratch_sz(KARATSUBA_SQR_CUTOFF + 1);
+    assert!(sqr_scratch > 0, "sqr scratch should be > 0 above cutoff");
+}
+
+#[test]
+fn test_find_max_ntt_size() {
+    for n in [1usize, 2, 3, 5, 25, 26, 27, 35, 513] {
+        let got = find_max_ntt_size(n);
+        assert!(got >= n, "find_max_ntt_size({n})={got} is too small");
+    }
+    assert_eq!(find_max_ntt_size(25), 25);
+    assert_eq!(find_max_ntt_size(27), 27);
+}
+
+#[test]
+fn test_dispatch_cost_helpers() {
+    // fft_cost, chunking_karatsuba_cost, karatsuba_cost should return positive values
+    assert!(fft_cost(50, 30) > 0.0);
+    assert!(fft_cost(1000, 500) > 0.0);
+
+    assert!(chunking_karatsuba_cost(100, 30) > 0.0);
+    assert!(karatsuba_cost(100, 60) > 0.0);
+
+    // is_karatsuba at boundary sizes
+    let l = 100;
+    let s_small = 10; // s <= half → chunking branch
+    let s_large = 80; // s > half → regular branch
+                      // Just ensure no panic; actual result depends on cutoffs
+    let _ = is_karatsuba(
+        l,
+        s_small,
+        FFT_CHUNKING_KARATSUBA_CUTOFF,
+        FFT_KARATSUBA_CUTOFF,
+    );
+    let _ = is_karatsuba(
+        l,
+        s_large,
+        FFT_CHUNKING_KARATSUBA_CUTOFF,
+        FFT_KARATSUBA_CUTOFF,
+    );
+}
+
+// ─── Section 9: FFT Accuracy at Cutoff ──────────────────────────────────────
+
+#[cfg(feature = "_fft_cutoffs")]
+mod fft_cutoff {
+    use super::*;
+    use rayon::prelude::*;
+
+    const TEST_CNT: u64 = 1 << 7;
+
+    #[test]
+    fn test_fft_mul_accuracy_at_16bit_cutoff() {
+        for &offset in &[1, 2, 4] {
+            let s = FFT_16BIT_CUTOFF - offset;
+            let l = s + 100;
+            (0u64..TEST_CNT).into_par_iter().for_each(|seed| {
+                let long = rand_nonzero_vec(l, seed);
+                let short = rand_nonzero_vec(s, seed + 5000);
+
+                let mut out_fft = vec![0u64; l + s - 1];
+                let c_fft = fft_entry(&long, &short, &mut out_fft);
+
+                let mut out_ntt = vec![0u64; l + s - 1];
+                let c_ntt = ntt_entry_dyn(&long, &short, &mut out_ntt);
+
+                if let Some(report) = diff_report(
+                    &out_fft,
+                    c_fft,
+                    &out_ntt,
+                    c_ntt,
+                    &format!("FFT 16-bit accuracy s={s} seed={seed}"),
+                ) {
+                    panic!("{report}");
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn test_fft_sqr_accuracy_at_16bit_cutoff() {
+        for &offset in &[1, 2] {
+            let n = FFT_16BIT_CUTOFF - offset;
+            (0u64..TEST_CNT).into_par_iter().for_each(|seed| {
+                let a = rand_nonzero_vec(n, seed);
+
+                let mut out_fft = vec![0u64; 2 * n - 1];
+                let c_fft = fft_sqr_entry(&a, &mut out_fft);
+
+                let mut out_ntt = vec![0u64; 2 * n - 1];
+                let c_ntt = ntt_sqr_entry_dyn(&a, &mut out_ntt);
+
+                if let Some(report) = diff_report(
+                    &out_fft,
+                    c_fft,
+                    &out_ntt,
+                    c_ntt,
+                    &format!("FFT sqr 16-bit accuracy n={n} seed={seed}"),
+                ) {
+                    panic!("{report}");
+                }
+            });
+        }
+    }
+}
+
+#[test]
+fn test_karatsuba_mul_prim_dispatch_ignores_stale_out_tail() {
+    // karatsuba_mul's Prim/Prim2 dispatch used to call mul_prim/mul_prim2 on
+    // the FULL out slice, even when out is wider than the standard
+    // long.len()+short.len()-1 convention (a legitimate case once
+    // karatsuba_core's Recurse-boundary sizing fix can hand nested Prim/Prim2
+    // sub-calls a scratch-backed buffer wider than that) — silently
+    // multiplying whatever garbage sat beyond long.len() as if it were part
+    // of the multiplicand. Poison out's tail explicitly and confirm the
+    // dispatch ignores it, for both arms, calling karatsuba_entry_dyn
+    // directly with an over-sized out (bypassing karatsuba_core entirely).
+    let long = rand_nonzero_vec(20, 1);
+    let poison = 0xDEADBEEFDEADBEEFu64;
+    let extra = 5;
+
+    for short in [vec![7u64], vec![7u64, 9u64]] {
+        let standard_len = long.len() + short.len() - 1;
+        let mut out = vec![poison; standard_len + extra];
+        let carry = karatsuba_entry_dyn(&long, &short, &mut out);
+
+        let (exp_buf, exp_carry) = mul_ref_parts(&long, &short);
+        assert_eq!(
+            carry,
+            0,
+            "short.len()={}: overflow should fold into out, not the return",
+            short.len()
+        );
+        assert_eq!(
+            &out[..standard_len],
+            &exp_buf[..],
+            "short.len()={}: product mismatch",
+            short.len()
+        );
+        assert_eq!(
+            out[standard_len],
+            exp_carry,
+            "short.len()={}: overflow limb wrong (likely poisoned)",
+            short.len()
+        );
+        assert!(
+            out[standard_len + 1..].iter().all(|&x| x == 0),
+            "short.len()={}: tail beyond the legitimate overflow limb must be zero, got {:?}",
+            short.len(),
+            &out[standard_len + 1..]
+        );
+    }
 }

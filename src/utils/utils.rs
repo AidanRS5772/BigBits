@@ -94,311 +94,453 @@ pub fn cmp_buf(lhs: &[u64], rhs: &[u64]) -> std::cmp::Ordering {
 
 #[inline]
 pub fn signed_shl(val: u64, sh: i32) -> u64 {
-    return if sh < 0 {
-        val >> sh.unsigned_abs()
+    if sh < 0 {
+        val.checked_shr(sh.unsigned_abs()).unwrap_or(0)
     } else {
-        val << sh.unsigned_abs()
-    };
+        val.checked_shl(sh.unsigned_abs()).unwrap_or(0)
+    }
 }
 
 #[inline]
 pub fn signed_shr(val: u64, sh: i32) -> u64 {
-    return if sh < 0 {
-        val << sh.unsigned_abs()
+    if sh < 0 {
+        val.checked_shl(sh.unsigned_abs()).unwrap_or(0)
     } else {
-        val >> sh.unsigned_abs()
-    };
+        val.checked_shr(sh.unsigned_abs()).unwrap_or(0)
+    }
 }
 
 #[inline]
 pub fn lsb(val: u64, sh: i32) -> u64 {
-    return if sh <= 0 {
+    if sh <= 0 {
         0
+    } else if sh >= 64 {
+        val
     } else {
         val & ((1 << sh.unsigned_abs()) - 1)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn add_asm_x86(lhs: *mut u64, rhs: *const u64, len: usize) -> bool {
+    let carry: u8;
+    asm!(
+        "clc",
+        "2:",
+        "mov {tmp}, [{r}]",
+        "adc [{l}], {tmp}",
+        "lea {l}, [{l} + 8]",
+        "lea {r}, [{r} + 8]",
+        "dec {len}",
+        "jnz 2b",
+        "setc {c}",
+        l = inout(reg) lhs => _,
+        r = inout(reg) rhs => _,
+        len = inout(reg) len => _,
+        c = out(reg_byte) carry,
+        tmp = out(reg) _,
+        options(nostack)
+    );
+    return carry != 0;
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn sub_asm_x86(lhs: *mut u64, rhs: *const u64, len: usize) -> bool {
+    let carry: u8;
+    asm!(
+        "stc",
+        "2:",
+        "mov {tmp}, [{r}]",
+        "not {tmp}",
+        "adc [{l}], {tmp}",
+        "lea {l}, [{l} + 8]",
+        "lea {r}, [{r} + 8]",
+        "dec {len}",
+        "jnz 2b",
+        "setc {c}",
+        l = inout(reg) lhs => _,
+        r = inout(reg) rhs => _,
+        len = inout(reg) len => _,
+        c = out(reg_byte) carry,
+        tmp = out(reg) _,
+        options(nostack),
+    );
+    return carry == 0;
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn add_asm_aarch(lhs: *mut u64, rhs: *const u64, len: usize) -> bool {
+    let carry: u64;
+    asm!(
+        "adds xzr, xzr, xzr",
+        "2:",
+        "ldr {tmp1}, [{l}]",
+        "ldr {tmp2}, [{r}], #8",
+        "adcs {tmp1}, {tmp1}, {tmp2}",
+        "str {tmp1}, [{l}], #8",
+        "sub {len}, {len}, #1",
+        "cbnz {len}, 2b",
+        "cset {c}, cs",
+        l = inout(reg) lhs => _,
+        r = inout(reg) rhs => _,
+        len = inout(reg) len => _,
+        c = out(reg) carry,
+        tmp1 = out(reg) _,
+        tmp2 = out(reg) _,
+        options(nostack)
+    );
+    return carry != 0;
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sub_asm_aarch(lhs: *mut u64, rhs: *const u64, len: usize) -> bool {
+    let carry: u64;
+    asm!(
+        "cmp xzr, xzr",
+        "2:",
+        "ldr {tmp1}, [{l}]",
+        "ldr {tmp2}, [{r}], #8",
+        "mvn {tmp2}, {tmp2}",
+        "adcs {tmp1}, {tmp1}, {tmp2}",
+        "str {tmp1}, [{l}], #8",
+        "sub {len}, {len}, #1",
+        "cbnz {len}, 2b",
+        "cset {c}, cs",
+        l = inout(reg) lhs => _,
+        r = inout(reg) rhs => _,
+        len = inout(reg) len => _,
+        c = out(reg) carry,
+        tmp1 = out(reg) _,
+        tmp2 = out(reg) _,
+        options(nostack)
+    );
+    return carry == 0;
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn inc_asm_x86(buf: *mut u64, len: usize) -> bool {
+    let carry: u8;
+    asm!(
+        "stc",
+        "2:",
+        "adc QWORD PTR [{l}], 0",
+        "lea {l}, [{l} + 8]",
+        "jnc 3f",
+        "dec {len}",
+        "jnz 2b",
+        "3:",
+        "setc {c}",
+        l = inout(reg) buf => _,
+        len = inout(reg) len => _,
+        c = out(reg_byte) carry,
+        options(nostack)
+    );
+    return carry != 0;
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn dec_asm_x86(buf: *mut u64, len: usize) -> bool {
+    let carry: u8;
+    asm!(
+        "stc",
+        "2:",
+        "sbb QWORD PTR [{l}], 0",
+        "lea {l}, [{l} + 8]",
+        "jnc 3f",
+        "dec {len}",
+        "jnz 2b",
+        "3:",
+        "setc {c}",
+        l = inout(reg) buf => _,
+        len = inout(reg) len => _,
+        c = out(reg_byte) carry,
+        options(nostack)
+    );
+    return carry != 0;
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn inc_asm_aarch(buf: *mut u64, len: usize) -> bool {
+    let carry: u64;
+    asm!(
+        "cmp xzr, xzr",
+        "2:",
+        "ldr {tmp}, [{l}]",
+        "adcs {tmp}, {tmp}, xzr",
+        "str {tmp}, [{l}], #8",
+        "b.cc 3f",
+        "sub {len}, {len}, #1",
+        "cbnz {len}, 2b",
+        "3:",
+        "cset {c}, cs",
+        l = inout(reg) buf => _,
+        len = inout(reg) len => _,
+        c = out(reg) carry,
+        tmp = out(reg) _,
+        options(nostack)
+    );
+    return carry != 0;
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn dec_asm_aarch(buf: *mut u64, len: usize) -> bool {
+    let carry: u64;
+    asm!(
+        "adds xzr, xzr, xzr",
+        "2:",
+        "ldr {tmp}, [{l}]",
+        "sbcs {tmp}, {tmp}, xzr",
+        "str {tmp}, [{l}], #8",
+        "b.cs 3f",
+        "sub {len}, {len}, #1",
+        "cbnz {len}, 2b",
+        "3:",
+        "cset {c}, cs",
+        l = inout(reg) buf => _,
+        len = inout(reg) len => _,
+        c = out(reg) carry,
+        tmp = out(reg) _,
+        options(nostack)
+    );
+    return carry == 0;
+}
+
+#[inline(always)]
+unsafe fn add_asm(lhs: *mut u64, rhs: *const u64, len: usize) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        add_asm_aarch(lhs, rhs, len)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        add_asm_x86(lhs, rhs, len)
+    }
+}
+
+#[inline(always)]
+unsafe fn sub_asm(lhs: *mut u64, rhs: *const u64, len: usize) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        sub_asm_aarch(lhs, rhs, len)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        sub_asm_x86(lhs, rhs, len)
+    }
+}
+
+#[inline(always)]
+unsafe fn inc_asm(buf: *mut u64, len: usize) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        inc_asm_aarch(buf, len)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        inc_asm_x86(buf, len)
+    }
+}
+
+#[inline(always)]
+unsafe fn dec_asm(buf: *mut u64, len: usize) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        dec_asm_aarch(buf, len)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        dec_asm_x86(buf, len)
+    }
+}
+
+#[inline]
+pub fn add_buf(lhs: &mut [u64], rhs: &[u64]) -> bool {
+    let rhs_len = rhs.len();
+    let lhs_len = lhs.len();
+    assert!(lhs_len >= rhs_len, "lhs must be longer then rhs");
+    if rhs_len == 0 {
+        return false;
+    }
+    let lhs_ptr = lhs.as_mut_ptr();
+    let rhs_ptr = rhs.as_ptr();
+    let mut carry: bool;
+    unsafe {
+        carry = add_asm(lhs_ptr, rhs_ptr, rhs_len);
+        if carry && lhs_len > rhs_len {
+            carry = inc_asm(lhs_ptr.add(rhs_len), lhs_len - rhs_len);
+        }
+    }
+    return carry;
+}
+
+#[inline]
+pub fn sub_buf(lhs: &mut [u64], rhs: &[u64]) -> bool {
+    let rhs_len = rhs.len();
+    let lhs_len = lhs.len();
+    assert!(lhs_len >= rhs_len, "lhs must be longer then rhs");
+    if rhs_len == 0 {
+        return false;
+    }
+    let lhs_ptr = lhs.as_mut_ptr();
+    let rhs_ptr = rhs.as_ptr();
+    let mut carry: bool;
+    unsafe {
+        carry = sub_asm(lhs_ptr, rhs_ptr, rhs_len);
+        if carry && lhs_len > rhs_len {
+            carry = dec_asm(lhs_ptr.add(rhs_len), lhs_len - rhs_len);
+        }
+    }
+    return carry;
+}
+
+#[inline]
+pub fn inc_buf(buf: &mut [u64]) -> bool {
+    let buf_len = buf.len();
+    if buf_len == 0 {
+        return true;
+    }
+
+    unsafe {
+        return inc_asm(buf.as_mut_ptr(), buf_len);
+    }
+}
+
+#[inline]
+pub fn dec_buf(buf: &mut [u64]) -> bool {
+    let buf_len = buf.len();
+    if buf_len == 0 {
+        return true;
+    }
+
+    unsafe {
+        return dec_asm(buf.as_mut_ptr(), buf_len);
+    }
+}
+
+#[inline]
+pub fn add_prim(buf: &mut [u64], prim: u64) -> bool {
+    if prim == 0 {
+        return false;
+    }
+    let buf_len = buf.len();
+    if buf_len == 0 {
+        return true;
+    }
+    let (res, c) = buf[0].overflowing_add(prim);
+    buf[0] = res;
+    return if c && buf_len > 1 {
+        unsafe { inc_asm(buf.as_mut_ptr().add(1), buf_len - 1) }
+    } else {
+        c
     };
 }
 
-// adds values with carry and propagates carry on ARM
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn add_with_carry_aarch64(l: &mut u64, s: u64, c: &mut u8) {
-    asm!(
-        "subs wzr, {c:w}, #1", // c -> cf
-        "adcs {l}, {l}, {s}", // l+s+cf -> l , updates cf
-        "cset {c:w}, cs", // cf -> c
-        l = inout(reg) *l,
-        s = in(reg) s,
-        c = inout(reg) *c,
-        options(nostack)
-    );
-}
-
-// adds values with carry and propagates carry on x86
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn add_with_carry_x86_64(l: &mut u64, s: u64, c: &mut u8) {
-    asm!(
-        "add {c} , 0xFF", // c -> cc
-        "adc {l}, {s}", // l+s+cf -> l , updates cf
-        "setc {c}", // cf -> c
-        c = inout(reg_byte) *c,
-        l = inout(reg) *l,
-        s = in(reg) s,
-        options(nostack)
-    );
-}
-
-//architecture wrapper
-#[inline(always)]
-pub(super) unsafe fn add_with_carry(l: &mut u64, s: u64, c: &mut u8) {
-    #[cfg(target_arch = "aarch64")]
-    add_with_carry_aarch64(l, s, c);
-
-    #[cfg(target_arch = "x86_64")]
-    add_with_carry_x86_64(l, s, c);
-}
-
-pub fn acc(lhs: &mut [u64], rhs: &[u64], comp: u8) -> bool {
-    let mask = if comp == 0 { 0 } else { u64::MAX };
-    let cf = comp;
-    unsafe {
-        let mut c = comp;
-        for (l, s) in lhs.iter_mut().zip(rhs) {
-            add_with_carry(l, *s ^ mask, &mut c);
-        }
-        if c != cf {
-            for l in &mut lhs[rhs.len()..] {
-                add_with_carry(l, mask, &mut c);
-                if c == cf {
-                    break;
-                }
-            }
-        }
-
-        return c != cf;
+#[inline]
+pub fn sub_prim(buf: &mut [u64], prim: u64) -> bool {
+    if prim == 0 {
+        return false;
     }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn inc_propagate_aarch64(l: &mut u64, c: &mut u8) {
-    asm!(
-        "adds {l}, {l}, {c}", // l + c -> l, sets CF
-        "cset {c:w}, cs",     // CF -> c
-        l = inout(reg) * l,
-        c = inout(reg) * c,
-        options(nostack)
-    );
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn inc_propagate_x86_64(l: &mut u64, c: &mut u8) {
-    asm!(
-        "add {c}, 0xFF", // c -> CF (0xFF + 1 overflows, 0xFF + 0 doesn't)
-        "adc {l}, 0",    // l + 0 + CF -> l
-        "setc {c}",      // CF -> c
-        c = inout(reg_byte) * c,
-        l = inout(reg) * l,
-        options(nostack)
-    );
-}
-
-#[inline(always)]
-unsafe fn inc_propagate(l: &mut u64, c: &mut u8) {
-    #[cfg(target_arch = "aarch64")]
-    inc_propagate_aarch64(l, c);
-    #[cfg(target_arch = "x86_64")]
-    inc_propagate_x86_64(l, c);
-}
-
-pub fn inc(lhs: &mut [u64]) -> bool {
-    unsafe {
-        let mut c: u8 = 1;
-        for l in lhs.iter_mut() {
-            inc_propagate(l, &mut c);
-            if c == 0 {
-                return false;
-            }
-        }
-        true
+    let buf_len = buf.len();
+    if buf_len == 0 {
+        return true;
     }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn dec_propagate_aarch64(l: &mut u64, b: &mut u8) {
-    asm!(
-        "subs {l}, {l}, {b}", // l - b -> l, sets C = NOT borrow
-        "cset {b:w}, cc",     // cc (carry clear) = borrow occurred -> b
-        l = inout(reg) * l,
-        b = inout(reg) * b,
-        options(nostack)
-    );
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn dec_propagate_x86_64(l: &mut u64, b: &mut u8) {
-    asm!(
-        "add {b}, 0xFF", // b -> CF
-        "sbb {l}, 0",    // l - 0 - CF -> l
-        "setc {b}",      // CF -> b
-        b = inout(reg_byte) * b,
-        l = inout(reg) * l,
-        options(nostack)
-    );
-}
-
-#[inline(always)]
-unsafe fn dec_propagate(l: &mut u64, b: &mut u8) {
-    #[cfg(target_arch = "aarch64")]
-    dec_propagate_aarch64(l, b);
-    #[cfg(target_arch = "x86_64")]
-    dec_propagate_x86_64(l, b);
-}
-
-pub fn dec(lhs: &mut [u64]) -> bool {
-    unsafe {
-        let mut b: u8 = 1;
-        for l in lhs.iter_mut() {
-            dec_propagate(l, &mut b);
-            if b == 0 {
-                return false;
-            }
-        }
-        true
-    }
+    let (res, c) = buf[0].overflowing_sub(prim);
+    buf[0] = res;
+    return if c && buf_len > 1 {
+        unsafe { dec_asm(buf.as_mut_ptr().add(1), buf_len - 1) }
+    } else {
+        c
+    };
 }
 
 pub fn twos_comp(buf: &mut [u64]) {
     for l in buf.iter_mut() {
         *l = !*l;
     }
-    inc(buf);
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn shr_carry_aarch64(e: &mut u64, c: &mut u64, sh: u8, mv_sz: u8) {
-    asm!(
-        "lsl {tmp}, {e}, {ms:x}", // put the last bits of the e into tmp
-        "lsr {e}, {e}, {r:x}", // shift e by rem
-        "orr {e}, {e}, {c}", // put the last bits of previous e at the start of e
-        "mov {c}, {tmp}", // put tmp into carry
-        e = inout(reg) *e,
-        c = inout(reg) *c,
-        r = in(reg) sh,
-        ms = in(reg) mv_sz,
-        tmp = out(reg) _,
-        options(nostack)
-    );
+    inc_buf(buf);
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn shr_carry_x86_64(e: &mut u64, c: &mut u64, sh: u8, mv_sz: u8) {
+unsafe fn shr_asm_x86(dst: &mut u64, src: u64, sh: u8) {
     asm!(
-        "mov {tmp}, {e}", // put e into tmp
-        "mov cl , {ms}", // move into cl reg
-        "shl {tmp}, cl", // get last digits of e into tmp
-        "mov cl , {r}", // move into cl reg
-        "shr {e}, cl", // shift e by rem
-        "or {e}, {c}", // put the last bits of previous e at the start of e
-        "mov {c}, {tmp}", // put tmp into carry
-        e = inout(reg) *e,
-        c = inout(reg) *c,
-        r = in(reg_byte) sh,
-        ms = in(reg_byte) mv_sz,
-        tmp = out(reg) _,
-        out("cl") _ ,
-        options(nostack)
+        "shrd {dst}, {src}, cl",
+        dst = inout(reg) *dst,
+        src = in(reg) src,
+        in("cl") sh,
+        options(nostack, nomem)
     );
 }
 
-unsafe fn shr_carry(e: &mut u64, c: &mut u64, sh: u8, mv_sz: u8) {
+unsafe fn shr_asm(dst: &mut u64, src: u64, sh: u8) {
     #[cfg(target_arch = "aarch64")]
-    shr_carry_aarch64(e, c, sh, mv_sz);
+    {
+        *dst = (*dst >> sh) | (src << (64 - sh))
+    }
 
     #[cfg(target_arch = "x86_64")]
-    shr_carry_x86_64(e, c, sh, mv_sz);
+    shr_asm_x86(dst, src, sh);
 }
 
 pub fn shr_buf(buf: &mut [u64], sh: u8) -> u64 {
-    if sh == 0 {
+    assert!(sh < 64, "shift right must be less then 64");
+    if sh == 0 || buf.is_empty() {
         return 0;
     }
-
-    assert!(sh < 64);
-    let mv_sz = 64 - sh;
-    unsafe {
-        let mut c = 0;
-        for e in buf.iter_mut().rev() {
-            shr_carry(e, &mut c, sh, mv_sz);
+    let carry = buf[0] << (64 - sh);
+    for i in 0..buf.len() - 1 {
+        let src = buf[i + 1];
+        unsafe {
+            shr_asm(&mut buf[i], src, sh);
         }
-        return c;
     }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn shl_carry_aarch64(e: &mut u64, c: &mut u64, sh: u8, mv_sz: u8) {
-    asm!(
-        "lsr {tmp}, {e}, {ms:x}", // put the last bits of the e into tmp
-        "lsl {e}, {e}, {r:x}", // shift e by rem
-        "orr {e}, {e}, {c}", // put the last bits of previous e at the start of e
-        "mov {c}, {tmp}", // put tmp into carry
-        e = inout(reg) *e,
-        c = inout(reg) *c,
-        r = in(reg) sh,
-        ms = in(reg) mv_sz,
-        tmp = out(reg) _,
-        options(nostack)
-    );
+    *buf.last_mut().unwrap() >>= sh;
+    return carry;
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn shl_carry_x86_64(e: &mut u64, c: &mut u64, sh: u8, mv_sz: u8) {
+unsafe fn shl_asm_x86(dst: &mut u64, src: u64, sh: u8) {
     asm!(
-        "mov {tmp}, {e}", // put e into tmp
-        "mov cl , {ms}", // move into cl reg
-        "shr {tmp}, cl", // get last digits of e into tmp
-        "mov cl , {r}", // move into cl reg
-        "shl {e}, cl", // shift e by rem
-        "or {e}, {c}", // put the last bits of previous e at the start of e
-        "mov {c}, {tmp}", // put tmp into carry
-        e = inout(reg) *e,
-        c = inout(reg) *c,
-        r = in(reg_byte) sh,
-        ms = in(reg_byte) mv_sz,
-        tmp = out(reg) _,
-        out("cl") _ ,
-        options(nostack)
+        "shld {dst}, {src}, cl",
+        dst = inout(reg) *dst,
+        src = in(reg) src,
+        in("cl") sh,
+        options(nostack, nomem)
     );
 }
 
-unsafe fn shl_carry(e: &mut u64, c: &mut u64, sh: u8, mv_sz: u8) {
+unsafe fn shl_asm(dst: &mut u64, src: u64, sh: u8) {
     #[cfg(target_arch = "aarch64")]
-    shl_carry_aarch64(e, c, sh, mv_sz);
+    {
+        *dst = (*dst << sh) | (src >> (64 - sh))
+    }
 
     #[cfg(target_arch = "x86_64")]
-    shl_carry_x86_64(e, c, sh, mv_sz);
+    shl_asm_x86(dst, src, sh);
 }
 
 pub fn shl_buf(buf: &mut [u64], sh: u8) -> u64 {
-    if sh == 0 {
+    assert!(sh < 64, "shift left must be less then 64");
+    if sh == 0 || buf.is_empty() {
         return 0;
     }
-
-    assert!(sh < 64);
-    let mv_sz = 64 - sh;
-    unsafe {
-        let mut c = 0;
-        for e in buf.iter_mut() {
-            shl_carry(e, &mut c, sh, mv_sz);
-        }
-        return c;
+    let carry = *buf.last().unwrap() >> (64 - sh);
+    for i in (1..buf.len()).rev() {
+        let src = buf[i - 1];
+        unsafe { shl_asm(&mut buf[i], src, sh) }
     }
+    buf[0] <<= sh;
+    return carry;
 }

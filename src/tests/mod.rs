@@ -1,9 +1,9 @@
-mod test_utils;
-mod test_mul;
 mod test_div;
+mod test_mul;
+mod test_utils;
 
-use crate::utils::mul::mul_vec;
-use crate::utils::utils::{acc, eq_buf, trim_lz};
+use crate::utils::mul::{mul_buf, mul_vec};
+use crate::utils::utils::{add_buf, eq_buf, sub_buf, trim_lz};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -17,50 +17,46 @@ pub(super) fn to_u128(buf: &[u64]) -> u128 {
     }
 }
 
-/// Verify the division invariant: q * d + r == n_orig, using big-integer arithmetic.
-pub(super) fn verify_divmod(n_orig: &[u64], d: &[u64], q: &[u64], r: &[u64]) -> bool {
-    // quotient zero means n < d, so remainder should equal n
-    if q.is_empty() || q.iter().all(|&x| x == 0) {
-        let mut n = n_orig.to_vec();
-        let mut r2 = r.to_vec();
-        trim_lz(&mut n);
-        trim_lz(&mut r2);
-        return eq_buf(&n, &r2);
-    }
-
-    if d.is_empty() {
-        return false;
-    }
-
-    let (mut result, c) = mul_vec(q, d);
-    if c > 0 {
-        result.push(c);
-    }
-
-    if result.len() < r.len() {
-        result.resize(r.len(), 0);
-    }
-    // Ignore the overflow bool — if q*d+r > n, the equality check below will catch it.
-    acc(&mut result, r, 0);
-
-    trim_lz(&mut result);
-    let mut n = n_orig.to_vec();
-    trim_lz(&mut n);
-    eq_buf(&result, &n)
-}
-
-/// Generate a random Vec<u64> of `len` limbs with a given seed offset.
+// Generate a random Vec<u64> of `len` limbs with a given seed offset.
 pub(super) fn rand_vec(len: usize, seed: u64) -> Vec<u64> {
     let mut rng = StdRng::seed_from_u64(seed);
     (0..len).map(|_| rng.gen::<u64>()).collect()
 }
 
-/// Generate a random non-zero Vec<u64> of `len` limbs.
+// Generate a random non-zero Vec<u64> of `len` limbs.
 pub(super) fn rand_nonzero_vec(len: usize, seed: u64) -> Vec<u64> {
     let mut v = rand_vec(len, seed);
-    // Ensure the most significant limb is non-zero so buf_len == len.
     if v[len - 1] == 0 {
         v[len - 1] = 1;
     }
     v
+}
+
+/// Schoolbook reference multiplication (normalized: carry appended, leading zeros trimmed).
+pub(super) fn mul_ref(a: &[u64], b: &[u64]) -> Vec<u64> {
+    if a.is_empty() || b.is_empty() {
+        return vec![0];
+    }
+    let mut out = vec![0u64; a.len() + b.len() - 1];
+    let c = mul_buf(a, b, &mut out);
+    if c > 0 {
+        out.push(c);
+    }
+    trim_lz(&mut out);
+    out
+}
+
+/// Verify the division invariant: q*d + r == n.
+pub(super) fn verify_divmod(n: &[u64], d: &[u64], q: &[u64], r: &[u64]) -> bool {
+    let qd = mul_ref(q, d);
+    let mut sum = vec![0u64; qd.len().max(r.len())];
+    sum[..qd.len()].copy_from_slice(&qd);
+    let c = add_buf(&mut sum, r);
+    if c {
+        sum.push(1);
+    }
+    trim_lz(&mut sum);
+    let mut n_trimmed = n.to_vec();
+    trim_lz(&mut n_trimmed);
+    eq_buf(&sum, &n_trimmed)
 }

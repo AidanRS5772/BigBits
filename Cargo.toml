@@ -7,8 +7,25 @@ edition = "2021"
 criterion = "0.5.1"
 
 [dependencies]
+criterion = "0.5.1"
 itertools = "0.12.1"
 rand = "0.8.5"
+rayon = "1.12.0"
+rustfft = "6.4.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.prof]
+inherits = "release"
+debug = 2
+strip = "none"
+lto = "thin"
+panic = "unwind"
 
 [profile.bench]
 lto = "thin"
@@ -16,8 +33,18 @@ codegen-units = 1
 
 [features]
 _bench_internals = []
+_fft_cutoffs = []
 
 [[bench]]
 name = "utils_bench"
 harness = false
 required-features = ["_bench_internals"]
+
+[[bench]]
+name = "cutoffs_bench"
+harness = false
+required-features = ["_bench_internals"]
+
+[[bench]]
+name = "div_profile"
+harness = false
