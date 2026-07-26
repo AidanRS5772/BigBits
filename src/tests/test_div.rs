@@ -1,6 +1,8 @@
 use super::{rand_nonzero_vec, to_u128, verify_divmod};
 use crate::utils::div::*;
-use crate::utils::utils::{buf_len, cmp_buf, trim_lz};
+use crate::utils::mul::mul_dyn;
+use crate::utils::utils::{cmp_buf, shl_buf, shr_buf, sub_buf, trim_lz};
+use crate::utils::{ScratchGuard, BZ_CUTOFF, BZ_TOP_PADDED_COST_SCALE};
 
 // ─── div_prim ───────────────────────────────────────────────────────────────
 
@@ -84,302 +86,465 @@ fn test_div_prim_invariant() {
     }
 }
 
-// ─── div_vec ────────────────────────────────────────────────────────────────
+// ─── direct algorithm helpers ───────────────────────────────────────────────
 
-/// Helper: run div_vec and check that n becomes the remainder.
-fn run_div(n: &[u64], d: &[u64]) -> (Vec<u64>, Vec<u64>) {
+fn assert_divmod_algorithm(name: &str, n: &[u64], d: &[u64], q: &[u64], r: &[u64]) {
+    let mut q_trimmed = q.to_vec();
+    trim_lz(&mut q_trimmed);
+    let mut r_trimmed = r.to_vec();
+    trim_lz(&mut r_trimmed);
+    let mut d_trimmed = d.to_vec();
+    trim_lz(&mut d_trimmed);
+
+    assert!(
+        verify_divmod(n, d, &q_trimmed, &r_trimmed),
+        "{name}: q*d+r != n; q={q_trimmed:?}, r={r_trimmed:?}"
+    );
+    assert!(
+        r_trimmed.is_empty() || cmp_buf(&r_trimmed, &d_trimmed).is_lt(),
+        "{name}: remainder is not reduced; r={r_trimmed:?}, d={d_trimmed:?}"
+    );
+}
+
+fn run_knuth_div_buf_of(n: &[u64], d: &[u64]) -> (Vec<u64>, Vec<u64>) {
+    assert!(d.len() >= 2, "div_buf_of requires a multi-limb divisor");
+    assert!(n.len() >= d.len(), "div_buf_of requires n.len() >= d.len()");
+
     let mut n_work = n.to_vec();
     let mut d_work = d.to_vec();
-    let q = div_vec(&mut n_work, &mut d_work);
-    let r = n_work; // remainder now in n
-    (q, r)
+    let sh = d_work[d_work.len() - 1].leading_zeros() as u8;
+    shl_buf(&mut d_work, sh);
+    let mut of = shl_buf(&mut n_work, sh);
+
+    let mut q = vec![0u64; n_work.len() - d_work.len() + 1];
+    div_buf_of(&mut n_work, &mut of, &d_work, &mut q);
+    assert_eq!(of, 0, "Knuth remainder overflow limb should be zero");
+    shr_buf(&mut n_work, sh);
+
+    (q, n_work)
 }
 
-#[test]
-fn test_div_vec_basic() {
-    let (q, r) = run_div(&[6], &[3]);
-    let mut q2 = q.clone();
-    trim_lz(&mut q2);
-    assert_eq!(q2, vec![2]);
-    let mut r2 = r.clone();
-    trim_lz(&mut r2);
-    assert!(r2.is_empty() || r2.iter().all(|&x| x == 0));
+fn run_bz_top_block_knuth(n: &mut [u64], d: &[u64], out: &mut [u64]) {
+    let mut of = 0;
+    div_buf_of(n, &mut of, d, out);
+    assert_eq!(of, 0, "top-block Knuth overflow limb should be zero");
 }
 
-#[test]
-fn test_div_vec_with_remainder() {
-    let (q, r) = run_div(&[7], &[3]);
-    let mut q2 = q;
-    trim_lz(&mut q2);
-    assert_eq!(q2, vec![2]);
-    let mut r2 = r;
-    trim_lz(&mut r2);
-    assert_eq!(r2, vec![1]);
+fn run_bz_top_block_padded(n: &mut [u64], d: &[u64], out: &mut [u64]) {
+    let dlen = d.len();
+    let qlen = out.len();
+    let mut scratch = ScratchGuard::acquire();
+    let [top_n, q_tmp, div_scratch] = scratch.get_splits([2 * dlen, dlen, dlen]);
+
+    top_n[..n.len()].copy_from_slice(n);
+    top_n[n.len()..].fill(0);
+
+    div_2_1(top_n, d, q_tmp, div_scratch, &mut |n, d, q| {
+        mul_dyn(n, d, q);
+    });
+
+    out.copy_from_slice(&q_tmp[..qlen]);
+    n.fill(0);
+    n[..dlen].copy_from_slice(&top_n[..dlen]);
 }
 
-#[test]
-fn test_div_vec_n_less_than_d_returns_zero_quotient() {
-    let (q, r) = run_div(&[1], &[2]);
-    let mut q2 = q;
-    trim_lz(&mut q2);
-    assert!(q2.is_empty());
-    // remainder == original n
-    let mut r2 = r;
-    trim_lz(&mut r2);
-    assert_eq!(r2, vec![1]);
+fn assert_quotient_algorithm(name: &str, n: &[u64], d: &[u64], q: &[u64]) {
+    let mut n_trimmed = n.to_vec();
+    trim_lz(&mut n_trimmed);
+    let mut d_trimmed = d.to_vec();
+    trim_lz(&mut d_trimmed);
+    let mut q_trimmed = q.to_vec();
+    trim_lz(&mut q_trimmed);
+
+    let qd = super::mul_ref(&q_trimmed, &d_trimmed);
+    assert!(
+        cmp_buf(&qd, &n_trimmed).is_le(),
+        "{name}: quotient is too large; q={q_trimmed:?}"
+    );
+
+    let mut r = n_trimmed.clone();
+    r.resize(r.len().max(qd.len()), 0);
+    assert!(!sub_buf(&mut r, &qd), "{name}: q*d > n");
+    trim_lz(&mut r);
+
+    assert!(
+        verify_divmod(n, d, &q_trimmed, &r),
+        "{name}: q*d+r != n; q={q_trimmed:?}, r={r:?}"
+    );
+    assert!(
+        r.is_empty() || cmp_buf(&r, &d_trimmed).is_lt(),
+        "{name}: quotient is too small; r={r:?}, d={d_trimmed:?}"
+    );
 }
 
-#[test]
-fn test_div_vec_equal_n_and_d() {
-    let (q, r) = run_div(&[u64::MAX], &[u64::MAX]);
-    let mut q2 = q;
-    trim_lz(&mut q2);
-    assert_eq!(q2, vec![1]);
-    let mut r2 = r;
-    trim_lz(&mut r2);
-    assert!(r2.is_empty() || r2.iter().all(|&x| x == 0));
-}
+// ─── direct algorithm entry points ──────────────────────────────────────────
 
 #[test]
-fn test_div_vec_two_limb_numerator() {
-    // [0, 1] = 2^64, divided by [2] = 2 → quotient = [2^63], remainder = 0
-    let (q, r) = run_div(&[0, 1], &[2]);
-    let mut q2 = q;
-    trim_lz(&mut q2);
-    assert_eq!(q2, vec![1u64 << 63]);
-    let mut r2 = r;
-    trim_lz(&mut r2);
-    assert!(r2.is_empty() || r2.iter().all(|&x| x == 0));
-}
+fn test_knuth_div_buf_of_direct_invariant() {
+    let cases = [
+        (vec![u64::MAX, u64::MAX], vec![u64::MAX, 1]),
+        (vec![0, 1, 2], vec![3, 1]),
+        (vec![5, 0, 7, 9], vec![u64::MAX - 3, 8]),
+    ];
 
-#[test]
-fn test_div_vec_multi_limb_exact() {
-    // (2^128 - 1) / (2^64 - 1) = 2^64 + 1 = [1, 1]
-    let (q, r) = run_div(&[u64::MAX, u64::MAX], &[u64::MAX]);
-    let mut q2 = q;
-    trim_lz(&mut q2);
-    assert_eq!(q2, vec![1, 1]);
-    let mut r2 = r;
-    trim_lz(&mut r2);
-    assert!(r2.is_empty() || r2.iter().all(|&x| x == 0));
-}
+    for (idx, (n, d)) in cases.into_iter().enumerate() {
+        let (q, r) = run_knuth_div_buf_of(&n, &d);
+        assert_divmod_algorithm(&format!("knuth edge case {idx}"), &n, &d, &q, &r);
+    }
 
-#[test]
-fn test_div_vec_multi_by_multi() {
-    // [u64::MAX, u64::MAX] / [u64::MAX, u64::MAX] = 1, rem = 0
-    let (q, r) = run_div(&[u64::MAX, u64::MAX], &[u64::MAX, u64::MAX]);
-    let mut q2 = q;
-    trim_lz(&mut q2);
-    assert_eq!(q2, vec![1]);
-    let mut r2 = r;
-    trim_lz(&mut r2);
-    assert!(r2.is_empty() || r2.iter().all(|&x| x == 0));
-}
+    for seed in 0u64..64 {
+        let d_len = (seed % 4 + 2) as usize;
+        let n_len = d_len + (seed % 5) as usize;
+        let n = rand_nonzero_vec(n_len, seed + 7200);
+        let d = rand_nonzero_vec(d_len, seed + 7300);
 
-/// The fundamental invariant: q * d + r == n and r < d.
-/// Tested with random inputs at several sizes including the BZ_CUTOFF boundary.
-#[test]
-fn test_div_vec_invariant_small_random() {
-    for seed in 0u64..40 {
-        let n_len = (seed % 4 + 1) as usize;
-        let d_len = ((seed / 4) as usize % n_len) + 1;
-        let n = rand_nonzero_vec(n_len, seed);
-        let d = rand_nonzero_vec(d_len, seed + 1000);
-
-        let n_orig = n.clone();
-        let mut n_work = n.clone();
-        let mut d_work = d.clone();
-        let q = div_vec(&mut n_work, &mut d_work);
-        let r = &n_work;
-
-        assert!(
-            verify_divmod(&n_orig, &d, &q, r),
-            "q*d+r != n: seed={seed}, n_len={n_len}, d_len={d_len}"
-        );
-
-        // r < d (unless q == 0 and n < d, in which case r == n < d already)
-        let mut r_trimmed = r.clone();
-        trim_lz(&mut r_trimmed);
-        let mut d_trimmed = d.clone();
-        trim_lz(&mut d_trimmed);
-        assert!(
-            cmp_buf(&r_trimmed, &d_trimmed) == std::cmp::Ordering::Less
-                || r_trimmed.is_empty()
-                || r_trimmed.iter().all(|&x| x == 0),
-            "remainder r >= d: seed={seed}"
-        );
+        let (q, r) = run_knuth_div_buf_of(&n, &d);
+        assert_divmod_algorithm(&format!("knuth random seed={seed}"), &n, &d, &q, &r);
     }
 }
 
-/// Test near the BZ_CUTOFF to exercise the recursive Burnikel-Ziegler path.
 #[test]
-fn test_div_vec_invariant_bz_cutoff_even() {
-    for seed in 0u64..5 {
-        let d_len = BZ_CUTOFF + (seed % 2 + 1) as usize;
-        let n_len = d_len * 2 + (seed as usize % 10);
-        let n = rand_nonzero_vec(n_len, seed + 5000);
-        let d = rand_nonzero_vec(d_len, seed + 6000);
+fn test_knuth_div_buf_of_varied_sizes() {
+    let cases = [
+        (2usize, 0usize),
+        (3, 1),
+        (8, 3),
+        (31, 7),
+        (96, 17),
+        (257, 33),
+    ];
 
-        let n_orig = n.clone();
-        let mut n_work = n.clone();
-        let mut d_work = d.clone();
-        let q = div_vec(&mut n_work, &mut d_work);
-        let r = n_work.clone();
-
-        assert!(
-            verify_divmod(&n_orig, &d, &q, &r),
-            "BZ invariant failed for seed={seed}"
-        );
-    }
-}
-
-/// Deep BZ recursion: divisor large enough that div_2_1 recurses into itself.
-/// Tests both even (2*BZ_CUTOFF+2) and odd (2*BZ_CUTOFF+1) at this depth.
-#[test]
-fn test_div_vec_invariant_bz_deep_recursive() {
-    for (d_len, seed_base) in [
-        (BZ_CUTOFF * 2 + 2, 10000u64),
-        (BZ_CUTOFF * 2 + 1, 11000u64),
-    ] {
+    for (idx, &(d_len, extra_q)) in cases.iter().enumerate() {
         for seed in 0u64..3 {
-            let n_len = d_len * 2 + 4;
-            let n = rand_nonzero_vec(n_len, seed + seed_base);
-            let d = rand_nonzero_vec(d_len, seed + seed_base + 100);
+            let n_len = d_len + extra_q;
+            let n = rand_nonzero_vec(n_len, 8100 + seed + 17 * idx as u64);
+            let d = rand_nonzero_vec(d_len, 8200 + seed + 17 * idx as u64);
 
-            let n_orig = n.clone();
-            let mut n_work = n.clone();
-            let mut d_work = d.clone();
-            let q = div_vec(&mut n_work, &mut d_work);
-            let r = n_work.clone();
-
-            assert!(
-                verify_divmod(&n_orig, &d, &q, &r),
-                "BZ deep invariant failed: d_len={d_len}, seed={seed}"
+            let (q, r) = run_knuth_div_buf_of(&n, &d);
+            assert_divmod_algorithm(
+                &format!("knuth varied d_len={d_len} n_len={n_len} seed={seed}"),
+                &n,
+                &d,
+                &q,
+                &r,
             );
         }
     }
 }
 
-/// Test when divisor is much smaller than dividend.
 #[test]
-fn test_div_vec_invariant_large_quotient() {
-    for seed in 0u64..10 {
-        let n = rand_nonzero_vec(8, seed + 2000);
-        let d = rand_nonzero_vec(1, seed + 3000);
+fn test_burnikel_ziegler_direct_invariant() {
+    for seed in 0u64..4 {
+        let d_len = BZ_CUTOFF + 3 + seed as usize;
+        let n_len = 2 * d_len + 5;
+        let n = rand_nonzero_vec(n_len, seed + 7400);
+        let d = rand_nonzero_vec(d_len, seed + 7500);
 
-        let n_orig = n.clone();
+        let mut n_dyn = n.clone();
+        let mut d_dyn = d.clone();
+        let mut q_dyn = vec![0u64; n_len - d_len + 1];
+        bz_div_dyn(&mut n_dyn, &mut d_dyn, &mut q_dyn);
+        assert_divmod_algorithm(
+            &format!("burnikel-ziegler dyn seed={seed}"),
+            &n,
+            &d,
+            &q_dyn,
+            &n_dyn,
+        );
+
+        const N: usize = 512;
+        let mut n_static = [0u64; N];
+        let mut d_static = [0u64; N];
+        let mut q_static = [0u64; N];
+        n_static[..n_len].copy_from_slice(&n);
+        d_static[..d_len].copy_from_slice(&d);
+        bz_div_static::<N>(
+            &mut n_static[..n_len],
+            &mut d_static[..d_len],
+            &mut q_static[..n_len - d_len + 1],
+        );
+        assert_divmod_algorithm(
+            &format!("burnikel-ziegler static seed={seed}"),
+            &n,
+            &d,
+            &q_static[..n_len - d_len + 1],
+            &n_static[..n_len],
+        );
+    }
+}
+
+#[test]
+fn test_burnikel_ziegler_dynamic_top_block_shapes() {
+    let d_len = BZ_CUTOFF + 8;
+    let recursive_top_q = (d_len + 1) / 2;
+    let cases = [
+        ("t0_knuth", recursive_top_q - 1),
+        ("t0_scratch_q", recursive_top_q),
+        ("t0_out_q", d_len),
+        ("t1_reused_out_q", d_len + recursive_top_q),
+    ];
+
+    for (idx, &(name, q_len)) in cases.iter().enumerate() {
+        let n_len = d_len + q_len - 1;
+        let n = rand_nonzero_vec(n_len, 8700 + idx as u64);
+        let d = rand_nonzero_vec(d_len, 8800 + idx as u64);
         let mut n_work = n.clone();
         let mut d_work = d.clone();
-        let q = div_vec(&mut n_work, &mut d_work);
-        let r = n_work.clone();
+        let mut q = vec![0u64; q_len];
 
-        assert!(
-            verify_divmod(&n_orig, &d, &q, &r),
-            "large quotient invariant failed for seed={seed}"
+        bz_div_dyn(&mut n_work, &mut d_work, &mut q);
+        assert_divmod_algorithm(name, &n, &d, &q, &n_work);
+    }
+}
+
+#[test]
+fn test_burnikel_ziegler_static_top_block_shapes() {
+    fn run<const N: usize>(name: &str, d_len: usize, q_len: usize, seed: u64) {
+        let n_len = d_len + q_len - 1;
+        assert!(n_len <= N);
+
+        let n = rand_nonzero_vec(n_len, seed);
+        let d = rand_nonzero_vec(d_len, seed + 100);
+        let mut n_work = [0u64; N];
+        let mut d_work = [0u64; N];
+        let mut q = [0u64; N];
+        n_work[..n_len].copy_from_slice(&n);
+        d_work[..d_len].copy_from_slice(&d);
+
+        bz_div_static::<N>(&mut n_work[..n_len], &mut d_work[..d_len], &mut q[..q_len]);
+        assert_divmod_algorithm(name, &n, &d, &q[..q_len], &n_work[..n_len]);
+    }
+
+    const FIT_N: usize = 512;
+    let d_len = BZ_CUTOFF + 8;
+    let recursive_top_q = (d_len + 1) / 2;
+    run::<FIT_N>("static t0 knuth", d_len, recursive_top_q - 1, 8900);
+    run::<FIT_N>("static t0 scratch q", d_len, recursive_top_q, 8901);
+    run::<FIT_N>("static t0 out q", d_len, d_len, 8902);
+    run::<FIT_N>(
+        "static t1 reused out q",
+        d_len,
+        d_len + recursive_top_q,
+        8903,
+    );
+
+    const LIMITED_N: usize = 250;
+    run::<LIMITED_N>("static capacity fallback", d_len, recursive_top_q, 8904);
+}
+
+#[test]
+fn test_burnikel_ziegler_top_block_cost_model_is_monotone() {
+    for d_len in [BZ_CUTOFF, BZ_CUTOFF + 8, 192, 512, 1024] {
+        assert!(!use_bz_for_top_block(d_len, 0));
+        if d_len <= BZ_CUTOFF {
+            assert!(!use_bz_for_top_block(d_len, d_len));
+            continue;
+        }
+
+        let mut seen_bz = false;
+        for q_len in 1..=d_len {
+            let use_bz = use_bz_for_top_block(d_len, q_len);
+            assert_eq!(
+                use_bz,
+                BZ_TOP_PADDED_COST_SCALE * bz_top_block_padded_work(d_len)
+                    <= bz_top_block_knuth_work(d_len, q_len)
+            );
+            assert!(
+                !seen_bz || use_bz,
+                "BZ top-block dispatch should stay true after d_len={d_len}, q_len={q_len}"
+            );
+            seen_bz |= use_bz;
+        }
+    }
+}
+
+#[test]
+fn test_burnikel_ziegler_forced_top_block_paths_match() {
+    let cases = [
+        (BZ_CUTOFF + 8, 1usize),
+        (BZ_CUTOFF + 8, (BZ_CUTOFF + 8) / 2),
+        (BZ_CUTOFF + 8, BZ_CUTOFF + 8),
+        (192, 17),
+        (384, 192),
+    ];
+
+    for (idx, &(d_len, q_len)) in cases.iter().enumerate() {
+        let n_len = d_len + q_len - 1;
+        let n = rand_nonzero_vec(n_len, 9000 + idx as u64);
+        let mut d = rand_nonzero_vec(d_len, 9100 + idx as u64);
+        d[d_len - 1] |= 1 << 63;
+
+        let mut n_knuth = n.clone();
+        let mut n_bz = n.clone();
+        let mut q_knuth = vec![0u64; q_len];
+        let mut q_bz = vec![0u64; q_len];
+
+        run_bz_top_block_knuth(&mut n_knuth, &d, &mut q_knuth);
+        run_bz_top_block_padded(&mut n_bz, &d, &mut q_bz);
+
+        assert_eq!(q_bz, q_knuth, "forced top quotient mismatch");
+        assert_eq!(n_bz, n_knuth, "forced top remainder mismatch");
+        assert_divmod_algorithm(
+            &format!("forced top block d_len={d_len} q_len={q_len}"),
+            &n,
+            &d,
+            &q_bz,
+            &n_bz,
         );
     }
 }
 
-/// Test when divisor is close in size to dividend (quotient ≈ 1).
 #[test]
-fn test_div_vec_invariant_near_equal_sizes() {
-    for seed in 0u64..10 {
-        let n = rand_nonzero_vec(4, seed + 4000);
-        let d = rand_nonzero_vec(3, seed + 4100);
+fn test_burnikel_ziegler_varied_mul_sizes() {
+    const STATIC_N: usize = 2048;
 
-        let n_orig = n.clone();
-        let mut n_work = n.clone();
-        let mut d_work = d.clone();
-        let q = div_vec(&mut n_work, &mut d_work);
-        let r = n_work.clone();
+    let cases = [(BZ_CUTOFF + 1, 5usize), (192, 11), (384, 13), (640, 17)];
 
-        assert!(
-            verify_divmod(&n_orig, &d, &q, &r),
-            "near-equal size invariant failed for seed={seed}"
+    for (idx, &(d_len, extra_q)) in cases.iter().enumerate() {
+        for seed in 0u64..2 {
+            let n_len = 2 * d_len + extra_q;
+            let q_len = n_len - d_len + 1;
+            assert!(n_len <= STATIC_N);
+            assert!(q_len <= STATIC_N);
+
+            let n = rand_nonzero_vec(n_len, 8300 + seed + 19 * idx as u64);
+            let d = rand_nonzero_vec(d_len, 8400 + seed + 19 * idx as u64);
+
+            let mut n_dyn = n.clone();
+            let mut d_dyn = d.clone();
+            let mut q_dyn = vec![0u64; q_len];
+            bz_div_dyn(&mut n_dyn, &mut d_dyn, &mut q_dyn);
+            assert_divmod_algorithm(
+                &format!("burnikel-ziegler dyn d_len={d_len} n_len={n_len} seed={seed}"),
+                &n,
+                &d,
+                &q_dyn,
+                &n_dyn,
+            );
+
+            let mut n_static = [0u64; STATIC_N];
+            let mut d_static = [0u64; STATIC_N];
+            let mut q_static = [0u64; STATIC_N];
+            n_static[..n_len].copy_from_slice(&n);
+            d_static[..d_len].copy_from_slice(&d);
+            bz_div_static::<STATIC_N>(
+                &mut n_static[..n_len],
+                &mut d_static[..d_len],
+                &mut q_static[..q_len],
+            );
+            assert_divmod_algorithm(
+                &format!("burnikel-ziegler static d_len={d_len} n_len={n_len} seed={seed}"),
+                &n,
+                &d,
+                &q_static[..q_len],
+                &n_static[..n_len],
+            );
+        }
+    }
+}
+
+#[test]
+fn test_newton_raphson_schedule_lands_exactly_on_target() {
+    let mut sizes = [0usize; 64];
+
+    let steps = nr_rcp_schedule(12, &mut sizes);
+    assert_eq!(&sizes[..steps], &[12, 6, 3, 2]);
+
+    let steps = nr_rcp_schedule(1027, &mut sizes);
+    assert_eq!(&sizes[..steps], &[1027, 514, 257, 129, 65, 33, 17, 9, 5, 3, 2]);
+
+    assert_eq!(nr_rcp_schedule(0, &mut sizes), 0);
+    assert_eq!(nr_rcp_schedule(1, &mut sizes), 0);
+
+    // Forward from precision 1, every step must double or double-minus-one-limb
+    // and the chain must land exactly on the target.
+    for p_target in 2usize..=600 {
+        let steps = nr_rcp_schedule(p_target, &mut sizes);
+        assert_eq!(sizes[0], p_target);
+        let mut p = 1;
+        for &q in sizes[..steps].iter().rev() {
+            assert!(
+                q == 2 * p || q == 2 * p - 1,
+                "p_target={p_target} p={p} q={q}"
+            );
+            p = q;
+        }
+        assert_eq!(p, p_target);
+    }
+}
+
+#[test]
+fn test_newton_raphson_div_dyn_trim_schedule_sweep() {
+    // Contiguous q_len sweep hits every trim pattern in the reciprocal schedule
+    // (p_target = q_len + 3), with both the padded and sliced d_work paths.
+    for q_len in 2usize..=34 {
+        for (case, d_len) in [(0u64, q_len + 3), (1, 2 * q_len + 8)] {
+            let n_len = d_len + q_len - 1;
+            let n = rand_nonzero_vec(n_len, 9300 + 7 * q_len as u64 + case);
+            let mut d = rand_nonzero_vec(d_len, 9400 + 7 * q_len as u64 + case);
+            let mut q = vec![0u64; q_len];
+
+            nr_div_dyn(&n, &mut d, &mut q);
+            assert_quotient_algorithm(
+                &format!("newton-raphson trim sweep d_len={d_len} q_len={q_len}"),
+                &n,
+                &d,
+                &q,
+            );
+        }
+    }
+
+    // Reciprocal targets on and just above powers of two, where the old blind
+    // doubling wasted the most work and the new schedule is trim-heavy.
+    for q_len in [59usize, 60, 61, 62, 124, 125, 126, 127, 251, 252, 253] {
+        let d_len = q_len + 3;
+        let n_len = d_len + q_len - 1;
+        let n = rand_nonzero_vec(n_len, 9500 + 7 * q_len as u64);
+        let mut d = rand_nonzero_vec(d_len, 9600 + 7 * q_len as u64);
+        let mut q = vec![0u64; q_len];
+
+        nr_div_dyn(&n, &mut d, &mut q);
+        assert_quotient_algorithm(
+            &format!("newton-raphson trim sweep large d_len={d_len} q_len={q_len}"),
+            &n,
+            &d,
+            &q,
         );
     }
 }
 
-// ─── div_arr ────────────────────────────────────────────────────────────────
-
 #[test]
-fn test_div_arr_basic() {
-    let mut n = [6u64, 0, 0, 0];
-    let mut d = [3u64, 0, 0, 0];
-    let n_len = buf_len(&n);
-    let d_len = buf_len(&d);
-    let q = div_arr::<4>(&mut n[..n_len], &mut d[..d_len]);
-    assert_eq!(q[0], 2);
-    assert_eq!(q[1], 0);
-}
+fn test_newton_raphson_div_dyn_varied_mul_sizes() {
+    let cases = [(6usize, 4usize), (24, 16), (96, 72), (180, 140), (360, 320)];
 
-#[test]
-fn test_div_arr_matches_div_vec() {
-    for seed in 0u64..8 {
-        let n_vec = rand_nonzero_vec(4, seed + 7000);
-        let d_vec = rand_nonzero_vec(2, seed + 7100);
+    for (idx, &(d_len, q_len)) in cases.iter().enumerate() {
+        for seed in 0u64..2 {
+            let n_len = d_len + q_len - 1;
+            let n = rand_nonzero_vec(n_len, 8500 + seed + 23 * idx as u64);
+            let mut d = rand_nonzero_vec(d_len, 8600 + seed + 23 * idx as u64);
+            let mut q = vec![0u64; q_len];
 
-        // div_vec path
-        let n_orig = n_vec.clone();
-        let mut n_work_v = n_vec.clone();
-        let mut d_work_v = d_vec.clone();
-        let q_vec = div_vec(&mut n_work_v, &mut d_work_v);
-        let mut q_vec_trimmed = q_vec;
-        trim_lz(&mut q_vec_trimmed);
-
-        // div_arr path
-        let mut n_arr = [0u64; 8];
-        let mut d_arr = [0u64; 8];
-        n_arr[..n_vec.len()].copy_from_slice(&n_vec);
-        d_arr[..d_vec.len()].copy_from_slice(&d_vec);
-        let n_a_len = buf_len(&n_arr);
-        let d_a_len = buf_len(&d_arr);
-        let q_arr = div_arr::<8>(&mut n_arr[..n_a_len], &mut d_arr[..d_a_len]);
-        let mut q_arr_trimmed: Vec<u64> = q_arr.to_vec();
-        trim_lz(&mut q_arr_trimmed);
-
-        assert_eq!(
-            q_vec_trimmed, q_arr_trimmed,
-            "div_arr vs div_vec mismatch for seed={seed}"
-        );
-
-        // Also verify the invariant
-        let r_arr: Vec<u64> = n_arr[..n_a_len].to_vec();
-        assert!(
-            verify_divmod(&n_orig, &d_vec, &q_arr_trimmed, &r_arr),
-            "div_arr invariant failed for seed={seed}"
-        );
+            nr_div_dyn(&n, &mut d, &mut q);
+            assert_quotient_algorithm(
+                &format!("newton-raphson dyn d_len={d_len} q_len={q_len} seed={seed}"),
+                &n,
+                &d,
+                &q,
+            );
+        }
     }
 }
 
-// ─── div_buf_of (tested indirectly via div_vec) ─────────────────────────────
-// div_buf_of is used internally by bz_div_init and div_2_1. All div_vec tests
-// that pass through the Knuth path (d.len() <= 64) exercise it indirectly.
-
-/// Specifically trigger the Knuth path by using d.len() = 2 (just above 1 limb).
 #[test]
-fn test_div_buf_of_path_via_div_vec() {
-    for seed in 0u64..15 {
-        let n = rand_nonzero_vec(4, seed + 8000);
-        let d = rand_nonzero_vec(2, seed + 8100);
-        let n_orig = n.clone();
-        let mut n_work = n.clone();
-        let mut d_work = d.clone();
-        let q = div_vec(&mut n_work, &mut d_work);
-        let r = n_work.clone();
-        assert!(
-            verify_divmod(&n_orig, &d, &q, &r),
-            "Knuth (div_buf_of) invariant failed for seed={seed}"
-        );
-    }
-}
+fn test_newton_raphson_div_dyn_bench_1024_regression() {
+    let d_len = 1024;
+    let n_len = 2 * d_len;
+    let q_len = d_len + 1;
+    let n = rand_nonzero_vec(n_len, 9000);
+    let mut d = rand_nonzero_vec(d_len, 9100);
+    d[d_len - 1] |= 1 << 63;
+    let mut q = vec![0u64; q_len];
 
-// ─── Panic cases (documented / expected behaviors) ──────────────────────────
-
-#[test]
-#[should_panic]
-fn test_div_vec_panic_on_zero_divisor() {
-    let mut n = vec![1u64];
-    let mut d: Vec<u64> = vec![];
-    div_vec(&mut n, &mut d);
+    nr_div_dyn(&n, &mut d, &mut q);
+    assert_quotient_algorithm("newton-raphson dyn bench size 1024", &n, &d, &q);
 }

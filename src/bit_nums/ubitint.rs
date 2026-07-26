@@ -179,7 +179,7 @@ impl Add for UBitInt {
             (rhs.data, &self.data)
         };
 
-        if acc(&mut long, short, 0) {
+        if add_buf(&mut long, short) {
             long.push(1);
         }
         UBitInt { data: long }
@@ -195,7 +195,7 @@ impl Add for &UBitInt {
             (rhs.data.clone(), &self.data)
         };
 
-        if acc(&mut longer, shorter, 0) {
+        if add_buf(&mut longer, shorter) {
             longer.push(1);
         }
         UBitInt { data: longer }
@@ -211,7 +211,7 @@ impl Add<&UBitInt> for UBitInt {
             (rhs.data.clone(), &self.data)
         };
 
-        if acc(&mut longer, shorter, 0) {
+        if add_buf(&mut longer, shorter) {
             longer.push(1);
         }
         UBitInt { data: longer }
@@ -227,7 +227,7 @@ impl Add<UBitInt> for &UBitInt {
             (rhs.data, &self.data)
         };
 
-        if acc(&mut longer, &shorter, 0) {
+        if add_buf(&mut longer, &shorter) {
             longer.push(1);
         }
         UBitInt { data: longer }
@@ -242,7 +242,7 @@ impl<T: Into<SmallBuf>> Add<T> for UBitInt {
         if lhs.data.len() < sml_buf.len() {
             lhs.data.resize(sml_buf.len(), 0);
         }
-        if acc(&mut lhs.data, &sml_buf, 0) {
+        if add_buf(&mut lhs.data, &sml_buf) {
             lhs.data.push(1);
         }
         return lhs;
@@ -260,7 +260,7 @@ impl<T: Into<SmallBuf>> Add<T> for &UBitInt {
         if lhs.data.len() < sml_buf.len() {
             lhs.data.resize(sml_buf.len(), 0);
         }
-        if acc(&mut lhs.data, &sml_buf, 0) {
+        if add_buf(&mut lhs.data, &sml_buf) {
             lhs.data.push(1);
         }
         return lhs;
@@ -273,7 +273,7 @@ fn add_assign_ubi(lhs: &mut UBitInt, rhs: &[u64]) {
     if lhs.data.len() < rhs.len() {
         lhs.data.resize(rhs.len(), 0);
     }
-    if acc(&mut lhs.data, rhs, 0) {
+    if add_buf(&mut lhs.data, rhs) {
         lhs.data.push(1);
     }
 }
@@ -300,7 +300,7 @@ fn sub_ubi(lhs: &mut UBitInt, rhs: &[u64]) -> bool {
     if lhs.data.len() < rhs.len() {
         return true;
     }
-    if acc(&mut lhs.data, rhs, 1) {
+    if sub_buf(&mut lhs.data, rhs) {
         return true;
     }
     trim_lz(&mut lhs.data);

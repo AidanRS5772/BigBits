@@ -359,76 +359,76 @@ fn test_lsb_zero_value() {
 
 // Addition (comp = 0)
 #[test]
-fn test_acc_add_basic() {
+fn test_add_buf_basic() {
     let mut lhs = vec![5u64];
-    assert!(!acc(&mut lhs, &[3], 0));
+    assert!(!add_buf(&mut lhs, &[3]));
     assert_eq!(lhs, vec![8]);
 }
 
 #[test]
-fn test_acc_add_carry_out() {
+fn test_add_buf_carry_out() {
     let mut lhs = vec![u64::MAX];
-    assert!(acc(&mut lhs, &[1], 0));
+    assert!(add_buf(&mut lhs, &[1]));
     assert_eq!(lhs, vec![0]);
 }
 
 #[test]
-fn test_acc_add_carry_propagates() {
+fn test_add_buf_carry_propagates() {
     let mut lhs = vec![u64::MAX, u64::MAX];
-    assert!(acc(&mut lhs, &[1], 0));
+    assert!(add_buf(&mut lhs, &[1]));
     assert_eq!(lhs, vec![0, 0]);
 }
 
 #[test]
-fn test_acc_add_carry_into_next_limb() {
+fn test_add_buf_carry_into_next_limb() {
     // [u64::MAX, 0] + [1] → [0, 1], no final carry
     let mut lhs = vec![u64::MAX, 0];
-    assert!(!acc(&mut lhs, &[1], 0));
+    assert!(!add_buf(&mut lhs, &[1]));
     assert_eq!(lhs, vec![0, 1]);
 }
 
 #[test]
-fn test_acc_add_zeros() {
+fn test_add_buf_zeros() {
     let mut lhs = vec![0u64, 0];
-    assert!(!acc(&mut lhs, &[0], 0));
+    assert!(!add_buf(&mut lhs, &[0]));
     assert_eq!(lhs, vec![0, 0]);
 }
 
 #[test]
 fn test_acc_add_empty_rhs() {
     let mut lhs = vec![u64::MAX];
-    assert!(!acc(&mut lhs, &[], 0));
+    assert!(!add_buf(&mut lhs, &[]));
     assert_eq!(lhs, vec![u64::MAX]);
 }
 
 // Subtraction (comp = 1): lhs ≥ rhs
 #[test]
-fn test_acc_sub_basic() {
+fn test_sub_buf_basic() {
     let mut lhs = vec![5u64];
-    assert!(!acc(&mut lhs, &[3], 1));
+    assert!(!sub_buf(&mut lhs, &[3]));
     assert_eq!(lhs, vec![2]);
 }
 
 #[test]
-fn test_acc_sub_equal() {
+fn test_sub_buf_equal() {
     let mut lhs = vec![u64::MAX];
-    assert!(!acc(&mut lhs, &[u64::MAX], 1));
+    assert!(!sub_buf(&mut lhs, &[u64::MAX]));
     assert_eq!(lhs, vec![0]);
 }
 
 #[test]
-fn test_acc_sub_borrow_propagation() {
+fn test_sub_buf_borrow_propagation() {
     // [0, 1] - [1] = [u64::MAX, 0], no underflow
     let mut lhs = vec![0u64, 1];
-    assert!(!acc(&mut lhs, &[1], 1));
+    assert!(!sub_buf(&mut lhs, &[1]));
     assert_eq!(lhs, vec![u64::MAX, 0]);
 }
 
 // Subtraction (comp = 1): lhs < rhs — returns true (caller should twos_comp)
 #[test]
-fn test_acc_sub_underflow() {
+fn test_sub_buf_underflow() {
     let mut lhs = vec![3u64];
-    assert!(acc(&mut lhs, &[5], 1));
+    assert!(sub_buf(&mut lhs, &[5]));
     // result is in two's-complement form; twos_comp([u64::MAX - 1]) = [2]
     twos_comp(&mut lhs);
     assert_eq!(lhs, vec![2]);
@@ -437,76 +437,76 @@ fn test_acc_sub_underflow() {
 // ─── inc / dec ──────────────────────────────────────────────────────────────
 
 #[test]
-fn test_inc_from_zero() {
+fn test_inc_buf_from_zero() {
     let mut v = vec![0u64];
-    assert!(!inc(&mut v));
+    assert!(!inc_buf(&mut v));
     assert_eq!(v, vec![1]);
 }
 
 #[test]
-fn test_inc_overflow_single_limb() {
+fn test_inc_buf_overflow_single_limb() {
     let mut v = vec![u64::MAX];
-    assert!(inc(&mut v));
+    assert!(inc_buf(&mut v));
     assert_eq!(v, vec![0]);
 }
 
 #[test]
-fn test_inc_carry_into_second_limb() {
+fn test_inc_buf_carry_into_second_limb() {
     let mut v = vec![u64::MAX, 0];
-    assert!(!inc(&mut v));
+    assert!(!inc_buf(&mut v));
     assert_eq!(v, vec![0, 1]);
 }
 
 #[test]
-fn test_inc_overflow_all_max() {
+fn test_inc_buf_overflow_all_max() {
     let mut v = vec![u64::MAX, u64::MAX];
-    assert!(inc(&mut v));
+    assert!(inc_buf(&mut v));
     assert_eq!(v, vec![0, 0]);
 }
 
 #[test]
-fn test_inc_no_carry_needed() {
+fn test_inc_buf_no_carry_needed() {
     let mut v = vec![0u64, 1];
-    assert!(!inc(&mut v));
+    assert!(!inc_buf(&mut v));
     assert_eq!(v, vec![1, 1]);
 }
 
 #[test]
-fn test_dec_from_one() {
+fn test_dec_buf_from_one() {
     let mut v = vec![1u64];
-    assert!(!dec(&mut v));
+    assert!(!dec_buf(&mut v));
     assert_eq!(v, vec![0]);
 }
 
 #[test]
-fn test_dec_underflow_zero() {
+fn test_dec_buf_underflow_zero() {
     let mut v = vec![0u64];
-    assert!(dec(&mut v));
+    assert!(dec_buf(&mut v));
     assert_eq!(v, vec![u64::MAX]);
 }
 
 #[test]
-fn test_dec_borrow_propagation() {
+fn test_dec_buf_borrow_propagation() {
     // [0, 1] - 1 = [u64::MAX, 0]
     let mut v = vec![0u64, 1];
-    assert!(!dec(&mut v));
+    assert!(!dec_buf(&mut v));
     assert_eq!(v, vec![u64::MAX, 0]);
 }
 
 #[test]
-fn test_dec_no_borrow() {
+fn test_dec_buf_no_borrow() {
     let mut v = vec![u64::MAX];
-    assert!(!dec(&mut v));
+    assert!(!dec_buf(&mut v));
     assert_eq!(v, vec![u64::MAX - 1]);
 }
 
 #[test]
-fn test_inc_dec_roundtrip() {
+fn test_inc_buf_dec_buf_roundtrip() {
     for seed in [0u64, 1, 42, 999] {
         let orig = rand_vec(4, seed);
         let mut v = orig.clone();
-        inc(&mut v);
-        dec(&mut v);
+        inc_buf(&mut v);
+        dec_buf(&mut v);
         assert_eq!(v, orig, "roundtrip failed for seed {seed}");
     }
 }
