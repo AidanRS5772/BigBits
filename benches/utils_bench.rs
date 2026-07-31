@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use big_bits::utils::sqrt::binom_sqrt;
 use big_bits::{utils::div::*, *};
 use criterion::{
     black_box, criterion_group, criterion_main, measurement::WallTime, BatchSize, BenchmarkGroup,
@@ -637,12 +638,39 @@ fn bench_rcp_setup(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_bz_div,
-    bench_nr_div,
-    bench_nr_div_rem,
-    bench_rcp_setup
-);
+fn bench_binom_sqrt(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("binom_sqrt/{ARCH}"));
+    set_up_group(&mut group);
+
+    for root_len in [4usize, 16, 64, 256] {
+        group.throughput(Throughput::Elements(root_len as u64));
+
+        for (shape, x_len) in [
+            ("min_x_eq_s_plus_1", root_len + 1),
+            ("mid_x_eq_3s_over_2", root_len + root_len / 2),
+            ("full_x_eq_2s", 2 * root_len),
+        ] {
+            let input = random_normalized_limbs(x_len);
+            group.bench_with_input(
+                BenchmarkId::new(shape, root_len),
+                &root_len,
+                |bench, &root_len| {
+                    bench.iter_batched_ref(
+                        || (input.clone(), vec![0; root_len]),
+                        |data| {
+                            let (x, root) = data;
+                            binom_sqrt(black_box(x.as_mut_slice()), black_box(root.as_mut_slice()))
+                        },
+                        BatchSize::LargeInput,
+                    );
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_knuth_div);
 
 criterion_main!(benches);
