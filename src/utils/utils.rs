@@ -544,3 +544,21 @@ pub fn shl_buf(buf: &mut [u64], sh: u8) -> u64 {
     buf[0] <<= sh;
     return carry;
 }
+
+// Copies the top out.len() limbs of (src << sh) into out; reads one limb below
+// the copied window for the shifted-in bits and zero-pads when src is shorter.
+pub(crate) fn shl_top_copy(src: &[u64], out: &mut [u64], sh: u8) {
+    let copy_len = src.len().min(out.len());
+    let src_start = src.len() - copy_len;
+    let out_start = out.len() - copy_len;
+
+    out[..out_start].fill(0);
+    out[out_start..].copy_from_slice(&src[src_start..]);
+
+    if sh != 0 && copy_len != 0 {
+        shl_buf(&mut out[out_start..], sh);
+        if src_start != 0 {
+            out[0] |= src[src_start - 1] >> (64 - sh);
+        }
+    }
+}

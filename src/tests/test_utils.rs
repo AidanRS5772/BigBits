@@ -783,6 +783,27 @@ fn test_shl_shr_roundtrip_multi_limb() {
     }
 }
 
+#[test]
+fn test_shl_top_copy_alignment_and_discarded_limb_carry() {
+    let mut short = [u64::MAX; 3];
+    shl_top_copy(&[0x8000_0000_0000_0001], &mut short, 1);
+    assert_eq!(short, [0, 0, 2]);
+
+    let mut equal = [0; 2];
+    shl_top_copy(&[u64::MAX, 1], &mut equal, 1);
+    assert_eq!(equal, [u64::MAX - 1, 3]);
+
+    let mut long = [0; 2];
+    shl_top_copy(&[99, 1 << 63, 5, 6], &mut long, 1);
+    assert_eq!(long, [11, 12]);
+
+    shl_top_copy(&[99, 2, 3, 4], &mut long, 63);
+    assert_eq!(long, [(1 << 63) | 1, 1]);
+
+    shl_top_copy(&[99, 1 << 63, 5, 6], &mut long, 0);
+    assert_eq!(long, [5, 6]);
+}
+
 // ─── to_u128 helper (self-test) ─────────────────────────────────────────────
 
 #[test]

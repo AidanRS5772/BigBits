@@ -250,20 +250,6 @@ fn assert_approx_buf(got: &[u64], expected: &[u64], msg: &str) {
     panic!("{report}");
 }
 
-fn assert_approx_result(
-    got: &[u64],
-    got_carry: u64,
-    expected: &[u64],
-    expected_carry: u64,
-    msg: &str,
-) {
-    assert_eq!(
-        got_carry, expected_carry,
-        "{msg}: carry mismatch; got={got_carry:#018x}, expected={expected_carry:#018x}"
-    );
-    assert_approx_buf(got, expected, msg);
-}
-
 fn assert_approx_mid_result(
     got: &[u64],
     got_carry: (u64, u64),

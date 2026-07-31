@@ -2,6 +2,7 @@ use std::cell::RefCell;
 
 pub mod div;
 pub mod mul;
+pub mod sqrt;
 pub mod utils;
 
 pub const CHUNKING_KARATSUBA_CUTOFF: usize = 22;

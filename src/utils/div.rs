@@ -56,123 +56,6 @@ pub fn div_prim(buf: &mut [u64], prim: u64) -> u64 {
     return r;
 }
 
-/// Full structural quotient width for trimmed little-endian operands.
-///
-/// This includes a possible zero top quotient limb. Division entries may be
-/// given a shorter output to request only the high quotient limbs.
-pub fn div_quotient_len(n_len: usize, d_len: usize) -> usize {
-    assert!(d_len != 0, "Division by zero error");
-    n_len.checked_sub(d_len).map_or(0, |delta| delta + 1)
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct DivisionRequest {
-    /// First numerator limb that can affect the requested quotient window.
-    n_start: usize,
-    /// First nonzero divisor limb.
-    d_start: usize,
-    /// Effective divisor width after removing exact low zero limbs.
-    d_len: usize,
-    /// Quotient slice length passed through the selected algorithm wrapper.
-    q_len: usize,
-    /// Shift that bit-normalizes the effective divisor.
-    normalization_shift: u8,
-}
-
-/// Performs checks and operand-window preparation shared by every public
-/// division API entry.
-///
-/// If the structural quotient width is `L`, the caller receives the high
-/// `min(q.len(), L)` limbs packed at the low end of `q`; any excess output
-/// limbs stay zero. A nondegenerate request leaves the requested output window
-/// untouched for the chosen algorithm wrapper to overwrite. Degenerate calls
-/// zero the complete output before returning `None`.
-pub fn division_preflight(n: &[u64], d: &[u64], q: &mut [u64]) -> Option<DivisionRequest> {
-    assert!(
-        d.last().is_some_and(|&top| top != 0),
-        "division requires a trimmed nonzero divisor"
-    );
-    assert!(
-        n.last().is_none_or(|&top| top != 0),
-        "division requires a trimmed numerator"
-    );
-    let full_q_len = div_quotient_len(n.len(), d.len());
-    let q_len = q.len().min(full_q_len);
-    if q_len == 0 {
-        q.fill(0);
-        return None;
-    }
-
-    if n.len() == d.len() && cmp_buf(n, d).is_lt() {
-        q.fill(0);
-        return None;
-    }
-
-    q[q_len..].fill(0);
-    let quotient_skip = full_q_len - q_len;
-    let d_start = divisor_limb_shift(d);
-    let d_len = d.len() - d_start;
-
-    Some(DivisionRequest {
-        n_start: quotient_skip + d_start,
-        d_start,
-        d_len,
-        q_len,
-        normalization_shift: d[d.len() - 1].leading_zeros() as u8,
-    })
-}
-
-#[inline]
-fn divisor_limb_shift(d: &[u64]) -> usize {
-    d.iter().position(|&limb| limb != 0).unwrap()
-}
-
-/// Performs validation shared by every public reciprocal entry. An empty
-/// output requests zero precision and therefore no work.
-pub fn reciprocal_preflight(d: &[u64], rcp: &[u64]) -> bool {
-    if rcp.is_empty() {
-        return false;
-    }
-    assert!(
-        d.last().is_some_and(|&top| top != 0),
-        "reciprocal requires a trimmed nonzero divisor"
-    );
-    true
-}
-
-/// Selects the part of the divisor that can affect the requested reciprocal
-/// precision. Removing low zero limbs is exact. Keeping one limb beyond the
-/// output precision bounds input-truncation error to the final output limb;
-/// static wrappers may keep only `precision` limbs when their capacity is
-/// tight, which still bounds the numeric error to less than one whole limb.
-fn reciprocal_divisor_window(d: &[u64], precision: usize, capacity: usize) -> &[u64] {
-    debug_assert!(precision != 0 && capacity != 0);
-    let max_window_len = d.len().min(precision.saturating_add(1)).min(capacity);
-    let window = &d[d.len() - max_window_len..];
-    let first_nonzero = window.iter().position(|&limb| limb != 0).unwrap();
-    &window[first_nonzero..]
-}
-
-fn assert_static_division_capacity<const N: usize>(n: &[u64], d: &[u64], q: &[u64]) {
-    assert!(
-        n.len() <= N && d.len() <= N && q.len() <= N,
-        "prepared division operands exceed static capacity"
-    );
-}
-
-#[inline]
-fn debug_assert_rigid_division_shape(n: &[u64], d: &[u64], q: &[u64]) {
-    debug_assert!(!d.is_empty());
-    debug_assert!(n.len() >= d.len());
-    debug_assert_eq!(q.len(), n.len() - d.len() + 1);
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RemainderMode {
-    Discard,
-    Restore,
-}
-
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn sub_mul_of_aarch(win: *mut u64, of: *mut u64, d: *const u64, q: u64, len: usize) -> bool {
@@ -302,7 +185,7 @@ unsafe fn mul_u64_aarch(a: u64, b: u64) -> (u64, u64) {
 }
 
 #[inline(always)]
-unsafe fn mul_u64_asm(a: u64, b: u64) -> (u64, u64) {
+pub unsafe fn mul_u64_asm(a: u64, b: u64) -> (u64, u64) {
     #[cfg(target_arch = "aarch64")]
     {
         mul_u64_aarch(a, b)
@@ -313,7 +196,7 @@ unsafe fn mul_u64_asm(a: u64, b: u64) -> (u64, u64) {
     }
 }
 
-fn knuth_est(win: &mut [u64], of: &mut u64, d: &[u64], d1: u64, d0: u64) -> u64 {
+pub fn knuth_est(win: &mut [u64], of: &mut u64, d: &[u64], d1: u64, d0: u64) -> u64 {
     let (mut qhat, rhat_hi, rhat_lo) = if *of >= d1 {
         let (rhat_lo, c) = win.last().unwrap().overflowing_add(d1);
         (u64::MAX, *of - d1 + c as u64, rhat_lo)
@@ -366,6 +249,123 @@ pub fn div_buf_of(n: &mut [u64], of: &mut u64, d: &[u64], out: &mut [u64]) {
         let (win, of) = n[i..].split_at_mut(d_len);
         out[i] = knuth_est(win, &mut of[0], d, d1, d0)
     }
+}
+
+/// Full structural quotient width for trimmed little-endian operands.
+///
+/// This includes a possible zero top quotient limb. Division entries may be
+/// given a shorter output to request only the high quotient limbs.
+pub fn div_quotient_len(n_len: usize, d_len: usize) -> usize {
+    assert!(d_len != 0, "Division by zero error");
+    n_len.checked_sub(d_len).map_or(0, |delta| delta + 1)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DivisionRequest {
+    /// First numerator limb that can affect the requested quotient window.
+    n_start: usize,
+    /// First nonzero divisor limb.
+    d_start: usize,
+    /// Effective divisor width after removing exact low zero limbs.
+    d_len: usize,
+    /// Quotient slice length passed through the selected algorithm wrapper.
+    q_len: usize,
+    /// Shift that bit-normalizes the effective divisor.
+    normalization_shift: u8,
+}
+
+/// Performs checks and operand-window preparation shared by every public
+/// division API entry.
+///
+/// If the structural quotient width is `L`, the caller receives the high
+/// `min(q.len(), L)` limbs packed at the low end of `q`; any excess output
+/// limbs stay zero. A nondegenerate request leaves the requested output window
+/// untouched for the chosen algorithm wrapper to overwrite. Degenerate calls
+/// zero the complete output before returning `None`.
+pub fn division_preflight(n: &[u64], d: &[u64], q: &mut [u64]) -> Option<DivisionRequest> {
+    assert!(
+        d.last().is_some_and(|&top| top != 0),
+        "division requires a trimmed nonzero divisor"
+    );
+    assert!(
+        n.last().is_none_or(|&top| top != 0),
+        "division requires a trimmed numerator"
+    );
+    let full_q_len = div_quotient_len(n.len(), d.len());
+    let q_len = q.len().min(full_q_len);
+    if q_len == 0 {
+        q.fill(0);
+        return None;
+    }
+
+    if n.len() == d.len() && cmp_buf(n, d).is_lt() {
+        q.fill(0);
+        return None;
+    }
+
+    q[q_len..].fill(0);
+    let quotient_skip = full_q_len - q_len;
+    let d_start = divisor_limb_shift(d);
+    let d_len = d.len() - d_start;
+
+    Some(DivisionRequest {
+        n_start: quotient_skip + d_start,
+        d_start,
+        d_len,
+        q_len,
+        normalization_shift: d[d.len() - 1].leading_zeros() as u8,
+    })
+}
+
+#[inline]
+fn divisor_limb_shift(d: &[u64]) -> usize {
+    d.iter().position(|&limb| limb != 0).unwrap()
+}
+
+/// Performs validation shared by every public reciprocal entry. An empty
+/// output requests zero precision and therefore no work.
+pub fn reciprocal_preflight(d: &[u64], rcp: &[u64]) -> bool {
+    if rcp.is_empty() {
+        return false;
+    }
+    assert!(
+        d.last().is_some_and(|&top| top != 0),
+        "reciprocal requires a trimmed nonzero divisor"
+    );
+    true
+}
+
+/// Selects the part of the divisor that can affect the requested reciprocal
+/// precision. Removing low zero limbs is exact. Keeping one limb beyond the
+/// output precision bounds input-truncation error to the final output limb;
+/// static wrappers may keep only `precision` limbs when their capacity is
+/// tight, which still bounds the numeric error to less than one whole limb.
+fn reciprocal_divisor_window(d: &[u64], precision: usize, capacity: usize) -> &[u64] {
+    debug_assert!(precision != 0 && capacity != 0);
+    let max_window_len = d.len().min(precision.saturating_add(1)).min(capacity);
+    let window = &d[d.len() - max_window_len..];
+    let first_nonzero = window.iter().position(|&limb| limb != 0).unwrap();
+    &window[first_nonzero..]
+}
+
+fn assert_static_division_capacity<const N: usize>(n: &[u64], d: &[u64], q: &[u64]) {
+    assert!(
+        n.len() <= N && d.len() <= N && q.len() <= N,
+        "prepared division operands exceed static capacity"
+    );
+}
+
+#[inline]
+fn debug_assert_rigid_division_shape(n: &[u64], d: &[u64], q: &[u64]) {
+    debug_assert!(!d.is_empty());
+    debug_assert!(n.len() >= d.len());
+    debug_assert_eq!(q.len(), n.len() - d.len() + 1);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemainderMode {
+    Discard,
+    Restore,
 }
 
 fn knuth_div_rem_core(
@@ -1021,24 +1021,6 @@ fn nr_err_band(
         }
     }
     Some((val == u64::MAX, e_idx))
-}
-
-// Copies the top out.len() limbs of (src << sh) into out; reads one limb below
-// the copied window for the shifted-in bits and zero-pads when src is shorter.
-pub(crate) fn shl_top_copy(src: &[u64], out: &mut [u64], sh: u8) {
-    let copy_len = src.len().min(out.len());
-    let src_start = src.len() - copy_len;
-    let out_start = out.len() - copy_len;
-
-    out[..out_start].fill(0);
-    out[out_start..].copy_from_slice(&src[src_start..]);
-
-    if sh != 0 && copy_len != 0 {
-        shl_buf(&mut out[out_start..], sh);
-        if src_start != 0 {
-            out[0] |= src[src_start - 1] >> (64 - sh);
-        }
-    }
 }
 
 // Knuth long division over an implicit power-of-B numerator. `d` must be
