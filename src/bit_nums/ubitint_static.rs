@@ -246,7 +246,7 @@ impl<const N: usize, T: Into<SmallBuf>> SubAssign<T> for UBitIntStatic<N> {
 impl<const N: usize> Mul for UBitIntStatic<N> {
     type Output = UBitIntStatic<N>;
     fn mul(self, rhs: Self) -> Self::Output {
-        let (data, c) = mul_arr(&self.data, &rhs.data).expect("attempt to multiply with overflow");
+        let (data, c) = mul_arr(&self.data, &rhs.data);
         debug_assert!(c == 0, "attempt to multiply with overflow");
         UBitIntStatic::<N> { data }
     }
@@ -276,7 +276,7 @@ impl_commutative!(const N, Mul, mul, UBitIntStatic, |x| x, u128, u64);
 
 impl<const N: usize> MulAssign for UBitIntStatic<N> {
     fn mul_assign(&mut self, rhs: Self) {
-        let (data, c) = mul_arr(&self.data, &rhs.data).expect("attempt to multiply with overflow");
+        let (data, c) = mul_arr(&self.data, &rhs.data);
         debug_assert!(c == 0, "attempt to multiply with overflow");
         self.data = data;
     }
@@ -298,7 +298,7 @@ impl<const N: usize> MulAssign<u64> for UBitIntStatic<N> {
 
 impl<const N: usize> Sqr for UBitIntStatic<N> {
     fn sqr(&self) -> Self {
-        let (data, c) = sqr_arr(&self.data).expect("attempt to multiply with overflow");
+        let (data, c) = sqr_arr(&self.data);
         debug_assert!(c == 0, "attempt to multiply with overflow");
         UBitIntStatic { data }
     }
@@ -444,7 +444,7 @@ impl<const N: usize> PowI<usize> for UBitIntStatic<N> {
     type Output = UBitIntStatic<N>;
     fn powi(&self, rhs: usize) -> Self::Output {
         UBitIntStatic {
-            data: powi_arr(&self.data, rhs).expect("attempt to take integer power with overflow"),
+            data: powi_arr(&self.data, rhs),
         }
     }
 }

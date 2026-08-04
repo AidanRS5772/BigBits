@@ -1537,7 +1537,6 @@ fn test_newton_raphson_div_dyn_skewed_shapes() {
 
 // ─── reciprocal stack ────────────────────────────────────────────────────────
 
-
 fn exact_rcp_reference(d: &[u64], r_len: usize) -> Vec<u64> {
     if r_len == 0 {
         return Vec::new();

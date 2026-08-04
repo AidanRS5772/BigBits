@@ -2925,14 +2925,15 @@ fn static_dispatch(l: usize, s: usize) -> StaticDispatch {
     }
 }
 
-pub fn mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> Result<u64, ()> {
+pub fn mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     if a.is_empty() || b.is_empty() {
-        return Ok(0);
+        return 0;
     }
     let out_len = a.len() + b.len() - 1;
-    if out_len > out.len() {
-        return Err(());
-    }
+    debug_assert!(
+        out_len <= out.len(),
+        "out is not large enough for multiplication"
+    );
     let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
     let out_core = &mut out[..out_len];
     let overflow = match static_dispatch(long.len(), short.len()) {
@@ -2949,19 +2950,19 @@ pub fn mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> Resu
         StaticDispatch::Karatsuba => karatsuba_entry_static::<N>(long, short, out_core),
         StaticDispatch::NTT => ntt_entry_static::<N>(long, short, out_core),
     };
-    Ok(if out.len() > out_len {
+    if out.len() > out_len {
         out[out_len] = overflow;
         out[out_len + 1..].fill(0);
         0
     } else {
         overflow
-    })
+    }
 }
 
-pub fn mul_arr<const N: usize>(a: &[u64], b: &[u64]) -> Result<([u64; N], u64), ()> {
+pub fn mul_arr<const N: usize>(a: &[u64], b: &[u64]) -> ([u64; N], u64) {
     let mut out = [0; N];
-    let of = mul_static::<N>(a, b, &mut out)?;
-    Ok((out, of))
+    let of = mul_static::<N>(a, b, &mut out);
+    (out, of)
 }
 
 //SQUARE MULTIPLICATION
@@ -3536,27 +3537,32 @@ fn static_sqr_dispatch(n: usize) -> StaticSqrDispatch {
     }
 }
 
-pub fn sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> Result<u64, ()> {
+pub fn sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
     if buf.is_empty() {
-        return Ok(0);
+        return 0;
     }
     let out_len = 2 * buf.len() - 1;
-    if out_len > N || out_len > out.len() {
-        return Err(());
-    }
+    debug_assert!(
+        out_len <= N,
+        "multiplication exceeds static capacity N: {N}"
+    );
+    debug_assert!(
+        out_len <= out.len(),
+        "out is not large enough for multiplication"
+    );
     let (out_core, out_tail) = out.split_at_mut(out_len);
     let overflow = match static_sqr_dispatch(buf.len()) {
         StaticSqrDispatch::School => sqr_buf(buf, out_core),
         StaticSqrDispatch::Karatsubaa => karatsuba_sqr_entry_static::<N>(buf, out_core),
         StaticSqrDispatch::NTT => ntt_sqr_entry_static::<N>(buf, out_core),
     };
-    Ok(absorb_overflow(out_tail, overflow))
+    absorb_overflow(out_tail, overflow)
 }
 
-pub fn sqr_arr<const N: usize>(buf: &[u64]) -> Result<([u64; N], u64), ()> {
+pub fn sqr_arr<const N: usize>(buf: &[u64]) -> ([u64; N], u64) {
     let mut out = [0; N];
-    let of = sqr_static::<N>(buf, &mut out)?;
-    Ok((out, of))
+    let of = sqr_static::<N>(buf, &mut out);
+    (out, of)
 }
 
 //SHORT MULTIPLICATION
@@ -3614,7 +3620,7 @@ pub fn short_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -
     );
     let out_len = out.len();
     if a.len() + b.len() - 1 <= out.len() {
-        return mul_static::<N>(a, b, out).unwrap();
+        return mul_static::<N>(a, b, out);
     }
     if out_len <= SHORT_MUL_CUTOFF {
         return short_mul_buf(a, b, out);
@@ -3625,7 +3631,7 @@ pub fn short_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -
     let tmp_len = trunc_a.len() + trunc_b.len() - 1;
     if trunc_a.len() + trunc_b.len() - 1 <= N {
         let mut tmp = [0; N];
-        let of = mul_static::<N>(trunc_a, trunc_b, &mut tmp[..tmp_len]).unwrap();
+        let of = mul_static::<N>(trunc_a, trunc_b, &mut tmp[..tmp_len]);
         out.copy_from_slice(&tmp[tmp_len - out_len..tmp_len]);
         return of;
     }
@@ -3647,21 +3653,21 @@ pub fn short_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -
     let (l0, l1) = long.split_at(l_split_idx);
     let (s0, s1) = short.split_at(s_split_idx);
 
-    let mut of = mul_static::<N>(l1, s1, out).unwrap();
+    let mut of = mul_static::<N>(l1, s1, out);
     let mut low_carry = 0u64;
     let low_len = l0.len() + s0.len();
     let mut low = [0; N];
 
     if !l0.is_empty() && !s0.is_empty() {
         debug_assert!(low_len <= N);
-        let low_of = mul_static::<N>(l0, s0, &mut low[..low_len]).unwrap();
+        let low_of = mul_static::<N>(l0, s0, &mut low[..low_len]);
         debug_assert_eq!(low_of, 0);
     }
 
     if !l0.is_empty() {
         let tmp1_len = l0.len() + s1.len() - 1;
         let mut tmp1 = [0; N];
-        let tmp1_of = mul_static::<N>(l0, s1, &mut tmp1[..tmp1_len]).unwrap();
+        let tmp1_of = mul_static::<N>(l0, s1, &mut tmp1[..tmp1_len]);
 
         low_carry += add_buf(&mut low[s0.len()..low_len], &tmp1[..l0.len()]) as u64;
         of += add_buf(out, &tmp1[l0.len()..tmp1_len]) as u64;
@@ -3671,7 +3677,7 @@ pub fn short_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -
     if !s0.is_empty() {
         let tmp2_len = l1.len() + s0.len();
         let mut tmp2 = [0; N];
-        let tmp2_of = mul_static::<N>(l1, s0, &mut tmp2[..tmp2_len]).unwrap();
+        let tmp2_of = mul_static::<N>(l1, s0, &mut tmp2[..tmp2_len]);
         debug_assert_eq!(tmp2_of, 0);
 
         low_carry += add_buf(&mut low[l0.len()..low_len], &tmp2[..s0.len()]) as u64;
@@ -3733,7 +3739,7 @@ pub fn short_sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
     );
     let out_len = out.len();
     if 2 * buf.len() - 1 <= out.len() {
-        return sqr_static::<N>(buf, out).unwrap();
+        return sqr_static::<N>(buf, out);
     }
     if out_len <= SHORT_SQR_CUTOFF {
         return short_sqr_buf(buf, out);
@@ -3743,7 +3749,7 @@ pub fn short_sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
     let tmp_len = 2 * trunc_buf.len() - 1;
     if tmp_len <= N {
         let mut tmp = [0; N];
-        let of = sqr_static::<N>(trunc_buf, &mut tmp[..tmp_len]).unwrap();
+        let of = sqr_static::<N>(trunc_buf, &mut tmp[..tmp_len]);
         out.copy_from_slice(&tmp[tmp_len - out.len()..tmp_len]);
         return of;
     }
@@ -3756,11 +3762,11 @@ pub fn short_sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
     debug_assert_eq!(2 * x0.len() - hi_ofs, d);
 
     out[..hi_ofs].fill(0);
-    let mut of = sqr_static::<N>(x1, &mut out[hi_ofs..]).unwrap();
+    let mut of = sqr_static::<N>(x1, &mut out[hi_ofs..]);
 
     let mut low = [0u64; N];
     let x0_sqr_len = 2 * x0.len() - 1;
-    let x0_sqr_of = sqr_static::<N>(x0, &mut low[..x0_sqr_len]).unwrap();
+    let x0_sqr_of = sqr_static::<N>(x0, &mut low[..x0_sqr_len]);
     let x0_high = if x0_sqr_len < d {
         low[x0_sqr_len] = x0_sqr_of;
         0
@@ -3770,7 +3776,7 @@ pub fn short_sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
 
     let cross_len = x0.len() + x1.len() - 1;
     let mut cross = [0u64; N];
-    let mut cross_of = mul_static::<N>(x0, x1, &mut cross[..cross_len]).unwrap();
+    let mut cross_of = mul_static::<N>(x0, x1, &mut cross[..cross_len]);
     let shl_of = shl_buf(&mut cross[..cross_len], 1);
     let cross_of_hi = cross_of >> 63;
     cross_of = (cross_of << 1) | shl_of;
@@ -4377,36 +4383,31 @@ fn powi_static_core<const N: usize>(
     reverse_pow: usize,
     src: &mut [u64],
     dst: &mut [u64],
-) -> Result<(), ()> {
+) {
     if reverse_pow == 1 {
-        return Ok(());
+        return;
     }
     let src_len = buf_len(src);
-    sqr_static::<N>(&src[..src_len], dst)?;
+    sqr_static::<N>(&src[..src_len], dst);
     if reverse_pow & 1 == 1 {
         let dst_len = buf_len(dst);
-        mul_static::<N>(&dst[..dst_len], buf, src)?;
-        return powi_static_core::<N>(buf, reverse_pow >> 1, src, dst);
+        mul_static::<N>(&dst[..dst_len], buf, src);
+        powi_static_core::<N>(buf, reverse_pow >> 1, src, dst);
+        return;
     }
     powi_static_core::<N>(buf, reverse_pow >> 1, dst, src)
 }
 
-pub fn powi_static_entry<const N: usize>(
-    buf: &[u64],
-    pow: usize,
-    out: &mut [u64],
-) -> Result<(), ()> {
+pub fn powi_static_entry<const N: usize>(buf: &[u64], pow: usize, out: &mut [u64]) {
     out.fill(0);
     if pow == 0 {
-        if out.is_empty() {
-            return Err(());
-        }
+        debug_assert!(!out.is_empty(), "output is not large enough for x^0");
         out[0] = 1;
-        return Ok(());
+        return;
     }
     let buf = &buf[..buf_len(buf)];
     if buf.is_empty() {
-        return Ok(());
+        return;
     }
     let reverse_pow = reverse_pow(pow);
     let mut tmp = [0; N];
@@ -4420,12 +4421,10 @@ pub fn powi_static_entry<const N: usize>(
     }
 }
 
-pub fn powi_arr<const N: usize>(buf: &[u64], pow: usize) -> Result<[u64; N], ()> {
+pub fn powi_arr<const N: usize>(buf: &[u64], pow: usize) -> [u64; N] {
     let (min, _) = powi_sz(buf, pow);
-    if N < min {
-        return Err(());
-    }
+    debug_assert!(N >= min, "power exceeds static capacity N: {N}");
     let mut out = [0; N];
-    powi_static_entry::<N>(buf, pow, &mut out)?;
-    Ok(out)
+    powi_static_entry::<N>(buf, pow, &mut out);
+    out
 }

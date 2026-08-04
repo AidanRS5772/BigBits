@@ -667,7 +667,7 @@ fn bz_div_init_static<const N: usize>(
         if out.len() >= dlen {
             let q_tmp = &mut out[..dlen];
             div_2_1(top_n, d, q_tmp, &mut scratch[..dlen], &mut |n, d, q| {
-                mul_static::<N>(n, d, q).unwrap();
+                mul_static::<N>(n, d, q);
             });
 
             out.copy_within(0..init_qlen, init_idx);
@@ -676,7 +676,7 @@ fn bz_div_init_static<const N: usize>(
         } else {
             let (q_tmp, div_scratch) = scratch[..2 * dlen].split_at_mut(dlen);
             div_2_1(top_n, d, q_tmp, div_scratch, &mut |n, d, q| {
-                mul_static::<N>(n, d, q).unwrap();
+                mul_static::<N>(n, d, q);
             });
 
             out.copy_from_slice(&q_tmp[..init_qlen]);
@@ -799,7 +799,7 @@ fn bz_div_core_static<const N: usize>(
         bz_div_init_static::<N>(n, d, out, &mut scratch, normalization_shift, remainder_mode)
     {
         bz_div_alg(n, d, out, &mut scratch, t, |n, d, q| {
-            mul_static::<N>(n, d, q).unwrap();
+            mul_static::<N>(n, d, q);
         });
         if remainder_mode == RemainderMode::Restore {
             debug_assert!(n[d.len()..].iter().all(|&limb| limb == 0));
@@ -1558,7 +1558,7 @@ fn nr_div_core_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) {
             let num = &mut num[..n.len()];
             num.copy_from_slice(n);
             if !nr_exact_correction(num, d, q, &mut prod[..n.len()], &mut |a, b, o| {
-                mul_static::<N>(a, b, o).unwrap();
+                mul_static::<N>(a, b, o);
             }) {
                 bz_quotient_core_static::<N>(n, d, q);
             }
@@ -1584,7 +1584,7 @@ fn nr_div_rem_core_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64
                 &mut rem[..rem_len],
                 &mut prod[..d.len() + q_low_len - 1],
                 &mut |a, b, o| {
-                    mul_static::<N>(a, b, o).unwrap();
+                    mul_static::<N>(a, b, o);
                 },
             ) {
                 n[..rem_len].copy_from_slice(&rem[..rem_len]);

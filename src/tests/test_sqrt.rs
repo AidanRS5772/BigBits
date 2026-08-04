@@ -1,13 +1,13 @@
 use super::{mul_ref, rand_vec};
-use crate::utils::sqrt::binom_sqrt;
+use crate::utils::sqrt::{binom_sqrt, zimmerman_sqrt_dyn, zimmerman_sqrt_static};
 use crate::utils::utils::{cmp_buf, eq_buf, inc_buf, sub_buf};
 
 /// Verify both outputs for
 /// `shifted_x = x * B^(2 * root.len() - x.len()) = root^2 + remainder`.
-fn assert_sqrt_contract(x: &[u64], root_len: usize) {
+fn assert_sqrt_contract_with(x: &[u64], root_len: usize, sqrt_alg: fn(&mut [u64], &mut [u64])) {
     assert!(root_len < x.len());
     assert!(x.len() <= 2 * root_len);
-    assert!(x.last().copied().unwrap() >= (1 << 62));
+    assert_ne!(x.last().copied().unwrap(), 0);
 
     let shift = 2 * root_len - x.len();
     let mut shifted_x = vec![0; shift];
@@ -15,7 +15,7 @@ fn assert_sqrt_contract(x: &[u64], root_len: usize) {
 
     let mut work = x.to_vec();
     let mut root = vec![u64::MAX; root_len];
-    binom_sqrt(&mut work, &mut root);
+    sqrt_alg(&mut work, &mut root);
 
     let root_squared = mul_ref(&root, &root);
     let mut expected_remainder = shifted_x.clone();
@@ -45,6 +45,10 @@ fn assert_sqrt_contract(x: &[u64], root_len: usize) {
         "remainder mismatch: x={x:#x?}, root={root:#x?}, \
          got_remainder={work:#x?}, expected_remainder={expected_remainder:#x?}"
     );
+}
+
+fn assert_sqrt_contract(x: &[u64], root_len: usize) {
+    assert_sqrt_contract_with(x, root_len, binom_sqrt);
 }
 
 #[test]
@@ -116,4 +120,51 @@ fn test_binom_sqrt_normalized_randomized_contract() {
             }
         }
     }
+}
+
+#[test]
+fn test_zimmerman_sqrt_dyn_full_and_virtually_padded_inputs() {
+    for root_len in [50usize, 51, 64] {
+        for x_len in [root_len + 1, 3 * root_len / 2, 2 * root_len] {
+            for case in 0..3 {
+                let seed = 30_000 + 1_000 * root_len as u64 + 32 * x_len as u64 + case;
+                let mut x = rand_vec(x_len, seed);
+                x[x_len - 1] = match case {
+                    0 => 1,
+                    1 => x[x_len - 1] | (1 << 61),
+                    _ => x[x_len - 1] | (1 << 63),
+                };
+                assert_sqrt_contract_with(&x, root_len, zimmerman_sqrt_dyn);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_zimmerman_sqrt_static_full_and_virtually_padded_inputs() {
+    for root_len in [50usize, 51, 64] {
+        for x_len in [root_len + 1, 3 * root_len / 2, 2 * root_len] {
+            for case in 0..3 {
+                let seed = 40_000 + 1_000 * root_len as u64 + 32 * x_len as u64 + case;
+                let mut x = rand_vec(x_len, seed);
+                x[x_len - 1] = match case {
+                    0 => 1,
+                    1 => x[x_len - 1] | (1 << 61),
+                    _ => x[x_len - 1] | (1 << 63),
+                };
+                assert_sqrt_contract_with(&x, root_len, zimmerman_sqrt_static::<128>);
+            }
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "Zimmermann sqrt operands exceed static capacity")]
+fn test_zimmerman_sqrt_static_rejects_insufficient_capacity() {
+    let root_len = 50;
+    let mut x = vec![0; 2 * root_len];
+    x[2 * root_len - 1] = 1;
+    let mut root = vec![0; root_len];
+
+    zimmerman_sqrt_static::<99>(&mut x, &mut root);
 }

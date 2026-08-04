@@ -448,27 +448,39 @@ fn test_montgomery_public_arithmetic_paths() {
 fn test_empty_input_public_paths() {
     let mut empty_out = [];
     assert_eq!(mul_dyn(&[], &[3], &mut empty_out), 0);
-    assert_eq!(mul_static::<1>(&[], &[3], &mut empty_out).unwrap(), 0);
+    assert_eq!(mul_static::<1>(&[], &[3], &mut empty_out), 0);
     assert_eq!(mul_vec(&[], &[3]), (Vec::new(), 0));
-    assert_eq!(mul_arr::<1>(&[], &[3]).unwrap(), ([0], 0));
+    assert_eq!(mul_arr::<1>(&[], &[3]), ([0], 0));
     assert_eq!(short_mul_dyn(&[], &[3], &mut empty_out), 0);
     assert_eq!(short_mul_dyn(&[], &[], &mut empty_out), 0);
     assert_eq!(short_mul_static::<1>(&[], &[], &mut empty_out), 0);
 
     assert_eq!(sqr_dyn(&[], &mut empty_out), 0);
-    assert_eq!(sqr_static::<1>(&[], &mut empty_out).unwrap(), 0);
+    assert_eq!(sqr_static::<1>(&[], &mut empty_out), 0);
     assert_eq!(sqr_vec(&[]), (Vec::new(), 0));
-    assert_eq!(sqr_arr::<1>(&[]).unwrap(), ([0], 0));
+    assert_eq!(sqr_arr::<1>(&[]), ([0], 0));
     assert_eq!(short_sqr_dyn(&[], &mut empty_out), 0);
     assert_eq!(short_sqr_static::<1>(&[], &mut empty_out), 0);
 
     assert_eq!(powi_sz(&[], 3), (0, 0));
     assert!(powi_vec(&[], 3).is_empty());
-    assert_eq!(powi_arr::<1>(&[], 3).unwrap(), [0]);
+    assert_eq!(powi_arr::<1>(&[], 3), [0]);
 
     let mut untouched = [123u64, 456];
     assert_eq!(short_sqr_buf(&[], &mut untouched), 0);
     assert_eq!(untouched, [123, 456]);
+}
+
+#[test]
+fn test_static_entry_signatures_match_dynamic_entries() {
+    let _: fn(&[u64], &[u64], &mut [u64]) -> u64 = mul_dyn;
+    let _: fn(&[u64], &[u64], &mut [u64]) -> u64 = mul_static::<8>;
+
+    let _: fn(&[u64], &mut [u64]) -> u64 = sqr_dyn;
+    let _: fn(&[u64], &mut [u64]) -> u64 = sqr_static::<8>;
+
+    let _: fn(&[u64], usize, &mut [u64]) = powi_dyn_entry;
+    let _: fn(&[u64], usize, &mut [u64]) = powi_static_entry::<8>;
 }
 
 // ─── Section 1: mul_prim ────────────────────────────────────────────────────
@@ -1232,7 +1244,7 @@ fn test_mul_static_oversized_output_absorbs_carry() {
     let out_len = raw_len + 2;
     let mut out = vec![u64::MAX; out_len];
 
-    let carry = mul_static::<128>(&a, &b, &mut out).unwrap();
+    let carry = mul_static::<128>(&a, &b, &mut out);
     let expected = mul_ref_oversized(&a, &b, out_len);
 
     assert_eq_result(&out, carry, &expected, 0, "mul_static oversized output");
@@ -1333,16 +1345,16 @@ fn test_mul_static_basic() {
     let b = &[3u64, 2];
     let out_sz = a.len() + b.len() - 1;
     let mut out = [0u64; 4];
-    let c = mul_static::<4>(a, b, &mut out).unwrap();
+    let c = mul_static::<4>(a, b, &mut out);
     let (exp_buf, exp_carry) = mul_ref_parts(a, b);
     assert_eq_result(&out[..out_sz], c, &exp_buf, exp_carry, "mul_static basic");
 }
 
 #[test]
-fn test_mul_static_err_on_overflow() {
+#[should_panic(expected = "out is not large enough for multiplication")]
+fn test_mul_static_rejects_short_output() {
     let mut out = [0u64; 2];
-    let result = mul_static::<2>(&[1, 1, 1], &[1, 1], &mut out);
-    assert!(result.is_err(), "expected Err for overflow");
+    mul_static::<2>(&[1, 1, 1], &[1, 1], &mut out);
 }
 
 #[test]
@@ -1350,15 +1362,15 @@ fn test_mul_arr_basic() {
     let a = &[5u64, 1];
     let b = &[3u64, 2];
     let out_sz = a.len() + b.len() - 1;
-    let (arr, c) = mul_arr::<3>(a, b).unwrap();
+    let (arr, c) = mul_arr::<3>(a, b);
     let (exp_buf, exp_carry) = mul_ref_parts(a, b);
     assert_eq_result(&arr[..out_sz], c, &exp_buf, exp_carry, "mul_arr basic");
 }
 
 #[test]
-fn test_mul_arr_err_on_overflow() {
-    let result = mul_arr::<2>(&[1, 1, 1], &[1, 1]);
-    assert!(result.is_err(), "expected Err for overflow");
+#[should_panic(expected = "out is not large enough for multiplication")]
+fn test_mul_arr_rejects_insufficient_capacity() {
+    mul_arr::<2>(&[1, 1, 1], &[1, 1]);
 }
 
 #[test]
@@ -1378,7 +1390,7 @@ fn test_mul_static_matches_dyn() {
         let c_dyn = mul_dyn(&a, &b, &mut out_dyn);
 
         let mut out_st = vec![0u64; out_sz];
-        let c_st = mul_static::<64>(&a, &b, &mut out_st).unwrap();
+        let c_st = mul_static::<64>(&a, &b, &mut out_st);
 
         assert_eq_result(
             &out_dyn,
@@ -1403,7 +1415,7 @@ fn test_mul_arr_random_sweep() {
             continue;
         }
 
-        let (arr, c) = mul_arr::<16>(&a, &b).unwrap();
+        let (arr, c) = mul_arr::<16>(&a, &b);
         // mul_arr may absorb carry into extra array positions, so compare
         // full normalized results
         let got = norm(arr.to_vec(), c);
@@ -1747,19 +1759,23 @@ fn test_sqr_static_basic() {
     let a = &[3u64, 2];
     let out_sz = 2 * a.len() - 1;
     let mut out = [0u64; 4];
-    let c = sqr_static::<4>(a, &mut out).unwrap();
+    let c = sqr_static::<4>(a, &mut out);
     let (exp_buf, exp_carry) = sqr_ref_parts(a);
     assert_eq_result(&out[..out_sz], c, &exp_buf, exp_carry, "sqr_static basic");
 }
 
 #[test]
-fn test_sqr_static_err_on_overflow() {
-    let mut out = [0u64; 1];
-    let result = sqr_static::<1>(&[1, 1], &mut out);
-    assert!(result.is_err(), "expected Err for sqr_static overflow");
+#[should_panic(expected = "multiplication exceeds static capacity")]
+fn test_sqr_static_rejects_insufficient_static_capacity() {
+    let mut out = [0u64; 3];
+    sqr_static::<1>(&[1, 1], &mut out);
+}
 
-    let result = sqr_static::<8>(&[1, 1], &mut out);
-    assert!(result.is_err(), "expected Err for a short output slice");
+#[test]
+#[should_panic(expected = "out is not large enough for multiplication")]
+fn test_sqr_static_rejects_short_output() {
+    let mut out = [0u64; 1];
+    sqr_static::<8>(&[1, 1], &mut out);
 }
 
 #[test]
@@ -1783,7 +1799,7 @@ fn test_sqr_static_matches_dyn() {
         let c_dyn = sqr_dyn(&a, &mut out_dyn);
 
         let mut out_st = vec![0u64; out_sz];
-        let c_st = sqr_static::<64>(&a, &mut out_st).unwrap();
+        let c_st = sqr_static::<64>(&a, &mut out_st);
 
         assert_eq_result(
             &out_dyn,
@@ -1800,7 +1816,7 @@ fn test_sqr_static_karatsuba_dispatch() {
     let n = KARATSUBA_SQR_CUTOFF + 1;
     let a = rand_nonzero_vec(n, 5900);
     let mut out = vec![0u64; 2 * n - 1];
-    let c = sqr_static::<64>(&a, &mut out).unwrap();
+    let c = sqr_static::<64>(&a, &mut out);
     let (exp_buf, exp_carry) = sqr_ref_parts(&a);
     assert_eq_result(
         &out,
@@ -2483,10 +2499,10 @@ fn test_mid_mul_static_cutoff_approximately_matches_ntt() {
 // ─── Section 12: Power Functions (powi_*) ───────────────────────────────────
 
 #[test]
-fn test_powi_arr_err_path() {
+#[should_panic(expected = "power exceeds static capacity")]
+fn test_powi_arr_rejects_insufficient_capacity() {
     let big_base = rand_nonzero_vec(3, 99);
-    let err: Result<[u64; 2], ()> = powi_arr::<2>(&big_base, 5);
-    assert!(err.is_err(), "powi_arr should fail when N is too small");
+    powi_arr::<2>(&big_base, 5);
 }
 
 #[test]
@@ -2512,10 +2528,10 @@ fn test_powi_identity_base_paths() {
     assert_eq!(dyn_out, [1]);
 
     let mut static_out = [0u64; 1];
-    powi_static_entry::<1>(&[1], 9, &mut static_out).unwrap();
+    powi_static_entry::<1>(&[1], 9, &mut static_out);
     assert_eq!(static_out, [1]);
 
-    let arr = powi_arr::<1>(&[1], 11).unwrap();
+    let arr = powi_arr::<1>(&[1], 11);
     assert_eq!(arr, [1]);
 }
 
@@ -2526,10 +2542,10 @@ fn test_powi_zero_entry_paths() {
     assert_eq!(dyn_out, [1, 0]);
 
     let mut static_out = [0u64; 2];
-    powi_static_entry::<2>(&[3], 0, &mut static_out).unwrap();
+    powi_static_entry::<2>(&[3], 0, &mut static_out);
     assert_eq!(static_out, [1, 0]);
 
-    let arr = powi_arr::<1>(&[3], 0).unwrap();
+    let arr = powi_arr::<1>(&[3], 0);
     assert_eq!(arr, [1]);
 }
 
@@ -2537,14 +2553,14 @@ fn test_powi_zero_entry_paths() {
 fn test_powi_zero_value_and_poisoned_output_paths() {
     assert_eq!(powi_sz(&[0, 0], 7), (0, 0));
     assert!(powi_vec(&[0, 0], 7).is_empty());
-    assert_eq!(powi_arr::<4>(&[0, 0], 7).unwrap(), [0; 4]);
+    assert_eq!(powi_arr::<4>(&[0, 0], 7), [0; 4]);
 
     let mut dyn_out = [9u64; 4];
     powi_dyn_entry(&[3, 0], 1, &mut dyn_out);
     assert_eq!(dyn_out, [3, 0, 0, 0]);
 
     let mut static_out = [9u64; 4];
-    powi_static_entry::<4>(&[3, 0], 1, &mut static_out).unwrap();
+    powi_static_entry::<4>(&[3, 0], 1, &mut static_out);
     assert_eq!(static_out, [3, 0, 0, 0]);
 
     let mut dyn_identity = [9u64; 4];
@@ -2600,18 +2616,16 @@ fn test_powi_vec_small_exponents_exhaustive() {
 #[test]
 fn test_sqr_arr_basic() {
     let a = &[3u64, 2];
-    let result: Result<([u64; 4], u64), ()> = sqr_arr::<4>(a);
-    assert!(result.is_ok());
-    let (arr, c) = result.unwrap();
+    let (arr, c) = sqr_arr::<4>(a);
     let (exp_buf, exp_carry) = sqr_ref_parts(a);
     let out_sz = 2 * a.len() - 1;
     assert_eq_result(&arr[..out_sz], c, &exp_buf, exp_carry, "sqr_arr basic");
 }
 
 #[test]
-fn test_sqr_arr_err_on_overflow() {
-    let result: Result<([u64; 1], u64), ()> = sqr_arr::<1>(&[1, 1]);
-    assert!(result.is_err(), "sqr_arr should fail when N is too small");
+#[should_panic(expected = "multiplication exceeds static capacity")]
+fn test_sqr_arr_rejects_insufficient_capacity() {
+    sqr_arr::<1>(&[1, 1]);
 }
 
 #[test]
@@ -2621,7 +2635,7 @@ fn test_sqr_static_ntt_dispatch() {
     let out_sz = 2 * n - 1;
 
     let mut out = vec![0u64; out_sz];
-    let c = sqr_static::<4096>(&a, &mut out).unwrap();
+    let c = sqr_static::<4096>(&a, &mut out);
 
     let (exp_buf, exp_carry) = sqr_ref_parts(&a);
     assert_eq_result(&out, c, &exp_buf, exp_carry, "sqr_static NTT dispatch");
@@ -2641,7 +2655,7 @@ fn test_mul_static_ntt_split() {
         let out_sz = 2 * n - 1;
         if out_sz <= 128 {
             let mut out = vec![0u64; out_sz];
-            let c = mul_static::<128>(&a, &b, &mut out).unwrap();
+            let c = mul_static::<128>(&a, &b, &mut out);
             let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
             assert_eq_result(
                 &out,
@@ -2669,7 +2683,7 @@ fn test_mul_static_ntt_dispatch() {
     let b = rand_nonzero_vec(n, 8400);
     let out_sz = 2 * n - 1;
     let mut out = vec![0u64; out_sz];
-    let c = mul_static::<4096>(&a, &b, &mut out).unwrap();
+    let c = mul_static::<4096>(&a, &b, &mut out);
 
     let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
     assert_eq_result(&out, c, &exp_buf, exp_carry, "mul_static NTT dispatch");
