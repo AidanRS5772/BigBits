@@ -45,6 +45,7 @@ struct ProfileCase {
     operation: Operation,
     divisor_limbs: usize,
     output_limbs: usize,
+    exact_output: bool,
     capacity: usize,
     expected_path: &'static str,
     batch: u64,
@@ -64,6 +65,7 @@ const fn dynamic_case(
         operation,
         divisor_limbs,
         output_limbs,
+        exact_output: false,
         capacity: 0,
         expected_path,
         batch,
@@ -85,6 +87,50 @@ const fn static_case(
         operation,
         divisor_limbs,
         output_limbs,
+        exact_output: false,
+        capacity,
+        expected_path,
+        batch,
+    }
+}
+
+const fn dynamic_exact_case(
+    name: &'static str,
+    operation: Operation,
+    divisor_limbs: usize,
+    output_limbs: usize,
+    expected_path: &'static str,
+    batch: u64,
+) -> ProfileCase {
+    ProfileCase {
+        name,
+        model: Model::Dynamic,
+        operation,
+        divisor_limbs,
+        output_limbs,
+        exact_output: true,
+        capacity: 0,
+        expected_path,
+        batch,
+    }
+}
+
+const fn static_exact_case(
+    name: &'static str,
+    operation: Operation,
+    divisor_limbs: usize,
+    output_limbs: usize,
+    capacity: usize,
+    expected_path: &'static str,
+    batch: u64,
+) -> ProfileCase {
+    ProfileCase {
+        name,
+        model: Model::Static,
+        operation,
+        divisor_limbs,
+        output_limbs,
+        exact_output: true,
         capacity,
         expected_path,
         batch,
@@ -120,6 +166,14 @@ const CASES: &[ProfileCase] = &[
         2048,
         2048,
         "nr/fft-middle",
+        1,
+    ),
+    dynamic_exact_case(
+        "dyn_div_nr_fft_exact_output",
+        Operation::Div,
+        2048,
+        2047,
+        "nr/fft-middle + quotient adapter",
         1,
     ),
     dynamic_case(
@@ -161,6 +215,14 @@ const CASES: &[ProfileCase] = &[
         2048,
         2048,
         "nr/fft-middle",
+        1,
+    ),
+    dynamic_exact_case(
+        "dyn_div_rem_nr_fft_exact_output",
+        Operation::DivRem,
+        2048,
+        2047,
+        "nr/fft-middle + quotient adapter",
         1,
     ),
     dynamic_case(
@@ -247,6 +309,15 @@ const CASES: &[ProfileCase] = &[
         "nr/ntt-middle",
         1,
     ),
+    static_exact_case(
+        "static_div_nr_ntt_exact_output",
+        Operation::Div,
+        2048,
+        2047,
+        4096,
+        "nr/ntt-middle + quotient adapter",
+        1,
+    ),
     static_case(
         "static_div_bz_ntt_region",
         Operation::Div,
@@ -290,6 +361,15 @@ const CASES: &[ProfileCase] = &[
         2048,
         4096,
         "nr/ntt-middle",
+        1,
+    ),
+    static_exact_case(
+        "static_div_rem_nr_ntt_exact_output",
+        Operation::DivRem,
+        2048,
+        2047,
+        4096,
+        "nr/ntt-middle + quotient adapter",
         1,
     ),
     static_case(
@@ -341,7 +421,9 @@ struct Workload {
 impl Workload {
     fn new(case: ProfileCase) -> Self {
         let numerator_len = match case.operation {
-            Operation::Div | Operation::DivRem => case.divisor_limbs + case.output_limbs - 1,
+            Operation::Div | Operation::DivRem => {
+                case.divisor_limbs + case.output_limbs - usize::from(!case.exact_output)
+            }
             Operation::Rcp => 0,
         };
         let numerator_template = deterministic_limbs(numerator_len, 0x1234_5678_9abc_def0);
@@ -361,11 +443,13 @@ impl Workload {
     fn execute(&mut self) {
         match self.case.model {
             Model::Dynamic => match self.case.operation {
-                Operation::Div => div_dyn(
-                    black_box(&self.numerator),
-                    black_box(&self.divisor),
-                    black_box(&mut self.output),
-                ),
+                Operation::Div => {
+                    div_dyn(
+                        black_box(&self.numerator),
+                        black_box(&self.divisor),
+                        black_box(&mut self.output),
+                    );
+                }
                 Operation::DivRem => {
                     self.numerator.copy_from_slice(&self.numerator_template);
                     div_rem_dyn(
@@ -393,11 +477,13 @@ impl Workload {
     #[inline(never)]
     fn execute_static<const N: usize>(&mut self) {
         match self.case.operation {
-            Operation::Div => div_static::<N>(
-                black_box(&self.numerator),
-                black_box(&self.divisor),
-                black_box(&mut self.output),
-            ),
+            Operation::Div => {
+                div_static::<N>(
+                    black_box(&self.numerator),
+                    black_box(&self.divisor),
+                    black_box(&mut self.output),
+                );
+            }
             Operation::DivRem => {
                 self.numerator.copy_from_slice(&self.numerator_template);
                 div_rem_static::<N>(
@@ -453,15 +539,18 @@ fn run_for(workload: &mut Workload, duration: Duration) -> (u64, Duration) {
 }
 
 fn print_cases() {
-    println!("name\tmodel\toperation\tdivisor_limbs\toutput_limbs\tcapacity\texpected_path");
+    println!(
+        "name\tmodel\toperation\tdivisor_limbs\toutput_limbs\texact_output\tcapacity\texpected_path"
+    );
     for case in CASES {
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             case.name,
             case.model.label(),
             case.operation.label(),
             case.divisor_limbs,
             case.output_limbs,
+            case.exact_output,
             case.capacity,
             case.expected_path
         );
@@ -523,12 +612,13 @@ fn main() {
     }
 
     println!(
-        "PROFILE case={} model={} operation={} divisor_limbs={} output_limbs={} capacity={} expected_path={}",
+        "PROFILE case={} model={} operation={} divisor_limbs={} output_limbs={} exact_output={} capacity={} expected_path={}",
         case.name,
         case.model.label(),
         case.operation.label(),
         case.divisor_limbs,
         case.output_limbs,
+        case.exact_output,
         case.capacity,
         case.expected_path,
     );

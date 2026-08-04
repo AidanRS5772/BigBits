@@ -1319,7 +1319,8 @@ fn div_bf(mut n: BitFloat, mut d: BitFloat, p: usize) -> BitFloat {
     n.m.drain(nlen.saturating_sub(np));
     n.m.put_zeros((dp + p).saturating_sub(np));
 
-    let mut q = vec![0; div_quotient_len(n.m.len(), d.m.len())];
+    let q_len = div_quotient_len(n.m.len(), d.m.len()) + 1;
+    let mut q = vec![0; q_len];
     div_rem_dyn(&mut n.m, &d.m, &mut q);
     let mut m = Mantissa::make_take(q);
     let mut e = n.exp - d.exp + (nlen as i128 - dlen as i128) - p;

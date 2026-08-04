@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
-use big_bits::utils::sqrt::binom_sqrt;
+// Re-enable with the sqrt module after its division-call migration.
+// use big_bits::utils::sqrt::binom_sqrt;
 use big_bits::{utils::div::*, *};
 use criterion::{
     black_box, criterion_group, criterion_main, measurement::WallTime, BatchSize, BenchmarkGroup,
@@ -638,6 +639,7 @@ fn bench_rcp_setup(c: &mut Criterion) {
     group.finish();
 }
 
+/*
 fn bench_binom_sqrt(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("binom_sqrt/{ARCH}"));
     set_up_group(&mut group);
@@ -670,6 +672,7 @@ fn bench_binom_sqrt(c: &mut Criterion) {
 
     group.finish();
 }
+*/
 
 criterion_group!(benches, bench_knuth_div);
 

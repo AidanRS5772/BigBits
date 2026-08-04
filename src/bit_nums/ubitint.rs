@@ -616,7 +616,8 @@ impl ShrAssign<usize> for UBitInt {
 }
 
 fn div_rem_ubi(mut n: UBitInt, d: &[u64]) -> (UBitInt, UBitInt) {
-    let mut q = vec![0; div_quotient_len(n.data.len(), d.len())];
+    let body_len = div_quotient_len(n.data.len(), d.len());
+    let mut q = vec![0; body_len + usize::from(n.data.len() >= d.len())];
     div_rem_dyn(&mut n.data, d, &mut q);
     trim_lz(&mut n.data);
     trim_lz(&mut q);
@@ -776,7 +777,8 @@ where
 
 impl RemAssign for UBitInt {
     fn rem_assign(&mut self, rhs: Self) {
-        let mut q = vec![0; div_quotient_len(self.data.len(), rhs.data.len())];
+        let body_len = div_quotient_len(self.data.len(), rhs.data.len());
+        let mut q = vec![0; body_len + usize::from(self.data.len() >= rhs.data.len())];
         div_rem_dyn(&mut self.data, &rhs.data, &mut q);
         trim_lz(&mut self.data);
     }
@@ -784,7 +786,8 @@ impl RemAssign for UBitInt {
 
 impl RemAssign<&UBitInt> for UBitInt {
     fn rem_assign(&mut self, rhs: &UBitInt) {
-        let mut q = vec![0; div_quotient_len(self.data.len(), rhs.data.len())];
+        let body_len = div_quotient_len(self.data.len(), rhs.data.len());
+        let mut q = vec![0; body_len + usize::from(self.data.len() >= rhs.data.len())];
         div_rem_dyn(&mut self.data, &rhs.data, &mut q);
         trim_lz(&mut self.data);
     }

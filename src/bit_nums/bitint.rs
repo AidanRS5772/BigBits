@@ -692,7 +692,8 @@ impl ShrAssign<usize> for BitInt {
 }
 
 fn div_rem_bi(mut n: BitInt, d: &[u64], d_sign: bool) -> (BitInt, BitInt) {
-    let mut q = vec![0; div_quotient_len(n.data.len(), d.len())];
+    let body_len = div_quotient_len(n.data.len(), d.len());
+    let mut q = vec![0; body_len + usize::from(n.data.len() >= d.len())];
     div_rem_dyn(&mut n.data, d, &mut q);
     trim_lz(&mut q);
     trim_lz(&mut n.data);

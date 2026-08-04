@@ -132,7 +132,7 @@ unsafe fn sub_mul_of_x86(win: *mut u64, of: *mut u64, d: *const u64, q: u64, len
         out("rdx") _,
         options(nostack),
     );
-    return borrow != 0;
+    borrow != 0
 }
 
 #[inline(always)]
@@ -148,8 +148,9 @@ unsafe fn sub_mul_of_asm(win: *mut u64, of: *mut u64, d: *const u64, q: u64, len
     }
 }
 
+#[inline(always)]
 fn sub_mul_of(win: &mut [u64], of: &mut u64, d: &[u64], q: u64) -> bool {
-    unsafe { sub_mul_of_asm(win.as_mut_ptr(), of as *mut u64, d.as_ptr(), q, d.len()) }
+    unsafe { sub_mul_of_asm(win.as_mut_ptr(), of, d.as_ptr(), q, d.len()) }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -233,31 +234,55 @@ pub fn knuth_est(win: &mut [u64], of: &mut u64, d: &[u64], d1: u64, d0: u64) -> 
     return qhat;
 }
 
-//assumes normalized d and handles overflow of normalized n
-pub fn div_buf_of(n: &mut [u64], of: &mut u64, d: &[u64], out: &mut [u64]) {
+/// Knuth division step for a normalized multi-limb divisor and an explicit
+/// normalized-numerator overflow limb.
+///
+/// The minimum output length is `n.len() - d.len()`. The possible additional
+/// quotient limb is returned or absorbed into a longer output.
+pub fn div_buf_of(n: &mut [u64], of: &mut u64, d: &[u64], out: &mut [u64]) -> u64 {
     let d_len = d.len();
     let n_len = n.len();
-
+    let q_len = n_len - d_len;
+    debug_assert!(out.len() >= q_len, "out is not large enough for division");
+    let (out_body, out_tail) = out.split_at_mut(q_len);
     let d1 = d[d_len - 1];
     let d0 = d[d_len - 2];
+    let overflow = knuth_est(&mut n[q_len..], of, d, d1, d0);
+    div_buf_body(n, d, out_body);
+    absorb_div_overflow(out_tail, overflow)
+}
 
-    let q_len = n_len - d_len;
-    if out.len() > q_len {
-        out[q_len] = knuth_est(&mut n[q_len..], of, d, d1, d0);
-    }
+fn div_buf_body(n: &mut [u64], d: &[u64], out: &mut [u64]) {
+    let d_len = d.len();
+    let q_len = n.len() - d_len;
+    debug_assert_eq!(out.len(), q_len);
+    let d1 = d[d_len - 1];
+    let d0 = d[d_len - 2];
     for i in (0..q_len).rev() {
         let (win, of) = n[i..].split_at_mut(d_len);
         out[i] = knuth_est(win, &mut of[0], d, d1, d0)
     }
 }
 
-/// Full structural quotient width for trimmed little-endian operands.
+/// Minimum quotient-buffer width for trimmed little-endian operands.
 ///
-/// This includes a possible zero top quotient limb. Division entries may be
-/// given a shorter output to request only the high quotient limbs.
+/// A quotient can have one additional structural top limb. Standard division
+/// returns that limb when the output has exactly this length and absorbs it
+/// when the output is longer.
 pub fn div_quotient_len(n_len: usize, d_len: usize) -> usize {
     assert!(d_len != 0, "Division by zero error");
-    n_len.checked_sub(d_len).map_or(0, |delta| delta + 1)
+    n_len.saturating_sub(d_len)
+}
+
+#[inline]
+fn absorb_div_overflow(out_tail: &mut [u64], overflow: u64) -> u64 {
+    if let Some((slot, tail)) = out_tail.split_first_mut() {
+        *slot = overflow;
+        tail.fill(0);
+        0
+    } else {
+        overflow
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -268,21 +293,18 @@ pub struct DivisionRequest {
     d_start: usize,
     /// Effective divisor width after removing exact low zero limbs.
     d_len: usize,
-    /// Quotient slice length passed through the selected algorithm wrapper.
+    /// Quotient body length passed through the selected algorithm wrapper.
     q_len: usize,
     /// Shift that bit-normalizes the effective divisor.
     normalization_shift: u8,
 }
 
-/// Performs checks and operand-window preparation shared by every public
-/// division API entry.
-///
-/// If the structural quotient width is `L`, the caller receives the high
-/// `min(q.len(), L)` limbs packed at the low end of `q`; any excess output
-/// limbs stay zero. A nondegenerate request leaves the requested output window
-/// untouched for the chosen algorithm wrapper to overwrite. Degenerate calls
-/// zero the complete output before returning `None`.
-pub fn division_preflight(n: &[u64], d: &[u64], q: &mut [u64]) -> Option<DivisionRequest> {
+fn division_request(
+    n: &[u64],
+    d: &[u64],
+    q: &mut [u64],
+    requested_body_len: Option<usize>,
+) -> Option<DivisionRequest> {
     assert!(
         d.last().is_some_and(|&top| top != 0),
         "division requires a trimmed nonzero divisor"
@@ -291,35 +313,45 @@ pub fn division_preflight(n: &[u64], d: &[u64], q: &mut [u64]) -> Option<Divisio
         n.last().is_none_or(|&top| top != 0),
         "division requires a trimmed numerator"
     );
-    let full_q_len = div_quotient_len(n.len(), d.len());
-    let q_len = q.len().min(full_q_len);
-    if q_len == 0 {
+    let full_body_len = div_quotient_len(n.len(), d.len());
+    let requested_body_len = requested_body_len.map_or(full_body_len, |len| len.min(full_body_len));
+    debug_assert!(
+        q.len() >= requested_body_len,
+        "out is not large enough for division"
+    );
+    let _ = &q[requested_body_len..];
+
+    if n.len() < d.len() {
+        q.fill(0);
+        return None;
+    }
+    if requested_body_len == 0 && n.len() == d.len() && cmp_buf(n, d).is_lt() {
         q.fill(0);
         return None;
     }
 
-    if n.len() == d.len() && cmp_buf(n, d).is_lt() {
-        q.fill(0);
-        return None;
-    }
-
-    q[q_len..].fill(0);
-    let quotient_skip = full_q_len - q_len;
-    let d_start = divisor_limb_shift(d);
+    q[requested_body_len..].fill(0);
+    let quotient_skip = full_body_len - requested_body_len;
+    let d_start = d.iter().position(|&limb| limb != 0).unwrap();
     let d_len = d.len() - d_start;
 
     Some(DivisionRequest {
         n_start: quotient_skip + d_start,
         d_start,
         d_len,
-        q_len,
+        q_len: requested_body_len,
         normalization_shift: d[d.len() - 1].leading_zeros() as u8,
     })
 }
 
-#[inline]
-fn divisor_limb_shift(d: &[u64]) -> usize {
-    d.iter().position(|&limb| limb != 0).unwrap()
+/// Performs checks and operand-window preparation shared by standard public
+/// division entries.
+///
+/// `q` must hold at least `div_quotient_len(n.len(), d.len())` limbs. The
+/// possible additional structural quotient limb is returned by the selected
+/// algorithm or absorbed into a longer output.
+pub fn division_preflight(n: &[u64], d: &[u64], q: &mut [u64]) -> Option<DivisionRequest> {
+    division_request(n, d, q, None)
 }
 
 /// Performs validation shared by every public reciprocal entry. An empty
@@ -359,6 +391,13 @@ fn assert_static_division_capacity<const N: usize>(n: &[u64], d: &[u64], q: &[u6
 fn debug_assert_rigid_division_shape(n: &[u64], d: &[u64], q: &[u64]) {
     debug_assert!(!d.is_empty());
     debug_assert!(n.len() >= d.len());
+    debug_assert_eq!(q.len(), n.len() - d.len());
+}
+
+#[inline]
+fn debug_assert_full_division_shape(n: &[u64], d: &[u64], q: &[u64]) {
+    debug_assert!(!d.is_empty());
+    debug_assert!(n.len() >= d.len());
     debug_assert_eq!(q.len(), n.len() - d.len() + 1);
 }
 
@@ -374,13 +413,13 @@ fn knuth_div_rem_core(
     q: &mut [u64],
     normalization_shift: u8,
     remainder_mode: RemainderMode,
-) {
+) -> u64 {
     debug_assert_rigid_division_shape(n, d, q);
     debug_assert!(d.len() >= 2);
     debug_assert_eq!(d[d.len() - 1].leading_zeros(), 0);
 
     let mut overflow = shl_buf(n, normalization_shift);
-    div_buf_of(n, &mut overflow, d, q);
+    let quotient_overflow = div_buf_of(n, &mut overflow, d, q);
     debug_assert_eq!(
         overflow, 0,
         "Knuth division left an overflow remainder limb"
@@ -389,38 +428,37 @@ fn knuth_div_rem_core(
         debug_assert!(n[d.len()..].iter().all(|&limb| limb == 0));
         shr_buf(&mut n[..d.len()], normalization_shift);
     }
+    quotient_overflow
 }
 
-fn knuth_div_prim_quotient(n: &[u64], d: u64, q: &mut [u64]) {
-    debug_assert_eq!(q.len(), n.len());
-    q.copy_from_slice(n);
-    div_prim(q, d);
+fn knuth_div_prim(n: &[u64], d: u64, q: &mut [u64]) -> (u64, u64) {
+    debug_assert_eq!(q.len() + 1, n.len());
+    let mut rem = 0;
+    let mut overflow = n[n.len() - 1];
+    unsafe { div_rem_2_1_asm(&mut overflow, &mut rem, d) };
+    for i in (0..q.len()).rev() {
+        q[i] = n[i];
+        unsafe { div_rem_2_1_asm(&mut q[i], &mut rem, d) };
+    }
+    (overflow, rem)
 }
 
-fn knuth_div_prim_remainder(n: &mut [u64], d: u64, q: &mut [u64]) {
-    debug_assert_eq!(q.len(), n.len());
-    q.copy_from_slice(n);
-    let rem = div_prim(q, d);
-    n[0] = rem;
-    n[1..].fill(0);
-}
-
-pub fn knuth_div_wrapper_dyn(n: &[u64], d: &[u64], q: &mut [u64], request: DivisionRequest) {
+pub fn knuth_div_wrapper_dyn(n: &[u64], d: &[u64], q: &mut [u64], request: DivisionRequest) -> u64 {
     let n = &n[request.n_start..];
     let d = &d[request.d_start..];
-    let q = &mut q[..request.q_len];
+    let (q, q_tail) = q.split_at_mut(request.q_len);
     debug_assert_rigid_division_shape(n, d, q);
 
     if d.len() == 1 {
-        knuth_div_prim_quotient(n, d[0], q);
-        return;
+        let overflow = knuth_div_prim(n, d[0], q).0;
+        return absorb_div_overflow(q_tail, overflow);
     }
 
     let mut scratch = ScratchGuard::acquire();
-    if request.normalization_shift == 0 {
+    let overflow = if request.normalization_shift == 0 {
         let n_work = scratch.get(n.len());
         n_work.copy_from_slice(n);
-        knuth_div_rem_core(n_work, d, q, 0, RemainderMode::Discard);
+        knuth_div_rem_core(n_work, d, q, 0, RemainderMode::Discard)
     } else {
         let [n_work, d_work] = scratch.get_splits([n.len(), d.len()]);
         n_work.copy_from_slice(n);
@@ -431,8 +469,9 @@ pub fn knuth_div_wrapper_dyn(n: &[u64], d: &[u64], q: &mut [u64], request: Divis
             q,
             request.normalization_shift,
             RemainderMode::Discard,
-        );
-    }
+        )
+    };
+    absorb_div_overflow(q_tail, overflow)
 }
 
 pub fn knuth_div_rem_wrapper_dyn(
@@ -440,16 +479,19 @@ pub fn knuth_div_rem_wrapper_dyn(
     d: &[u64],
     q: &mut [u64],
     request: DivisionRequest,
-) {
+) -> u64 {
     let n = &mut n[request.n_start..];
     let d = &d[request.d_start..];
-    let q = &mut q[..request.q_len];
+    let (q, q_tail) = q.split_at_mut(request.q_len);
     debug_assert_rigid_division_shape(n, d, q);
 
-    if d.len() == 1 {
-        knuth_div_prim_remainder(n, d[0], q);
+    let overflow = if d.len() == 1 {
+        let (overflow, rem) = knuth_div_prim(n, d[0], q);
+        n[0] = rem;
+        n[1..].fill(0);
+        overflow
     } else if request.normalization_shift == 0 {
-        knuth_div_rem_core(n, d, q, 0, RemainderMode::Restore);
+        knuth_div_rem_core(n, d, q, 0, RemainderMode::Restore)
     } else {
         let mut scratch = ScratchGuard::acquire();
         let d_work = scratch.get(d.len());
@@ -460,8 +502,9 @@ pub fn knuth_div_rem_wrapper_dyn(
             q,
             request.normalization_shift,
             RemainderMode::Restore,
-        );
-    }
+        )
+    };
+    absorb_div_overflow(q_tail, overflow)
 }
 
 pub fn knuth_div_wrapper_static<const N: usize>(
@@ -469,22 +512,22 @@ pub fn knuth_div_wrapper_static<const N: usize>(
     d: &[u64],
     q: &mut [u64],
     request: DivisionRequest,
-) {
+) -> u64 {
     let n = &n[request.n_start..];
     let d = &d[request.d_start..];
-    let q = &mut q[..request.q_len];
+    let (q, q_tail) = q.split_at_mut(request.q_len);
     assert_static_division_capacity::<N>(n, d, q);
     debug_assert_rigid_division_shape(n, d, q);
 
     if d.len() == 1 {
-        knuth_div_prim_quotient(n, d[0], q);
-        return;
+        let overflow = knuth_div_prim(n, d[0], q).0;
+        return absorb_div_overflow(q_tail, overflow);
     }
 
     let mut n_work = [0u64; N];
     n_work[..n.len()].copy_from_slice(n);
-    if request.normalization_shift == 0 {
-        knuth_div_rem_core(&mut n_work[..n.len()], d, q, 0, RemainderMode::Discard);
+    let overflow = if request.normalization_shift == 0 {
+        knuth_div_rem_core(&mut n_work[..n.len()], d, q, 0, RemainderMode::Discard)
     } else {
         let mut d_work = [0u64; N];
         shl_top_copy(d, &mut d_work[..d.len()], request.normalization_shift);
@@ -494,8 +537,9 @@ pub fn knuth_div_wrapper_static<const N: usize>(
             q,
             request.normalization_shift,
             RemainderMode::Discard,
-        );
-    }
+        )
+    };
+    absorb_div_overflow(q_tail, overflow)
 }
 
 pub fn knuth_div_rem_wrapper_static<const N: usize>(
@@ -503,17 +547,20 @@ pub fn knuth_div_rem_wrapper_static<const N: usize>(
     d: &[u64],
     q: &mut [u64],
     request: DivisionRequest,
-) {
+) -> u64 {
     let n = &mut n[request.n_start..];
     let d = &d[request.d_start..];
-    let q = &mut q[..request.q_len];
+    let (q, q_tail) = q.split_at_mut(request.q_len);
     assert_static_division_capacity::<N>(n, d, q);
     debug_assert_rigid_division_shape(n, d, q);
 
-    if d.len() == 1 {
-        knuth_div_prim_remainder(n, d[0], q);
+    let overflow = if d.len() == 1 {
+        let (overflow, rem) = knuth_div_prim(n, d[0], q);
+        n[0] = rem;
+        n[1..].fill(0);
+        overflow
     } else if request.normalization_shift == 0 {
-        knuth_div_rem_core(n, d, q, 0, RemainderMode::Restore);
+        knuth_div_rem_core(n, d, q, 0, RemainderMode::Restore)
     } else {
         let mut d_work = [0u64; N];
         shl_top_copy(d, &mut d_work[..d.len()], request.normalization_shift);
@@ -523,8 +570,9 @@ pub fn knuth_div_rem_wrapper_static<const N: usize>(
             q,
             request.normalization_shift,
             RemainderMode::Restore,
-        );
-    }
+        )
+    };
+    absorb_div_overflow(q_tail, overflow)
 }
 
 pub fn div_3_2(
@@ -566,7 +614,10 @@ pub fn div_2_1(
 ) {
     let dlen = d.len();
     if dlen <= BZ_CUTOFF {
-        div_buf_of(n, &mut 0, d, q);
+        // The 2/1 invariant already proves the structural top quotient limb is
+        // zero, so do not pay for estimating it in every recursive base case.
+        debug_assert!(cmp_buf(&n[dlen..], d).is_lt());
+        div_buf_body(n, d, q);
         return;
     }
 
@@ -628,134 +679,61 @@ pub fn use_bz_for_top_block(dlen: usize, qlen: usize) -> bool {
     BZ_TOP_PADDED_COST_SCALE * bz_2_1_cost(dlen) <= bz_top_block_knuth_work(dlen, qlen)
 }
 
-fn bz_div_init_static<const N: usize>(
+fn bz_div_top(
     n: &mut [u64],
     d: &[u64],
     out: &mut [u64],
-    scratch: &mut [u64; N],
-    normalization_shift: u8,
-    remainder_mode: RemainderMode,
-) -> Option<usize> {
+    top_n: &mut [u64],
+    q_tmp: &mut [u64],
+    scratch: &mut [u64],
+    last_n: u64,
+    init_idx: usize,
+    init_len: usize,
+    mut mul: impl FnMut(&mut [u64], &[u64], &mut [u64]),
+) -> u64 {
     let dlen = d.len();
-    let nlen = n.len();
-
-    if dlen == 1 {
-        out[..nlen].copy_from_slice(n);
-        let rem = div_prim(&mut out[..nlen], d[0]);
-        if remainder_mode == RemainderMode::Restore {
-            n[0] = rem;
-            n[1..].fill(0);
-        }
-        return None;
-    }
-
-    debug_assert_eq!(d[dlen - 1].leading_zeros(), 0);
-    let mut last_n = shl_buf(n, normalization_shift);
-
-    let t = (nlen - dlen) / dlen;
-    let init_idx = dlen * t;
-    let init_len = nlen - init_idx;
-    let init_qlen = init_len - dlen + 1;
-    if !use_bz_for_top_block(dlen, init_qlen) || dlen > N / 2 {
-        div_buf_of(&mut n[init_idx..], &mut last_n, d, &mut out[init_idx..]);
-    } else {
-        let mut top_n_storage = [0; N];
-        let top_n = &mut top_n_storage[..2 * dlen];
-        top_n[..init_len].copy_from_slice(&n[init_idx..]);
-        top_n[init_len] = last_n;
-
-        if out.len() >= dlen {
-            let q_tmp = &mut out[..dlen];
-            div_2_1(top_n, d, q_tmp, &mut scratch[..dlen], &mut |n, d, q| {
-                mul_static::<N>(n, d, q);
-            });
-
-            out.copy_within(0..init_qlen, init_idx);
-            n[init_idx..init_idx + dlen].copy_from_slice(&top_n[..dlen]);
-            n[init_idx + dlen..].fill(0);
-        } else {
-            let (q_tmp, div_scratch) = scratch[..2 * dlen].split_at_mut(dlen);
-            div_2_1(top_n, d, q_tmp, div_scratch, &mut |n, d, q| {
-                mul_static::<N>(n, d, q);
-            });
-
-            out.copy_from_slice(&q_tmp[..init_qlen]);
-            n[..dlen].copy_from_slice(&top_n[..dlen]);
-            n[dlen..].fill(0);
-        }
-    }
-    if t == 0 {
-        if remainder_mode == RemainderMode::Restore {
-            debug_assert!(n[dlen..].iter().all(|&limb| limb == 0));
-            shr_buf(&mut n[..dlen], normalization_shift);
-        }
-        None
-    } else {
-        Some(t)
-    }
+    let init_body_len = init_len - dlen;
+    top_n[..init_len].copy_from_slice(&n[init_idx..]);
+    top_n[init_len] = last_n;
+    top_n[init_len + 1..].fill(0);
+    div_2_1(top_n, d, q_tmp, scratch, &mut mul);
+    out[init_idx..init_idx + init_body_len].copy_from_slice(&q_tmp[..init_body_len]);
+    n[init_idx..init_idx + dlen].copy_from_slice(&top_n[..dlen]);
+    n[init_idx + dlen..].fill(0);
+    q_tmp[init_body_len]
 }
 
-fn bz_div_init_dyn(
+fn bz_div_init(
     n: &mut [u64],
     d: &[u64],
     out: &mut [u64],
     normalization_shift: u8,
     remainder_mode: RemainderMode,
-) -> Option<usize> {
+    can_pad_top: bool,
+    padded_top: impl FnOnce(&mut [u64], &[u64], &mut [u64], u64, usize, usize) -> u64,
+) -> (Option<usize>, u64) {
     let dlen = d.len();
-    let nlen = n.len();
-
     if dlen == 1 {
-        out[..nlen].copy_from_slice(n);
-        let rem = div_prim(&mut out[..nlen], d[0]);
+        let (overflow, rem) = knuth_div_prim(n, d[0], out);
         if remainder_mode == RemainderMode::Restore {
             n[0] = rem;
             n[1..].fill(0);
         }
-        return None;
+        return (None, overflow);
     }
 
     debug_assert_eq!(d[dlen - 1].leading_zeros(), 0);
     let mut last_n = shl_buf(n, normalization_shift);
-
-    let t = (nlen - dlen) / dlen;
+    let t = (n.len() - dlen) / dlen;
     let init_idx = dlen * t;
-    let init_len = nlen - init_idx;
+    let init_len = n.len() - init_idx;
     let init_qlen = init_len - dlen + 1;
-    if !use_bz_for_top_block(dlen, init_qlen) {
-        div_buf_of(&mut n[init_idx..], &mut last_n, d, &mut out[init_idx..]);
+    let quotient_overflow = if !can_pad_top || !use_bz_for_top_block(dlen, init_qlen) {
+        div_buf_of(&mut n[init_idx..], &mut last_n, d, &mut out[init_idx..])
     } else {
-        let mut scratch = ScratchGuard::acquire();
-        if out.len() >= dlen {
-            let [top_n, div_scratch] = scratch.get_splits([2 * dlen, dlen]);
-            top_n[..init_len].copy_from_slice(&n[init_idx..]);
-            top_n[init_len] = last_n;
-            top_n[init_len + 1..].fill(0);
-
-            let q_tmp = &mut out[..dlen];
-            div_2_1(top_n, d, q_tmp, div_scratch, &mut |n, d, q| {
-                mul_dyn(n, d, q);
-            });
-
-            out.copy_within(0..init_qlen, init_idx);
-            n[init_idx..init_idx + dlen].copy_from_slice(&top_n[..dlen]);
-            n[init_idx + dlen..].fill(0);
-        } else {
-            let [top_n, q_tmp, div_scratch] = scratch.get_splits([2 * dlen, dlen, dlen]);
-            top_n[..init_len].copy_from_slice(&n[init_idx..]);
-            top_n[init_len] = last_n;
-            top_n[init_len + 1..].fill(0);
-
-            div_2_1(top_n, d, q_tmp, div_scratch, &mut |n, d, q| {
-                mul_dyn(n, d, q);
-            });
-
-            out.copy_from_slice(&q_tmp[..init_qlen]);
-            n[..dlen].copy_from_slice(&top_n[..dlen]);
-            n[dlen..].fill(0);
-        }
-    }
-    if t == 0 {
+        padded_top(n, d, out, last_n, init_idx, init_len)
+    };
+    let next = if t == 0 {
         if remainder_mode == RemainderMode::Restore {
             debug_assert!(n[dlen..].iter().all(|&limb| limb == 0));
             shr_buf(&mut n[..dlen], normalization_shift);
@@ -763,7 +741,8 @@ fn bz_div_init_dyn(
         None
     } else {
         Some(t)
-    }
+    };
+    (next, quotient_overflow)
 }
 
 fn bz_div_core_dyn(
@@ -772,9 +751,36 @@ fn bz_div_core_dyn(
     out: &mut [u64],
     normalization_shift: u8,
     remainder_mode: RemainderMode,
-) {
+) -> u64 {
     debug_assert_rigid_division_shape(n, d, out);
-    if let Some(t) = bz_div_init_dyn(n, d, out, normalization_shift, remainder_mode) {
+    let (next, quotient_overflow) = bz_div_init(
+        n,
+        d,
+        out,
+        normalization_shift,
+        remainder_mode,
+        true,
+        |n, d, out, last_n, init_idx, init_len| {
+            let dlen = d.len();
+            let mut scratch = ScratchGuard::acquire();
+            let [top_n, q_tmp, div_scratch] = scratch.get_splits([2 * dlen, dlen, dlen]);
+            bz_div_top(
+                n,
+                d,
+                out,
+                top_n,
+                q_tmp,
+                div_scratch,
+                last_n,
+                init_idx,
+                init_len,
+                |n, d, q| {
+                    mul_dyn(n, d, q);
+                },
+            )
+        },
+    );
+    if let Some(t) = next {
         let mut scratch_guard = ScratchGuard::acquire();
         bz_div_alg(n, d, out, scratch_guard.get(d.len()), t, |n, d, q| {
             mul_dyn(n, d, q);
@@ -784,6 +790,7 @@ fn bz_div_core_dyn(
             shr_buf(&mut n[..d.len()], normalization_shift);
         }
     }
+    quotient_overflow
 }
 
 fn bz_div_core_static<const N: usize>(
@@ -792,12 +799,37 @@ fn bz_div_core_static<const N: usize>(
     out: &mut [u64],
     normalization_shift: u8,
     remainder_mode: RemainderMode,
-) {
+) -> u64 {
     debug_assert_rigid_division_shape(n, d, out);
     let mut scratch = [0; N];
-    if let Some(t) =
-        bz_div_init_static::<N>(n, d, out, &mut scratch, normalization_shift, remainder_mode)
-    {
+    let (next, quotient_overflow) = bz_div_init(
+        n,
+        d,
+        out,
+        normalization_shift,
+        remainder_mode,
+        d.len() <= N / 2,
+        |n, d, out, last_n, init_idx, init_len| {
+            let dlen = d.len();
+            let mut top_n = [0; N];
+            let (q_tmp, div_scratch) = scratch[..2 * dlen].split_at_mut(dlen);
+            bz_div_top(
+                n,
+                d,
+                out,
+                &mut top_n[..2 * dlen],
+                q_tmp,
+                div_scratch,
+                last_n,
+                init_idx,
+                init_len,
+                |n, d, q| {
+                    mul_static::<N>(n, d, q);
+                },
+            )
+        },
+    );
+    if let Some(t) = next {
         bz_div_alg(n, d, out, &mut scratch, t, |n, d, q| {
             mul_static::<N>(n, d, q);
         });
@@ -806,16 +838,21 @@ fn bz_div_core_static<const N: usize>(
             shr_buf(&mut n[..d.len()], normalization_shift);
         }
     }
+    quotient_overflow
 }
 
-fn bz_div_owned_dyn(n: &mut [u64], d: &mut [u64], out: &mut [u64], remainder_mode: RemainderMode) {
+fn bz_div_owned_dyn(
+    n: &mut [u64],
+    d: &mut [u64],
+    out: &mut [u64],
+    remainder_mode: RemainderMode,
+) -> u64 {
     if d.len() == 1 {
-        bz_div_core_dyn(n, d, out, 0, remainder_mode);
-        return;
+        return bz_div_core_dyn(n, d, out, 0, remainder_mode);
     }
     let normalization_shift = d[d.len() - 1].leading_zeros() as u8;
     shl_buf(d, normalization_shift);
-    bz_div_core_dyn(n, d, out, normalization_shift, remainder_mode);
+    bz_div_core_dyn(n, d, out, normalization_shift, remainder_mode)
 }
 
 fn bz_div_owned_static<const N: usize>(
@@ -823,32 +860,31 @@ fn bz_div_owned_static<const N: usize>(
     d: &mut [u64],
     out: &mut [u64],
     remainder_mode: RemainderMode,
-) {
+) -> u64 {
     if d.len() == 1 {
-        bz_div_core_static::<N>(n, d, out, 0, remainder_mode);
-        return;
+        return bz_div_core_static::<N>(n, d, out, 0, remainder_mode);
     }
     let normalization_shift = d[d.len() - 1].leading_zeros() as u8;
     shl_buf(d, normalization_shift);
-    bz_div_core_static::<N>(n, d, out, normalization_shift, remainder_mode);
+    bz_div_core_static::<N>(n, d, out, normalization_shift, remainder_mode)
 }
 
-pub fn bz_div_wrapper_dyn(n: &[u64], d: &[u64], q: &mut [u64], request: DivisionRequest) {
+pub fn bz_div_wrapper_dyn(n: &[u64], d: &[u64], q: &mut [u64], request: DivisionRequest) -> u64 {
     let n = &n[request.n_start..];
     let d = &d[request.d_start..];
-    let q = &mut q[..request.q_len];
+    let (q, q_tail) = q.split_at_mut(request.q_len);
     debug_assert_rigid_division_shape(n, d, q);
 
     if d.len() == 1 {
-        knuth_div_prim_quotient(n, d[0], q);
-        return;
+        let overflow = knuth_div_prim(n, d[0], q).0;
+        return absorb_div_overflow(q_tail, overflow);
     }
 
     let mut scratch = ScratchGuard::acquire();
-    if request.normalization_shift == 0 {
+    let overflow = if request.normalization_shift == 0 {
         let n_work = scratch.get(n.len());
         n_work.copy_from_slice(n);
-        bz_div_core_dyn(n_work, d, q, 0, RemainderMode::Discard);
+        bz_div_core_dyn(n_work, d, q, 0, RemainderMode::Discard)
     } else {
         let [n_work, d_work] = scratch.get_splits([n.len(), d.len()]);
         n_work.copy_from_slice(n);
@@ -859,20 +895,29 @@ pub fn bz_div_wrapper_dyn(n: &[u64], d: &[u64], q: &mut [u64], request: Division
             q,
             request.normalization_shift,
             RemainderMode::Discard,
-        );
-    }
+        )
+    };
+    absorb_div_overflow(q_tail, overflow)
 }
 
-pub fn bz_div_rem_wrapper_dyn(n: &mut [u64], d: &[u64], q: &mut [u64], request: DivisionRequest) {
+pub fn bz_div_rem_wrapper_dyn(
+    n: &mut [u64],
+    d: &[u64],
+    q: &mut [u64],
+    request: DivisionRequest,
+) -> u64 {
     let n = &mut n[request.n_start..];
     let d = &d[request.d_start..];
-    let q = &mut q[..request.q_len];
+    let (q, q_tail) = q.split_at_mut(request.q_len);
     debug_assert_rigid_division_shape(n, d, q);
 
-    if d.len() == 1 {
-        knuth_div_prim_remainder(n, d[0], q);
+    let overflow = if d.len() == 1 {
+        let (overflow, rem) = knuth_div_prim(n, d[0], q);
+        n[0] = rem;
+        n[1..].fill(0);
+        overflow
     } else if request.normalization_shift == 0 {
-        bz_div_core_dyn(n, d, q, 0, RemainderMode::Restore);
+        bz_div_core_dyn(n, d, q, 0, RemainderMode::Restore)
     } else {
         let mut scratch = ScratchGuard::acquire();
         let d_work = scratch.get(d.len());
@@ -883,8 +928,9 @@ pub fn bz_div_rem_wrapper_dyn(n: &mut [u64], d: &[u64], q: &mut [u64], request: 
             q,
             request.normalization_shift,
             RemainderMode::Restore,
-        );
-    }
+        )
+    };
+    absorb_div_overflow(q_tail, overflow)
 }
 
 pub fn bz_div_wrapper_static<const N: usize>(
@@ -892,22 +938,22 @@ pub fn bz_div_wrapper_static<const N: usize>(
     d: &[u64],
     q: &mut [u64],
     request: DivisionRequest,
-) {
+) -> u64 {
     let n = &n[request.n_start..];
     let d = &d[request.d_start..];
-    let q = &mut q[..request.q_len];
+    let (q, q_tail) = q.split_at_mut(request.q_len);
     assert_static_division_capacity::<N>(n, d, q);
     debug_assert_rigid_division_shape(n, d, q);
 
     if d.len() == 1 {
-        knuth_div_prim_quotient(n, d[0], q);
-        return;
+        let overflow = knuth_div_prim(n, d[0], q).0;
+        return absorb_div_overflow(q_tail, overflow);
     }
 
     let mut n_work = [0u64; N];
     n_work[..n.len()].copy_from_slice(n);
-    if request.normalization_shift == 0 {
-        bz_div_core_static::<N>(&mut n_work[..n.len()], d, q, 0, RemainderMode::Discard);
+    let overflow = if request.normalization_shift == 0 {
+        bz_div_core_static::<N>(&mut n_work[..n.len()], d, q, 0, RemainderMode::Discard)
     } else {
         let mut d_work = [0u64; N];
         shl_top_copy(d, &mut d_work[..d.len()], request.normalization_shift);
@@ -917,8 +963,9 @@ pub fn bz_div_wrapper_static<const N: usize>(
             q,
             request.normalization_shift,
             RemainderMode::Discard,
-        );
-    }
+        )
+    };
+    absorb_div_overflow(q_tail, overflow)
 }
 
 pub fn bz_div_rem_wrapper_static<const N: usize>(
@@ -926,17 +973,20 @@ pub fn bz_div_rem_wrapper_static<const N: usize>(
     d: &[u64],
     q: &mut [u64],
     request: DivisionRequest,
-) {
+) -> u64 {
     let n = &mut n[request.n_start..];
     let d = &d[request.d_start..];
-    let q = &mut q[..request.q_len];
+    let (q, q_tail) = q.split_at_mut(request.q_len);
     assert_static_division_capacity::<N>(n, d, q);
     debug_assert_rigid_division_shape(n, d, q);
 
-    if d.len() == 1 {
-        knuth_div_prim_remainder(n, d[0], q);
+    let overflow = if d.len() == 1 {
+        let (overflow, rem) = knuth_div_prim(n, d[0], q);
+        n[0] = rem;
+        n[1..].fill(0);
+        overflow
     } else if request.normalization_shift == 0 {
-        bz_div_core_static::<N>(n, d, q, 0, RemainderMode::Restore);
+        bz_div_core_static::<N>(n, d, q, 0, RemainderMode::Restore)
     } else {
         let mut d_work = [0u64; N];
         shl_top_copy(d, &mut d_work[..d.len()], request.normalization_shift);
@@ -946,8 +996,9 @@ pub fn bz_div_rem_wrapper_static<const N: usize>(
             q,
             request.normalization_shift,
             RemainderMode::Restore,
-        );
-    }
+        )
+    };
+    absorb_div_overflow(q_tail, overflow)
 }
 
 #[inline(always)]
@@ -972,14 +1023,6 @@ pub fn nr_rcp_schedule(p_target: usize, sizes: &mut [usize; 64]) -> usize {
     steps
 }
 
-#[inline]
-fn sub_num_limb(val: u64, num: &[u64], idx: usize, borrow: &mut u64) -> u64 {
-    let (v, b1) = val.overflowing_sub(num.get(idx).copied().unwrap_or(0));
-    let (v, b2) = v.overflowing_sub(*borrow);
-    *borrow = (b1 | b2) as u64;
-    v
-}
-
 // Signed error band (d·y − num) around the cancellation point: fills e[..p+1]
 // with the middle band of d·y minus the aligned numerator limbs (num[i] lines
 // up with e[i]; empty num compares against zeros — the reciprocal case, where
@@ -995,6 +1038,12 @@ fn nr_err_band(
     cap: usize,
     mid: &mut dyn FnMut(&[u64], &[u64], &mut [u64]) -> (u64, u64),
 ) -> Option<(bool, usize)> {
+    let sub_num_limb = |val: u64, idx: usize, borrow: &mut u64| {
+        let (v, b1) = val.overflowing_sub(num.get(idx).copied().unwrap_or(0));
+        let (v, b2) = v.overflowing_sub(*borrow);
+        *borrow = (b1 | b2) as u64;
+        v
+    };
     // d may be shorter than the virtual 2p+1 window (top-aligned, implicit low
     // zeros); the extension walks actual product columns, offset by the pad.
     let z = 2 * p + 1 - d.len();
@@ -1007,7 +1056,7 @@ fn nr_err_band(
     }
     let mut val = mul_elem(d, y, p + e_idx - z, &mut acc0, &mut acc1, &mut acc2);
     if !num.is_empty() {
-        val = sub_num_limb(val, num, e_idx, &mut borrow);
+        val = sub_num_limb(val, e_idx, &mut borrow);
     }
     while val != 0 && val != u64::MAX {
         e[e_idx] = val;
@@ -1017,7 +1066,7 @@ fn nr_err_band(
         }
         val = mul_elem(d, y, p + e_idx - z, &mut acc0, &mut acc1, &mut acc2);
         if !num.is_empty() {
-            val = sub_num_limb(val, num, e_idx, &mut borrow);
+            val = sub_num_limb(val, e_idx, &mut borrow);
         }
     }
     Some((val == u64::MAX, e_idx))
@@ -1147,53 +1196,6 @@ fn nr_rcp_chain(
     true
 }
 
-fn nr_div_rcp_upper_checked(denom: &[u64], rcp: &mut [u64]) -> bool {
-    if rcp.is_empty() {
-        return true;
-    }
-
-    rcp.fill(0);
-    let sh = denom[denom.len() - 1].leading_zeros() as u8;
-
-    let mut sizes = [0usize; 64];
-    let steps = nr_rcp_schedule(rcp.len() - 1, &mut sizes);
-
-    // The widest step reads d at 2p+1 limbs for its input precision p, and the
-    // error band can write one limb past 2p+1 before bailing out. The seed
-    // numerator holds B^(seed_r + 2) for a seed_r limb quotient.
-    let pen_p = if steps >= 2 { sizes[1] } else { 1 };
-    let d_len = 2 * pen_p + 1;
-    let err_len = 2 * pen_p + 2;
-    let seed_len = rcp.len().min(2) + 2;
-
-    let mut scratch = ScratchGuard::acquire();
-    let (err, cor, seed_n, d_work) = if sh == 0 && d_len <= denom.len() {
-        let [err, cor, seed_n] = scratch.get_splits([err_len, err_len, seed_len]);
-        (err, cor, seed_n, end_ref(denom, d_len))
-    } else {
-        let [err, cor, seed_n, d_work] = scratch.get_splits([err_len, err_len, seed_len, d_len]);
-        shl_top_copy(denom, d_work, sh);
-        (err, cor, seed_n, &*d_work)
-    };
-
-    if !nr_rcp_chain(
-        d_work,
-        rcp,
-        err,
-        cor,
-        seed_n,
-        &sizes[..steps],
-        &mut |a, b, o| mid_mul_dyn(a, b, o),
-        &mut |a, b, o| short_mul_dyn(a, b, o),
-    ) {
-        // Pathological band bail: reseed the whole reciprocal by Knuth
-        // division.
-        knuth_div_rcp_seed_dyn(d_work, rcp);
-    }
-
-    shl_buf(rcp, sh) == 0
-}
-
 const GUARD: usize = 3;
 const NR_DIV_MAX_CORRECTIONS: usize = 32;
 
@@ -1303,20 +1305,51 @@ fn nr_split(q_len: usize, d_len: usize) -> (usize, usize) {
     (h, l)
 }
 
-// Shared front half of the Newton-Raphson division drivers: half-precision
-// reciprocal plus one quotient refinement. Fills q with an estimate within
-// one of the true quotient. Returns None when a band bailed (q untouched),
-// else Some(ambiguous) — the top-guard verdict.
+// Dynamic front half of Newton division: half-precision reciprocal plus one
+// quotient refinement. Fills q with an estimate within one of the true
+// quotient. Returns None when a band bailed, else Some(ambiguous).
 fn nr_quo_est_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> Option<bool> {
     if !nr_shape_supported(n.len(), q.len()) {
         return None;
     }
     let (h, l) = nr_split(q.len(), d.len());
 
+    let x_len = h + 3;
+    let mut sizes = [0usize; 64];
+    let steps = nr_rcp_schedule(x_len - 1, &mut sizes);
+    // The widest refinement reads 2p+1 divisor limbs and may extend its error
+    // band one limb beyond that; the seed numerator never exceeds four limbs.
+    let pen_p = if steps >= 2 { sizes[1] } else { 1 };
+    let d_len = 2 * pen_p + 1;
+    let rcp_err_len = d_len + 1;
     let mut scratch = ScratchGuard::acquire();
-    let [x, hq, err, corr] = scratch.get_splits([h + 3, h + 3, h + 4, l + 5]);
+    let [x, hq, err, corr, rcp_err, rcp_cor, seed_n, d_work] = scratch.get_splits([
+        x_len,
+        h + 3,
+        h + 4,
+        l + 5,
+        rcp_err_len,
+        rcp_err_len,
+        4,
+        d_len,
+    ]);
 
-    if !nr_div_rcp_upper_checked(d, x) {
+    let sh = d[d.len() - 1].leading_zeros() as u8;
+    x.fill(0);
+    shl_top_copy(d, d_work, sh);
+    if !nr_rcp_chain(
+        d_work,
+        x,
+        rcp_err,
+        rcp_cor,
+        seed_n,
+        &sizes[..steps],
+        &mut |a, b, o| mid_mul_dyn(a, b, o),
+        &mut |a, b, o| short_mul_dyn(a, b, o),
+    ) {
+        knuth_div_rcp_seed_dyn(d_work, x);
+    }
+    if shl_buf(x, sh) != 0 {
         return None;
     }
 
@@ -1457,8 +1490,7 @@ fn nr_rem_finish(
 //   Newton quotient / quotient-with-remainder, dynamic / static
 //   ├─ nr_quo_est_{dyn,static} — quotient estimate within +-1:
 //   │    ├─ upper reciprocal of d to half quotient precision
-//   │    │    (nr_div_rcp_upper_checked or the inline static setup):
-//   │    │    nr_rcp_chain seeds through div_buf_of, then
+//   │    │    through nr_rcp_chain, seeded by div_buf_of, then
 //   │    │    follows nr_rcp_schedule through nr_refine_rcp steps
 //   │    │    using error bands from nr_err_band
 //   │    └─ nr_refine_quo — guarded high product, then one Newton step on the
@@ -1469,55 +1501,36 @@ fn nr_rem_finish(
 //   └─ band bail → whole division through the matching BZ core;
 //        only the dyn reciprocal self-heals in place via an exact
 //        Knuth reciprocal seed
-fn bz_quotient_core_dyn(n: &[u64], d: &[u64], q: &mut [u64]) {
-    let mut scratch = ScratchGuard::acquire();
-    let [n_work, d_work] = scratch.get_splits([n.len(), d.len()]);
-    n_work.copy_from_slice(n);
+fn bz_fallback(
+    n: &mut [u64],
+    d: &[u64],
+    d_work: &mut [u64],
+    q: &mut [u64],
+    mode: RemainderMode,
+    divide: impl FnOnce(&mut [u64], &mut [u64], &mut [u64], RemainderMode) -> u64,
+) {
     d_work.copy_from_slice(d);
-    bz_div_owned_dyn(n_work, d_work, q, RemainderMode::Discard);
+    let body_len = q.len() - 1;
+    let overflow = divide(n, d_work, &mut q[..body_len], mode);
+    q[body_len] = overflow;
 }
 
-fn bz_quotient_core_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) {
-    let mut n_work = [0u64; N];
-    let mut d_work = [0u64; N];
-    n_work[..n.len()].copy_from_slice(n);
-    d_work[..d.len()].copy_from_slice(d);
-    bz_div_owned_static::<N>(
-        &mut n_work[..n.len()],
-        &mut d_work[..d.len()],
-        q,
-        RemainderMode::Discard,
-    );
-}
-
-fn bz_remainder_core_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) {
-    let mut scratch = ScratchGuard::acquire();
-    let d_work = scratch.get(d.len());
-    d_work.copy_from_slice(d);
-    bz_div_owned_dyn(n, d_work, q, RemainderMode::Restore);
-}
-
-fn bz_remainder_core_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) {
-    let mut d_work = [0u64; N];
-    d_work[..d.len()].copy_from_slice(d);
-    bz_div_owned_static::<N>(n, &mut d_work[..d.len()], q, RemainderMode::Restore);
-}
-
-fn nr_div_core_dyn(n: &[u64], d: &[u64], q: &mut [u64]) {
-    debug_assert_rigid_division_shape(n, d, q);
-    match nr_quo_est_dyn(n, d, q) {
-        Some(false) => {}
-        Some(true) => {
-            let mut scratch = ScratchGuard::acquire();
-            let [prod, num] = scratch.get_splits([n.len(), n.len()]);
-            num.copy_from_slice(n);
-            if !nr_exact_correction(num, d, q, prod, &mut |a, b, o| {
-                mul_dyn(a, b, o);
-            }) {
-                bz_quotient_core_dyn(n, d, q);
-            }
-        }
-        None => bz_quotient_core_dyn(n, d, q),
+fn nr_div_core(
+    n: &[u64],
+    d: &[u64],
+    q: &mut [u64],
+    estimate: impl FnOnce(&[u64], &[u64], &mut [u64]) -> Option<bool>,
+    correct: impl FnOnce(&[u64], &[u64], &mut [u64]) -> bool,
+    fallback: impl FnOnce(&[u64], &[u64], &mut [u64]),
+) {
+    debug_assert_full_division_shape(n, d, q);
+    let exact = match estimate(n, d, q) {
+        Some(false) => return,
+        Some(true) => correct(n, d, q),
+        None => false,
+    };
+    if !exact {
+        fallback(n, d, q);
     }
 }
 
@@ -1525,92 +1538,122 @@ fn nr_div_core_dyn(n: &[u64], d: &[u64], q: &mut [u64]) {
 // replaces the guard verdict and the exact correction. The remainder is left
 // in n (low d.len() limbs, top zeroed), matching the rest of the division
 // stack.
-fn nr_div_rem_core_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) {
-    debug_assert_rigid_division_shape(n, d, q);
-    match nr_quo_est_dyn(n, d, q) {
-        Some(_) => {
-            let q_low_len = q.len().min(d.len() + 1);
-            let rem_len = d.len() + 1;
-            let mut scratch = ScratchGuard::acquire();
-            let [prod, rem] = scratch.get_splits([d.len() + q_low_len - 1, rem_len]);
-            if nr_rem_finish(n, d, q, rem, prod, &mut |a, b, o| {
-                mul_dyn(a, b, o);
-            }) {
-                n[..rem_len].copy_from_slice(rem);
-                n[rem_len..].fill(0);
-            } else {
-                bz_remainder_core_dyn(n, d, q);
-            }
-        }
-        None => bz_remainder_core_dyn(n, d, q),
+fn nr_div_rem_core(
+    n: &mut [u64],
+    d: &[u64],
+    q: &mut [u64],
+    estimate: impl FnOnce(&[u64], &[u64], &mut [u64]) -> Option<bool>,
+    finish: impl FnOnce(&mut [u64], &[u64], &mut [u64]) -> bool,
+    fallback: impl FnOnce(&mut [u64], &[u64], &mut [u64]),
+) {
+    debug_assert_full_division_shape(n, d, q);
+    if estimate(n, d, q).is_none() || !finish(n, d, q) {
+        fallback(n, d, q);
     }
 }
 
-// Stack-backed quotient core: every buffer is a [u64; N] local and all products
-// dispatch through the static (FFT-free) mul layer.
-fn nr_div_core_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) {
-    debug_assert_rigid_division_shape(n, d, q);
-    match nr_quo_est_static::<N>(n, d, q) {
-        Some(false) => {}
-        Some(true) => {
-            let mut prod = [0u64; N];
-            let mut num = [0u64; N];
-            let num = &mut num[..n.len()];
-            num.copy_from_slice(n);
-            if !nr_exact_correction(num, d, q, &mut prod[..n.len()], &mut |a, b, o| {
-                mul_static::<N>(a, b, o);
-            }) {
-                bz_quotient_core_static::<N>(n, d, q);
-            }
-        }
-        None => bz_quotient_core_static::<N>(n, d, q),
+#[inline]
+fn nr_output(
+    q: &mut [u64],
+    body_len: usize,
+    run: &mut impl FnMut(&mut [u64]),
+    with_temp: impl FnOnce(usize, &mut dyn FnMut(&mut [u64])),
+) -> u64 {
+    let full_len = body_len + 1;
+    if q.len() >= full_len {
+        let (q, tail) = q.split_at_mut(full_len);
+        run(q);
+        tail.fill(0);
+        return 0;
     }
+    let mut overflow = 0;
+    with_temp(full_len, &mut |q_full| {
+        run(q_full);
+        q.copy_from_slice(&q_full[..body_len]);
+        overflow = q_full[body_len];
+    });
+    overflow
 }
 
-// Stack-backed quotient/remainder core; the remainder is left in n (low
-// d.len() limbs, top zeroed).
-fn nr_div_rem_core_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) {
-    debug_assert_rigid_division_shape(n, d, q);
-    match nr_quo_est_static::<N>(n, d, q) {
-        Some(_) => {
-            let q_low_len = q.len().min(d.len() + 1);
-            let rem_len = d.len() + 1;
-            let mut prod = [0u64; N];
-            let mut rem = [0u64; N];
-            if nr_rem_finish(
-                n,
-                d,
-                q,
-                &mut rem[..rem_len],
-                &mut prod[..d.len() + q_low_len - 1],
-                &mut |a, b, o| {
-                    mul_static::<N>(a, b, o);
-                },
-            ) {
-                n[..rem_len].copy_from_slice(&rem[..rem_len]);
-                n[rem_len..].fill(0);
-            } else {
-                bz_remainder_core_static::<N>(n, d, q);
-            }
-        }
-        None => bz_remainder_core_static::<N>(n, d, q),
-    }
-}
-
-pub fn nr_div_wrapper_dyn(n: &[u64], d: &[u64], q: &mut [u64], request: DivisionRequest) {
+pub fn nr_div_wrapper_dyn(n: &[u64], d: &[u64], q: &mut [u64], request: DivisionRequest) -> u64 {
     let n = &n[request.n_start..];
     let d = &d[request.d_start..];
-    let q = &mut q[..request.q_len];
-    debug_assert_rigid_division_shape(n, d, q);
-    nr_div_core_dyn(n, d, q);
+    let mut run = |q: &mut [u64]| {
+        nr_div_core(
+            n,
+            d,
+            q,
+            nr_quo_est_dyn,
+            |n, d, q| {
+                let mut scratch = ScratchGuard::acquire();
+                let [prod, num] = scratch.get_splits([n.len(), n.len()]);
+                num.copy_from_slice(n);
+                nr_exact_correction(num, d, q, prod, &mut |a, b, o| {
+                    mul_dyn(a, b, o);
+                })
+            },
+            |n, d, q| {
+                let mut scratch = ScratchGuard::acquire();
+                let [n_work, d_work] = scratch.get_splits([n.len(), d.len()]);
+                n_work.copy_from_slice(n);
+                bz_fallback(
+                    n_work,
+                    d,
+                    d_work,
+                    q,
+                    RemainderMode::Discard,
+                    |n, d, q, mode| bz_div_owned_dyn(n, d, q, mode),
+                );
+            },
+        );
+    };
+    nr_output(q, request.q_len, &mut run, |len, use_temp| {
+        let mut scratch = ScratchGuard::acquire();
+        use_temp(scratch.get(len));
+    })
 }
 
-pub fn nr_div_rem_wrapper_dyn(n: &mut [u64], d: &[u64], q: &mut [u64], request: DivisionRequest) {
+pub fn nr_div_rem_wrapper_dyn(
+    n: &mut [u64],
+    d: &[u64],
+    q: &mut [u64],
+    request: DivisionRequest,
+) -> u64 {
     let n = &mut n[request.n_start..];
     let d = &d[request.d_start..];
-    let q = &mut q[..request.q_len];
-    debug_assert_rigid_division_shape(n, d, q);
-    nr_div_rem_core_dyn(n, d, q);
+    let mut run = |q: &mut [u64]| {
+        nr_div_rem_core(
+            n,
+            d,
+            q,
+            nr_quo_est_dyn,
+            |n, d, q| {
+                let q_low_len = q.len().min(d.len() + 1);
+                let rem_len = d.len() + 1;
+                let mut scratch = ScratchGuard::acquire();
+                let [prod, rem] = scratch.get_splits([d.len() + q_low_len - 1, rem_len]);
+                let exact = nr_rem_finish(n, d, q, rem, prod, &mut |a, b, o| {
+                    mul_dyn(a, b, o);
+                });
+                if exact {
+                    n[..rem_len].copy_from_slice(rem);
+                    n[rem_len..].fill(0);
+                }
+                exact
+            },
+            |n, d, q| {
+                let mut scratch = ScratchGuard::acquire();
+                let d_work = scratch.get(d.len());
+                bz_fallback(n, d, d_work, q, RemainderMode::Restore, |n, d, q, mode| {
+                    bz_div_owned_dyn(n, d, q, mode)
+                });
+            },
+        );
+    };
+    nr_output(q, request.q_len, &mut run, |len, use_temp| {
+        let mut scratch = ScratchGuard::acquire();
+        use_temp(scratch.get(len));
+    })
 }
 
 pub fn nr_div_wrapper_static<const N: usize>(
@@ -1618,13 +1661,55 @@ pub fn nr_div_wrapper_static<const N: usize>(
     d: &[u64],
     q: &mut [u64],
     request: DivisionRequest,
-) {
+) -> u64 {
     let n = &n[request.n_start..];
     let d = &d[request.d_start..];
-    let q = &mut q[..request.q_len];
-    assert_static_division_capacity::<N>(n, d, q);
-    debug_assert_rigid_division_shape(n, d, q);
-    nr_div_core_static::<N>(n, d, q);
+    let full_len = request.q_len + 1;
+    assert!(
+        full_len <= N,
+        "prepared division quotient exceeds static capacity"
+    );
+    assert_static_division_capacity::<N>(n, d, &[]);
+    let mut run = |q: &mut [u64]| {
+        nr_div_core(
+            n,
+            d,
+            q,
+            nr_quo_est_static::<N>,
+            |n, d, q| {
+                // Every static product remains stack-backed and FFT-free.
+                let mut prod = [0u64; N];
+                let mut num = [0u64; N];
+                num[..n.len()].copy_from_slice(n);
+                nr_exact_correction(
+                    &mut num[..n.len()],
+                    d,
+                    q,
+                    &mut prod[..n.len()],
+                    &mut |a, b, o| {
+                        mul_static::<N>(a, b, o);
+                    },
+                )
+            },
+            |n, d, q| {
+                let mut n_work = [0u64; N];
+                let mut d_work = [0u64; N];
+                n_work[..n.len()].copy_from_slice(n);
+                bz_fallback(
+                    &mut n_work[..n.len()],
+                    d,
+                    &mut d_work[..d.len()],
+                    q,
+                    RemainderMode::Discard,
+                    |n, d, q, mode| bz_div_owned_static::<N>(n, d, q, mode),
+                );
+            },
+        );
+    };
+    nr_output(q, request.q_len, &mut run, |len, use_temp| {
+        let mut q_full = [0; N];
+        use_temp(&mut q_full[..len]);
+    })
 }
 
 pub fn nr_div_rem_wrapper_static<const N: usize>(
@@ -1632,13 +1717,59 @@ pub fn nr_div_rem_wrapper_static<const N: usize>(
     d: &[u64],
     q: &mut [u64],
     request: DivisionRequest,
-) {
+) -> u64 {
     let n = &mut n[request.n_start..];
     let d = &d[request.d_start..];
-    let q = &mut q[..request.q_len];
-    assert_static_division_capacity::<N>(n, d, q);
-    debug_assert_rigid_division_shape(n, d, q);
-    nr_div_rem_core_static::<N>(n, d, q);
+    let full_len = request.q_len + 1;
+    assert!(
+        full_len <= N,
+        "prepared division quotient exceeds static capacity"
+    );
+    assert_static_division_capacity::<N>(n, d, &[]);
+    let mut run = |q: &mut [u64]| {
+        nr_div_rem_core(
+            n,
+            d,
+            q,
+            nr_quo_est_static::<N>,
+            |n, d, q| {
+                let q_low_len = q.len().min(d.len() + 1);
+                let rem_len = d.len() + 1;
+                let mut prod = [0u64; N];
+                let mut rem = [0u64; N];
+                let exact = nr_rem_finish(
+                    n,
+                    d,
+                    q,
+                    &mut rem[..rem_len],
+                    &mut prod[..d.len() + q_low_len - 1],
+                    &mut |a, b, o| {
+                        mul_static::<N>(a, b, o);
+                    },
+                );
+                if exact {
+                    n[..rem_len].copy_from_slice(&rem[..rem_len]);
+                    n[rem_len..].fill(0);
+                }
+                exact
+            },
+            |n, d, q| {
+                let mut d_work = [0u64; N];
+                bz_fallback(
+                    n,
+                    d,
+                    &mut d_work[..d.len()],
+                    q,
+                    RemainderMode::Restore,
+                    |n, d, q, mode| bz_div_owned_static::<N>(n, d, q, mode),
+                );
+            },
+        );
+    };
+    nr_output(q, request.q_len, &mut run, |len, use_temp| {
+        let mut q_full = [0; N];
+        use_temp(&mut q_full[..len]);
+    })
 }
 
 fn knuth_rcp_prim(d: u64, rcp: &mut [u64]) {
@@ -1819,7 +1950,7 @@ struct DivCutoffs {
 
 fn div_alg_dispatch(q: usize, d: usize, tuning: DivCutoffs) -> DivAlg {
     debug_assert!(q != 0 && d != 0);
-    let algo = if d <= BZ_CUTOFF {
+    let algo = if q == 1 || d <= BZ_CUTOFF {
         DivAlg::Knuth
     } else if q.max(d) < tuning.karatsuba_transform_cutoff {
         if (q as f64) * tuning.karatsuba_bz_nr_ratio > d as f64 {
@@ -1851,12 +1982,9 @@ pub(crate) fn rcp_alg_dispatch(precision: usize, knuth_nr_cutoff: usize) -> RcpA
     }
 }
 
-pub fn div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) {
-    let Some(request) = division_preflight(n, d, q) else {
-        return;
-    };
+fn div_request_dyn(n: &[u64], d: &[u64], q: &mut [u64], request: DivisionRequest) -> u64 {
     match div_alg_dispatch(
-        request.q_len,
+        request.q_len + 1,
         request.d_len,
         DivCutoffs {
             karatsuba_transform_cutoff: DYN_DIV_KARATSUBA_FFT_NR_BZ_CUTOFF,
@@ -1870,31 +1998,14 @@ pub fn div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) {
     }
 }
 
-pub fn div_rem_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) {
-    let Some(request) = division_preflight(n, d, q) else {
-        return;
-    };
+fn div_request_static<const N: usize>(
+    n: &[u64],
+    d: &[u64],
+    q: &mut [u64],
+    request: DivisionRequest,
+) -> u64 {
     match div_alg_dispatch(
-        request.q_len,
-        request.d_len,
-        DivCutoffs {
-            karatsuba_transform_cutoff: DYN_DIV_REM_KARATSUBA_FFT_NR_BZ_CUTOFF,
-            karatsuba_bz_nr_ratio: DYN_DIV_REM_KARATSUBA_NR_BZ_CUTOFF,
-            transform_bz_nr_ratio: DYN_DIV_REM_FFT_NR_BZ_CUTOFF,
-        },
-    ) {
-        DivAlg::Knuth => knuth_div_rem_wrapper_dyn(n, d, q, request),
-        DivAlg::BZ => bz_div_rem_wrapper_dyn(n, d, q, request),
-        DivAlg::NR => nr_div_rem_wrapper_dyn(n, d, q, request),
-    }
-}
-
-pub fn div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) {
-    let Some(request) = division_preflight(n, d, q) else {
-        return;
-    };
-    match div_alg_dispatch(
-        request.q_len,
+        request.q_len + 1,
         request.d_len,
         DivCutoffs {
             karatsuba_transform_cutoff: STATIC_DIV_KARATSUBA_NTT_NR_BZ_CUTOFF,
@@ -1908,12 +2019,55 @@ pub fn div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) {
     }
 }
 
-pub fn div_rem_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) {
+/// Divides trimmed `n` by trimmed nonzero `d` using pooled dynamic scratch.
+///
+/// `q` must contain at least [`div_quotient_len`] limbs. With an exact-sized
+/// output the additional structural quotient limb is returned; a longer
+/// output absorbs it and the function returns zero.
+pub fn div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
     let Some(request) = division_preflight(n, d, q) else {
-        return;
+        return 0;
+    };
+    div_request_dyn(n, d, q, request)
+}
+
+/// Dynamic division with the same quotient contract as [`div_dyn`], leaving
+/// the exact remainder in `n`.
+pub fn div_rem_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) -> u64 {
+    let Some(request) = division_preflight(n, d, q) else {
+        return 0;
     };
     match div_alg_dispatch(
-        request.q_len,
+        request.q_len + 1,
+        request.d_len,
+        DivCutoffs {
+            karatsuba_transform_cutoff: DYN_DIV_REM_KARATSUBA_FFT_NR_BZ_CUTOFF,
+            karatsuba_bz_nr_ratio: DYN_DIV_REM_KARATSUBA_NR_BZ_CUTOFF,
+            transform_bz_nr_ratio: DYN_DIV_REM_FFT_NR_BZ_CUTOFF,
+        },
+    ) {
+        DivAlg::Knuth => knuth_div_rem_wrapper_dyn(n, d, q, request),
+        DivAlg::BZ => bz_div_rem_wrapper_dyn(n, d, q, request),
+        DivAlg::NR => nr_div_rem_wrapper_dyn(n, d, q, request),
+    }
+}
+
+/// Static-scratch division with the same quotient contract as [`div_dyn`].
+pub fn div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
+    let Some(request) = division_preflight(n, d, q) else {
+        return 0;
+    };
+    div_request_static::<N>(n, d, q, request)
+}
+
+/// Static-scratch division with the same quotient and remainder contract as
+/// [`div_rem_dyn`].
+pub fn div_rem_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) -> u64 {
+    let Some(request) = division_preflight(n, d, q) else {
+        return 0;
+    };
+    match div_alg_dispatch(
+        request.q_len + 1,
         request.d_len,
         DivCutoffs {
             karatsuba_transform_cutoff: STATIC_DIV_REM_KARATSUBA_NTT_NR_BZ_CUTOFF,
@@ -1925,6 +2079,26 @@ pub fn div_rem_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) {
         DivAlg::BZ => bz_div_rem_wrapper_static::<N>(n, d, q, request),
         DivAlg::NR => nr_div_rem_wrapper_static::<N>(n, d, q, request),
     }
+}
+
+/// Computes the highest `q.len()` limbs of the quotient body and returns the
+/// structural overflow limb. If the complete body fits, this delegates to
+/// [`div_dyn`] and follows its overflow-absorption behavior.
+pub fn short_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
+    let requested = q.len();
+    let Some(request) = division_request(n, d, q, Some(requested)) else {
+        return 0;
+    };
+    div_request_dyn(n, d, q, request)
+}
+
+/// Static-scratch counterpart of [`short_div_dyn`].
+pub fn short_div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
+    let requested = q.len();
+    let Some(request) = division_request(n, d, q, Some(requested)) else {
+        return 0;
+    };
+    div_request_static::<N>(n, d, q, request)
 }
 
 pub fn rcp_dyn(d: &[u64], rcp: &mut [u64]) {

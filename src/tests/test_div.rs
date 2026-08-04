@@ -197,7 +197,8 @@ fn test_dynamic_and_static_public_division_dispatch() {
     ];
 
     for (idx, (original_n, original_d)) in cases.into_iter().enumerate() {
-        let q_len = div_quotient_len(original_n.len(), original_d.len());
+        let body_len = div_quotient_len(original_n.len(), original_d.len());
+        let q_len = body_len + usize::from(original_n.len() >= original_d.len());
 
         let mut q_dyn = vec![0u64; q_len];
         div_dyn(&original_n, &original_d, &mut q_dyn);
@@ -283,263 +284,314 @@ fn assert_divmod_algorithm(name: &str, n: &[u64], d: &[u64], q: &[u64], r: &[u64
     );
 }
 
-struct HighDivisionReference {
-    q: Vec<u64>,
-    residual: Vec<u64>,
-    quotient_skip: usize,
-    unchanged_prefix: usize,
+fn forced_knuth_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
+    let request = division_preflight(n, d, q).unwrap();
+    knuth_div_wrapper_dyn(n, d, q, request)
 }
 
-/// Reference the high-quotient contract from a full Knuth quotient, then form
-/// the partial residual independently from
-///
-///     n = (q * d) * B^quotient_skip + residual.
-///
-/// `q_len` may exceed the full structural quotient width; those excess limbs
-/// are high zero padding in the public output.
-fn high_division_reference(n: &[u64], d: &[u64], q_len: usize) -> HighDivisionReference {
-    let full_q_len = div_quotient_len(n.len(), d.len());
-    let used_q_len = q_len.min(full_q_len);
-    let quotient_skip = full_q_len - used_q_len;
-
-    let mut full_q = vec![u64::MAX; full_q_len];
-    knuth_div_dyn(n, d, &mut full_q);
-
-    let mut q = vec![0; q_len];
-    if used_q_len != 0 {
-        q[..used_q_len].copy_from_slice(&full_q[quotient_skip..]);
-    }
-
-    let mut residual = n.to_vec();
-    if used_q_len != 0 {
-        let product = super::mul_ref(&q[..used_q_len], d);
-        if !product.is_empty() {
-            assert!(product.len() <= residual.len() - quotient_skip);
-            assert!(
-                !sub_buf(&mut residual[quotient_skip..], &product),
-                "reference high quotient exceeds the numerator"
-            );
-
-            let mut reconstructed = residual.clone();
-            assert!(
-                !add_buf(&mut reconstructed[quotient_skip..], &product),
-                "reference reconstruction overflowed"
-            );
-            assert_eq!(reconstructed, n, "reference partial-residual identity");
-        }
-    }
-
-    let divisor_zeros = d.iter().position(|&limb| limb != 0).unwrap();
-    HighDivisionReference {
-        q,
-        residual,
-        quotient_skip,
-        unchanged_prefix: quotient_skip + divisor_zeros,
-    }
+fn forced_bz_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
+    let request = division_preflight(n, d, q).unwrap();
+    bz_div_wrapper_dyn(n, d, q, request)
 }
 
-fn assert_high_division_result(
-    name: &str,
-    n: &[u64],
-    d: &[u64],
-    q: &[u64],
-    residual: &[u64],
-    expected: &HighDivisionReference,
-) {
-    assert_eq!(q, expected.q, "{name}: high quotient mismatch");
-    assert_eq!(
-        residual, expected.residual,
-        "{name}: partial residual mismatch"
-    );
-    assert_eq!(
-        &residual[..expected.unchanged_prefix],
-        &n[..expected.unchanged_prefix],
-        "{name}: omitted numerator prefix changed"
-    );
-    assert!(
-        cmp_buf(&residual[expected.quotient_skip..], d).is_lt(),
-        "{name}: shifted residual is not below the divisor"
-    );
-
-    let divisor_zeros = d.iter().position(|&limb| limb != 0).unwrap();
-    assert!(
-        cmp_buf(&residual[expected.unchanged_prefix..], &d[divisor_zeros..]).is_lt(),
-        "{name}: factored residual window is not reduced"
-    );
+fn forced_nr_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
+    let request = division_preflight(n, d, q).unwrap();
+    nr_div_wrapper_dyn(n, d, q, request)
 }
 
-fn exercise_high_division_entry_matrix<const N: usize>(
-    case: &str,
-    n: &[u64],
-    d: &[u64],
-    q_lengths: &[usize],
-) {
-    let dyn_divs: [(&str, fn(&[u64], &[u64], &mut [u64])); 4] = [
-        ("Knuth dyn", knuth_div_dyn),
-        ("Burnikel-Ziegler dyn", bz_div_dyn),
-        ("Newton-Raphson dyn", nr_div_dyn),
+fn forced_knuth_div_rem_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) -> u64 {
+    let request = division_preflight(n, d, q).unwrap();
+    knuth_div_rem_wrapper_dyn(n, d, q, request)
+}
+
+fn forced_bz_div_rem_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) -> u64 {
+    let request = division_preflight(n, d, q).unwrap();
+    bz_div_rem_wrapper_dyn(n, d, q, request)
+}
+
+fn forced_nr_div_rem_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) -> u64 {
+    let request = division_preflight(n, d, q).unwrap();
+    nr_div_rem_wrapper_dyn(n, d, q, request)
+}
+
+fn forced_knuth_div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
+    let request = division_preflight(n, d, q).unwrap();
+    knuth_div_wrapper_static::<N>(n, d, q, request)
+}
+
+fn forced_bz_div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
+    let request = division_preflight(n, d, q).unwrap();
+    bz_div_wrapper_static::<N>(n, d, q, request)
+}
+
+fn forced_nr_div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
+    let request = division_preflight(n, d, q).unwrap();
+    nr_div_wrapper_static::<N>(n, d, q, request)
+}
+
+fn forced_knuth_div_rem_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) -> u64 {
+    let request = division_preflight(n, d, q).unwrap();
+    knuth_div_rem_wrapper_static::<N>(n, d, q, request)
+}
+
+fn forced_bz_div_rem_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) -> u64 {
+    let request = division_preflight(n, d, q).unwrap();
+    bz_div_rem_wrapper_static::<N>(n, d, q, request)
+}
+
+fn forced_nr_div_rem_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) -> u64 {
+    let request = division_preflight(n, d, q).unwrap();
+    nr_div_rem_wrapper_static::<N>(n, d, q, request)
+}
+
+fn exercise_body_overflow_contract<const N: usize>(case: &str, n: &[u64], d: &[u64]) {
+    let body_len = div_quotient_len(n.len(), d.len());
+    let mut expected_body = vec![0; body_len];
+    let expected_overflow = forced_knuth_div_dyn(n, d, &mut expected_body);
+
+    let dyn_divs: [(&str, fn(&[u64], &[u64], &mut [u64]) -> u64); 4] = [
+        ("Knuth dyn", forced_knuth_div_dyn),
+        ("Burnikel-Ziegler dyn", forced_bz_div_dyn),
+        ("Newton-Raphson dyn", forced_nr_div_dyn),
         ("dispatched dyn", div_dyn),
     ];
-    let dyn_div_rems: [(&str, fn(&mut [u64], &[u64], &mut [u64])); 4] = [
-        ("Knuth div-rem dyn", knuth_div_rem_dyn),
-        ("Burnikel-Ziegler div-rem dyn", bz_div_rem_dyn),
-        ("Newton-Raphson div-rem dyn", nr_div_rem_dyn),
-        ("dispatched div-rem dyn", div_rem_dyn),
-    ];
-    let static_divs: [(&str, fn(&[u64], &[u64], &mut [u64])); 4] = [
-        ("Knuth static", knuth_div_static::<N>),
-        ("Burnikel-Ziegler static", bz_div_static::<N>),
-        ("Newton-Raphson static", nr_div_static::<N>),
+    for (name, divide) in dyn_divs {
+        let mut q = vec![u64::MAX; body_len];
+        let overflow = divide(n, d, &mut q);
+        assert_eq!(q, expected_body, "{case}, {name}: quotient body");
+        assert_eq!(overflow, expected_overflow, "{case}, {name}: overflow");
+
+        let mut q = vec![u64::MAX; body_len + 3];
+        assert_eq!(divide(n, d, &mut q), 0, "{case}, {name}: absorbed return");
+        assert_eq!(
+            &q[..body_len],
+            &expected_body,
+            "{case}, {name}: absorbed body"
+        );
+        assert_eq!(
+            q[body_len], expected_overflow,
+            "{case}, {name}: absorbed limb"
+        );
+        assert!(q[body_len + 1..].iter().all(|&limb| limb == 0));
+    }
+
+    let static_divs: [(&str, fn(&[u64], &[u64], &mut [u64]) -> u64); 4] = [
+        ("Knuth static", forced_knuth_div_static::<N>),
+        ("Burnikel-Ziegler static", forced_bz_div_static::<N>),
+        ("Newton-Raphson static", forced_nr_div_static::<N>),
         ("dispatched static", div_static::<N>),
     ];
-    let static_div_rems: [(&str, fn(&mut [u64], &[u64], &mut [u64])); 4] = [
-        ("Knuth div-rem static", knuth_div_rem_static::<N>),
-        ("Burnikel-Ziegler div-rem static", bz_div_rem_static::<N>),
-        ("Newton-Raphson div-rem static", nr_div_rem_static::<N>),
+    for (name, divide) in static_divs {
+        let mut q = vec![u64::MAX; body_len];
+        let overflow = divide(n, d, &mut q);
+        assert_eq!(q, expected_body, "{case}, {name}: quotient body");
+        assert_eq!(overflow, expected_overflow, "{case}, {name}: overflow");
+
+        let mut q = vec![u64::MAX; body_len + 3];
+        assert_eq!(divide(n, d, &mut q), 0, "{case}, {name}: absorbed return");
+        assert_eq!(
+            &q[..body_len],
+            &expected_body,
+            "{case}, {name}: absorbed body"
+        );
+        assert_eq!(
+            q[body_len], expected_overflow,
+            "{case}, {name}: absorbed limb"
+        );
+        assert!(q[body_len + 1..].iter().all(|&limb| limb == 0));
+    }
+
+    let mut expected_rem = n.to_vec();
+    let mut expected_rem_q = vec![0; body_len];
+    let expected_rem_overflow = forced_knuth_div_rem_dyn(&mut expected_rem, d, &mut expected_rem_q);
+    assert_eq!(expected_rem_q, expected_body);
+    assert_eq!(expected_rem_overflow, expected_overflow);
+
+    let dyn_div_rems: [(&str, fn(&mut [u64], &[u64], &mut [u64]) -> u64); 4] = [
+        ("Knuth div-rem dyn", forced_knuth_div_rem_dyn),
+        ("Burnikel-Ziegler div-rem dyn", forced_bz_div_rem_dyn),
+        ("Newton-Raphson div-rem dyn", forced_nr_div_rem_dyn),
+        ("dispatched div-rem dyn", div_rem_dyn),
+    ];
+    for (name, divide) in dyn_div_rems {
+        let mut rem = n.to_vec();
+        let mut q = vec![u64::MAX; body_len];
+        let overflow = divide(&mut rem, d, &mut q);
+        assert_eq!(q, expected_body, "{case}, {name}: quotient body");
+        assert_eq!(overflow, expected_overflow, "{case}, {name}: overflow");
+        assert_eq!(rem, expected_rem, "{case}, {name}: remainder");
+
+        let mut rem = n.to_vec();
+        let mut q = vec![u64::MAX; body_len + 3];
+        assert_eq!(
+            divide(&mut rem, d, &mut q),
+            0,
+            "{case}, {name}: absorbed return"
+        );
+        assert_eq!(&q[..body_len], &expected_body);
+        assert_eq!(q[body_len], expected_overflow);
+        assert!(q[body_len + 1..].iter().all(|&limb| limb == 0));
+        assert_eq!(rem, expected_rem, "{case}, {name}: absorbed remainder");
+    }
+
+    let static_div_rems: [(&str, fn(&mut [u64], &[u64], &mut [u64]) -> u64); 4] = [
+        ("Knuth div-rem static", forced_knuth_div_rem_static::<N>),
+        (
+            "Burnikel-Ziegler div-rem static",
+            forced_bz_div_rem_static::<N>,
+        ),
+        (
+            "Newton-Raphson div-rem static",
+            forced_nr_div_rem_static::<N>,
+        ),
         ("dispatched div-rem static", div_rem_static::<N>),
     ];
+    for (name, divide) in static_div_rems {
+        let mut rem = n.to_vec();
+        let mut q = vec![u64::MAX; body_len];
+        let overflow = divide(&mut rem, d, &mut q);
+        assert_eq!(q, expected_body, "{case}, {name}: quotient body");
+        assert_eq!(overflow, expected_overflow, "{case}, {name}: overflow");
+        assert_eq!(rem, expected_rem, "{case}, {name}: remainder");
 
-    for &q_len in q_lengths {
-        let expected = high_division_reference(n, d, q_len);
-
-        for (algorithm, divide) in dyn_divs {
-            let n_input = n.to_vec();
-            let d_input = d.to_vec();
-            let mut q = vec![0xa5a5_a5a5_a5a5_a5a5; q_len];
-            divide(&n_input, &d_input, &mut q);
-            assert_eq!(q, expected.q, "{case}, q_len={q_len}, {algorithm}");
-            assert_eq!(n_input, n, "{case}, q_len={q_len}, {algorithm}: n changed");
-            assert_eq!(d_input, d, "{case}, q_len={q_len}, {algorithm}: d changed");
-        }
-
-        for (algorithm, divide) in dyn_div_rems {
-            let mut residual = n.to_vec();
-            let d_input = d.to_vec();
-            let mut q = vec![0xa5a5_a5a5_a5a5_a5a5; q_len];
-            divide(&mut residual, &d_input, &mut q);
-            assert_high_division_result(
-                &format!("{case}, q_len={q_len}, {algorithm}"),
-                n,
-                d,
-                &q,
-                &residual,
-                &expected,
-            );
-            assert_eq!(d_input, d, "{case}, q_len={q_len}, {algorithm}: d changed");
-        }
-
-        for (algorithm, divide) in static_divs {
-            let n_input = n.to_vec();
-            let d_input = d.to_vec();
-            let mut q = vec![0xa5a5_a5a5_a5a5_a5a5; q_len];
-            divide(&n_input, &d_input, &mut q);
-            assert_eq!(q, expected.q, "{case}, q_len={q_len}, {algorithm}");
-            assert_eq!(n_input, n, "{case}, q_len={q_len}, {algorithm}: n changed");
-            assert_eq!(d_input, d, "{case}, q_len={q_len}, {algorithm}: d changed");
-        }
-
-        for (algorithm, divide) in static_div_rems {
-            let mut residual = n.to_vec();
-            let d_input = d.to_vec();
-            let mut q = vec![0xa5a5_a5a5_a5a5_a5a5; q_len];
-            divide(&mut residual, &d_input, &mut q);
-            assert_high_division_result(
-                &format!("{case}, q_len={q_len}, {algorithm}"),
-                n,
-                d,
-                &q,
-                &residual,
-                &expected,
-            );
-            assert_eq!(d_input, d, "{case}, q_len={q_len}, {algorithm}: d changed");
-        }
+        let mut rem = n.to_vec();
+        let mut q = vec![u64::MAX; body_len + 3];
+        assert_eq!(
+            divide(&mut rem, d, &mut q),
+            0,
+            "{case}, {name}: absorbed return"
+        );
+        assert_eq!(&q[..body_len], &expected_body);
+        assert_eq!(q[body_len], expected_overflow);
+        assert!(q[body_len + 1..].iter().all(|&limb| limb == 0));
+        assert_eq!(rem, expected_rem, "{case}, {name}: absorbed remainder");
     }
+
+    for k in 0..body_len {
+        let mut q = vec![u64::MAX; k];
+        let overflow = short_div_dyn(n, d, &mut q);
+        assert_eq!(q, expected_body[body_len - k..], "{case}: short dyn k={k}");
+        assert_eq!(
+            overflow, expected_overflow,
+            "{case}: short dyn overflow k={k}"
+        );
+
+        let mut q_static = vec![u64::MAX; k];
+        let static_overflow = short_div_static::<N>(n, d, &mut q_static);
+        assert_eq!(q_static, q, "{case}: short static k={k}");
+        assert_eq!(
+            static_overflow, overflow,
+            "{case}: short static overflow k={k}"
+        );
+    }
+
+    let mut exact = vec![u64::MAX; body_len];
+    assert_eq!(short_div_dyn(n, d, &mut exact), expected_overflow);
+    assert_eq!(exact, expected_body);
+
+    let mut oversized = vec![u64::MAX; body_len + 2];
+    assert_eq!(short_div_dyn(n, d, &mut oversized), 0);
+    assert_eq!(&oversized[..body_len], &expected_body);
+    assert_eq!(oversized[body_len], expected_overflow);
+    assert_eq!(oversized[body_len + 1], 0);
+
+    let mut exact_static = vec![u64::MAX; body_len];
+    assert_eq!(
+        short_div_static::<N>(n, d, &mut exact_static),
+        expected_overflow
+    );
+    assert_eq!(exact_static, expected_body);
+
+    let mut oversized_static = vec![u64::MAX; body_len + 2];
+    assert_eq!(short_div_static::<N>(n, d, &mut oversized_static), 0);
+    assert_eq!(&oversized_static[..body_len], &expected_body);
+    assert_eq!(oversized_static[body_len], expected_overflow);
+    assert_eq!(oversized_static[body_len + 1], 0);
 }
 
 #[test]
-fn test_high_quotient_entry_contract_matrix() {
+fn test_division_body_overflow_contract_matrix() {
     const N: usize = 128;
     let mut d = rand_nonzero_vec(BZ_CUTOFF + 5, 13_300);
     d[0] = 0;
     d[1] = 0;
     *d.last_mut().unwrap() |= 1 << 63;
-
     let mut n = rand_nonzero_vec(d.len() + 20, 13_301);
     *n.last_mut().unwrap() = u64::MAX;
-    let full_q_len = div_quotient_len(n.len(), d.len());
-    assert_eq!(full_q_len, 21);
 
-    let q_lengths = [
-        0,
-        1,
-        8,
-        full_q_len / 2,
-        full_q_len - 1,
-        full_q_len,
-        full_q_len + 2,
-    ];
-    exercise_high_division_entry_matrix::<N>("large factored divisor", &n, &d, &q_lengths);
+    exercise_body_overflow_contract::<N>("large factored divisor", &n, &d);
+    exercise_body_overflow_contract::<8>("one-limb divisor", &[u64::MAX, 2, 7, 11, 3], &[19]);
+    exercise_body_overflow_contract::<4>("nonzero low divisor limb", &[0, 0, 2], &[1, 1]);
 }
 
 #[test]
-fn test_high_quotient_equal_length_smaller_numerator() {
-    const N: usize = 8;
+fn test_equal_and_shorter_division_shapes() {
+    let equal_n = [7, 8, 9, 10];
+    let equal_d = equal_n;
+    let mut q = [];
+    assert_eq!(div_dyn(&equal_n, &equal_d, &mut q), 1);
+    let mut rem = equal_n;
+    assert_eq!(div_rem_dyn(&mut rem, &equal_d, &mut q), 1);
+    assert!(rem.iter().all(|&limb| limb == 0));
+
+    let wide_n = [u64::MAX, u64::MAX];
+    let wide_d = [1, 1];
+    assert_eq!(div_dyn(&wide_n, &wide_d, &mut []), u64::MAX);
+    assert_eq!(div_static::<2>(&wide_n, &wide_d, &mut []), u64::MAX);
+    let mut wide_rem = wide_n;
+    assert_eq!(div_rem_dyn(&mut wide_rem, &wide_d, &mut []), u64::MAX);
+    assert_eq!(wide_rem, [0, 0]);
+
+    let mut absorbed = [u64::MAX; 2];
+    assert_eq!(div_dyn(&wide_n, &wide_d, &mut absorbed), 0);
+    assert_eq!(absorbed, [u64::MAX, 0]);
+
     let n = [11, 22, 33, 4];
     let d = [0, 44, 55, 5];
-    assert!(cmp_buf(&n, &d).is_lt());
-    assert_eq!(div_quotient_len(n.len(), d.len()), 1);
+    let mut oversized = [u64::MAX; 3];
+    assert_eq!(div_dyn(&n, &d, &mut oversized), 0);
+    assert_eq!(oversized, [0; 3]);
+    let mut rem = n;
+    assert_eq!(div_rem_dyn(&mut rem, &d, &mut oversized), 0);
+    assert_eq!(rem, n);
 
-    exercise_high_division_entry_matrix::<N>("equal-length n < d", &n, &d, &[0, 1, 3]);
+    let shorter = [u64::MAX];
+    let longer = [0, 1];
+    assert_eq!(short_div_dyn(&shorter, &longer, &mut []), 0);
 }
 
 #[test]
-fn test_high_quotient_cropped_window_below_divisor() {
-    let n = [7, 1, 9];
-    let d = [5, 10];
-    assert!(cmp_buf(&n, &d).is_gt());
-    assert!(cmp_buf(&n[1..], &d).is_lt());
+#[cfg(debug_assertions)]
+fn test_standard_division_rejects_undersized_body() {
+    let n = [1, 2, 3];
+    let d = [7];
+    let result = std::panic::catch_unwind(|| {
+        let mut q = [0; 1];
+        div_dyn(&n, &d, &mut q);
+    });
+    assert!(result.is_err());
 
-    // The original division is nondegenerate, but its requested top
-    // structural quotient limb is zero. The wrapper must pass that cropped
-    // window to the rigid algorithm without changing the partial residual.
-    exercise_high_division_entry_matrix::<4>("cropped window below divisor", &n, &d, &[1]);
-
-    // Factoring the divisor's exact B^2 term makes both rigid operands fit N,
-    // even though the original numerator and divisor exceed it.
-    exercise_high_division_entry_matrix::<2>(
-        "factored cropped window fits static capacity",
-        &[7, 8, 9, 10, 11],
-        &[0, 0, 5],
-        &[1],
-    );
+    let result = std::panic::catch_unwind(|| {
+        let mut n = n;
+        let mut q = [0; 1];
+        div_rem_static::<4>(&mut n, &d, &mut q);
+    });
+    assert!(result.is_err());
 }
 
 #[test]
-fn test_high_quotient_boundary_shapes() {
-    // Dropping a nonzero low divisor limb would incorrectly turn this top
-    // quotient digit from 1 into 2.
-    exercise_high_division_entry_matrix::<4>("nonzero low divisor limb", &[0, 0, 2], &[1, 1], &[1]);
-
-    exercise_high_division_entry_matrix::<8>(
-        "one-limb divisor",
-        &[u64::MAX, 2, 0, 7, 11, 3],
-        &[19],
-        &[0, 1, 3, 6, 8],
-    );
-
-    exercise_high_division_entry_matrix::<4>("shorter numerator", &[u64::MAX], &[0, 1], &[0, 1, 3]);
-}
-
-#[test]
-fn test_high_quotient_static_capacity_uses_prepared_window() {
-    const N: usize = 16;
+fn test_short_division_static_capacity_uses_prepared_window() {
+    const N: usize = 17;
     let d = rand_nonzero_vec(12, 13_400);
     let n = rand_nonzero_vec(80, 13_401);
-    assert!(n.len() > N);
+    let body_len = div_quotient_len(n.len(), d.len());
+    let mut full_body = vec![0; body_len];
+    let expected_overflow = div_dyn(&n, &d, &mut full_body);
 
-    // The original numerator exceeds N, but each rigid high-quotient window
-    // has only d.len()+q.len()-1 limbs and fits the static scratch arrays.
-    exercise_high_division_entry_matrix::<N>("trimmed static capacity", &n, &d, &[1, 5]);
+    let mut q = [0; 5];
+    let overflow = short_div_static::<N>(&n, &d, &mut q);
+    assert_eq!(&q, &full_body[body_len - q.len()..]);
+    assert_eq!(overflow, expected_overflow);
 }
 
 #[test]
@@ -547,7 +599,7 @@ fn test_forced_division_entry_matrix_dyn_and_static() {
     const N: usize = 256;
     let d = rand_nonzero_vec(BZ_CUTOFF + 5, 13_000);
     let n = rand_nonzero_vec(d.len() + 71, 13_001);
-    let q_len = div_quotient_len(n.len(), d.len());
+    let q_len = div_quotient_len(n.len(), d.len()) + 1;
 
     let mut expected_r = n.clone();
     let mut expected_q = vec![0u64; q_len];
@@ -665,8 +717,9 @@ fn run_knuth_div_buf_of(n: &[u64], d: &[u64]) -> (Vec<u64>, Vec<u64>) {
     shl_buf(&mut d_work, sh);
     let mut of = shl_buf(&mut n_work, sh);
 
-    let mut q = vec![0u64; n_work.len() - d_work.len() + 1];
-    div_buf_of(&mut n_work, &mut of, &d_work, &mut q);
+    let mut q = vec![0u64; n_work.len() - d_work.len()];
+    let quotient_overflow = div_buf_of(&mut n_work, &mut of, &d_work, &mut q);
+    q.push(quotient_overflow);
     assert_eq!(of, 0, "Knuth remainder overflow limb should be zero");
     shr_buf(&mut n_work, sh);
 

@@ -474,7 +474,7 @@ impl<const N: usize> DivRem for BitIntStatic<N> {
         let d_len = buf_len(&rhs.data);
         let mut q = [0; N];
         let q_len = div_quotient_len(n_len, d_len);
-        div_rem_static::<N>(&mut n[..n_len], &rhs.data[..d_len], &mut q[..q_len]);
+        div_rem_static::<N>(&mut n[..n_len], &rhs.data[..d_len], &mut q[..q_len + 1]);
         (
             BitIntStatic {
                 data: q,
@@ -497,7 +497,7 @@ impl<const N: usize> DivRem<i128> for BitIntStatic<N> {
         let d = SmallBuf::from(rhs.unsigned());
         let mut q = [0; N];
         let q_len = div_quotient_len(n_len, d.len());
-        div_rem_static::<N>(&mut n[..n_len], &d, &mut q[..q_len]);
+        div_rem_static::<N>(&mut n[..n_len], &d, &mut q[..q_len + 1]);
         let rem_u128: u128 = SmallBuf::try_from(&n[..2]).ok().unwrap().into();
         (
             BitIntStatic {
