@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
-// Re-enable with the sqrt module after its division-call migration.
-// use big_bits::utils::sqrt::binom_sqrt;
+use big_bits::utils::sqrt::{binom_sqrt, zimmerman_sqrt_dyn, zimmerman_sqrt_static};
 use big_bits::{utils::div::*, *};
 use criterion::{
     black_box, criterion_group, criterion_main, measurement::WallTime, BatchSize, BenchmarkGroup,
@@ -639,41 +638,74 @@ fn bench_rcp_setup(c: &mut Criterion) {
     group.finish();
 }
 
-/*
-fn bench_binom_sqrt(c: &mut Criterion) {
-    let mut group = c.benchmark_group(format!("binom_sqrt/{ARCH}"));
+fn register_sqrt_size<const N: usize>(group: &mut BenchmarkGroup<'_, WallTime>, root_len: usize) {
+    let x_len = 2 * root_len;
+    assert_eq!(N, x_len);
+    let input = random_normalized_limbs(x_len);
+    group.throughput(Throughput::Elements(x_len as u64));
+
+    group.bench_with_input(
+        BenchmarkId::new("binom", root_len),
+        &root_len,
+        |bench, _| {
+            bench.iter_batched_ref(
+                || (input.clone(), vec![0; root_len]),
+                |data| {
+                    let (x, root) = data;
+                    binom_sqrt(black_box(x.as_mut_slice()), black_box(root.as_mut_slice()))
+                },
+                BatchSize::LargeInput,
+            );
+        },
+    );
+
+    group.bench_with_input(
+        BenchmarkId::new("zimmermann_dyn", root_len),
+        &root_len,
+        |bench, _| {
+            bench.iter_batched_ref(
+                || (input.clone(), vec![0; root_len]),
+                |data| {
+                    let (x, root) = data;
+                    zimmerman_sqrt_dyn(black_box(x.as_mut_slice()), black_box(root.as_mut_slice()))
+                },
+                BatchSize::LargeInput,
+            );
+        },
+    );
+
+    group.bench_with_input(
+        BenchmarkId::new(format!("zimmermann_static_n{N}"), root_len),
+        &root_len,
+        |bench, _| {
+            bench.iter_batched_ref(
+                || (input.clone(), vec![0; root_len]),
+                |data| {
+                    let (x, root) = data;
+                    zimmerman_sqrt_static::<N>(
+                        black_box(x.as_mut_slice()),
+                        black_box(root.as_mut_slice()),
+                    )
+                },
+                BatchSize::LargeInput,
+            );
+        },
+    );
+}
+
+fn bench_zimmermann_sqrt(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("zimmermann_sqrt/{ARCH}"));
     set_up_group(&mut group);
 
-    for root_len in [4usize, 16, 64, 256] {
-        group.throughput(Throughput::Elements(root_len as u64));
-
-        for (shape, x_len) in [
-            ("min_x_eq_s_plus_1", root_len + 1),
-            ("mid_x_eq_3s_over_2", root_len + root_len / 2),
-            ("full_x_eq_2s", 2 * root_len),
-        ] {
-            let input = random_normalized_limbs(x_len);
-            group.bench_with_input(
-                BenchmarkId::new(shape, root_len),
-                &root_len,
-                |bench, &root_len| {
-                    bench.iter_batched_ref(
-                        || (input.clone(), vec![0; root_len]),
-                        |data| {
-                            let (x, root) = data;
-                            binom_sqrt(black_box(x.as_mut_slice()), black_box(root.as_mut_slice()))
-                        },
-                        BatchSize::LargeInput,
-                    );
-                },
-            );
-        }
-    }
-
+    register_sqrt_size::<32>(&mut group, 16);
+    register_sqrt_size::<64>(&mut group, 32);
+    register_sqrt_size::<128>(&mut group, 64);
+    register_sqrt_size::<256>(&mut group, 128);
+    register_sqrt_size::<512>(&mut group, 256);
+    register_sqrt_size::<1024>(&mut group, 512);
     group.finish();
 }
-*/
 
-criterion_group!(benches, bench_knuth_div);
+criterion_group!(benches, bench_zimmermann_sqrt);
 
 criterion_main!(benches);

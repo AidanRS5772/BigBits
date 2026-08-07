@@ -1,6 +1,6 @@
 use super::{mul_ref, rand_vec};
 use crate::utils::sqrt::{binom_sqrt, zimmerman_sqrt_dyn, zimmerman_sqrt_static};
-use crate::utils::utils::{cmp_buf, eq_buf, inc_buf, sub_buf};
+use crate::utils::utils::{add_buf, cmp_buf, dec_buf, eq_buf, inc_buf, sub_buf};
 
 /// Verify both outputs for
 /// `shifted_x = x * B^(2 * root.len() - x.len()) = root^2 + remainder`.
@@ -49,6 +49,20 @@ fn assert_sqrt_contract_with(x: &[u64], root_len: usize, sqrt_alg: fn(&mut [u64]
 
 fn assert_sqrt_contract(x: &[u64], root_len: usize) {
     assert_sqrt_contract_with(x, root_len, binom_sqrt);
+}
+
+fn assert_zimmerman_contract(x: &[u64], root_len: usize) {
+    assert_sqrt_contract_with(x, root_len, zimmerman_sqrt_dyn);
+    assert_sqrt_contract_with(x, root_len, zimmerman_sqrt_static::<256>);
+
+    let mut dyn_work = x.to_vec();
+    let mut static_work = x.to_vec();
+    let mut dyn_root = vec![u64::MAX; root_len];
+    let mut static_root = vec![u64::MAX; root_len];
+    zimmerman_sqrt_dyn(&mut dyn_work, &mut dyn_root);
+    zimmerman_sqrt_static::<256>(&mut static_work, &mut static_root);
+    assert_eq!(dyn_root, static_root, "root mismatch for x={x:#x?}");
+    assert_eq!(dyn_work, static_work, "remainder mismatch for x={x:#x?}");
 }
 
 #[test]
@@ -159,6 +173,92 @@ fn test_zimmerman_sqrt_static_full_and_virtually_padded_inputs() {
 }
 
 #[test]
+fn test_zimmerman_sqrt_all_input_shapes_around_cutoff() {
+    for root_len in [49usize, 50, 51] {
+        for x_len in root_len + 1..=2 * root_len {
+            let seed = 50_000 + 1_000 * root_len as u64 + x_len as u64;
+            let mut x = rand_vec(x_len, seed);
+            x[x_len - 1] = match (x_len - root_len) % 3 {
+                0 => 1,
+                1 => x[x_len - 1] | (1 << 61),
+                _ => x[x_len - 1] | (1 << 63),
+            };
+            assert_zimmerman_contract(&x, root_len);
+        }
+    }
+}
+
+#[test]
+fn test_zimmerman_sqrt_deeper_recursion_boundaries() {
+    for root_len in [99usize, 100, 101] {
+        let mut x_lens = vec![
+            root_len + 1,
+            root_len + 2,
+            3 * root_len / 2,
+            2 * root_len - 1,
+            2 * root_len,
+        ];
+        x_lens.sort_unstable();
+        x_lens.dedup();
+
+        for x_len in x_lens {
+            let seed = 60_000 + 1_000 * root_len as u64 + x_len as u64;
+            let mut x = rand_vec(x_len, seed);
+            x[x_len - 1] |= 1 << 63;
+            assert_zimmerman_contract(&x, root_len);
+        }
+    }
+}
+
+#[test]
+fn test_zimmerman_sqrt_perfect_squares_with_virtual_padding() {
+    for root_len in [50usize, 51, 100] {
+        for x_len in [
+            root_len + 1,
+            root_len + 2,
+            3 * root_len / 2,
+            2 * root_len - 1,
+            2 * root_len,
+        ] {
+            let shift = 2 * root_len - x_len;
+            let mut root = rand_vec(root_len, 70_000 + 1_000 * root_len as u64 + x_len as u64);
+            root[..shift.div_ceil(2)].fill(0);
+            root[root_len - 1] |= 1 << 63;
+
+            let square = mul_ref(&root, &root);
+            assert_eq!(square.len(), 2 * root_len);
+            assert!(square[..shift].iter().all(|&limb| limb == 0));
+            assert_zimmerman_contract(&square[shift..], root_len);
+        }
+    }
+}
+
+#[test]
+fn test_zimmerman_sqrt_values_around_square_boundaries() {
+    for root_len in [50usize, 51, 100] {
+        let mut root = rand_vec(root_len, 80_000 + root_len as u64);
+        root[root_len - 1] = 1 << 63;
+        let square = mul_ref(&root, &root);
+        assert_eq!(square.len(), 2 * root_len);
+
+        let mut below_square = square.clone();
+        assert!(!dec_buf(&mut below_square));
+
+        let mut below_next_square = square.clone();
+        assert!(!add_buf(&mut below_next_square, &root));
+        assert!(!add_buf(&mut below_next_square, &root));
+
+        let mut next_square = below_next_square.clone();
+        assert!(!inc_buf(&mut next_square));
+
+        for x in [&below_square, &square, &below_next_square, &next_square] {
+            assert_zimmerman_contract(x, root_len);
+        }
+    }
+}
+
+#[test]
+#[cfg(debug_assertions)]
 #[should_panic(expected = "Zimmermann sqrt operands exceed static capacity")]
 fn test_zimmerman_sqrt_static_rejects_insufficient_capacity() {
     let root_len = 50;

@@ -2,8 +2,7 @@ use std::cell::RefCell;
 
 pub mod div;
 pub mod mul;
-// Re-enable after sqrt is migrated to the division overflow-return contract.
-// pub mod sqrt;
+pub mod sqrt;
 pub mod utils;
 
 pub const CHUNKING_KARATSUBA_CUTOFF: usize = 22;
@@ -53,6 +52,8 @@ pub const STATIC_DIV_REM_KARATSUBA_NR_BZ_CUTOFF: f64 = 0.82;
 pub const STATIC_DIV_REM_NTT_NR_BZ_CUTOFF: f64 = 10.5;
 
 pub const STATIC_RCP_KNUTH_NR_CUTOFF: usize = 100;
+
+pub const ZIMMERMAN_SQRT_CUTOFF: usize = 17;
 
 thread_local! {
     static SCRATCH_POOL: RefCell<Vec<Vec<u64>>> = RefCell::new(Vec::new());

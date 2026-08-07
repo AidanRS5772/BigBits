@@ -2,11 +2,11 @@ use crate::utils::{
     div::{div_rem_dyn, div_rem_static, knuth_est, mul_u64_asm},
     mul::{sqr_dyn, sqr_static},
     utils::{add_buf, add_prim, buf_len, cmp_buf, combine_u64, dec_buf, shl_buf, shr_buf, sub_buf},
-    ScratchGuard,
+    ScratchGuard, ZIMMERMAN_SQRT_CUTOFF,
 };
 
 #[inline]
-fn correct_sqrt(x: &mut [u64], s: &[u64], q_sqr: &[u64]) -> bool {
+pub fn correct_sqrt(x: &mut [u64], s: &[u64], q_sqr: &[u64]) -> bool {
     let c = sub_buf(x, q_sqr);
     if c {
         add_buf(x, s);
@@ -179,9 +179,7 @@ pub fn binom_sqrt(x: &mut [u64], s: &mut [u64]) {
     sqrt_denormalization(x, s, sh);
 }
 
-const ZIMMERMAN_SQRT_CUTOFF: usize = 50;
-
-fn reduce_sqrt_rem(sqrt_r: &mut [u64], s_hi: &[u64]) -> (bool, bool) {
+pub fn reduce_sqrt_rem(sqrt_r: &mut [u64], s_hi: &[u64]) -> (bool, bool) {
     let reduced = cmp_buf(sqrt_r, s_hi).is_ge();
     let saturated = if reduced {
         sub_buf(sqrt_r, s_hi);
@@ -195,7 +193,7 @@ fn reduce_sqrt_rem(sqrt_r: &mut [u64], s_hi: &[u64]) -> (bool, bool) {
 fn zimmermann_sqrt_core(
     x: &mut [u64],
     s: &mut [u64],
-    div_rem_alg: &mut dyn FnMut(&mut [u64], &[u64], &mut [u64]),
+    div_rem_alg: &mut dyn FnMut(&mut [u64], &[u64], &mut [u64]) -> u64,
     sqr_alg: &mut dyn FnMut(&[u64], &mut [u64]) -> u64,
 ) {
     debug_assert_eq!(x.len(), 2 * s.len());
@@ -212,28 +210,71 @@ fn zimmermann_sqrt_core(
     if saturated {
         let rem = &mut x[..s_len + 1];
         rem[2 * lo..].fill(0);
-
         add_buf(&mut rem[lo..], s_hi);
         add_buf(&mut rem[lo..], s_hi);
         s_lo.fill(u64::MAX);
     } else {
-        let (d, q_space) = x[lo..].split_at_mut(s_len);
-        let q = &mut q_space[..lo + 1];
-        let d_len = buf_len(d);
-        div_rem_alg(&mut d[..d_len], s_hi, q);
-        if shr_buf(q, 1) != 0 {
-            add_buf(d, s_hi);
+        let d_len = buf_len(&x[..s_len + lo]);
+        let overflow = div_rem_alg(&mut x[lo..d_len], s_hi, s_lo);
+        debug_assert_eq!(overflow, 0, "Zimmermann quotient exceeded low half");
+        if shr_buf(s_lo, 1) != 0 {
+            add_buf(&mut x[lo..], s_hi);
         }
         if reduced {
-            q[lo - 1] |= 1 << 63;
+            s_lo[lo - 1] |= 1 << 63;
         }
-        s_lo.copy_from_slice(&q[..lo]);
     }
 
-    let (rem, square_space) = x.split_at_mut(s_len + 1);
-    let s_lo_sqr = &mut square_space[..2 * lo];
-    sqr_alg(s_lo, s_lo_sqr);
+    let (rem, s_lo_sqr) = x[..s_len + 2 * lo + 1].split_at_mut(s_len + 1);
+    let overflow = sqr_alg(s_lo, s_lo_sqr);
+    debug_assert_eq!(overflow, 0, "Zimmermann low square exceeded its buffer");
     if correct_sqrt(rem, s, s_lo_sqr) {
+        dec_buf(s);
+    }
+}
+
+fn zimmerman_sqrt_top(
+    x: &mut [u64],
+    s: &mut [u64],
+    s_lo_sqr: &mut [u64],
+    div_rem_alg: &mut dyn FnMut(&mut [u64], &[u64], &mut [u64]) -> u64,
+    sqr_alg: &mut dyn FnMut(&[u64], &mut [u64]) -> u64,
+) {
+    let x_len = x.len();
+    let s_len = s.len();
+    let hi = x_len / 2;
+    let lo = s_len - hi;
+    let (s_lo, s_hi) = s.split_at_mut(lo);
+    let x_lo = x_len % 2;
+    zimmermann_sqrt_core(&mut x[x_lo..], s_hi, div_rem_alg, sqr_alg);
+    x[x_lo + hi + 1..].fill(0);
+    let (reduced, saturated) = reduce_sqrt_rem(&mut x[x_lo..hi + x_lo + 1], s_hi);
+
+    x.copy_within(..hi + x_lo + 1, lo - x_lo);
+    x[..lo - x_lo].fill(0);
+
+    if saturated {
+        x[lo..].fill(0);
+        add_buf(x, s_hi);
+        add_buf(x, s_hi);
+        s_lo.fill(u64::MAX);
+    } else {
+        let u_len = buf_len(&x);
+        let overflow = div_rem_alg(&mut x[..u_len], s_hi, s_lo);
+        debug_assert_eq!(overflow, 0, "Zimmermann quotient exceeded low half");
+        if shr_buf(s_lo, 1) != 0 {
+            add_buf(x, s_hi);
+        }
+        if reduced {
+            s_lo[lo - 1] |= 1 << 63;
+        }
+    }
+
+    x.copy_within(..x_len - lo, lo);
+    x[..lo].fill(0);
+    let overflow = sqr_alg(s_lo, s_lo_sqr);
+    debug_assert_eq!(overflow, 0, "Zimmermann low square exceeded its buffer");
+    if correct_sqrt(x, s, s_lo_sqr) {
         dec_buf(s);
     }
 }
@@ -261,30 +302,80 @@ pub fn zimmerman_sqrt_dyn(x: &mut [u64], s: &mut [u64]) {
         zimmermann_sqrt_core(x, s, &mut div_rem, &mut sqr);
         x[s_len + 1..].fill(0);
     } else {
-        let hi = x_len / 2;
-        let lo = s_len - hi;
-        let (s_lo, s_hi) = s.split_at_mut(lo);
-        let x_lo = x_len % 2;
-        zimmermann_sqrt_core(&mut x[x_lo..], s_hi, &mut div_rem, &mut sqr);
-        let (reduced, saturated) = reduce_sqrt_rem(&mut x[x_lo..hi + x_lo + 1], s_hi);
-
         let mut gaurd = ScratchGuard::acquire();
-
-        if saturated {
-        } else {
-            x.copy_within(..hi + x_lo + 1, lo - x_lo);
-            x[..lo - x_lo].fill(0);
-            let u_len = buf_len(&x);
-            let q = gaurd.get(lo + 1);
-            div_rem_dyn(&mut x[..u_len], s_hi, q);
-            if shr_buf(q, 1) != 0{
-                add_buf(x, s_hi);
-            }
-            if reduced {
-                
-            }
-        }
+        let s_lo_sqr = gaurd.get(2 * (s_len - x_len / 2));
+        zimmerman_sqrt_top(x, s, s_lo_sqr, &mut div_rem, &mut sqr);
     }
 
     sqrt_denormalization(x, s, sh);
+}
+
+pub fn zimmerman_sqrt_static<const N: usize>(x: &mut [u64], s: &mut [u64]) {
+    // assume correct size bounds
+    debug_assert!(x.len() > s.len());
+    debug_assert!(2 * s.len() >= x.len());
+    debug_assert!(
+        x.len() <= N && s.len() <= N,
+        "Zimmermann sqrt operands exceed static capacity"
+    );
+
+    if s.len() < ZIMMERMAN_SQRT_CUTOFF {
+        binom_sqrt(x, s);
+        return;
+    }
+
+    let x_len = x.len();
+    let s_len = s.len();
+    let full_len = 2 * s_len;
+    let sh = x[x_len - 1].leading_zeros() as u8 & !1_u8;
+    shl_buf(x, sh);
+
+    let mut div_rem = |n: &mut [u64], d: &[u64], q: &mut [u64]| div_rem_static::<N>(n, d, q);
+    let mut sqr = |value: &[u64], out: &mut [u64]| sqr_static::<N>(value, out);
+
+    if x_len == full_len {
+        zimmermann_sqrt_core(x, s, &mut div_rem, &mut sqr);
+        x[s_len + 1..].fill(0);
+    } else {
+        let mut s_lo_sqr = [0_u64; N];
+        zimmerman_sqrt_top(
+            x,
+            s,
+            &mut s_lo_sqr[..2 * (s_len - x_len / 2)],
+            &mut div_rem,
+            &mut sqr,
+        );
+    }
+
+    sqrt_denormalization(x, s, sh);
+}
+
+fn nr_seed(x: &[u64]) -> u64 {
+    let (mut x0, mut x1, mut x2, mut x3) = (
+        x[x.len() - 4],
+        x[x.len() - 3],
+        x[x.len() - 2],
+        x[x.len() - 1],
+    );
+    let (s0, s1) = sqrt_4x2(&mut x0, &mut x1, &mut x2, &mut x3);
+    let sh = s1.leading_zeros() as u8;
+    let mut seed_s = [s0, s1];
+}
+
+fn nr_sqrt(
+    x: &[u64],
+    s: &mut [u64],
+    mul_alg: &mut dyn FnMut(&mut [u64], &[u64], &mut [u64]) -> u64,
+    short_sqr_alg: &mut dyn FnMut(&[u64], &mut [u64]) -> u64,
+    mid_mul_alg: &mut dyn FnMut(&mut [u64], &[u64], &mut [u64]) -> u64,
+) {
+    debug_assert!(x.last().copied().unwrap().leading_zeros() <= 1);
+    let (mut x0, mut x1, mut x2, mut x3) = (
+        x[x.len() - 4],
+        x[x.len() - 3],
+        x[x.len() - 2],
+        x[x.len() - 1],
+    );
+    let (s0, s1) = sqrt_4x2(&mut x0, &mut x1, &mut x2, &mut x3);
+    let mut seed_s = [s0, s1];
 }

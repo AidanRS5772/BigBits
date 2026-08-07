@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use big_bits::utils::sqrt::{binom_sqrt_core, correct_sqrt, reduce_sqrt_rem};
 use big_bits::{utils::div::*, utils::*, *};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -1717,6 +1718,9 @@ fn register_reciprocal_scan(
 }
 
 fn bench_division_tuning(c: &mut Criterion) {
+    if env::var_os("SQRT_TUNE_FAMILY").is_some() {
+        return;
+    }
     let family = DivisionTuneFamily::from_env();
     let regime = env::var("DIV_TUNE_REGIME").unwrap_or_else(|_| "karatsuba".to_owned());
     let mut group = c.benchmark_group(format!("division_tuning/{ARCH}"));
@@ -1770,6 +1774,215 @@ fn bench_division_tuning(c: &mut Criterion) {
     group.finish();
 }
 
+// Zimmermann/binomial square-root cutoff tuning.
+//
+// Set:
+//   SQRT_TUNE_FAMILY=dyn|static (required, keeping the two runs independent)
+//   SQRT_TUNE_VALUES=comma-separated root lengths
+//
+// Each result encodes one-Zimmermann-descent runtime / binomial runtime as a
+// duration relative to 1.000 ms. Values below 1.000 ms favor descending.
+
+const SQRT_TUNE_CASES_PER_POINT: usize = 4;
+const SQRT_TUNE_STATIC_CAPACITY: usize = 512;
+const SQRT_TUNE_DEFAULT_LENGTHS: [usize; 17] = [
+    12, 14, 15, 16, 17, 18, 19, 20, 22, 24, 28, 32, 36, 40, 48, 56, 64,
+];
+
+#[derive(Clone, Copy)]
+enum SqrtTuneFamily {
+    Dyn,
+    Static,
+}
+
+impl SqrtTuneFamily {
+    fn label(self) -> String {
+        match self {
+            Self::Dyn => "dyn".to_owned(),
+            Self::Static => format!("static_n{SQRT_TUNE_STATIC_CAPACITY}"),
+        }
+    }
+}
+
+struct SqrtTuneInput {
+    x: Vec<u64>,
+    root_len: usize,
+}
+
+fn sqrt_tune_families() -> Vec<SqrtTuneFamily> {
+    match env::var("SQRT_TUNE_FAMILY")
+        .expect("SQRT_TUNE_FAMILY must be dyn or static")
+        .as_str()
+    {
+        "dyn" => vec![SqrtTuneFamily::Dyn],
+        "static" => vec![SqrtTuneFamily::Static],
+        other => panic!("unknown SQRT_TUNE_FAMILY={other}"),
+    }
+}
+
+fn make_sqrt_tune_inputs(root_len: usize) -> Vec<SqrtTuneInput> {
+    let mut rng =
+        StdRng::seed_from_u64(0x5351_5254_u64 ^ (root_len as u64).wrapping_mul(0x9e37_79b9));
+    (0..SQRT_TUNE_CASES_PER_POINT)
+        .map(|_| SqrtTuneInput {
+            x: random_normalized_limbs(2 * root_len, &mut rng),
+            root_len,
+        })
+        .collect()
+}
+
+fn zimmermann_one_descent_core(
+    x: &mut [u64],
+    s: &mut [u64],
+    div_rem_alg: &mut dyn FnMut(&mut [u64], &[u64], &mut [u64]) -> u64,
+    sqr_alg: &mut dyn FnMut(&[u64], &mut [u64]) -> u64,
+) {
+    debug_assert_eq!(x.len(), 2 * s.len());
+    let s_len = s.len();
+    let lo = (s_len - 1) / 2;
+    let (s_lo, s_hi) = s.split_at_mut(lo);
+
+    // This is the forced cutoff decision: descend exactly once, then solve the
+    // high half directly with the binomial algorithm.
+    binom_sqrt_core(&mut x[2 * lo..], s_hi);
+    let (reduced, saturated) = reduce_sqrt_rem(&mut x[2 * lo..s_len + lo + 1], s_hi);
+
+    if saturated {
+        let rem = &mut x[..s_len + 1];
+        rem[2 * lo..].fill(0);
+        add_buf(&mut rem[lo..], s_hi);
+        add_buf(&mut rem[lo..], s_hi);
+        s_lo.fill(u64::MAX);
+    } else {
+        let d_len = buf_len(&x[..s_len + lo]);
+        let overflow = div_rem_alg(&mut x[lo..d_len], s_hi, s_lo);
+        debug_assert_eq!(overflow, 0);
+        if shr_buf(s_lo, 1) != 0 {
+            add_buf(&mut x[lo..], s_hi);
+        }
+        if reduced {
+            s_lo[lo - 1] |= 1 << 63;
+        }
+    }
+
+    let (rem, s_lo_sqr) = x[..s_len + 2 * lo + 1].split_at_mut(s_len + 1);
+    let overflow = sqr_alg(s_lo, s_lo_sqr);
+    debug_assert_eq!(overflow, 0);
+    if correct_sqrt(rem, s, s_lo_sqr) {
+        dec_buf(s);
+    }
+}
+
+fn zimmermann_one_descent_dyn(x: &mut [u64], s: &mut [u64]) {
+    debug_assert!(x.last().is_some_and(|&top| top >= 1 << 62));
+    debug_assert_eq!(x.len(), 2 * s.len());
+    let mut div_rem = |n: &mut [u64], d: &[u64], q: &mut [u64]| div_rem_dyn(n, d, q);
+    let mut sqr = |value: &[u64], out: &mut [u64]| sqr_dyn(value, out);
+    zimmermann_one_descent_core(x, s, &mut div_rem, &mut sqr);
+    x[s.len() + 1..].fill(0);
+}
+
+fn zimmermann_one_descent_static<const N: usize>(x: &mut [u64], s: &mut [u64]) {
+    debug_assert!(x.last().is_some_and(|&top| top >= 1 << 62));
+    debug_assert_eq!(x.len(), 2 * s.len());
+    debug_assert!(x.len() <= N && s.len() <= N);
+    let mut div_rem = |n: &mut [u64], d: &[u64], q: &mut [u64]| div_rem_static::<N>(n, d, q);
+    let mut sqr = |value: &[u64], out: &mut [u64]| sqr_static::<N>(value, out);
+    zimmermann_one_descent_core(x, s, &mut div_rem, &mut sqr);
+    x[s.len() + 1..].fill(0);
+}
+
+fn sqrt_tuning_ratio_bench(
+    iters: u64,
+    inputs: &[SqrtTuneInput],
+    family: SqrtTuneFamily,
+) -> Duration {
+    alternating_ratio_bench(iters, inputs, |input, zimmermann_first| {
+        let mut zimmermann_x = input.x.clone();
+        let mut binom_x = input.x.clone();
+        let mut zimmermann_root = vec![0u64; input.root_len];
+        let mut binom_root = vec![0u64; input.root_len];
+
+        let times = time_pair_alternating(
+            zimmermann_first,
+            || match family {
+                SqrtTuneFamily::Dyn => zimmermann_one_descent_dyn(
+                    black_box(zimmermann_x.as_mut_slice()),
+                    black_box(zimmermann_root.as_mut_slice()),
+                ),
+                SqrtTuneFamily::Static => {
+                    zimmermann_one_descent_static::<SQRT_TUNE_STATIC_CAPACITY>(
+                        black_box(zimmermann_x.as_mut_slice()),
+                        black_box(zimmermann_root.as_mut_slice()),
+                    )
+                }
+            },
+            || {
+                binom_sqrt_core(
+                    black_box(binom_x.as_mut_slice()),
+                    black_box(binom_root.as_mut_slice()),
+                )
+            },
+        );
+
+        assert_eq!(zimmermann_root, binom_root);
+        assert_eq!(zimmermann_x, binom_x);
+        times
+    })
+}
+
+fn bench_sqrt_tuning(c: &mut Criterion) {
+    if env::var_os("SQRT_TUNE_FAMILY").is_none() {
+        return;
+    }
+    let lengths = env_usize_values("SQRT_TUNE_VALUES", &SQRT_TUNE_DEFAULT_LENGTHS);
+    let families = sqrt_tune_families();
+    assert!(!lengths.is_empty(), "SQRT_TUNE_VALUES cannot be empty");
+    assert!(
+        lengths.iter().all(|&root_len| root_len >= 3),
+        "sqrt tuning requires root lengths of at least three limbs"
+    );
+    if families
+        .iter()
+        .any(|family| matches!(family, SqrtTuneFamily::Static))
+    {
+        assert!(
+            lengths
+                .iter()
+                .all(|&root_len| 2 * root_len <= SQRT_TUNE_STATIC_CAPACITY),
+            "static sqrt tuning inputs exceed SQRT_TUNE_STATIC_CAPACITY"
+        );
+    }
+
+    let mut group = c.benchmark_group(format!("sqrt_tuning/{ARCH}"));
+    group.sample_size(30);
+    group.warm_up_time(Duration::from_millis(750));
+    group.measurement_time(Duration::from_secs(2));
+    group.noise_threshold(0.02);
+
+    println!("Reported value is one Zimmermann descent / direct binomial sqrt.");
+    println!("Below 1.000 ms favors Zimmermann; above 1.000 ms favors binomial.");
+    println!("Dynamic and static results must be interpreted independently.");
+    println!("Static measurements use N={SQRT_TUNE_STATIC_CAPACITY}.");
+
+    for family in families {
+        for &root_len in &lengths {
+            let inputs = make_sqrt_tune_inputs(root_len);
+            group.bench_with_input(
+                BenchmarkId::new(
+                    format!("{}_zimmermann_over_binom", family.label()),
+                    root_len,
+                ),
+                &root_len,
+                |bench, _| {
+                    bench.iter_custom(|iters| sqrt_tuning_ratio_bench(iters, &inputs, family))
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 // Criterion setup.
 
 fn cutoff_criterion() -> Criterion {
@@ -1782,6 +1995,6 @@ fn cutoff_criterion() -> Criterion {
 criterion_group! {
     name = benches;
     config = cutoff_criterion();
-    targets = bench_division_tuning
+    targets = bench_division_tuning, bench_sqrt_tuning
 }
 criterion_main!(benches);
