@@ -1001,17 +1001,6 @@ pub fn bz_div_rem_wrapper_static<const N: usize>(
     absorb_div_overflow(q_tail, overflow)
 }
 
-#[inline(always)]
-pub fn end_ref(buf: &[u64], idx: usize) -> &[u64] {
-    &buf[buf.len().saturating_sub(idx)..]
-}
-
-#[inline(always)]
-pub fn end_mut(buf: &mut [u64], idx: usize) -> &mut [u64] {
-    let len = buf.len();
-    &mut buf[len.saturating_sub(idx)..]
-}
-
 pub fn nr_rcp_schedule(p_target: usize, sizes: &mut [usize; 64]) -> usize {
     let mut steps = 0;
     let mut q = p_target;
@@ -1074,15 +1063,16 @@ fn nr_err_band(
 
 // Knuth long division over an implicit power-of-B numerator. `d` must be
 // bit-normalized and `win` is the sliding d.len()-limb remainder window.
-fn knuth_rcp_normalized(d: &[u64], rcp: &mut [u64], win: &mut [u64], seed: u64) {
+pub fn knuth_rcp_normalized(d: &[u64], rcp: &mut [u64], win: &mut [u64], seed: u64) {
     debug_assert!(d.len() >= 2);
     debug_assert_eq!(win.len(), d.len());
 
     win.fill(0);
     let mut of = seed;
-    for i in (0..rcp.len()).rev() {
-        div_buf_of(win, &mut of, d, &mut rcp[i..=i]);
-        // Slide the remainder up one limb over the implicit zero numerator.
+    let d1 = d[d.len() - 1];
+    let d0 = d[d.len() - 2];
+    for q in rcp.iter_mut().rev() {
+        *q = knuth_est(win, &mut of, d, d1, d0);
         of = win[win.len() - 1];
         win.copy_within(0..win.len() - 1, 1);
         win[0] = 0;

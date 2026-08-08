@@ -4243,8 +4243,9 @@ fn dyn_mid_dispatch(n: usize) -> DynMidDispatch {
 }
 
 pub fn mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
-    debug_assert!(
-        long.len() <= 2 * short.len() - 1,
+    debug_assert_eq!(
+        long.len(),
+        2 * short.len() - 1,
         "long must be at most 2*short-1 limbs for middle product (top-aligned when shorter)"
     );
     debug_assert_eq!(
@@ -4271,8 +4272,9 @@ pub fn mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
 }
 
 pub fn mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
-    debug_assert!(
-        long.len() <= 2 * short.len() - 1,
+    debug_assert_eq!(
+        long.len(),
+        2 * short.len() - 1,
         "long must be at most 2*short-1 limbs for middle product (top-aligned when shorter)"
     );
     debug_assert_eq!(

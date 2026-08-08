@@ -562,3 +562,14 @@ pub(crate) fn shl_top_copy(src: &[u64], out: &mut [u64], sh: u8) {
         }
     }
 }
+
+#[inline(always)]
+pub fn end_ref(buf: &[u64], idx: usize) -> &[u64] {
+    &buf[buf.len().saturating_sub(idx)..]
+}
+
+#[inline(always)]
+pub fn end_mut(buf: &mut [u64], idx: usize) -> &mut [u64] {
+    let len = buf.len();
+    &mut buf[len.saturating_sub(idx)..]
+}
