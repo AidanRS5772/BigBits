@@ -1,15 +1,11 @@
-use crate::{
-    end_mut, end_ref, inc_buf, mul_elem, twos_comp,
+use crate::utils::{
+    div::{div_buf_of, div_rem_dyn, div_rem_static, knuth_est, knuth_rcp_normalized, mul_u64_asm},
+    mul::{mul_elem, sqr_dyn, sqr_static},
     utils::{
-        div::{
-            div_buf_of, div_rem_dyn, div_rem_static, knuth_est, knuth_rcp_normalized, mul_u64_asm,
-        },
-        mul::{sqr_dyn, sqr_static},
-        utils::{
-            add_buf, add_prim, buf_len, cmp_buf, combine_u64, dec_buf, shl_buf, shr_buf, sub_buf,
-        },
-        ScratchGuard, ZIMMERMAN_SQRT_CUTOFF,
+        add_buf, add_prim, buf_len, cmp_buf, combine_u64, dec_buf, end_mut, end_ref, inc_buf,
+        shl_buf, shr_buf, sub_buf, twos_comp,
     },
+    ScratchGuard, ZIMMERMAN_SQRT_CUTOFF,
 };
 
 #[inline]
@@ -357,8 +353,9 @@ pub fn zimmerman_sqrt_static<const N: usize>(x: &mut [u64], s: &mut [u64]) {
     sqrt_denormalization(x, s, sh);
 }
 
-fn nr_seed<const TwoP: usize, const P: usize>(x: &[u64]) -> [u64; P] {
-    let mut work_x = [0_u64; TwoP];
+fn nr_seed<const TWO_P: usize, const P: usize>(x: &[u64]) -> [u64; P] {
+    let mut work_x = [0_u64; TWO_P];
+    work_x.copy_from_slice(end_ref(x, TWO_P));
     let mut sqrt = [0_u64; P];
     binom_sqrt_core(&mut work_x, &mut sqrt);
     let mut seed = [0_u64; P];
@@ -367,8 +364,6 @@ fn nr_seed<const TwoP: usize, const P: usize>(x: &[u64]) -> [u64; P] {
     inc_buf(&mut seed);
     return seed;
 }
-
-const BAND_EXT_CAP: usize = 3;
 
 fn nr_err(
     x: &[u64],
@@ -379,17 +374,16 @@ fn nr_err(
 ) -> Option<(bool, usize)> {
     let (mut acc0, mut acc1) = mid_mul_alg(x, sqr, &mut err[..p]);
     let mut acc2 = 0;
-    let mut e_idx = 2 * p - 1;
-    let mut val = mul_elem(x, sqr, e_idx, &mut acc0, &mut acc1, &mut acc2);
-    let mut cnt = 1;
+    let mut e_idx = p;
+    let mut val = mul_elem(x, sqr, p + e_idx - 1, &mut acc0, &mut acc1, &mut acc2);
+    const BAND_EXT_CAP: usize = 5;
     while val != 0 && val != u64::MAX {
-        if BAND_EXT_CAP == cnt {
+        if BAND_EXT_CAP == e_idx + 1 - p {
             return None;
         }
-        cnt += 1;
         err[e_idx] = val;
         e_idx += 1;
-        val = mul_elem(x, sqr, e_idx, &mut acc0, &mut acc1, &mut acc2);
+        val = mul_elem(x, sqr, p + e_idx - 1, &mut acc0, &mut acc1, &mut acc2);
     }
     return Some((val == u64::MAX, e_idx));
 }
@@ -403,15 +397,11 @@ fn nr_sqrt(
     short_mul_alg: &mut dyn FnMut(&[u64], &[u64], &mut [u64]) -> u64,
     short_sqr_alg: &mut dyn FnMut(&[u64], &mut [u64]) -> u64,
     mid_mul_alg: &mut dyn FnMut(&[u64], &[u64], &mut [u64]) -> (u64, u64),
-) {
+) -> bool {
     debug_assert!(x.last().copied().unwrap().leading_zeros() <= 1);
     let s_len = s.len();
-    let x_len = x.len();
-    let mut schedule = {
-        let diff = s_len.next_power_of_two() - s_len;
-        let sh = diff.leading_zeros();
-        (diff << sh).reverse_bits()
-    };
+    let mut schedule =
+        (s_len.next_power_of_two() - s_len).reverse_bits() >> (s_len.leading_zeros() + 1);
     let mut p = match schedule & 0b11 {
         0 => {
             s[s_len - 8..].copy_from_slice(&nr_seed::<16, 8>(x));
@@ -431,27 +421,30 @@ fn nr_sqrt(
         }
         _ => unreachable!(),
     };
+    s[..s_len - p].fill(0);
     schedule >>= 2;
 
     while p != s_len {
         let s_p = end_ref(s, p);
+        let x_p = end_ref(x, 2 * p - 1);
         sqr[p - 1] = short_sqr_alg(s_p, &mut sqr[..p - 1]);
-        let Some((neg, e_len)) = nr_err(x, sqr, err, p, mid_mul_alg) else {
-            // zimmerman fallback
-            return;
+        let Some((neg, e_len)) = nr_err(x_p, &sqr[..p], err, p, mid_mul_alg) else {
+            return false;
         };
         cor[e_len - 1] = short_mul_alg(s_p, &err[..e_len], &mut cor[..e_len - 1]);
-        shr_buf(&mut cor[..e_len], 1);
         let extra = e_len - p;
         let skip = schedule & 1;
         if neg {
-            sub_buf(&mut cor[extra..e_len], x);
+            sub_buf(&mut cor[extra..e_len], s_p);
             twos_comp(&mut cor[..e_len]);
+            shr_buf(&mut cor[skip..e_len], 1);
             add_buf(end_mut(s, 2 * p - skip), &cor[skip..]);
         } else {
+            shr_buf(&mut cor[skip..e_len], 1);
             sub_buf(end_mut(s, 2 * p - skip), &cor[skip..]);
         }
         schedule >>= 1;
         p = 2 * p - skip;
     }
+    return true;
 }
