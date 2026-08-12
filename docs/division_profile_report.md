@@ -27,7 +27,7 @@ operation around it contributes another 10–12%, much of it symbolized as
 of the Karatsuba-region BZ profiles because BZ reaches Knuth base cases.
 
 The primary large-NR target is therefore not dispatch or wrapper cleanup. It is
-the middle/short multiplication pipeline in `mul.rs`, especially transform
+the middle/high multiplication pipeline in `mul.rs`, especially transform
 memory movement and NTT parallel scheduling. A division-specific opportunity
 also exists in [`nr_rem_finish`](../src/utils/div.rs#L1417): it computes a full
 `d * q_low` product even though it consumes only the low `d.len() + 1` limbs.
@@ -177,7 +177,7 @@ The relevant stages are
 [`nr_refine_quo`](../src/utils/div.rs#L1243).
 
 At 89 limbs, their own instructions account for only a few percent; the
-schoolbook middle and short products beneath them account for 92–96%. At FFT
+schoolbook middle and high products beneath them account for 92–96%. At FFT
 and NTT sizes, direct division work falls below 1% and multiplication rises to
 about 99%.
 
@@ -230,12 +230,12 @@ below 0.1% in most static cases.
 
 ## Optimization triage
 
-1. **Optimize transform-backed middle/short multiplication for NR.**
+1. **Optimize transform-backed middle/high multiplication for NR.**
 
    This owns 92–99.9% of every nontrivial NR profile and also dominates
    transform-sized BZ. Focus on the exact operand bands used by
    [`mid_mul_dyn`/`mid_mul_static`](../src/utils/mul.rs#L4239) and
-   [`short_mul_dyn`/`short_mul_static`](../src/utils/mul.rs#L3585):
+   [`hi_mul_dyn`/`hi_mul_static`](../src/utils/mul.rs#L3585):
 
    - reduce decomposition, transpose, and result-copy traffic;
    - investigate reusing transformed `x` within quotient refinement where it

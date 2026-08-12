@@ -871,8 +871,12 @@ where
 impl PowI<usize> for BitInt {
     type Output = BitInt;
     fn powi(&self, rhs: usize) -> Self::Output {
+        let (_, capacity) = powi_sz(&self.data, rhs);
+        let mut data = vec![0; capacity];
+        powi_dyn_entry(&self.data, rhs, &mut data);
+        trim_lz(&mut data);
         BitInt {
-            data: powi_vec(&self.data, rhs),
+            data,
             sign: self.sign && (rhs % 2 == 1),
         }
     }

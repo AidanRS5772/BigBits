@@ -24,8 +24,8 @@ pub const KARATSUBA_SQR_CUTOFF: usize = 14;
 pub const FFT_SQR_CUTOFF: usize = 33;
 pub const STATIC_NTT_SQR_CUTOFF: usize = 1014;
 
-pub const SHORT_MUL_CUTOFF: usize = 114;
-pub const SHORT_SQR_CUTOFF: usize = 128;
+pub const PARTIAL_MUL_CUTOFF: usize = 90;
+pub const PARTIAL_SQR_CUTOFF: usize = 128;
 
 pub const FFT_MID_CUTOFF: usize = 90;
 pub const NTT_MID_CUTOFF: usize = 200;

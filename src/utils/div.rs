@@ -1033,9 +1033,8 @@ fn nr_err_band(
         *borrow = (b1 | b2) as u64;
         v
     };
-    // d may be shorter than the virtual 2p+1 window (top-aligned, implicit low
-    // zeros); the extension walks actual product columns, offset by the pad.
-    let z = 2 * p + 1 - d.len();
+    debug_assert_eq!(d.len(), 2 * p + 1);
+    debug_assert_eq!(y.len(), p + 1);
     let mut e_idx = p + 1;
     let (mut acc0, mut acc1) = mid(d, y, &mut e[..e_idx]);
     let mut acc2 = 0;
@@ -1043,7 +1042,7 @@ fn nr_err_band(
     if !num.is_empty() {
         borrow = sub_buf(&mut e[..e_idx], &num[..e_idx]) as u64;
     }
-    let mut val = mul_elem(d, y, p + e_idx - z, &mut acc0, &mut acc1, &mut acc2);
+    let mut val = mul_elem(d, y, p + e_idx, &mut acc0, &mut acc1, &mut acc2);
     if !num.is_empty() {
         val = sub_num_limb(val, e_idx, &mut borrow);
     }
@@ -1053,7 +1052,7 @@ fn nr_err_band(
         if e_idx > cap {
             return None;
         }
-        val = mul_elem(d, y, p + e_idx - z, &mut acc0, &mut acc1, &mut acc2);
+        val = mul_elem(d, y, p + e_idx, &mut acc0, &mut acc1, &mut acc2);
         if !num.is_empty() {
             val = sub_num_limb(val, e_idx, &mut borrow);
         }
@@ -1313,7 +1312,7 @@ fn nr_quo_est_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> Option<bool> {
     let d_len = 2 * pen_p + 1;
     let rcp_err_len = d_len + 1;
     let mut scratch = ScratchGuard::acquire();
-    let [x, hq, err, corr, rcp_err, rcp_cor, seed_n, d_work] = scratch.get_splits([
+    let [x, hq, err, corr, rcp_err, rcp_cor, seed_n, d_work, d_top] = scratch.get_splits([
         x_len,
         h + 3,
         h + 4,
@@ -1322,6 +1321,7 @@ fn nr_quo_est_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> Option<bool> {
         rcp_err_len,
         4,
         d_len,
+        2 * h + 1,
     ]);
 
     let sh = d[d.len() - 1].leading_zeros() as u8;
@@ -1335,7 +1335,7 @@ fn nr_quo_est_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> Option<bool> {
         seed_n,
         &sizes[..steps],
         &mut |a, b, o| mid_mul_dyn(a, b, o),
-        &mut |a, b, o| short_mul_dyn(a, b, o),
+        &mut |a, b, o| hi_mul_dyn(a, b, o),
     ) {
         knuth_div_rcp_seed_dyn(d_work, x);
     }
@@ -1343,9 +1343,7 @@ fn nr_quo_est_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> Option<bool> {
         return None;
     }
 
-    // end_ref saturates, so a short d stays as-is: the error band treats it as
-    // the top of the virtual 2h+1 window with implicit low zeros.
-    let d_top = end_ref(d, 2 * h + 1);
+    shl_top_copy(d, d_top, 0);
 
     nr_refine_quo(
         n,
@@ -1358,7 +1356,7 @@ fn nr_quo_est_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> Option<bool> {
         h,
         l,
         &mut |a, b, o| mid_mul_dyn(a, b, o),
-        &mut |a, b, o| short_mul_dyn(a, b, o),
+        &mut |a, b, o| hi_mul_dyn(a, b, o),
     )
 }
 
@@ -1367,6 +1365,9 @@ fn nr_quo_est_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) -> Opt
         return None;
     }
     let (h, l) = nr_split(q.len(), d.len());
+    if 2 * h + 1 > N {
+        return None;
+    }
 
     let mut x = [0u64; N];
     let x = &mut x[..h + 3];
@@ -1395,7 +1396,7 @@ fn nr_quo_est_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) -> Opt
             &mut seed_n,
             &sizes[..steps],
             &mut |a, b, o| mid_mul_static::<N>(a, b, o),
-            &mut |a, b, o| short_mul_static::<N>(a, b, o),
+            &mut |a, b, o| hi_mul_static::<N>(a, b, o),
         )
     };
 
@@ -1408,7 +1409,9 @@ fn nr_quo_est_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) -> Opt
         return None;
     }
 
-    let d_top = end_ref(d, 2 * h + 1);
+    let mut d_top = [0u64; N];
+    let d_top = &mut d_top[..2 * h + 1];
+    shl_top_copy(d, d_top, 0);
 
     let mut hq = [0u64; N];
     let mut err = [0u64; N];
@@ -1424,7 +1427,7 @@ fn nr_quo_est_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) -> Opt
         h,
         l,
         &mut |a, b, o| mid_mul_static::<N>(a, b, o),
-        &mut |a, b, o| short_mul_static::<N>(a, b, o),
+        &mut |a, b, o| hi_mul_static::<N>(a, b, o),
     )
 }
 
@@ -1851,7 +1854,7 @@ pub fn nr_rcp_wrapper_dyn(d: &[u64], rcp: &mut [u64]) {
         seed_n,
         &sizes[..steps],
         &mut |a, b, o| mid_mul_dyn(a, b, o),
-        &mut |a, b, o| short_mul_dyn(a, b, o),
+        &mut |a, b, o| hi_mul_dyn(a, b, o),
     ) || shl_buf(work, sh) != 0
     {
         knuth_rcp_wrapper_dyn(d, rcp);
@@ -1904,7 +1907,7 @@ pub fn nr_rcp_wrapper_static<const N: usize>(d: &[u64], rcp: &mut [u64]) {
         &mut seed_n,
         &sizes[..steps],
         &mut |a, b, o| mid_mul_static::<N>(a, b, o),
-        &mut |a, b, o| short_mul_static::<N>(a, b, o),
+        &mut |a, b, o| hi_mul_static::<N>(a, b, o),
     ) {
         knuth_rcp_wrapper_static::<N>(d, rcp);
         return;
@@ -2074,7 +2077,7 @@ pub fn div_rem_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) -
 /// Computes the highest `q.len()` limbs of the quotient body and returns the
 /// structural overflow limb. If the complete body fits, this delegates to
 /// [`div_dyn`] and follows its overflow-absorption behavior.
-pub fn short_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
+pub fn hi_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
     let requested = q.len();
     let Some(request) = division_request(n, d, q, Some(requested)) else {
         return 0;
@@ -2082,8 +2085,8 @@ pub fn short_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
     div_request_dyn(n, d, q, request)
 }
 
-/// Static-scratch counterpart of [`short_div_dyn`].
-pub fn short_div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
+/// Static-scratch counterpart of [`hi_div_dyn`].
+pub fn hi_div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
     let requested = q.len();
     let Some(request) = division_request(n, d, q, Some(requested)) else {
         return 0;

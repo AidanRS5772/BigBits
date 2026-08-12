@@ -796,9 +796,11 @@ impl RemAssign<&UBitInt> for UBitInt {
 impl PowI<usize> for UBitInt {
     type Output = UBitInt;
     fn powi(&self, rhs: usize) -> Self::Output {
-        UBitInt {
-            data: powi_vec(&self.data, rhs),
-        }
+        let (_, capacity) = powi_sz(&self.data, rhs);
+        let mut data = vec![0; capacity];
+        powi_dyn_entry(&self.data, rhs, &mut data);
+        trim_lz(&mut data);
+        UBitInt { data }
     }
 }
 

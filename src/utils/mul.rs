@@ -2642,7 +2642,7 @@ where
 
 // Emulates a declared size-n cyclic convolution inside res (clamped to
 // res.len()) by chunking long into pieces whose transforms fit N; every chunk
-// is rescaled so the accumulated values carry the size-n scale.
+// is re-scaled so the accumulated values carry the size-n scale.
 fn ntt_chunked_convolution<const N: usize, P: NTTPrime>(
     long: &[u64],
     short: &[u64],
@@ -3565,11 +3565,11 @@ pub fn sqr_arr<const N: usize>(buf: &[u64]) -> ([u64; N], u64) {
     (out, of)
 }
 
-//SHORT MULTIPLICATION
+// HIGH MULTIPLICATION
 // Gets only the top part of a multiplication, only optimized for small inputs asymptotically same
 // computation as a full product other then truncating inputs dynamically.
 
-pub fn short_mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+pub fn hi_mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     if a.is_empty() || b.is_empty() {
         return 0;
     }
@@ -3588,15 +3588,15 @@ pub fn short_mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     return acc0;
 }
 
-pub fn short_mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+pub fn hi_mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     if a.is_empty() || b.is_empty() {
         return 0;
     }
     if a.len() + b.len() - 1 <= out.len() {
         return mul_dyn(a, b, out);
     }
-    if out.len() <= SHORT_MUL_CUTOFF {
-        return short_mul_buf(a, b, out);
+    if out.len() <= PARTIAL_MUL_CUTOFF {
+        return hi_mul_buf(a, b, out);
     }
     let trunc_a = &a[a.len().saturating_sub(out.len())..];
     let trunc_b = &b[b.len().saturating_sub(out.len())..];
@@ -3608,7 +3608,7 @@ pub fn short_mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     return of;
 }
 
-pub fn short_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+pub fn hi_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     if a.is_empty() || b.is_empty() {
         return 0;
     }
@@ -3622,8 +3622,8 @@ pub fn short_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -
     if a.len() + b.len() - 1 <= out.len() {
         return mul_static::<N>(a, b, out);
     }
-    if out_len <= SHORT_MUL_CUTOFF {
-        return short_mul_buf(a, b, out);
+    if out_len <= PARTIAL_MUL_CUTOFF {
+        return hi_mul_buf(a, b, out);
     }
 
     let trunc_a = &a[a.len().saturating_sub(out_len)..];
@@ -3689,12 +3689,9 @@ pub fn short_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -
     return of;
 }
 
-//SHORT SQUARING
+// HIGH SQUARING
 
-pub fn short_sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
-    if buf.is_empty() {
-        return 0;
-    }
+pub fn hi_sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
     let d = (2 * buf.len() - 1).saturating_sub(out.len());
     let (mut acc0, mut acc1, mut acc2) = (0, 0, 0);
     if d >= 2 {
@@ -3709,15 +3706,15 @@ pub fn short_sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
     return acc0;
 }
 
-pub fn short_sqr_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
+pub fn hi_sqr_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
     if buf.is_empty() {
         return 0;
     }
     if 2 * buf.len() - 1 <= out.len() {
         return sqr_dyn(buf, out);
     }
-    if out.len() <= SHORT_SQR_CUTOFF {
-        return short_sqr_buf(buf, out);
+    if out.len() <= PARTIAL_SQR_CUTOFF {
+        return hi_sqr_buf(buf, out);
     }
     let trunc_buf = &buf[buf.len().saturating_sub(out.len())..];
     let mut scratch = ScratchGuard::acquire();
@@ -3728,7 +3725,7 @@ pub fn short_sqr_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
     return of;
 }
 
-pub fn short_sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
+pub fn hi_sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
     if buf.is_empty() {
         return 0;
     }
@@ -3741,8 +3738,8 @@ pub fn short_sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
     if 2 * buf.len() - 1 <= out.len() {
         return sqr_static::<N>(buf, out);
     }
-    if out_len <= SHORT_SQR_CUTOFF {
-        return short_sqr_buf(buf, out);
+    if out_len <= PARTIAL_SQR_CUTOFF {
+        return hi_sqr_buf(buf, out);
     }
 
     let trunc_buf = &buf[buf.len().saturating_sub(out.len())..];
@@ -3803,8 +3800,28 @@ pub fn short_sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
 }
 
 //MIDDLE MULTIPLICATION
-// gets the middle part n limbs of a n x 2n product
-// n: [0..n-1] x 2n-1: [0..2n-2] -> 3n-1: [0..3n-3] -> [n-1 .. 2n-2]
+// Gets n middle limbs from a (2n-1) x n product.
+// n: [0..n-1] x 2n-1: [0..2n-2] -> 3n-2: [0..3n-3] -> [n-1..2n-2]
+
+#[inline]
+fn debug_assert_mid_mul_operands(long: &[u64], short: &[u64]) {
+    debug_assert!(!short.is_empty(), "short must not be empty");
+    debug_assert_eq!(
+        long.len(),
+        short.len().saturating_mul(2).saturating_sub(1),
+        "long must be exactly 2*short-1 limbs for middle product"
+    );
+}
+
+#[inline]
+fn debug_assert_mid_mul_shape(long: &[u64], short: &[u64], out: &[u64]) {
+    debug_assert_mid_mul_operands(long, short);
+    debug_assert_eq!(
+        out.len(),
+        short.len(),
+        "size of out must be the same size as short"
+    );
+}
 
 #[inline]
 fn mul_column_parts(a: &[u64], b: &[u64], n: usize) -> (u64, u64, u64) {
@@ -3814,29 +3831,22 @@ fn mul_column_parts(a: &[u64], b: &[u64], n: usize) -> (u64, u64, u64) {
 }
 
 pub fn middle_correction(long: &[u64], short: &[u64]) -> (u64, u64) {
-    debug_assert!(long.len() <= 2 * short.len() - 1);
+    debug_assert_mid_mul_operands(long, short);
     let n = short.len();
-    let z = 2 * n - 1 - long.len();
-    if n < z + 2 {
+    if n < 2 {
         return (0, 0);
     }
-    let (_, acc0, acc1) = mul_column_parts(long, short, n - 2 - z);
+    let (_, acc0, acc1) = mul_column_parts(long, short, n - 2);
     return (acc0, acc1);
 }
 
-// long is the top of a virtual 2n-1 limb operand (implicit low zero limbs when
-// shorter); the band stays columns n-1..2n-2 of the virtual product.
 pub fn mid_mul_buf(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
+    debug_assert_mid_mul_shape(long, short, out);
     let (mut acc0, mut acc1) = middle_correction(long, short);
     let mut acc2: u64 = 0;
     let n = short.len();
-    let z = 2 * n - 1 - long.len();
     for (i, elem) in ((n - 1)..=(2 * n - 2)).zip(out) {
-        *elem = if i >= z {
-            mul_elem(long, short, i - z, &mut acc0, &mut acc1, &mut acc2)
-        } else {
-            0
-        };
+        *elem = mul_elem(long, short, i, &mut acc0, &mut acc1, &mut acc2);
     }
     return (acc0, acc1);
 }
@@ -3876,16 +3886,8 @@ fn fft_accumulate_mid(
 }
 
 pub fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
+    debug_assert_mid_mul_shape(long, short, out);
     let sz = short.len();
-    let z = 2 * sz - 1 - long.len();
-    if z >= sz {
-        // The band starts below the actual product; materialize the virtual pad.
-        let mut scratch = ScratchGuard::acquire();
-        let full = scratch.get(2 * sz - 1);
-        full[..z].fill(0);
-        full[z..].copy_from_slice(long);
-        return fft_mid_mul(full, short, out);
-    }
     // Inputs may carry zero top limbs (quotient-refinement operands are not
     // normalized); treating them as one 16-bit digit only over-sizes the fft.
     let (l_len, s_len, w) = (
@@ -3893,11 +3895,11 @@ pub fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
         bit16_length(short.len(), short.last().copied().unwrap().max(1)),
         4,
     );
-    let start_coef = (sz - 1 - z) * w;
-    let end_coef = (2 * sz + 1 - z) * w;
+    let start_coef = (sz - 1) * w;
+    let end_coef = (2 * sz + 1) * w;
     let n = find_fft_size((l_len + s_len - start_coef - 1).max(end_coef));
-    let (next_col_lo, next_col_hi, _) = mul_column_parts(long, short, 2 * sz - 1 - z);
-    let (next_next_col_lo, _, _) = mul_column_parts(long, short, 2 * sz - z);
+    let (next_col_lo, next_col_hi, _) = mul_column_parts(long, short, 2 * sz - 1);
+    let (next_next_col_lo, _, _) = mul_column_parts(long, short, 2 * sz);
     let next_col = (next_col_lo, next_col_hi);
     let mut of = FFT_CACHE.with(|cell| {
         let fft_cache = &mut *cell.borrow_mut();
@@ -3928,7 +3930,6 @@ fn ntt_mid_accumulate_scaled(
     res3: &mut [u64],
     out: &mut [u64], // len == s
     s: usize,
-    shift: usize,
     n1: usize,
     n2: usize,
     n3: usize,
@@ -3937,10 +3938,7 @@ fn ntt_mid_accumulate_scaled(
     let inv_n2 = Montgomery::to(n2 as u64).pow(P2::P - 2);
     let inv_n3 = Montgomery::to(n3 as u64).pow(P3::P - 2);
 
-    debug_assert!(shift <= s - 3);
-    let crt_start = s - 3 - shift;
-    let crt_end = 2 * s - 1 - shift;
-    for i in crt_start..crt_end {
+    for i in s - 3..2 * s - 1 {
         CRT.crt(
             &mut res1[i],
             &mut res2[i],
@@ -3951,18 +3949,12 @@ fn ntt_mid_accumulate_scaled(
         );
     }
 
-    out.copy_from_slice(&res1[s - 1 - shift..2 * s - 1 - shift]);
-    let of1 = add_buf(out, &res2[s - 2 - shift..2 * s - 2 - shift]) as u64;
-    let of2 = add_buf(out, &res3[s - 3 - shift..2 * s - 3 - shift]) as u64;
+    out.copy_from_slice(&res1[s - 1..2 * s - 1]);
+    let of1 = add_buf(out, &res2[s - 2..2 * s - 2]) as u64;
+    let of2 = add_buf(out, &res3[s - 3..2 * s - 3]) as u64;
 
-    let lo = res2[2 * s - 2 - shift] as u128
-        + res3[2 * s - 3 - shift] as u128
-        + of1 as u128
-        + of2 as u128;
-    (
-        lo as u64,
-        res3[2 * s - 2 - shift].wrapping_add((lo >> 64) as u64),
-    )
+    let lo = res2[2 * s - 2] as u128 + res3[2 * s - 3] as u128 + of1 as u128 + of2 as u128;
+    (lo as u64, res3[2 * s - 2].wrapping_add((lo >> 64) as u64))
 }
 
 fn acc_scaled_cyclic_convolution<const N: usize, P: NTTPrime>(
@@ -4033,6 +4025,7 @@ fn ntt_mid_static_convolution<const N: usize, P: NTTPrime>(
 }
 
 pub fn ntt_mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
+    debug_assert_mid_mul_shape(long, short, out);
     let sz = short.len();
     let n1 = find_ntt_size::<P1>(2 * sz - 1);
     let n2 = find_ntt_size::<P2>(2 * sz - 1);
@@ -4089,7 +4082,7 @@ pub fn ntt_mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u6
             conv3();
         }
     }
-    let mut of = ntt_mid_accumulate_scaled(res1, res2, res3, out, sz, 0, n1, n2, n3);
+    let mut of = ntt_mid_accumulate_scaled(res1, res2, res3, out, sz, n1, n2, n3);
     let (c0, c1) = middle_correction(long, short);
     add_mid_overflow(&mut of, add_prim(out, c0));
     add_mid_overflow(&mut of, add_prim(&mut out[1..], c1));
@@ -4101,15 +4094,7 @@ pub fn ntt_mid_mul_static<const N: usize>(
     short: &[u64],
     out: &mut [u64],
 ) -> (u64, u64) {
-    debug_assert!(
-        long.len() <= 2 * short.len() - 1,
-        "long must be at most 2*short-1 limbs for middle product (top-aligned when shorter)"
-    );
-    debug_assert_eq!(
-        out.len(),
-        short.len(),
-        "size of out must be the same size as short"
-    );
+    debug_assert_mid_mul_shape(long, short, out);
     debug_assert!(long.len() <= N);
     debug_assert!(short.len() <= N);
     debug_assert!(out.len() <= N);
@@ -4119,15 +4104,6 @@ pub fn ntt_mid_mul_static<const N: usize>(
     }
 
     let sz = short.len();
-    let shift = 2 * sz - 1 - long.len();
-    // Multiplying the unpadded operand rotates every cyclic-convolution
-    // coefficient left by `shift`.  All coefficients needed below are
-    // available directly while the CRT window stays above index zero; wrapped
-    // indices may lie beyond a clamped static residue buffer, so keep that rare
-    // shape on the allocation-free school path.
-    if shift > sz - 3 {
-        return mid_mul_buf(long, short, out);
-    }
     let n1 = find_ntt_size::<P1>(2 * sz - 1);
     let n2 = find_ntt_size::<P2>(2 * sz - 1);
     let n3 = find_ntt_size::<P3>(2 * sz - 1);
@@ -4215,7 +4191,6 @@ pub fn ntt_mid_mul_static<const N: usize>(
         &mut res3[..res3_len],
         out,
         sz,
-        shift,
         n1,
         n2,
         n3,
@@ -4243,45 +4218,16 @@ fn dyn_mid_dispatch(n: usize) -> DynMidDispatch {
 }
 
 pub fn mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
-    debug_assert_eq!(
-        long.len(),
-        2 * short.len() - 1,
-        "long must be at most 2*short-1 limbs for middle product (top-aligned when shorter)"
-    );
-    debug_assert_eq!(
-        out.len(),
-        short.len(),
-        "size of out must be the same size as short"
-    );
+    debug_assert_mid_mul_shape(long, short, out);
     match dyn_mid_dispatch(short.len()) {
         DynMidDispatch::School => mid_mul_buf(long, short, out),
         DynMidDispatch::FFT => fft_mid_mul(long, short, out),
-        DynMidDispatch::NTT => {
-            if long.len() < 2 * short.len() - 1 {
-                let z = 2 * short.len() - 1 - long.len();
-                let mut scratch = ScratchGuard::acquire();
-                let full = scratch.get(2 * short.len() - 1);
-                full[..z].fill(0);
-                full[z..].copy_from_slice(long);
-                ntt_mid_mul_dyn(full, short, out)
-            } else {
-                ntt_mid_mul_dyn(long, short, out)
-            }
-        }
+        DynMidDispatch::NTT => ntt_mid_mul_dyn(long, short, out),
     }
 }
 
 pub fn mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
-    debug_assert_eq!(
-        long.len(),
-        2 * short.len() - 1,
-        "long must be at most 2*short-1 limbs for middle product (top-aligned when shorter)"
-    );
-    debug_assert_eq!(
-        out.len(),
-        short.len(),
-        "size of out must be the same size as short"
-    );
+    debug_assert_mid_mul_shape(long, short, out);
     if short.len() < NTT_MID_CUTOFF {
         mid_mul_buf(long, short, out)
     } else {
@@ -4291,7 +4237,6 @@ pub fn mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u6
 
 //FAST EXPONENTIATION
 // does an integer powers via log(n) squaring s
-//
 // pow's binary form is `1 r_{k-1} ... r_0` (k = pow.ilog2() rest bits below
 // the leading one). reverse_pow packs those rest bits in reverse (bit i holds
 // r_{k-1-i}, the order powi_dyn_core/powi_static_core consume them in via
@@ -4372,14 +4317,6 @@ pub fn powi_dyn_entry(buf: &[u64], pow: usize, out: &mut [u64]) {
     }
 }
 
-pub fn powi_vec(buf: &[u64], pow: usize) -> Vec<u64> {
-    let (_, max) = powi_sz(buf, pow);
-    let mut out = vec![0; max];
-    powi_dyn_entry(buf, pow, &mut out);
-    trim_lz(&mut out);
-    out
-}
-
 fn powi_static_core<const N: usize>(
     buf: &[u64],
     reverse_pow: usize,
@@ -4401,6 +4338,13 @@ fn powi_static_core<const N: usize>(
 }
 
 pub fn powi_static_entry<const N: usize>(buf: &[u64], pow: usize, out: &mut [u64]) {
+    let (min, _) = powi_sz(buf, pow);
+    let capacity = N.min(out.len());
+    debug_assert!(
+        capacity >= min,
+        "power exceeds output capacity: {}",
+        capacity
+    );
     out.fill(0);
     if pow == 0 {
         debug_assert!(!out.is_empty(), "output is not large enough for x^0");
@@ -4421,12 +4365,4 @@ pub fn powi_static_entry<const N: usize>(buf: &[u64], pow: usize, out: &mut [u64
         tmp[..buf.len()].copy_from_slice(buf);
         powi_static_core::<N>(buf, reverse_pow, &mut tmp, out)
     }
-}
-
-pub fn powi_arr<const N: usize>(buf: &[u64], pow: usize) -> [u64; N] {
-    let (min, _) = powi_sz(buf, pow);
-    debug_assert!(N >= min, "power exceeds static capacity N: {N}");
-    let mut out = [0; N];
-    powi_static_entry::<N>(buf, pow, &mut out);
-    out
 }

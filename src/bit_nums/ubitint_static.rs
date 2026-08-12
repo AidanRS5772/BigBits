@@ -447,9 +447,9 @@ impl<const N: usize> RemAssign for UBitIntStatic<N> {
 impl<const N: usize> PowI<usize> for UBitIntStatic<N> {
     type Output = UBitIntStatic<N>;
     fn powi(&self, rhs: usize) -> Self::Output {
-        UBitIntStatic {
-            data: powi_arr(&self.data, rhs),
-        }
+        let mut data = [0; N];
+        powi_static_entry::<N>(&self.data, rhs, &mut data);
+        UBitIntStatic { data }
     }
 }
 

@@ -469,41 +469,38 @@ fn exercise_body_overflow_contract<const N: usize>(case: &str, n: &[u64], d: &[u
 
     for k in 0..body_len {
         let mut q = vec![u64::MAX; k];
-        let overflow = short_div_dyn(n, d, &mut q);
-        assert_eq!(q, expected_body[body_len - k..], "{case}: short dyn k={k}");
-        assert_eq!(
-            overflow, expected_overflow,
-            "{case}: short dyn overflow k={k}"
-        );
+        let overflow = hi_div_dyn(n, d, &mut q);
+        assert_eq!(q, expected_body[body_len - k..], "{case}: hi dyn k={k}");
+        assert_eq!(overflow, expected_overflow, "{case}: hi dyn overflow k={k}");
 
         let mut q_static = vec![u64::MAX; k];
-        let static_overflow = short_div_static::<N>(n, d, &mut q_static);
-        assert_eq!(q_static, q, "{case}: short static k={k}");
+        let static_overflow = hi_div_static::<N>(n, d, &mut q_static);
+        assert_eq!(q_static, q, "{case}: hi static k={k}");
         assert_eq!(
             static_overflow, overflow,
-            "{case}: short static overflow k={k}"
+            "{case}: hi static overflow k={k}"
         );
     }
 
     let mut exact = vec![u64::MAX; body_len];
-    assert_eq!(short_div_dyn(n, d, &mut exact), expected_overflow);
+    assert_eq!(hi_div_dyn(n, d, &mut exact), expected_overflow);
     assert_eq!(exact, expected_body);
 
     let mut oversized = vec![u64::MAX; body_len + 2];
-    assert_eq!(short_div_dyn(n, d, &mut oversized), 0);
+    assert_eq!(hi_div_dyn(n, d, &mut oversized), 0);
     assert_eq!(&oversized[..body_len], &expected_body);
     assert_eq!(oversized[body_len], expected_overflow);
     assert_eq!(oversized[body_len + 1], 0);
 
     let mut exact_static = vec![u64::MAX; body_len];
     assert_eq!(
-        short_div_static::<N>(n, d, &mut exact_static),
+        hi_div_static::<N>(n, d, &mut exact_static),
         expected_overflow
     );
     assert_eq!(exact_static, expected_body);
 
     let mut oversized_static = vec![u64::MAX; body_len + 2];
-    assert_eq!(short_div_static::<N>(n, d, &mut oversized_static), 0);
+    assert_eq!(hi_div_static::<N>(n, d, &mut oversized_static), 0);
     assert_eq!(&oversized_static[..body_len], &expected_body);
     assert_eq!(oversized_static[body_len], expected_overflow);
     assert_eq!(oversized_static[body_len + 1], 0);
@@ -557,7 +554,7 @@ fn test_equal_and_shorter_division_shapes() {
 
     let shorter = [u64::MAX];
     let longer = [0, 1];
-    assert_eq!(short_div_dyn(&shorter, &longer, &mut []), 0);
+    assert_eq!(hi_div_dyn(&shorter, &longer, &mut []), 0);
 }
 
 #[test]
@@ -580,7 +577,7 @@ fn test_standard_division_rejects_undersized_body() {
 }
 
 #[test]
-fn test_short_division_static_capacity_uses_prepared_window() {
+fn test_hi_div_static_capacity_uses_prepared_window() {
     const N: usize = 17;
     let d = rand_nonzero_vec(12, 13_400);
     let n = rand_nonzero_vec(80, 13_401);
@@ -589,7 +586,7 @@ fn test_short_division_static_capacity_uses_prepared_window() {
     let expected_overflow = div_dyn(&n, &d, &mut full_body);
 
     let mut q = [0; 5];
-    let overflow = short_div_static::<N>(&n, &d, &mut q);
+    let overflow = hi_div_static::<N>(&n, &d, &mut q);
     assert_eq!(&q, &full_body[body_len - q.len()..]);
     assert_eq!(overflow, expected_overflow);
 }
@@ -1834,7 +1831,7 @@ fn test_static_reciprocal_entry_matrix_precision() {
     // The refinement bands fit N, so static NR can complete without its
     // capacity fallback.
     run::<256>("actual NR", 128, 96, 12_500);
-    // Strongly skewed precision exercises top-aligned divisor padding.
+    // Strongly skewed precision exercises the caller-materialized divisor padding.
     run::<256>("skewed", 12, 129, 12_600);
     // d + r exceeds N, but reciprocal wrappers only need the precision window.
     run::<128>("precision window capacity", 96, 120, 12_700);

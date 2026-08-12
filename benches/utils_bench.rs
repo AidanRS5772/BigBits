@@ -78,6 +78,13 @@ fn set_up_group(group: &mut BenchmarkGroup<'_, WallTime>) {
     group.measurement_time(std::time::Duration::from_secs(15));
 }
 
+fn set_up_ratio_group(group: &mut BenchmarkGroup<'_, WallTime>) {
+    group.sample_size(100);
+    group.sampling_mode(criterion::SamplingMode::Flat);
+    group.warm_up_time(std::time::Duration::from_secs(1));
+    group.measurement_time(std::time::Duration::from_secs(3));
+}
+
 macro_rules! bench_static_sizes {
     ($group:expr, $fn:ident, $(($n:literal, $N:literal)),*) => {
         $(
@@ -374,8 +381,8 @@ fn bench_static_ntt_sqr(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_short_school_mul(c: &mut Criterion) {
-    let mut group = c.benchmark_group(format!("short_school_mul/{ARCH}"));
+fn bench_hi_school_mul(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("hi_school_mul/{ARCH}"));
     set_up_group(&mut group);
     let sizes: Vec<usize> = vec![112, 116, 120, 124, 128];
     for &n in &sizes {
@@ -384,14 +391,14 @@ fn bench_short_school_mul(c: &mut Criterion) {
             let a = random_limbs(n);
             let b = random_limbs(n);
             let mut out = vec![0; n];
-            bench.iter(|| short_mul_buf(black_box(&a), black_box(&b), black_box(&mut out)));
+            bench.iter(|| hi_mul_buf(black_box(&a), black_box(&b), black_box(&mut out)));
         });
     }
     group.finish();
 }
 
-fn bench_short_gen_mul(c: &mut Criterion) {
-    let mut group = c.benchmark_group(format!("short_gen_mul/{ARCH}"));
+fn bench_hi_gen_mul(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("hi_gen_mul/{ARCH}"));
     set_up_group(&mut group);
     let sizes: Vec<usize> = vec![112, 116, 120, 124, 128];
     for &n in &sizes {
@@ -400,14 +407,14 @@ fn bench_short_gen_mul(c: &mut Criterion) {
             let a = random_limbs(n);
             let b = random_limbs(n);
             let mut out = vec![0; n];
-            bench.iter(|| short_mul_dyn(black_box(&a), black_box(&b), black_box(&mut out)));
+            bench.iter(|| hi_mul_dyn(black_box(&a), black_box(&b), black_box(&mut out)));
         });
     }
     group.finish();
 }
 
-fn bench_short_school_sqr(c: &mut Criterion) {
-    let mut group = c.benchmark_group(format!("short_school_sqr/{ARCH}"));
+fn bench_hi_school_sqr(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("hi_school_sqr/{ARCH}"));
     set_up_group(&mut group);
     let sizes: Vec<usize> = vec![64, 80, 96, 112, 128];
     for &n in &sizes {
@@ -415,14 +422,14 @@ fn bench_short_school_sqr(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
             let a = random_limbs(n);
             let mut out = vec![0; n];
-            bench.iter(|| short_sqr_buf(black_box(&a), black_box(&mut out)));
+            bench.iter(|| hi_sqr_buf(black_box(&a), black_box(&mut out)));
         });
     }
     group.finish();
 }
 
-fn bench_short_gen_sqr(c: &mut Criterion) {
-    let mut group = c.benchmark_group(format!("short_gen_sqr/{ARCH}"));
+fn bench_hi_gen_sqr(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("hi_gen_sqr/{ARCH}"));
     set_up_group(&mut group);
     let sizes: Vec<usize> = vec![64, 80, 96, 112, 128];
     for &n in &sizes {
@@ -430,7 +437,7 @@ fn bench_short_gen_sqr(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
             let a = random_limbs(n);
             let mut out = vec![0; n];
-            bench.iter(|| short_sqr_dyn(black_box(&a), black_box(&mut out)));
+            bench.iter(|| hi_sqr_dyn(black_box(&a), black_box(&mut out)));
         });
     }
     group.finish();
@@ -463,6 +470,48 @@ fn bench_mid_fft(c: &mut Criterion) {
             let long = random_limbs(2 * n - 1);
             let mut out = vec![0; n];
             bench.iter(|| fft_mid_mul(black_box(&long), black_box(&short), black_box(&mut out)));
+        });
+    }
+    group.finish();
+}
+
+fn bench_mul_band_ratios(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("mul_band_ratio/{ARCH}"));
+    set_up_ratio_group(&mut group);
+    let sizes = [
+        8, 16, 32, 64, 89, 90, 114, 115, 128, 256, 1024, 4096, 16_384, 21_846, 21_847, 32_768,
+        32_769,
+    ];
+
+    for n in sizes {
+        let a = random_limbs(n);
+        let b = random_limbs(n);
+        let long = random_limbs(2 * n - 1);
+        let short = random_limbs(n);
+        let mut full_out = vec![0; 2 * n - 1];
+        let mut full_wide_out = vec![0; 3 * n - 2];
+        let mut hi_out = vec![0; n];
+        let mut mid_out = vec![0; n];
+
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::new("full", n), &n, |bench, _| {
+            bench.iter(|| mul_dyn(black_box(&a), black_box(&b), black_box(&mut full_out)));
+        });
+        group.bench_with_input(BenchmarkId::new("full_wide", n), &n, |bench, _| {
+            bench.iter(|| {
+                mul_dyn(
+                    black_box(&long),
+                    black_box(&short),
+                    black_box(&mut full_wide_out),
+                )
+            });
+        });
+        group.bench_with_input(BenchmarkId::new("hi", n), &n, |bench, _| {
+            bench.iter(|| hi_mul_dyn(black_box(&a), black_box(&b), black_box(&mut hi_out)));
+        });
+        group.bench_with_input(BenchmarkId::new("middle", n), &n, |bench, _| {
+            bench
+                .iter(|| mid_mul_dyn(black_box(&long), black_box(&short), black_box(&mut mid_out)));
         });
     }
     group.finish();
@@ -706,6 +755,6 @@ fn bench_zimmermann_sqrt(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_zimmermann_sqrt);
+criterion_group!(benches, bench_zimmermann_sqrt, bench_mul_band_ratios);
 
 criterion_main!(benches);

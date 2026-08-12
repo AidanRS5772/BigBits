@@ -568,8 +568,10 @@ where
 impl<const N: usize> PowI<usize> for BitIntStatic<N> {
     type Output = BitIntStatic<N>;
     fn powi(&self, rhs: usize) -> Self::Output {
+        let mut data = [0; N];
+        powi_static_entry::<N>(&self.data, rhs, &mut data);
         BitIntStatic {
-            data: powi_arr(&self.data, rhs),
+            data,
             sign: self.sign && (rhs % 2 == 1),
         }
     }

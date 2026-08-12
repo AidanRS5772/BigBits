@@ -959,7 +959,7 @@ fn run_nr_prior_seed_plus_step(d: &[u64], rcp: &mut [u64], prior_p: usize) {
         prior_p,
         trunc,
         &mut |a, b, o| mid_mul_dyn(a, b, o),
-        &mut |a, b, o| short_mul_dyn(a, b, o),
+        &mut |a, b, o| hi_mul_dyn(a, b, o),
     ) {
         knuth_div_rcp_seed_dyn(d, rcp);
     }
