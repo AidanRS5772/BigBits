@@ -1,6 +1,11 @@
 use super::{mul_ref, rand_vec};
-use crate::utils::sqrt::{binom_sqrt, zimmerman_sqrt_dyn, zimmerman_sqrt_static};
+use crate::utils::sqrt::{
+    binom_sqrt, sqrt_approx_dyn, sqrt_approx_static, sqrt_dyn, sqrt_only_dyn, sqrt_only_static,
+    sqrt_static, zimmerman_sqrt_approx_dyn, zimmerman_sqrt_approx_static, zimmerman_sqrt_dyn,
+    zimmerman_sqrt_only_dyn, zimmerman_sqrt_only_static, zimmerman_sqrt_static,
+};
 use crate::utils::utils::{add_buf, cmp_buf, dec_buf, eq_buf, inc_buf, sub_buf};
+use crate::utils::ZIMMERMAN_SQRT_CUTOFF;
 
 /// Verify both outputs for
 /// `shifted_x = x * B^(2 * root.len() - x.len()) = root^2 + remainder`.
@@ -267,4 +272,248 @@ fn test_zimmerman_sqrt_static_rejects_insufficient_capacity() {
     let mut root = vec![0; root_len];
 
     zimmerman_sqrt_static::<99>(&mut x, &mut root);
+}
+
+fn assert_sqrt_only_contract<const N: usize>(x: &[u64], root_len: usize) {
+    // The independent digit-by-digit path supplies the expected root. Also
+    // verify it against schoolbook squares, without relying on sqrt remainders.
+    let mut reference_work = x.to_vec();
+    let mut expected = vec![u64::MAX; root_len];
+    binom_sqrt(&mut reference_work, &mut expected);
+    let mut shifted_x = vec![0; 2 * root_len - x.len()];
+    shifted_x.extend_from_slice(x);
+    let mut next_root = expected.clone();
+    if inc_buf(&mut next_root) {
+        next_root.push(1);
+    }
+    assert!(cmp_buf(&mul_ref(&expected, &expected), &shifted_x).is_le());
+    assert!(cmp_buf(&shifted_x, &mul_ref(&next_root, &next_root)).is_lt());
+
+    let entries: [(&str, fn(&mut [u64], &mut [u64]), bool); 8] = [
+        ("exact dyn", zimmerman_sqrt_only_dyn, false),
+        ("exact static", zimmerman_sqrt_only_static::<N>, false),
+        ("approx dyn", zimmerman_sqrt_approx_dyn, true),
+        ("approx static", zimmerman_sqrt_approx_static::<N>, true),
+        ("dispatched exact dyn", sqrt_only_dyn, false),
+        ("dispatched exact static", sqrt_only_static::<N>, false),
+        ("dispatched approx dyn", sqrt_approx_dyn, true),
+        ("dispatched approx static", sqrt_approx_static::<N>, true),
+    ];
+    for (name, entry, approximate) in entries {
+        let mut work = x.to_vec();
+        // Poisoned outputs catch unwritten quotient limbs and scratch leakage.
+        let mut root = vec![u64::MAX; root_len];
+        entry(&mut work, &mut root);
+        assert!(
+            root == expected || (approximate && eq_buf(&root, &next_root)),
+            "{name} violated root contract: root_len={root_len}, x={x:#x?}, \
+             root={root:#x?}, expected={expected:#x?}"
+        );
+    }
+}
+
+#[test]
+fn test_sqrt_only_all_shapes_and_normalization_around_cutoff() {
+    let cutoff = ZIMMERMAN_SQRT_CUTOFF;
+    for root_len in [
+        1,
+        2,
+        3,
+        cutoff - 1,
+        cutoff,
+        cutoff + 1,
+        2 * cutoff - 1,
+        2 * cutoff + 1,
+    ] {
+        for x_len in root_len + 1..=2 * root_len {
+            for case in 0..5 {
+                let mut x = rand_vec(
+                    x_len,
+                    90_000 + 1000 * root_len as u64 + 10 * x_len as u64 + case,
+                );
+                x[x_len - 1] = match case {
+                    0 => 1,
+                    1 => 1 << 2,
+                    2 => 1 << 61,
+                    3 => 1 << 62,
+                    _ => x[x_len - 1] | (1 << 63),
+                };
+                assert_sqrt_only_contract::<128>(&x, root_len);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_sqrt_only_square_boundaries_and_saturation() {
+    for root_len in [16, 17, 18, 33, 34, 65, 100] {
+        let mut root = rand_vec(root_len, 100_000 + root_len as u64);
+        root[root_len - 1] |= 1 << 63;
+        let square = mul_ref(&root, &root);
+        let mut below = square.clone();
+        dec_buf(&mut below);
+        let mut above = square.clone();
+        inc_buf(&mut above);
+        for x in [&below, &square, &above] {
+            assert_sqrt_only_contract::<256>(x, root_len);
+        }
+
+        for x_len in root_len + 1..=2 * root_len {
+            // An all-ones high radicand has remainder 2*s_hi, exercising
+            // quotient saturation in recursive and virtually padded stages.
+            assert_sqrt_only_contract::<256>(&vec![u64::MAX; x_len], root_len);
+        }
+    }
+}
+
+#[test]
+fn test_sqrt_only_correction_and_one_unit_overestimate() {
+    for root_len in [17, 18, 33, 34, 65] {
+        let lo = (root_len - 1) / 2;
+        let mut candidate = vec![0; root_len];
+        candidate[root_len - 1] = 1 << 63;
+        candidate[lo - 1] = 1;
+        let mut x = mul_ref(&candidate, &candidate);
+        assert!(!dec_buf(&mut x));
+        let mut expected = candidate.clone();
+        assert!(!dec_buf(&mut expected));
+
+        let mut root = vec![0; root_len];
+        zimmerman_sqrt_only_dyn(&mut x.clone(), &mut root);
+        assert_eq!(root, expected);
+        zimmerman_sqrt_only_static::<256>(&mut x.clone(), &mut root);
+        assert_eq!(root, expected);
+        sqrt_only_dyn(&mut x.clone(), &mut root);
+        assert_eq!(root, expected);
+        sqrt_only_static::<256>(&mut x.clone(), &mut root);
+        assert_eq!(root, expected);
+        // The uncorrected outer stage must actually return the candidate,
+        // including when the exact correction borrows across many limbs.
+        zimmerman_sqrt_approx_dyn(&mut x.clone(), &mut root);
+        assert_eq!(root, candidate);
+        zimmerman_sqrt_approx_static::<256>(&mut x.clone(), &mut root);
+        assert_eq!(root, candidate);
+        sqrt_approx_dyn(&mut x.clone(), &mut root);
+        assert_eq!(root, candidate);
+        sqrt_approx_static::<256>(&mut x.clone(), &mut root);
+        assert_eq!(root, candidate);
+    }
+}
+
+#[test]
+fn test_sqrt_only_virtually_padded_perfect_squares() {
+    for root_len in [17usize, 18, 33, 64] {
+        for x_len in root_len + 1..2 * root_len {
+            let shift = 2 * root_len - x_len;
+            let mut root = rand_vec(root_len, 110_000 + 100 * root_len as u64 + x_len as u64);
+            root[..shift.div_ceil(2)].fill(0);
+            root[root_len - 1] |= 1 << 63;
+            let square = mul_ref(&root, &root);
+            assert_sqrt_only_contract::<128>(&square[shift..], root_len);
+        }
+    }
+}
+
+#[test]
+fn test_sqrt_zero_numerator_and_power_of_two_squares() {
+    for root_len in [17, 18, 33, 34, 65] {
+        for x_len in root_len + 1..=2 * root_len {
+            let mut x = vec![0; x_len];
+            x[x_len - 1] = 1 << 62;
+            assert_sqrt_only_contract::<256>(&x, root_len);
+            assert_zimmerman_contract(&x, root_len);
+
+            // Nonzero data below the recursive division's numerator window
+            // must not affect how its empty numerator is trimmed.
+            x[0] = 1;
+            assert_sqrt_only_contract::<256>(&x, root_len);
+            assert_zimmerman_contract(&x, root_len);
+        }
+    }
+}
+
+#[test]
+fn test_sqrt_only_larger_division_backends() {
+    for root_len in [255, 256, 257, 512] {
+        for x_len in [
+            root_len + 1,
+            root_len + 2,
+            3 * root_len / 2,
+            2 * root_len - 1,
+            2 * root_len,
+        ] {
+            let mut x = rand_vec(x_len, 120_000 + 1000 * root_len as u64 + x_len as u64);
+            x[x_len - 1] |= 1 << 63;
+            assert_sqrt_only_contract::<1024>(&x, root_len);
+        }
+    }
+}
+
+#[test]
+fn test_sqrt_static_exact_capacity() {
+    let mut full = rand_vec(34, 130_000);
+    full[33] |= 1 << 63;
+    assert_sqrt_only_contract::<34>(&full, 17);
+    assert_sqrt_contract_with(&full, 17, sqrt_static::<34>);
+    let mut padded = rand_vec(18, 130_001);
+    padded[17] |= 1 << 63;
+    assert_sqrt_only_contract::<18>(&padded, 17);
+    assert_sqrt_contract_with(&padded, 17, sqrt_static::<18>);
+}
+
+#[test]
+fn test_sqrt_dispatch_root_remainder_all_shapes_around_cutoff() {
+    const N: usize = 2 * (ZIMMERMAN_SQRT_CUTOFF + 1);
+    for root_len in [
+        1,
+        2,
+        ZIMMERMAN_SQRT_CUTOFF - 1,
+        ZIMMERMAN_SQRT_CUTOFF,
+        ZIMMERMAN_SQRT_CUTOFF + 1,
+    ] {
+        for x_len in root_len + 1..=2 * root_len {
+            for top in [1, 1 << 61, 1 << 62, u64::MAX] {
+                let mut x = rand_vec(x_len, 140_000 + 100 * root_len as u64 + x_len as u64);
+                x[x_len - 1] = top;
+                assert_sqrt_contract_with(&x, root_len, sqrt_dyn);
+                assert_sqrt_contract_with(&x, root_len, sqrt_static::<N>);
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn test_sqrt_dispatch_static_capacity_applies_to_both_algorithms() {
+    const N: usize = ZIMMERMAN_SQRT_CUTOFF;
+    let entries: [fn(&mut [u64], &mut [u64]); 3] = [
+        sqrt_static::<N>,
+        sqrt_only_static::<N>,
+        sqrt_approx_static::<N>,
+    ];
+    for root_len in [N - 1, N] {
+        for entry in entries {
+            let result = std::panic::catch_unwind(|| {
+                entry(&mut vec![u64::MAX; 2 * root_len], &mut vec![0; root_len]);
+            });
+            assert!(
+                result.is_err(),
+                "accepted operands exceeding static capacity"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "Zimmermann sqrt operands exceed static capacity")]
+fn test_sqrt_only_static_rejects_insufficient_capacity() {
+    zimmerman_sqrt_only_static::<33>(&mut [1; 34], &mut [0; 17]);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "Zimmermann sqrt operands exceed static capacity")]
+fn test_sqrt_approx_static_rejects_insufficient_capacity() {
+    zimmerman_sqrt_approx_static::<17>(&mut [1; 18], &mut [0; 17]);
 }

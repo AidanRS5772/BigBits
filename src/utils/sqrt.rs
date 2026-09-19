@@ -1,5 +1,8 @@
 use crate::utils::{
-    div::{div_buf_of, div_rem_dyn, div_rem_static, knuth_est, knuth_rcp_normalized, mul_u64_asm},
+    div::{
+        div_buf_of, div_dyn, div_rem_dyn, div_rem_static, div_static, knuth_est,
+        knuth_rcp_normalized, mul_u64_asm,
+    },
     mul::{mul_elem, sqr_dyn, sqr_static},
     utils::{
         add_buf, add_prim, buf_len, cmp_buf, combine_u64, dec_buf, end_mut, end_ref, inc_buf,
@@ -177,9 +180,13 @@ pub fn binom_sqrt(x: &mut [u64], s: &mut [u64]) {
 
     let x_len = x.len();
     let sh = x[x_len - 1].leading_zeros() as u8 & !1_u8;
-    shl_buf(x, sh);
+    if sh != 0 {
+        shl_buf(x, sh);
+    }
     binom_sqrt_core(x, s);
-    sqrt_denormalization(x, s, sh);
+    if sh != 0 {
+        sqrt_denormalization(x, s, sh);
+    }
 }
 
 pub fn reduce_sqrt_rem(sqrt_r: &mut [u64], s_hi: &[u64]) -> (bool, bool) {
@@ -193,10 +200,20 @@ pub fn reduce_sqrt_rem(sqrt_r: &mut [u64], s_hi: &[u64]) -> (bool, bool) {
     (reduced, saturated)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SqrtOutput {
+    RootRem,
+    Root,
+    ApproxRoot,
+}
+
+// The outermost stage can discard the remainder; every recursive child must
+// still return an exact root and remainder for its parent's division.
 fn zimmermann_sqrt_core(
     x: &mut [u64],
     s: &mut [u64],
-    div_rem_alg: &mut dyn FnMut(&mut [u64], &[u64], &mut [u64]) -> u64,
+    output: SqrtOutput,
+    div_alg: &mut dyn FnMut(&mut [u64], &[u64], &mut [u64], bool) -> u64,
     sqr_alg: &mut dyn FnMut(&[u64], &mut [u64]) -> u64,
 ) {
     debug_assert_eq!(x.len(), 2 * s.len());
@@ -207,20 +224,34 @@ fn zimmermann_sqrt_core(
     let s_len = s.len();
     let lo = (s_len - 1) / 2;
     let (s_lo, s_hi) = s.split_at_mut(lo);
-    zimmermann_sqrt_core(&mut x[2 * lo..], s_hi, div_rem_alg, sqr_alg);
+    zimmermann_sqrt_core(
+        &mut x[2 * lo..],
+        s_hi,
+        SqrtOutput::RootRem,
+        div_alg,
+        sqr_alg,
+    );
     let (reduced, saturated) = reduce_sqrt_rem(&mut x[2 * lo..s_len + lo + 1], s_hi);
 
     if saturated {
-        let rem = &mut x[..s_len + 1];
-        rem[2 * lo..].fill(0);
-        add_buf(&mut rem[lo..], s_hi);
-        add_buf(&mut rem[lo..], s_hi);
+        if output != SqrtOutput::ApproxRoot {
+            let rem = &mut x[..s_len + 1];
+            rem[2 * lo..].fill(0);
+            add_buf(&mut rem[lo..], s_hi);
+            add_buf(&mut rem[lo..], s_hi);
+        }
         s_lo.fill(u64::MAX);
     } else {
-        let d_len = buf_len(&x[..s_len + lo]);
-        let overflow = div_rem_alg(&mut x[lo..d_len], s_hi, s_lo);
+        let numerator = &mut x[lo..s_len + lo];
+        let n_len = buf_len(numerator);
+        let overflow = div_alg(
+            &mut numerator[..n_len],
+            s_hi,
+            s_lo,
+            output != SqrtOutput::ApproxRoot,
+        );
         debug_assert_eq!(overflow, 0, "Zimmermann quotient exceeded low half");
-        if shr_buf(s_lo, 1) != 0 {
+        if shr_buf(s_lo, 1) != 0 && output != SqrtOutput::ApproxRoot {
             add_buf(&mut x[lo..], s_hi);
         }
         if reduced {
@@ -228,10 +259,34 @@ fn zimmermann_sqrt_core(
         }
     }
 
-    let (rem, s_lo_sqr) = x[..s_len + 2 * lo + 1].split_at_mut(s_len + 1);
-    let overflow = sqr_alg(s_lo, s_lo_sqr);
+    let high_rem = &x[2 * lo..s_len + 1];
+
+    match output {
+        SqrtOutput::ApproxRoot => return,
+        SqrtOutput::Root if high_rem.iter().any(|&limb| limb != 0) => return,
+        _ => {
+            let (rem, s_lo_sqr) = x[..s_len + 2 * lo + 1].split_at_mut(s_len + 1);
+            finish_sqrt(rem, s, s_lo_sqr, output, sqr_alg);
+        }
+    }
+}
+
+fn finish_sqrt(
+    x: &mut [u64],
+    s: &mut [u64],
+    s_lo_sqr: &mut [u64],
+    output: SqrtOutput,
+    sqr_alg: &mut dyn FnMut(&[u64], &mut [u64]) -> u64,
+) {
+    debug_assert!(output != SqrtOutput::ApproxRoot);
+    let overflow = sqr_alg(&s[..s_lo_sqr.len() / 2], s_lo_sqr);
     debug_assert_eq!(overflow, 0, "Zimmermann low square exceeded its buffer");
-    if correct_sqrt(rem, s, s_lo_sqr) {
+    let correct = if output == SqrtOutput::RootRem {
+        correct_sqrt(x, s, s_lo_sqr)
+    } else {
+        cmp_buf(x, s_lo_sqr).is_lt()
+    };
+    if correct {
         dec_buf(s);
     }
 }
@@ -239,17 +294,17 @@ fn zimmermann_sqrt_core(
 fn zimmerman_sqrt_top(
     x: &mut [u64],
     s: &mut [u64],
-    s_lo_sqr: &mut [u64],
-    div_rem_alg: &mut dyn FnMut(&mut [u64], &[u64], &mut [u64]) -> u64,
+    output: SqrtOutput,
+    div_alg: &mut dyn FnMut(&mut [u64], &[u64], &mut [u64], bool) -> u64,
     sqr_alg: &mut dyn FnMut(&[u64], &mut [u64]) -> u64,
-) {
+) -> Option<usize> {
     let x_len = x.len();
     let s_len = s.len();
     let hi = x_len / 2;
     let lo = s_len - hi;
     let (s_lo, s_hi) = s.split_at_mut(lo);
     let x_lo = x_len % 2;
-    zimmermann_sqrt_core(&mut x[x_lo..], s_hi, div_rem_alg, sqr_alg);
+    zimmermann_sqrt_core(&mut x[x_lo..], s_hi, SqrtOutput::RootRem, div_alg, sqr_alg);
     x[x_lo + hi + 1..].fill(0);
     let (reduced, saturated) = reduce_sqrt_rem(&mut x[x_lo..hi + x_lo + 1], s_hi);
 
@@ -257,15 +312,22 @@ fn zimmerman_sqrt_top(
     x[..lo - x_lo].fill(0);
 
     if saturated {
-        x[lo..].fill(0);
-        add_buf(x, s_hi);
-        add_buf(x, s_hi);
+        if output != SqrtOutput::ApproxRoot {
+            x[lo..].fill(0);
+            add_buf(x, s_hi);
+            add_buf(x, s_hi);
+        }
         s_lo.fill(u64::MAX);
     } else {
         let u_len = buf_len(&x);
-        let overflow = div_rem_alg(&mut x[..u_len], s_hi, s_lo);
-        debug_assert_eq!(overflow, 0, "Zimmermann quotient exceeded low half");
-        if shr_buf(s_lo, 1) != 0 {
+        let overflow = div_alg(
+            &mut x[..u_len],
+            s_hi,
+            s_lo,
+            output != SqrtOutput::ApproxRoot,
+        );
+        debug_assert_eq!(overflow, 0, "Zimmerman quotient exceeded low half");
+        if shr_buf(s_lo, 1) != 0 && output != SqrtOutput::ApproxRoot {
             add_buf(x, s_hi);
         }
         if reduced {
@@ -273,22 +335,49 @@ fn zimmerman_sqrt_top(
         }
     }
 
+    match output {
+        SqrtOutput::ApproxRoot => return None,
+        SqrtOutput::Root if x[lo..].iter().any(|&limb| limb != 0) => return None,
+        _ => {}
+    }
     x.copy_within(..x_len - lo, lo);
     x[..lo].fill(0);
-    let overflow = sqr_alg(s_lo, s_lo_sqr);
-    debug_assert_eq!(overflow, 0, "Zimmermann low square exceeded its buffer");
-    if correct_sqrt(x, s, s_lo_sqr) {
-        dec_buf(s);
-    }
+    Some(2 * lo)
 }
 
+/// Computes the exact root and remainder of `X = value(x) * B^(2*s.len()-x.len())`,
+/// where `B = 2^64`, using pooled dynamic scratch. Writes `floor(sqrt(X))` to `s`
+/// and the remainder to `x`. Requires trimmed nonzero `x` and
+/// `s.len() < x.len() <= 2*s.len()`.
 pub fn zimmerman_sqrt_dyn(x: &mut [u64], s: &mut [u64]) {
+    sqrt_dyn(x, s);
+}
+
+/// Computes only the exact root of `X = value(x) * B^(2*s.len()-x.len())`, where
+/// `B = 2^64`, using pooled dynamic scratch. Writes `floor(sqrt(X))` to `s`.
+/// Requires trimmed nonzero `x` and `s.len() < x.len() <= 2*s.len()`.
+/// The input `x` is used as scratch; its contents on return are unspecified.
+pub fn zimmerman_sqrt_only_dyn(x: &mut [u64], s: &mut [u64]) {
+    sqrt_only_dyn(x, s);
+}
+
+/// Computes an approximate root of `X = value(x) * B^(2*s.len()-x.len())`, where
+/// `B = 2^64`, using pooled dynamic scratch. The returned integer in `s` is either
+/// `floor(sqrt(X))` or `floor(sqrt(X)) + 1`; small inputs may be computed exactly.
+/// This is a numeric error bound, not a guarantee of identical high limbs.
+/// Requires trimmed nonzero `x` and `s.len() < x.len() <= 2*s.len()`.
+/// The input `x` is used as scratch; its contents on return are unspecified.
+pub fn zimmerman_sqrt_approx_dyn(x: &mut [u64], s: &mut [u64]) {
+    sqrt_approx_dyn(x, s);
+}
+
+fn sqrt_dyn_output(x: &mut [u64], s: &mut [u64], output: SqrtOutput) {
     // assume correct size bounds
     debug_assert!(x.len() > s.len());
     debug_assert!(2 * s.len() >= x.len());
 
     if s.len() < ZIMMERMAN_SQRT_CUTOFF {
-        binom_sqrt(x, s);
+        binom_sqrt_output(x, s, output);
         return;
     }
 
@@ -298,22 +387,54 @@ pub fn zimmerman_sqrt_dyn(x: &mut [u64], s: &mut [u64]) {
     let sh = x[x_len - 1].leading_zeros() as u8 & !1_u8;
     shl_buf(x, sh);
 
-    let mut div_rem = |n: &mut [u64], d: &[u64], q: &mut [u64]| div_rem_dyn(n, d, q);
+    let mut div = |n: &mut [u64], d: &[u64], q: &mut [u64], remainder: bool| {
+        if remainder {
+            div_rem_dyn(n, d, q)
+        } else {
+            div_dyn(n, d, q)
+        }
+    };
     let mut sqr = |value: &[u64], out: &mut [u64]| sqr_dyn(value, out);
 
     if x_len == full_len {
-        zimmermann_sqrt_core(x, s, &mut div_rem, &mut sqr);
-        x[s_len + 1..].fill(0);
-    } else {
-        let mut gaurd = ScratchGuard::acquire();
-        let s_lo_sqr = gaurd.get(2 * (s_len - x_len / 2));
-        zimmerman_sqrt_top(x, s, s_lo_sqr, &mut div_rem, &mut sqr);
+        zimmermann_sqrt_core(x, s, output, &mut div, &mut sqr);
+        if output == SqrtOutput::RootRem {
+            x[s_len + 1..].fill(0);
+        }
+    } else if let Some(square_len) = zimmerman_sqrt_top(x, s, output, &mut div, &mut sqr) {
+        let mut guard = ScratchGuard::acquire();
+        finish_sqrt(x, s, guard.get(square_len), output, &mut sqr);
     }
 
-    sqrt_denormalization(x, s, sh);
+    if output == SqrtOutput::RootRem {
+        sqrt_denormalization(x, s, sh);
+    } else {
+        shr_buf(s, sh / 2);
+    }
 }
 
+/// Static-scratch counterpart of [`zimmerman_sqrt_dyn`]. Requires both operand
+/// lengths to be at most `N`; writes the exact root to `s` and remainder to `x`.
 pub fn zimmerman_sqrt_static<const N: usize>(x: &mut [u64], s: &mut [u64]) {
+    sqrt_static::<N>(x, s);
+}
+
+/// Static-scratch counterpart of [`zimmerman_sqrt_only_dyn`], with the same
+/// scaling and exact-root contract. Requires both operand lengths to be at most
+/// `N`. The contents of `x` on return are unspecified. Does not allocate on the heap.
+pub fn zimmerman_sqrt_only_static<const N: usize>(x: &mut [u64], s: &mut [u64]) {
+    sqrt_only_static::<N>(x, s);
+}
+
+/// Static-scratch counterpart of [`zimmerman_sqrt_approx_dyn`], with the same
+/// scaling and at-most-one-unit upward integer error. Requires both operand
+/// lengths to be at most `N`. The contents of `x` on return are unspecified.
+/// Does not allocate on the heap.
+pub fn zimmerman_sqrt_approx_static<const N: usize>(x: &mut [u64], s: &mut [u64]) {
+    sqrt_approx_static::<N>(x, s);
+}
+
+fn sqrt_static_output<const N: usize>(x: &mut [u64], s: &mut [u64], output: SqrtOutput) {
     // assume correct size bounds
     debug_assert!(x.len() > s.len());
     debug_assert!(2 * s.len() >= x.len());
@@ -323,7 +444,7 @@ pub fn zimmerman_sqrt_static<const N: usize>(x: &mut [u64], s: &mut [u64]) {
     );
 
     if s.len() < ZIMMERMAN_SQRT_CUTOFF {
-        binom_sqrt(x, s);
+        binom_sqrt_output(x, s, output);
         return;
     }
 
@@ -333,149 +454,83 @@ pub fn zimmerman_sqrt_static<const N: usize>(x: &mut [u64], s: &mut [u64]) {
     let sh = x[x_len - 1].leading_zeros() as u8 & !1_u8;
     shl_buf(x, sh);
 
-    let mut div_rem = |n: &mut [u64], d: &[u64], q: &mut [u64]| div_rem_static::<N>(n, d, q);
+    let mut div = |n: &mut [u64], d: &[u64], q: &mut [u64], remainder: bool| {
+        if remainder {
+            div_rem_static::<N>(n, d, q)
+        } else {
+            div_static::<N>(n, d, q)
+        }
+    };
     let mut sqr = |value: &[u64], out: &mut [u64]| sqr_static::<N>(value, out);
 
     if x_len == full_len {
-        zimmermann_sqrt_core(x, s, &mut div_rem, &mut sqr);
-        x[s_len + 1..].fill(0);
-    } else {
+        zimmermann_sqrt_core(x, s, output, &mut div, &mut sqr);
+        if output == SqrtOutput::RootRem {
+            x[s_len + 1..].fill(0);
+        }
+    } else if let Some(square_len) = zimmerman_sqrt_top(x, s, output, &mut div, &mut sqr) {
         let mut s_lo_sqr = [0_u64; N];
-        zimmerman_sqrt_top(
-            x,
-            s,
-            &mut s_lo_sqr[..2 * (s_len - x_len / 2)],
-            &mut div_rem,
-            &mut sqr,
-        );
+        finish_sqrt(x, s, &mut s_lo_sqr[..square_len], output, &mut sqr);
     }
 
-    sqrt_denormalization(x, s, sh);
-}
-
-fn nr_seed<const TWO_P: usize, const P: usize>(x: &[u64], rcp: &mut [u64]) -> usize {
-    let mut work_x = [0_u64; TWO_P];
-    work_x.copy_from_slice(end_ref(x, TWO_P));
-    let mut sqrt = [0_u64; P];
-    binom_sqrt_core(&mut work_x, &mut sqrt);
-    let mut win = [0_u64; P];
-    let rcp_seed = end_mut(rcp, P);
-    knuth_rcp_normalized(&sqrt, rcp_seed, &mut win, 1);
-    inc_buf(rcp_seed);
-    P
-}
-
-fn nr_err(
-    x: &[u64],
-    sqr: &[u64],
-    err: &mut [u64],
-    p: usize,
-    mid_mul_alg: &mut dyn FnMut(&[u64], &[u64], &mut [u64]) -> (u64, u64),
-) -> Option<(bool, usize)> {
-    let (mut acc0, mut acc1) = mid_mul_alg(x, sqr, &mut err[..p]);
-    let mut acc2 = 0;
-    let mut e_idx = p;
-    let mut val = mul_elem(x, sqr, p + e_idx - 1, &mut acc0, &mut acc1, &mut acc2);
-
-    const BAND_EXT_CAP: usize = 5;
-    while val != 0 && val != u64::MAX {
-        if BAND_EXT_CAP == e_idx - p || e_idx == err.len() {
-            return None;
-        }
-        err[e_idx] = val;
-        e_idx += 1;
-        val = mul_elem(x, sqr, p + e_idx - 1, &mut acc0, &mut acc1, &mut acc2);
-    }
-    return Some((val == u64::MAX, e_idx));
-}
-
-fn nr_sqrt_core(
-    x: &[u64],
-    s: &mut [u64],
-    rcp: &mut [u64],
-    err: &mut [u64],
-    cor: &mut [u64],
-    hi_mul_alg: &mut dyn FnMut(&[u64], &[u64], &mut [u64]) -> u64,
-    hi_sqr_alg: &mut dyn FnMut(&[u64], &mut [u64]) -> u64,
-    sqr_alg: &mut dyn FnMut(&[u64], &mut [u64]) -> u64,
-    mid_mul_alg: &mut dyn FnMut(&[u64], &[u64], &mut [u64]) -> (u64, u64),
-) -> bool {
-    debug_assert!(s.len() > 4);
-    debug_assert!(x.last().copied().unwrap().leading_zeros() <= 1);
-    debug_assert_eq!(x.len(), 2 * s.len());
-
-    let s_len = s.len();
-    let mut schedule =
-        (s_len.next_power_of_two() - s_len).reverse_bits() >> (s_len.leading_zeros() + 1);
-    let mut p = match schedule & 0b1 {
-        0 => nr_seed::<8, 4>(x, rcp),
-        1 => nr_seed::<6, 3>(x, rcp),
-        _ => unreachable!(),
-    };
-    rcp[..s_len - p].fill(0);
-    schedule >>= 1;
-
-    //Newton - Raphson
-    // x' = x - s(x*s^2 - 1)/2
-    while p != (s_len + 1) / 2 {
-        let r_p = end_ref(rcp, p);
-        let x_p = end_ref(x, 2 * p - 1);
-        let of = hi_sqr_alg(r_p, &mut cor[..p]);
-        debug_assert_eq!(of, 0);
-
-        let Some((neg, e_len)) = nr_err(x_p, &cor[..p], err, p, mid_mul_alg) else {
-            return false;
-        };
-
-        let of = hi_mul_alg(r_p, &err[..e_len], &mut cor[..e_len]);
-        debug_assert_eq!(of, 0);
-
-        let extra = e_len - p;
-        let skip = schedule & 1;
-        if neg {
-            sub_buf(&mut cor[extra..e_len], r_p);
-            twos_comp(&mut cor[..e_len]);
-            shr_buf(&mut cor[skip..e_len], 1);
-            add_buf(end_mut(rcp, 2 * p - skip), &cor[skip..]);
-        } else {
-            shr_buf(&mut cor[skip..e_len], 1);
-            sub_buf(end_mut(rcp, 2 * p - skip), &cor[skip..]);
-        }
-        schedule >>= 1;
-        p = 2 * p - skip;
-    }
-
-    //Karp - Markstien
-    // y = x*s
-    // s' = x - x*(y^2 - x)/2
-    let x_p = end_ref(x, 2 * p);
-    let r_p = end_mut(rcp, p);
-    let of = hi_mul_alg(x, r_p, &mut cor[..p]);
-    debug_assert_eq!(of, 0);
-
-    s[s_len - p..].copy_from_slice(&cor[..p]);
-    s[..s_len - p].fill(0);
-
-    sqr_alg(&cor[..p], &mut err[..2 * p]);
-    let neg = sub_buf(&mut err[..2 * p], x_p);
-    if neg {
-        twos_comp(&mut err[..2 * p]);
-    }
-    let e_len = buf_len(&err[..2 * p]);
-    if e_len == 0 {
-        return true;
-    }
-    let of = hi_mul_alg(r_p, &err[..e_len], &mut cor[..e_len]);
-    debug_assert_eq!(of, 0);
-
-    let skip = 2 * p - s_len;
-    let fin_cor = &mut cor[skip..e_len];
-    shr_buf(fin_cor, 1);
-    if neg {
-        add_buf(s, fin_cor);
+    if output == SqrtOutput::RootRem {
+        sqrt_denormalization(x, s, sh);
     } else {
-        sub_buf(s, fin_cor);
+        shr_buf(s, sh / 2);
     }
+}
 
-    return true;
+fn binom_sqrt_output(x: &mut [u64], s: &mut [u64], output: SqrtOutput) {
+    if output == SqrtOutput::RootRem {
+        binom_sqrt(x, s);
+    } else {
+        let sh = x.last().unwrap().leading_zeros() as u8 & !1_u8;
+        shl_buf(x, sh);
+        binom_sqrt_core(x, s);
+        shr_buf(s, sh / 2);
+    }
+}
+
+/// Computes the exact root and remainder of `X = value(x) * B^(2*s.len()-x.len())`,
+/// where `B = 2^64`. Writes `floor(sqrt(X))` to `s` and the remainder to `x`.
+/// Requires trimmed nonzero `x` and `s.len() < x.len() <= 2*s.len()`.
+///
+/// Dispatches to binomial sqrt when `s.len() < ZIMMERMAN_SQRT_CUTOFF`, or
+/// Zimmermann sqrt otherwise, using pooled dynamic scratch when needed.
+pub fn sqrt_dyn(x: &mut [u64], s: &mut [u64]) {
+    sqrt_dyn_output(x, s, SqrtOutput::RootRem);
+}
+
+/// Computes only the exact root with the scaling, input requirements, and
+/// algorithm selection of [`sqrt_dyn`]. Writes `floor(sqrt(X))` to `s`.
+/// The input `x` is used as scratch; its contents on return are unspecified.
+pub fn sqrt_only_dyn(x: &mut [u64], s: &mut [u64]) {
+    sqrt_dyn_output(x, s, SqrtOutput::Root);
+}
+
+/// Computes an approximate root with the scaling, input requirements, and
+/// algorithm selection of [`sqrt_dyn`]. The result in `s` is either
+/// `floor(sqrt(X))` or `floor(sqrt(X)) + 1`; the binomial path is exact.
+/// This is a numeric error bound, not a guarantee of identical high limbs.
+/// The input `x` is used as scratch; its contents on return are unspecified.
+pub fn sqrt_approx_dyn(x: &mut [u64], s: &mut [u64]) {
+    sqrt_dyn_output(x, s, SqrtOutput::ApproxRoot);
+}
+
+/// Static-scratch counterpart of [`sqrt_dyn`], with the same algorithm selection.
+/// Requires both operand lengths to be at most `N`. Does not allocate on the heap.
+pub fn sqrt_static<const N: usize>(x: &mut [u64], s: &mut [u64]) {
+    sqrt_static_output::<N>(x, s, SqrtOutput::RootRem);
+}
+
+/// Static-scratch counterpart of [`sqrt_only_dyn`], with the same algorithm selection.
+/// Requires both operand lengths to be at most `N`. Does not allocate on the heap.
+pub fn sqrt_only_static<const N: usize>(x: &mut [u64], s: &mut [u64]) {
+    sqrt_static_output::<N>(x, s, SqrtOutput::Root);
+}
+
+/// Static-scratch counterpart of [`sqrt_approx_dyn`], with the same algorithm selection.
+/// Requires both operand lengths to be at most `N`. Does not allocate on the heap.
+pub fn sqrt_approx_static<const N: usize>(x: &mut [u64], s: &mut [u64]) {
+    sqrt_static_output::<N>(x, s, SqrtOutput::ApproxRoot);
 }

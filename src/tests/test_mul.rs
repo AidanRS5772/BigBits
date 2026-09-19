@@ -3,9 +3,9 @@ use crate::utils::mul::*;
 use crate::utils::utils::trim_lz;
 use crate::utils::{
     CHUNKING_KARATSUBA_CUTOFF, FFT_16BIT_CUTOFF, FFT_CHUNKING_KARATSUBA_CUTOFF,
-    FFT_KARATSUBA_CUTOFF, FFT_MID_CUTOFF, FFT_SQR_CUTOFF, HI_MUL_CUTOFF, HI_SQR_CUTOFF,
-    KARATSUBA_CUTOFF, KARATSUBA_SQR_CUTOFF, NTT_CHUNKING_KARATSUBA_CUTOFF, NTT_KARATSUBA_CUTOFF,
-    NTT_MID_CUTOFF, STATIC_NTT_SQR_CUTOFF,
+    FFT_KARATSUBA_CUTOFF, FFT_MID_CUTOFF, FFT_SQR_CUTOFF, KARATSUBA_CUTOFF, KARATSUBA_SQR_CUTOFF,
+    NTT_CHUNKING_KARATSUBA_CUTOFF, NTT_KARATSUBA_CUTOFF, NTT_MID_CUTOFF, PARTIAL_MUL_CUTOFF,
+    PARTIAL_SQR_CUTOFF, STATIC_NTT_SQR_CUTOFF,
 };
 use rustfft::num_complex::Complex;
 use rustfft::num_traits::Zero;
@@ -1882,7 +1882,7 @@ fn test_hi_mul_buf_accuracy_small() {
 
 #[test]
 fn test_hi_mul_buf_accuracy_at_cutoff() {
-    let out_len = HI_MUL_CUTOFF;
+    let out_len = PARTIAL_MUL_CUTOFF;
     for seed in 0u64..10 {
         let a_len = out_len + 3;
         let b_len = out_len + 2;
@@ -1930,8 +1930,8 @@ fn test_hi_mul_dyn_exact_fit() {
 
 #[test]
 fn test_hi_mul_dyn_below_cutoff() {
-    // out.len() <= HI_MUL_CUTOFF → hi_mul_buf path
-    let out_len = HI_MUL_CUTOFF;
+    // out.len() <= PARTIAL_MUL_CUTOFF → hi_mul_buf path
+    let out_len = PARTIAL_MUL_CUTOFF;
     for seed in 0u64..10 {
         let a_len = out_len + 5;
         let b_len = out_len + 3;
@@ -1956,10 +1956,10 @@ fn test_hi_mul_dyn_below_cutoff() {
 
 #[test]
 fn test_hi_mul_dyn_above_cutoff() {
-    // out.len() > HI_MUL_CUTOFF → truncation path
+    // out.len() > PARTIAL_MUL_CUTOFF → truncation path
     // hi_mul_dyn truncates inputs to out_len before multiplying. The only
     // omitted effect should be carry into the lowest returned limbs.
-    let out_len = HI_MUL_CUTOFF + 10;
+    let out_len = PARTIAL_MUL_CUTOFF + 10;
     for seed in 0u64..10 {
         let a_len = out_len + 20;
         let b_len = out_len + 15;
@@ -2052,7 +2052,7 @@ fn test_hi_sqr_buf_accuracy_small() {
 
 #[test]
 fn test_hi_sqr_buf_accuracy_at_cutoff() {
-    let out_len = HI_SQR_CUTOFF;
+    let out_len = PARTIAL_SQR_CUTOFF;
     for seed in 0u64..10 {
         let n = out_len + 3;
         let a = rand_nonzero_vec(n, seed + 6900);
@@ -2091,12 +2091,12 @@ fn test_hi_sqr_dyn_exact_when_out_is_larger_than_full_product() {
 #[test]
 fn test_hi_sqr_dyn_below_and_above_cutoff() {
     for seed in 0u64..10 {
-        let n = HI_SQR_CUTOFF + 20 + seed as usize;
+        let n = PARTIAL_SQR_CUTOFF + 20 + seed as usize;
         let a = rand_nonzero_vec(n, seed + 7100);
 
-        let mut below_dyn = vec![0u64; HI_SQR_CUTOFF];
+        let mut below_dyn = vec![0u64; PARTIAL_SQR_CUTOFF];
         let c_below_dyn = hi_sqr_dyn(&a, &mut below_dyn);
-        let mut below_buf = vec![0u64; HI_SQR_CUTOFF];
+        let mut below_buf = vec![0u64; PARTIAL_SQR_CUTOFF];
         let c_below_buf = hi_sqr_buf(&a, &mut below_buf);
         assert_eq_result(
             &below_dyn,
@@ -2106,7 +2106,7 @@ fn test_hi_sqr_dyn_below_and_above_cutoff() {
             &format!("hi_sqr_dyn below cutoff seed={seed}"),
         );
 
-        let out_len = HI_SQR_CUTOFF + 10;
+        let out_len = PARTIAL_SQR_CUTOFF + 10;
         let mut above = vec![0u64; out_len];
         let _c = hi_sqr_dyn(&a, &mut above);
         let ref_top = hi_sqr_ref(&a, out_len);
@@ -2912,7 +2912,7 @@ fn test_karatsuba_static_chunking_scratch_fallback() {
 
 #[test]
 fn test_hi_mul_static_split_matches_dyn() {
-    const N: usize = HI_MUL_CUTOFF + 1;
+    const N: usize = PARTIAL_MUL_CUTOFF + 1;
     for seed in 0u64..5 {
         let a = rand_nonzero_vec(N, seed + 9_700);
         let b = rand_nonzero_vec(N, seed + 9_800);
@@ -2942,7 +2942,7 @@ fn test_hi_mul_static_split_matches_dyn() {
 
 #[test]
 fn test_hi_sqr_static_split_matches_dyn() {
-    const N: usize = HI_SQR_CUTOFF + 1;
+    const N: usize = PARTIAL_SQR_CUTOFF + 1;
     for seed in 0u64..5 {
         let a = rand_nonzero_vec(N, seed + 9_900);
 

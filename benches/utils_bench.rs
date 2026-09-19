@@ -1,12 +1,16 @@
 #![allow(dead_code)]
 
-use big_bits::utils::sqrt::{binom_sqrt, zimmerman_sqrt_dyn, zimmerman_sqrt_static};
+use big_bits::utils::sqrt::{
+    binom_sqrt, sqrt_approx_dyn, sqrt_approx_static, sqrt_dyn, sqrt_only_dyn, sqrt_only_static,
+    sqrt_static, zimmerman_sqrt_dyn, zimmerman_sqrt_static,
+};
+use big_bits::utils::ZIMMERMAN_SQRT_CUTOFF;
 use big_bits::{utils::div::*, *};
 use criterion::{
     black_box, criterion_group, criterion_main, measurement::WallTime, BatchSize, BenchmarkGroup,
     BenchmarkId, Criterion, Throughput,
 };
-use rand::Rng;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 
 fn random_limbs(n: usize) -> Vec<u64> {
     let mut rng = rand::thread_rng();
@@ -755,6 +759,75 @@ fn bench_zimmermann_sqrt(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_zimmermann_sqrt, bench_mul_band_ratios);
+fn register_sqrt_only_size<const N: usize>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    root_len: usize,
+) {
+    assert_eq!(N, 2 * root_len);
+    let entries: [(&str, fn(&mut [u64], &mut [u64])); 6] = [
+        ("rem_dyn", sqrt_dyn),
+        ("only_dyn", sqrt_only_dyn),
+        ("approx_dyn", sqrt_approx_dyn),
+        ("rem_static", sqrt_static::<N>),
+        ("only_static", sqrt_only_static::<N>),
+        ("approx_static", sqrt_approx_static::<N>),
+    ];
+    for (shape, x_len) in [("full", 2 * root_len), ("padded", root_len + 1)] {
+        let mut rng = StdRng::seed_from_u64(0x5351_5254 ^ x_len as u64);
+        let inputs: Vec<Vec<u64>> = (0..8)
+            .map(|_| {
+                let mut x: Vec<u64> = (0..x_len).map(|_| rng.gen()).collect();
+                x[x_len - 1] |= 1 << 63;
+                x
+            })
+            .collect();
+        group.throughput(Throughput::Elements(x_len as u64));
+        for (name, entry) in entries {
+            group.bench_with_input(
+                BenchmarkId::new(format!("{name}/{shape}"), root_len),
+                &root_len,
+                |bench, &root_len| {
+                    let mut case = 0;
+                    bench.iter_batched_ref(
+                        || {
+                            let x = inputs[case].clone();
+                            case = (case + 1) % inputs.len();
+                            (x, vec![0; root_len])
+                        },
+                        |(x, root)| {
+                            entry(black_box(x.as_mut_slice()), black_box(root.as_mut_slice()))
+                        },
+                        BatchSize::LargeInput,
+                    );
+                },
+            );
+        }
+    }
+}
+
+fn bench_sqrt_only(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("sqrt_only/{ARCH}"));
+    set_up_group(&mut group);
+    register_sqrt_only_size::<{ 2 * (ZIMMERMAN_SQRT_CUTOFF - 1) }>(
+        &mut group,
+        ZIMMERMAN_SQRT_CUTOFF - 1,
+    );
+    register_sqrt_only_size::<{ 2 * ZIMMERMAN_SQRT_CUTOFF }>(&mut group, ZIMMERMAN_SQRT_CUTOFF);
+    register_sqrt_only_size::<{ 2 * (ZIMMERMAN_SQRT_CUTOFF + 1) }>(
+        &mut group,
+        ZIMMERMAN_SQRT_CUTOFF + 1,
+    );
+    register_sqrt_only_size::<64>(&mut group, 32);
+    register_sqrt_only_size::<256>(&mut group, 128);
+    register_sqrt_only_size::<1024>(&mut group, 512);
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_zimmermann_sqrt,
+    bench_sqrt_only,
+    bench_mul_band_ratios
+);
 
 criterion_main!(benches);
