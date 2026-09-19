@@ -1,16 +1,11 @@
-use crate::{
-    hi_mul_buf,
+use crate::utils::{
+    div::{div_buf_of, div_rem_dyn, div_rem_static, knuth_est, knuth_rcp_normalized, mul_u64_asm},
+    mul::{mul_elem, sqr_dyn, sqr_static},
     utils::{
-        div::{
-            div_buf_of, div_rem_dyn, div_rem_static, knuth_est, knuth_rcp_normalized, mul_u64_asm,
-        },
-        mul::{mul_elem, sqr_dyn, sqr_static},
-        utils::{
-            add_buf, add_prim, buf_len, cmp_buf, combine_u64, dec_buf, end_mut, end_ref, inc_buf,
-            shl_buf, shr_buf, sub_buf, twos_comp,
-        },
-        ScratchGuard, ZIMMERMAN_SQRT_CUTOFF,
+        add_buf, add_prim, buf_len, cmp_buf, combine_u64, dec_buf, end_mut, end_ref, inc_buf,
+        shl_buf, shr_buf, sub_buf, twos_comp,
     },
+    ScratchGuard, ZIMMERMAN_SQRT_CUTOFF,
 };
 
 #[inline]
@@ -381,9 +376,10 @@ fn nr_err(
     let mut acc2 = 0;
     let mut e_idx = p;
     let mut val = mul_elem(x, sqr, p + e_idx - 1, &mut acc0, &mut acc1, &mut acc2);
+
     const BAND_EXT_CAP: usize = 5;
     while val != 0 && val != u64::MAX {
-        if BAND_EXT_CAP == e_idx + 1 - p {
+        if BAND_EXT_CAP == e_idx - p || e_idx == err.len() {
             return None;
         }
         err[e_idx] = val;
@@ -393,7 +389,7 @@ fn nr_err(
     return Some((val == u64::MAX, e_idx));
 }
 
-fn nr_sqrt(
+fn nr_sqrt_core(
     x: &[u64],
     s: &mut [u64],
     rcp: &mut [u64],
@@ -404,30 +400,36 @@ fn nr_sqrt(
     sqr_alg: &mut dyn FnMut(&[u64], &mut [u64]) -> u64,
     mid_mul_alg: &mut dyn FnMut(&[u64], &[u64], &mut [u64]) -> (u64, u64),
 ) -> bool {
+    debug_assert!(s.len() > 4);
     debug_assert!(x.last().copied().unwrap().leading_zeros() <= 1);
     debug_assert_eq!(x.len(), 2 * s.len());
 
     let s_len = s.len();
     let mut schedule =
         (s_len.next_power_of_two() - s_len).reverse_bits() >> (s_len.leading_zeros() + 1);
-    let mut p = match schedule & 0b11 {
-        0 => nr_seed::<16, 8>(x, rcp),
-        1 => nr_seed::<12, 6>(x, rcp),
-        2 => nr_seed::<14, 7>(x, rcp),
-        3 => nr_seed::<10, 5>(x, rcp),
+    let mut p = match schedule & 0b1 {
+        0 => nr_seed::<8, 4>(x, rcp),
+        1 => nr_seed::<6, 3>(x, rcp),
         _ => unreachable!(),
     };
     rcp[..s_len - p].fill(0);
-    schedule >>= 2;
+    schedule >>= 1;
 
+    //Newton - Raphson
+    // x' = x - s(x*s^2 - 1)/2
     while p != (s_len + 1) / 2 {
         let r_p = end_ref(rcp, p);
         let x_p = end_ref(x, 2 * p - 1);
-        cor[p - 1] = hi_sqr_alg(r_p, &mut cor[..p - 1]);
+        let of = hi_sqr_alg(r_p, &mut cor[..p]);
+        debug_assert_eq!(of, 0);
+
         let Some((neg, e_len)) = nr_err(x_p, &cor[..p], err, p, mid_mul_alg) else {
             return false;
         };
-        cor[e_len - 1] = hi_mul_alg(r_p, &err[..e_len], &mut cor[..e_len - 1]);
+
+        let of = hi_mul_alg(r_p, &err[..e_len], &mut cor[..e_len]);
+        debug_assert_eq!(of, 0);
+
         let extra = e_len - p;
         let skip = schedule & 1;
         if neg {
@@ -443,23 +445,36 @@ fn nr_sqrt(
         p = 2 * p - skip;
     }
 
+    //Karp - Markstien
+    // y = x*s
+    // s' = x - x*(y^2 - x)/2
     let x_p = end_ref(x, 2 * p);
     let r_p = end_mut(rcp, p);
-    cor[p - 1] = hi_mul_alg(x, r_p, &mut cor[..p - 1]);
+    let of = hi_mul_alg(x, r_p, &mut cor[..p]);
+    debug_assert_eq!(of, 0);
+
     s[s_len - p..].copy_from_slice(&cor[..p]);
     s[..s_len - p].fill(0);
+
     sqr_alg(&cor[..p], &mut err[..2 * p]);
     let neg = sub_buf(&mut err[..2 * p], x_p);
     if neg {
         twos_comp(&mut err[..2 * p]);
     }
     let e_len = buf_len(&err[..2 * p]);
-    cor[e_len - 1] = hi_mul_alg(r_p, &err[..e_len], &mut cor[..e_len - 1]);
-    shr_buf(&mut cor[..e_len], 1);
+    if e_len == 0 {
+        return true;
+    }
+    let of = hi_mul_alg(r_p, &err[..e_len], &mut cor[..e_len]);
+    debug_assert_eq!(of, 0);
+
+    let skip = 2 * p - s_len;
+    let fin_cor = &mut cor[skip..e_len];
+    shr_buf(fin_cor, 1);
     if neg {
-        add_buf(s, end_ref(&cor[..e_len], s_len));
+        add_buf(s, fin_cor);
     } else {
-        sub_buf(s, end_ref(&cor[..e_len], s_len));
+        sub_buf(s, fin_cor);
     }
 
     return true;
