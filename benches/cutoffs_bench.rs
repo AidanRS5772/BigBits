@@ -2,7 +2,7 @@
 
 use big_bits::utils::sqrt::{binom_sqrt_core, correct_sqrt, reduce_sqrt_rem};
 use big_bits::{utils::div::*, utils::*, *};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -18,49 +18,49 @@ pub type Point = (usize, usize);
 
 fn bz_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        bz_div_wrapper_dyn(n, d, q, request);
+        div_prepared_dyn(n, d, q, request, DivAlg::BZ);
     }
 }
 
 fn nr_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        nr_div_wrapper_dyn(n, d, q, request);
+        div_prepared_dyn(n, d, q, request, DivAlg::NR);
     }
 }
 
 fn bz_div_rem_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        bz_div_rem_wrapper_dyn(n, d, q, request);
+        div_rem_prepared_dyn(n, d, q, request, DivAlg::BZ);
     }
 }
 
 fn nr_div_rem_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        nr_div_rem_wrapper_dyn(n, d, q, request);
+        div_rem_prepared_dyn(n, d, q, request, DivAlg::NR);
     }
 }
 
 fn bz_div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        bz_div_wrapper_static::<N>(n, d, q, request);
+        div_prepared_static::<N>(n, d, q, request, DivAlg::BZ);
     }
 }
 
 fn nr_div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        nr_div_wrapper_static::<N>(n, d, q, request);
+        div_prepared_static::<N>(n, d, q, request, DivAlg::NR);
     }
 }
 
 fn bz_div_rem_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        bz_div_rem_wrapper_static::<N>(n, d, q, request);
+        div_rem_prepared_static::<N>(n, d, q, request, DivAlg::BZ);
     }
 }
 
 fn nr_div_rem_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        nr_div_rem_wrapper_static::<N>(n, d, q, request);
+        div_rem_prepared_static::<N>(n, d, q, request, DivAlg::NR);
     }
 }
 
@@ -742,7 +742,7 @@ fn bench_sqr_school_to_fft(c: &mut Criterion) {
 }
 
 const BZ_TOP_RATIO_D_WINDOWS: [(usize, usize); 9] = [
-    (BZ_CUTOFF + 1, 128),
+    (2, 128),
     (129, 192),
     (193, 256),
     (257, 384),
@@ -755,7 +755,11 @@ const BZ_TOP_RATIO_D_WINDOWS: [(usize, usize); 9] = [
 const BZ_TOP_RATIO_Q_RADIUS: usize = 16;
 const BZ_TOP_RATIO_SEARCH_BUDGET: usize = 50_000;
 const BZ_TOP_RATIO_CASES_PER_WINDOW: usize = 16;
-const BZ_TOP_RATIO_SCALES: [f64; 3] = [0.292, 0.295, 0.298];
+const BZ_TOP_RATIO_SCALES: [f64; 3] = [
+    BZ_TOP_PADDED_COST_SCALE * 0.95,
+    BZ_TOP_PADDED_COST_SCALE,
+    BZ_TOP_PADDED_COST_SCALE * 1.05,
+];
 
 fn use_bz_for_top_block_with_scale(d_len: usize, q_len: usize, padded_cost_scale: f64) -> bool {
     d_len > BZ_CUTOFF
@@ -800,6 +804,10 @@ fn bz_top_boundary_lengths(padded_cost_scale: f64) -> Vec<(usize, usize)> {
     let mut lengths = Vec::new();
 
     for &(d_min, d_max) in &BZ_TOP_RATIO_D_WINDOWS {
+        let d_min = d_min.max(BZ_CUTOFF + 1);
+        if d_min > d_max {
+            continue;
+        }
         let seed_d = (d_min + d_max) / 2;
         let seed_q = bz_top_q_center(seed_d, padded_cost_scale)
             .min(seed_d)
@@ -819,7 +827,7 @@ fn bz_top_boundary_lengths(padded_cost_scale: f64) -> Vec<(usize, usize)> {
 }
 
 fn make_bz_top_inputs(lengths: &[(usize, usize)]) -> Vec<BzTopInput> {
-    let mut rng = rand::thread_rng();
+    let mut rng = StdRng::seed_from_u64(0x425a_544f_50);
     lengths
         .iter()
         .map(|&(d_len, q_len)| BzTopInput {
@@ -902,12 +910,12 @@ fn bench_bz_top_block_dispatch_ratio(c: &mut Criterion) {
 
     println!("BZ_CUTOFF = {BZ_CUTOFF}");
     println!("BZ_TOP_PADDED_COST_SCALE = {BZ_TOP_PADDED_COST_SCALE}");
-    println!("Scale is the modeled q_len / d_len break-even ratio.");
+    println!("Scale multiplies bz_2_1_cost(d_len) in the top-block decision.");
     println!("Reported value is padded_bz_runtime / knuth_runtime.");
     println!("Below 1.0 means the boundary is conservative; decrease BZ_TOP_PADDED_COST_SCALE.");
     println!("Above 1.0 means the boundary is aggressive; increase BZ_TOP_PADDED_COST_SCALE.");
 
-    for &scale in &BZ_TOP_RATIO_SCALES {
+    for scale in env_f64_values(&BZ_TOP_RATIO_SCALES) {
         let lengths = bz_top_boundary_lengths(scale);
         assert!(
             !lengths.is_empty(),
@@ -938,6 +946,12 @@ const NR_SEED_CASES_PER_PRECISION: usize = 4;
 
 struct NrSeedTradeoffInput {
     denom: Vec<u64>,
+}
+
+fn knuth_div_rcp_seed_dyn(d: &[u64], rcp: &mut [u64]) {
+    let mut scratch = ScratchGuard::acquire();
+    knuth_rcp_normalized(d, rcp, scratch.get(d.len()), 1);
+    inc_buf(rcp);
 }
 
 fn run_nr_prior_seed_plus_step(d: &[u64], rcp: &mut [u64], prior_p: usize) {
@@ -1031,7 +1045,7 @@ fn bench_nr_seed_start_precision_ratio(c: &mut Criterion) {
 // Division BZ/NR cost-model tuning.
 //
 // Set:
-//   DIV_TUNE_REGIME=karatsuba|transform|transition|dispatch|reciprocal
+//   DIV_TUNE_REGIME=bz_base|bz_top|karatsuba|transform|transition|dispatch|reciprocal|grid|knuth|bz_knuth|runtime
 //   DIV_TUNE_FAMILY=dyn_div|dyn_rem|static_div|static_rem|dyn_rcp|static_rcp
 //   DIV_TUNE_VALUES=comma-separated candidate ratios or reciprocal precisions
 // For transition scans, also set DIV_TUNE_KARATSUBA_RATIO and
@@ -1048,6 +1062,96 @@ const DIV_TUNE_TRANSFORM_D_CENTERS: [usize; 5] = [1024, 1280, 1536, 1792, 2048];
 const DIV_TUNE_TRANSITION_SCALES: [usize; 12] = [
     256, 384, 512, 640, 768, 896, 1024, 1280, 1536, 2048, 3072, 4096,
 ];
+
+// Force exactly one BZ split, with Knuth children regardless of BZ_CUTOFF.
+// This mirrors div_3_2's correction while composing production kernels.
+fn bz_half_knuth(n: &mut [u64], d: &[u64], lo: usize, q: &mut [u64], scratch: &mut [u64]) {
+    let (d_lo, d_hi) = d.split_at(lo);
+    if cmp_buf(&n[d.len()..], d_hi).is_lt() {
+        div_buf_body(&mut n[lo..], d_hi, q);
+    } else {
+        q.fill(u64::MAX);
+        sub_buf(&mut n[d.len()..], d_hi);
+        add_buf(&mut n[lo..], d_hi);
+    }
+    let product = &mut scratch[..q.len() + lo];
+    *product.last_mut().unwrap() = 0;
+    mul_dyn(q, d_lo, product);
+    if sub_buf(n, product) {
+        dec_buf(q);
+        if !add_buf(n, d) {
+            dec_buf(q);
+            add_buf(n, d);
+        }
+    }
+}
+
+fn bz_one_split(n: &mut [u64], d: &[u64], q: &mut [u64], scratch: &mut [u64]) {
+    let lo = d.len() / 2;
+    let hi = d.len() - lo;
+    let (q_lo, q_hi) = q.split_at_mut(lo);
+    bz_half_knuth(&mut n[lo..], d, lo, q_hi, scratch);
+    bz_half_knuth(&mut n[..d.len() + lo], d, hi, q_lo, scratch);
+}
+
+fn register_bz_base_scan(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+) {
+    for d_len in env_usize_values(
+        "DIV_TUNE_VALUES",
+        &[32, 64, 88, 128, 176, 192, 208, 216, 224, 256, 384, 512],
+    ) {
+        assert!(d_len >= 4);
+        let mut rng = StdRng::seed_from_u64(0x425a_4241_5345 ^ d_len as u64);
+        let inputs = (0..16)
+            .map(|_| {
+                let d = random_normalized_limbs(d_len, &mut rng);
+                let mut n = random_limbs(2 * d_len, &mut rng);
+                n[2 * d_len - 1] &= (1 << 63) - 1;
+                (n, d)
+            })
+            .collect::<Vec<_>>();
+        for (n, d) in &inputs {
+            let (mut n_bz, mut n_knuth) = (n.clone(), n.clone());
+            let (mut q_bz, mut q_knuth) = (vec![0; d_len], vec![0; d_len]);
+            bz_one_split(&mut n_bz, d, &mut q_bz, &mut vec![0; d_len]);
+            div_buf_body(&mut n_knuth, d, &mut q_knuth);
+            assert_eq!(q_bz, q_knuth);
+            assert_eq!(n_bz, n_knuth);
+        }
+        group.bench_with_input(
+            BenchmarkId::new("bz_base/split_over_knuth", d_len),
+            &d_len,
+            |bench, _| {
+                bench.iter_custom(|iters| {
+                    alternating_ratio_bench(iters, &inputs, |(n, d), bz_first| {
+                        let (mut n_bz, mut n_knuth) = (n.clone(), n.clone());
+                        let (mut q_bz, mut q_knuth) = (vec![0; d_len], vec![0; d_len]);
+                        let mut scratch = vec![0; d_len];
+                        time_pair_alternating(
+                            bz_first,
+                            || {
+                                bz_one_split(
+                                    black_box(&mut n_bz),
+                                    black_box(d),
+                                    black_box(&mut q_bz),
+                                    &mut scratch,
+                                )
+                            },
+                            || {
+                                div_buf_body(
+                                    black_box(&mut n_knuth),
+                                    black_box(d),
+                                    black_box(&mut q_knuth),
+                                )
+                            },
+                        )
+                    })
+                });
+            },
+        );
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 enum DivisionTuneFamily {
@@ -1212,7 +1316,10 @@ fn division_boundary_lengths(regime: DivisionCostRegime, parameter: f64) -> Vec<
         DivisionCostRegime::Transform => &DIV_TUNE_TRANSFORM_D_CENTERS,
     };
     let mut lengths = Vec::new();
-    for &d_center in centers {
+    for d_center in env_usize_values("DIV_TUNE_SCALES", centers) {
+        if d_center <= BZ_CUTOFF {
+            continue;
+        }
         lengths.extend(division_boundary_lengths_at(regime, parameter, d_center));
     }
     lengths.sort_unstable();
@@ -1414,6 +1521,122 @@ fn register_division_boundary_candidates(
                 bench.iter_custom(|iters| division_tuning_ratio_bench(iters, &inputs, family))
             },
         );
+    }
+}
+
+fn division_knuth_ratio_bench(
+    iters: u64,
+    inputs: &[DivisionTuneInput],
+    family: DivisionTuneFamily,
+    use_bz: bool,
+) -> Duration {
+    alternating_ratio_bench(iters, inputs, |input, nr_first| {
+        let (mut n_nr, mut n_knuth) = (input.n.clone(), input.n.clone());
+        let (mut q_nr, mut q_knuth) = (vec![0; input.q_len], vec![0; input.q_len]);
+        time_pair_alternating(
+            nr_first,
+            || match (family, use_bz) {
+                (DivisionTuneFamily::DynDiv, true) => {
+                    bz_div_dyn(black_box(&n_nr), black_box(&input.d), black_box(&mut q_nr))
+                }
+                (DivisionTuneFamily::DynRem, true) => bz_div_rem_dyn(
+                    black_box(&mut n_nr),
+                    black_box(&input.d),
+                    black_box(&mut q_nr),
+                ),
+                (DivisionTuneFamily::DynDiv, false) => {
+                    nr_div_dyn(black_box(&n_nr), black_box(&input.d), black_box(&mut q_nr))
+                }
+                (DivisionTuneFamily::DynRem, false) => nr_div_rem_dyn(
+                    black_box(&mut n_nr),
+                    black_box(&input.d),
+                    black_box(&mut q_nr),
+                ),
+                _ => unreachable!(),
+            },
+            || {
+                let n = black_box(&mut n_knuth);
+                let d = black_box(&input.d);
+                let q = black_box(&mut q_knuth);
+                if let Some(request) = division_preflight(n, d, q) {
+                    match family {
+                        DivisionTuneFamily::DynDiv => {
+                            div_prepared_dyn(n, d, q, request, DivAlg::Knuth);
+                        }
+                        DivisionTuneFamily::DynRem => {
+                            div_rem_prepared_dyn(n, d, q, request, DivAlg::Knuth);
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            },
+        )
+    })
+}
+
+// Fixed shapes complement boundary averages and allow before/after dispatcher
+// measurements with Criterion's --save-baseline / --baseline options.
+fn register_division_grid(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    family: DivisionTuneFamily,
+    regime: &str,
+) {
+    assert!(matches!(
+        family,
+        DivisionTuneFamily::DynDiv | DivisionTuneFamily::DynRem
+    ));
+    let ratios = env_f64_values(&[0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 8.0]);
+    for d_len in env_usize_values("DIV_TUNE_SCALES", &[96, 128, 256, 512, 1024, 1536, 2048]) {
+        let mut seen_q = HashSet::new();
+        for &ratio in &ratios {
+            let q_len = (d_len as f64 * ratio).round().max(8.0) as usize;
+            if !seen_q.insert(q_len) {
+                continue;
+            }
+            let inputs = make_division_tuning_inputs(
+                &vec![(q_len, d_len); 4],
+                (q_len as u64).rotate_left(17) ^ d_len as u64,
+            );
+            group.bench_with_input(
+                BenchmarkId::new(
+                    format!("{}/{}", family.label(), regime),
+                    format!("d{d_len}_q{q_len}"),
+                ),
+                &(q_len, d_len),
+                |bench, _| {
+                    if regime == "runtime" {
+                        let mut index = 0;
+                        bench.iter_batched_ref(
+                            || {
+                                let input = &inputs[index % inputs.len()];
+                                index += 1;
+                                (input.n.clone(), vec![0; q_len], &input.d)
+                            },
+                            |(n, q, d)| {
+                                black_box(match family {
+                                    DivisionTuneFamily::DynDiv => {
+                                        div_dyn(black_box(n), black_box(d), black_box(q))
+                                    }
+                                    DivisionTuneFamily::DynRem => {
+                                        div_rem_dyn(black_box(n), black_box(d), black_box(q))
+                                    }
+                                    _ => unreachable!(),
+                                });
+                            },
+                            BatchSize::SmallInput,
+                        );
+                    } else if regime == "knuth" || regime == "bz_knuth" {
+                        bench.iter_custom(|iters| {
+                            division_knuth_ratio_bench(iters, &inputs, family, regime == "bz_knuth")
+                        });
+                    } else {
+                        bench.iter_custom(|iters| {
+                            division_tuning_ratio_bench(iters, &inputs, family)
+                        });
+                    }
+                },
+            );
+        }
     }
 }
 
@@ -1650,13 +1873,15 @@ fn reciprocal_tuning_ratio_bench(
                 for _ in 0..inner_repetitions {
                     match family {
                         DivisionTuneFamily::DynRcp => {
-                            nr_rcp_wrapper_dyn(black_box(&input.d), black_box(&mut nr))
+                            rcp_prepared_dyn(black_box(&input.d), black_box(&mut nr), RcpAlg::NR)
                         }
-                        DivisionTuneFamily::StaticRcp => nr_rcp_wrapper_static::<
-                            DIV_TUNE_STATIC_CAPACITY,
-                        >(
-                            black_box(&input.d), black_box(&mut nr)
-                        ),
+                        DivisionTuneFamily::StaticRcp => {
+                            rcp_prepared_static::<DIV_TUNE_STATIC_CAPACITY>(
+                                black_box(&input.d),
+                                black_box(&mut nr),
+                                RcpAlg::NR,
+                            )
+                        }
                         _ => unreachable!(),
                     }
                 }
@@ -1664,13 +1889,16 @@ fn reciprocal_tuning_ratio_bench(
             || {
                 for _ in 0..inner_repetitions {
                     match family {
-                        DivisionTuneFamily::DynRcp => {
-                            knuth_rcp_wrapper_dyn(black_box(&input.d), black_box(&mut knuth))
-                        }
+                        DivisionTuneFamily::DynRcp => rcp_prepared_dyn(
+                            black_box(&input.d),
+                            black_box(&mut knuth),
+                            RcpAlg::Knuth,
+                        ),
                         DivisionTuneFamily::StaticRcp => {
-                            knuth_rcp_wrapper_static::<DIV_TUNE_STATIC_CAPACITY>(
+                            rcp_prepared_static::<DIV_TUNE_STATIC_CAPACITY>(
                                 black_box(&input.d),
                                 black_box(&mut knuth),
+                                RcpAlg::Knuth,
                             )
                         }
                         _ => unreachable!(),
@@ -1723,16 +1951,37 @@ fn bench_division_tuning(c: &mut Criterion) {
     }
     let family = DivisionTuneFamily::from_env();
     let regime = env::var("DIV_TUNE_REGIME").unwrap_or_else(|_| "karatsuba".to_owned());
+    if regime == "bz_top" {
+        bench_bz_top_block_dispatch_ratio(c);
+        return;
+    }
     let mut group = c.benchmark_group(format!("division_tuning/{ARCH}"));
     group.sample_size(30);
+    if let Ok(samples) = env::var("DIV_TUNE_SAMPLE_SIZE") {
+        group.sample_size(samples.parse().expect("invalid sample size"));
+    }
     group.warm_up_time(Duration::from_millis(750));
     group.measurement_time(Duration::from_secs(2));
     group.noise_threshold(0.02);
+    if let Ok(ms) = env::var("DIV_TUNE_WARMUP_MS") {
+        group.warm_up_time(Duration::from_millis(ms.parse().expect("invalid warmup")));
+    }
+    if let Ok(ms) = env::var("DIV_TUNE_MEASUREMENT_MS") {
+        group.measurement_time(Duration::from_millis(
+            ms.parse().expect("invalid measurement"),
+        ));
+    }
 
-    if regime == "dispatch" {
+    if regime == "runtime" {
+        println!("Reported value is production dispatcher wall-clock time.");
+    } else if regime == "bz_base" {
+        println!("Reported value is one BZ split / Knuth runtime; 1.000 ms is break-even.");
+    } else if regime == "dispatch" {
         println!("Reported value is tuned_runtime / guessed_runtime.");
         println!("Below 1.000 ms favors the tuned dispatch.");
-    } else if regime == "reciprocal" {
+    } else if regime == "bz_knuth" {
+        println!("Reported value is BZ_runtime / Knuth_runtime; 1.000 ms is break-even.");
+    } else if regime == "reciprocal" || regime == "knuth" {
         println!("Reported value is NR_runtime / Knuth_runtime; 1.000 ms is break-even.");
         println!("Below 1.000 ms favors NR; above 1.000 ms favors Knuth.");
     } else {
@@ -1740,6 +1989,10 @@ fn bench_division_tuning(c: &mut Criterion) {
         println!("Below 1.000 ms favors NR; above 1.000 ms favors BZ.");
     }
     match regime.as_str() {
+        "bz_base" => register_bz_base_scan(&mut group),
+        "grid" | "knuth" | "bz_knuth" | "runtime" => {
+            register_division_grid(&mut group, family, &regime)
+        }
         "karatsuba" => {
             assert!(!family.is_reciprocal());
             let candidates = env_f64_values(&[0.30, 0.40, 0.50, 0.60, 0.75, 0.90, 1.05]);

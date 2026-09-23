@@ -4,7 +4,7 @@ use big_bits::utils::sqrt::{
     binom_sqrt, sqrt_approx_dyn, sqrt_approx_static, sqrt_dyn, sqrt_only_dyn, sqrt_only_static,
     sqrt_static, zimmerman_sqrt_dyn, zimmerman_sqrt_static,
 };
-use big_bits::utils::ZIMMERMAN_SQRT_CUTOFF;
+use big_bits::utils::DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF;
 use big_bits::{utils::div::*, *};
 use criterion::{
     black_box, criterion_group, criterion_main, measurement::WallTime, BatchSize, BenchmarkGroup,
@@ -47,31 +47,31 @@ const ARCH: &'static str = std::env::consts::ARCH;
 
 fn bz_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        bz_div_wrapper_dyn(n, d, q, request);
+        div_prepared_dyn(n, d, q, request, DivAlg::BZ);
     }
 }
 
 fn nr_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        nr_div_wrapper_dyn(n, d, q, request);
+        div_prepared_dyn(n, d, q, request, DivAlg::NR);
     }
 }
 
 fn nr_div_rem_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        nr_div_rem_wrapper_dyn(n, d, q, request);
+        div_rem_prepared_dyn(n, d, q, request, DivAlg::NR);
     }
 }
 
 fn nr_rcp_dyn(d: &[u64], rcp: &mut [u64]) {
     if reciprocal_preflight(d, rcp) {
-        nr_rcp_wrapper_dyn(d, rcp);
+        rcp_prepared_dyn(d, rcp, RcpAlg::NR);
     }
 }
 
 fn knuth_rcp_dyn(d: &[u64], rcp: &mut [u64]) {
     if reciprocal_preflight(d, rcp) {
-        knuth_rcp_wrapper_dyn(d, rcp);
+        rcp_prepared_dyn(d, rcp, RcpAlg::Knuth);
     }
 }
 
@@ -808,14 +808,14 @@ fn register_sqrt_only_size<const N: usize>(
 fn bench_sqrt_only(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("sqrt_only/{ARCH}"));
     set_up_group(&mut group);
-    register_sqrt_only_size::<{ 2 * (ZIMMERMAN_SQRT_CUTOFF - 1) }>(
+    register_sqrt_only_size::<{ 2 * (DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF - 1) }>(
         &mut group,
-        ZIMMERMAN_SQRT_CUTOFF - 1,
+        DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF - 1,
     );
-    register_sqrt_only_size::<{ 2 * ZIMMERMAN_SQRT_CUTOFF }>(&mut group, ZIMMERMAN_SQRT_CUTOFF);
-    register_sqrt_only_size::<{ 2 * (ZIMMERMAN_SQRT_CUTOFF + 1) }>(
+    register_sqrt_only_size::<{ 2 * DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF }>(&mut group, DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF);
+    register_sqrt_only_size::<{ 2 * (DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF + 1) }>(
         &mut group,
-        ZIMMERMAN_SQRT_CUTOFF + 1,
+        DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF + 1,
     );
     register_sqrt_only_size::<64>(&mut group, 32);
     register_sqrt_only_size::<256>(&mut group, 128);
@@ -823,8 +823,12 @@ fn bench_sqrt_only(c: &mut Criterion) {
     group.finish();
 }
 
+#[path = "probes/division_flow.rs"]
+mod division_flow;
+
 criterion_group!(
     benches,
+    division_flow::bench_division_flow,
     bench_zimmermann_sqrt,
     bench_sqrt_only,
     bench_mul_band_ratios

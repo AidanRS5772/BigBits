@@ -30,18 +30,19 @@ pub const PARTIAL_SQR_CUTOFF: usize = 128;
 pub const FFT_MID_CUTOFF: usize = 90;
 pub const NTT_MID_CUTOFF: usize = 200;
 
-pub const BZ_CUTOFF: usize = 88;
-pub const BZ_TOP_PADDED_COST_SCALE: f64 = 0.295;
+pub const DIV_KNUTH_CUTOFF: usize = 88;
+pub const BZ_CUTOFF: usize = 216;
+pub const BZ_TOP_PADDED_COST_SCALE: f64 = 1.60;
 
-pub const DYN_DIV_KARATSUBA_FFT_NR_BZ_CUTOFF: usize = 1568;
-pub const DYN_DIV_KARATSUBA_NR_BZ_CUTOFF: f64 = 0.31;
-pub const DYN_DIV_FFT_NR_BZ_CUTOFF: f64 = 7.84;
+pub const DYN_DIV_KARATSUBA_FFT_NR_BZ_CUTOFF: usize = 352;
+pub const DYN_DIV_KARATSUBA_NR_BZ_CUTOFF: f64 = 0.60;
+pub const DYN_DIV_FFT_NR_BZ_CUTOFF: f64 = 5.50;
 
-pub const DYN_DIV_REM_KARATSUBA_FFT_NR_BZ_CUTOFF: usize = 1280;
-pub const DYN_DIV_REM_KARATSUBA_NR_BZ_CUTOFF: f64 = 0.58;
-pub const DYN_DIV_REM_FFT_NR_BZ_CUTOFF: f64 = 8.70;
+pub const DYN_DIV_REM_KARATSUBA_FFT_NR_BZ_CUTOFF: usize = 192;
+pub const DYN_DIV_REM_KARATSUBA_NR_BZ_CUTOFF: f64 = 24.0;
+pub const DYN_DIV_REM_FFT_NR_BZ_CUTOFF: f64 = 6.17;
 
-pub const DYN_RCP_KNUTH_NR_CUTOFF: usize = 8;
+pub const DYN_RCP_KNUTH_NR_CUTOFF: usize = 11;
 
 pub const STATIC_DIV_KARATSUBA_NTT_NR_BZ_CUTOFF: usize = 1664;
 pub const STATIC_DIV_KARATSUBA_NR_BZ_CUTOFF: f64 = 0.65;
@@ -53,7 +54,13 @@ pub const STATIC_DIV_REM_NTT_NR_BZ_CUTOFF: f64 = 10.5;
 
 pub const STATIC_RCP_KNUTH_NR_CUTOFF: usize = 100;
 
-pub const ZIMMERMAN_SQRT_CUTOFF: usize = 17;
+pub const ZIMMERMAN_SQRT_LEAF_CUTOFF: usize = 15;
+pub const DYN_SQRT_REM_ZIMMERMAN_CUTOFF: usize = 20;
+pub const DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF: usize = 15;
+pub const DYN_SQRT_APPROX_ZIMMERMAN_CUTOFF: usize = 15;
+pub const STATIC_SQRT_REM_ZIMMERMAN_CUTOFF: usize = 20;
+pub const STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF: usize = 15;
+pub const STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF: usize = 14;
 
 thread_local! {
     static SCRATCH_POOL: RefCell<Vec<Vec<u64>>> = RefCell::new(Vec::new());

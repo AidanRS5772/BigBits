@@ -3,103 +3,103 @@ use crate::utils::div::*;
 use crate::utils::mul::mul_dyn;
 use crate::utils::utils::{add_buf, cmp_buf, dec_buf, inc_buf, shl_buf, shr_buf, sub_buf, trim_lz};
 use crate::utils::{
-    ScratchGuard, BZ_CUTOFF, BZ_TOP_PADDED_COST_SCALE, DYN_RCP_KNUTH_NR_CUTOFF,
+    ScratchGuard, BZ_CUTOFF, BZ_TOP_PADDED_COST_SCALE, DIV_KNUTH_CUTOFF, DYN_RCP_KNUTH_NR_CUTOFF,
     STATIC_RCP_KNUTH_NR_CUTOFF,
 };
 
 fn knuth_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        knuth_div_wrapper_dyn(n, d, q, request);
+        div_prepared_dyn(n, d, q, request, DivAlg::Knuth);
     }
 }
 
 fn knuth_div_rem_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        knuth_div_rem_wrapper_dyn(n, d, q, request);
+        div_rem_prepared_dyn(n, d, q, request, DivAlg::Knuth);
     }
 }
 
 fn knuth_div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        knuth_div_wrapper_static::<N>(n, d, q, request);
+        div_prepared_static::<N>(n, d, q, request, DivAlg::Knuth);
     }
 }
 
 fn knuth_div_rem_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        knuth_div_rem_wrapper_static::<N>(n, d, q, request);
+        div_rem_prepared_static::<N>(n, d, q, request, DivAlg::Knuth);
     }
 }
 
 fn bz_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        bz_div_wrapper_dyn(n, d, q, request);
+        div_prepared_dyn(n, d, q, request, DivAlg::BZ);
     }
 }
 
 fn bz_div_rem_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        bz_div_rem_wrapper_dyn(n, d, q, request);
+        div_rem_prepared_dyn(n, d, q, request, DivAlg::BZ);
     }
 }
 
 fn bz_div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        bz_div_wrapper_static::<N>(n, d, q, request);
+        div_prepared_static::<N>(n, d, q, request, DivAlg::BZ);
     }
 }
 
 fn bz_div_rem_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        bz_div_rem_wrapper_static::<N>(n, d, q, request);
+        div_rem_prepared_static::<N>(n, d, q, request, DivAlg::BZ);
     }
 }
 
 fn nr_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        nr_div_wrapper_dyn(n, d, q, request);
+        div_prepared_dyn(n, d, q, request, DivAlg::NR);
     }
 }
 
 fn nr_div_rem_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        nr_div_rem_wrapper_dyn(n, d, q, request);
+        div_rem_prepared_dyn(n, d, q, request, DivAlg::NR);
     }
 }
 
 fn nr_div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        nr_div_wrapper_static::<N>(n, d, q, request);
+        div_prepared_static::<N>(n, d, q, request, DivAlg::NR);
     }
 }
 
 fn nr_div_rem_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) {
     if let Some(request) = division_preflight(n, d, q) {
-        nr_div_rem_wrapper_static::<N>(n, d, q, request);
+        div_rem_prepared_static::<N>(n, d, q, request, DivAlg::NR);
     }
 }
 
 fn knuth_rcp_dyn(d: &[u64], rcp: &mut [u64]) {
     if reciprocal_preflight(d, rcp) {
-        knuth_rcp_wrapper_dyn(d, rcp);
+        rcp_prepared_dyn(d, rcp, RcpAlg::Knuth);
     }
 }
 
 fn knuth_rcp_static<const N: usize>(d: &[u64], rcp: &mut [u64]) {
     if reciprocal_preflight(d, rcp) {
-        knuth_rcp_wrapper_static::<N>(d, rcp);
+        rcp_prepared_static::<N>(d, rcp, RcpAlg::Knuth);
     }
 }
 
 fn nr_rcp_dyn(d: &[u64], rcp: &mut [u64]) {
     if reciprocal_preflight(d, rcp) {
-        nr_rcp_wrapper_dyn(d, rcp);
+        rcp_prepared_dyn(d, rcp, RcpAlg::NR);
     }
 }
 
 fn nr_rcp_static<const N: usize>(d: &[u64], rcp: &mut [u64]) {
     if reciprocal_preflight(d, rcp) {
-        nr_rcp_wrapper_static::<N>(d, rcp);
+        rcp_prepared_static::<N>(d, rcp, RcpAlg::NR);
     }
 }
 
@@ -286,62 +286,62 @@ fn assert_divmod_algorithm(name: &str, n: &[u64], d: &[u64], q: &[u64], r: &[u64
 
 fn forced_knuth_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
     let request = division_preflight(n, d, q).unwrap();
-    knuth_div_wrapper_dyn(n, d, q, request)
+    div_prepared_dyn(n, d, q, request, DivAlg::Knuth)
 }
 
 fn forced_bz_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
     let request = division_preflight(n, d, q).unwrap();
-    bz_div_wrapper_dyn(n, d, q, request)
+    div_prepared_dyn(n, d, q, request, DivAlg::BZ)
 }
 
 fn forced_nr_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
     let request = division_preflight(n, d, q).unwrap();
-    nr_div_wrapper_dyn(n, d, q, request)
+    div_prepared_dyn(n, d, q, request, DivAlg::NR)
 }
 
 fn forced_knuth_div_rem_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) -> u64 {
     let request = division_preflight(n, d, q).unwrap();
-    knuth_div_rem_wrapper_dyn(n, d, q, request)
+    div_rem_prepared_dyn(n, d, q, request, DivAlg::Knuth)
 }
 
 fn forced_bz_div_rem_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) -> u64 {
     let request = division_preflight(n, d, q).unwrap();
-    bz_div_rem_wrapper_dyn(n, d, q, request)
+    div_rem_prepared_dyn(n, d, q, request, DivAlg::BZ)
 }
 
 fn forced_nr_div_rem_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) -> u64 {
     let request = division_preflight(n, d, q).unwrap();
-    nr_div_rem_wrapper_dyn(n, d, q, request)
+    div_rem_prepared_dyn(n, d, q, request, DivAlg::NR)
 }
 
 fn forced_knuth_div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
     let request = division_preflight(n, d, q).unwrap();
-    knuth_div_wrapper_static::<N>(n, d, q, request)
+    div_prepared_static::<N>(n, d, q, request, DivAlg::Knuth)
 }
 
 fn forced_bz_div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
     let request = division_preflight(n, d, q).unwrap();
-    bz_div_wrapper_static::<N>(n, d, q, request)
+    div_prepared_static::<N>(n, d, q, request, DivAlg::BZ)
 }
 
 fn forced_nr_div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
     let request = division_preflight(n, d, q).unwrap();
-    nr_div_wrapper_static::<N>(n, d, q, request)
+    div_prepared_static::<N>(n, d, q, request, DivAlg::NR)
 }
 
 fn forced_knuth_div_rem_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) -> u64 {
     let request = division_preflight(n, d, q).unwrap();
-    knuth_div_rem_wrapper_static::<N>(n, d, q, request)
+    div_rem_prepared_static::<N>(n, d, q, request, DivAlg::Knuth)
 }
 
 fn forced_bz_div_rem_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) -> u64 {
     let request = division_preflight(n, d, q).unwrap();
-    bz_div_rem_wrapper_static::<N>(n, d, q, request)
+    div_rem_prepared_static::<N>(n, d, q, request, DivAlg::BZ)
 }
 
 fn forced_nr_div_rem_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) -> u64 {
     let request = division_preflight(n, d, q).unwrap();
-    nr_div_rem_wrapper_static::<N>(n, d, q, request)
+    div_rem_prepared_static::<N>(n, d, q, request, DivAlg::NR)
 }
 
 fn exercise_body_overflow_contract<const N: usize>(case: &str, n: &[u64], d: &[u64]) {
@@ -508,7 +508,7 @@ fn exercise_body_overflow_contract<const N: usize>(case: &str, n: &[u64], d: &[u
 
 #[test]
 fn test_division_body_overflow_contract_matrix() {
-    const N: usize = 128;
+    const N: usize = BZ_CUTOFF + 32;
     let mut d = rand_nonzero_vec(BZ_CUTOFF + 5, 13_300);
     d[0] = 0;
     d[1] = 0;
@@ -593,7 +593,7 @@ fn test_hi_div_static_capacity_uses_prepared_window() {
 
 #[test]
 fn test_forced_division_entry_matrix_dyn_and_static() {
-    const N: usize = 256;
+    const N: usize = BZ_CUTOFF + 80;
     let d = rand_nonzero_vec(BZ_CUTOFF + 5, 13_000);
     let n = rand_nonzero_vec(d.len() + 71, 13_001);
     let q_len = div_quotient_len(n.len(), d.len()) + 1;
@@ -665,11 +665,36 @@ fn test_forced_division_entry_matrix_dyn_and_static() {
 }
 
 #[test]
-fn test_public_division_dispatch_above_knuth_cutoff() {
-    const N: usize = 256;
+fn test_public_division_dispatch_split_cutoffs() {
+    const N: usize = 17 * (BZ_CUTOFF + 1);
     let cases = [
-        ("BZ side", BZ_CUTOFF + 8, 160usize, 13_100u64),
-        ("NR side", 160usize, 96usize, 13_200u64),
+        (
+            "mandatory Knuth boundary",
+            DIV_KNUTH_CUTOFF,
+            32usize,
+            13_110u64,
+        ),
+        (
+            "NR eligible below BZ recursion",
+            DIV_KNUTH_CUTOFF + 1,
+            32,
+            13_120,
+        ),
+        (
+            "BZ choice becomes direct Knuth",
+            DIV_KNUTH_CUTOFF + 8,
+            160,
+            13_100,
+        ),
+        ("last Knuth leaf width", BZ_CUTOFF, 16 * BZ_CUTOFF, 13_200),
+        (
+            "first recursive BZ width",
+            BZ_CUTOFF + 1,
+            16 * (BZ_CUTOFF + 1),
+            13_210,
+        ),
+        ("NR fallback below BZ recursion", BZ_CUTOFF, 7, 13_220),
+        ("NR fallback above BZ recursion", BZ_CUTOFF + 1, 7, 13_230),
     ];
 
     for (name, d_len, q_len, seed) in cases {
@@ -914,7 +939,7 @@ fn test_burnikel_ziegler_static_top_block_shapes() {
         assert_divmod_algorithm(name, &n, &d, &q[..q_len], &n_work[..n_len]);
     }
 
-    const FIT_N: usize = 512;
+    const FIT_N: usize = 3 * (BZ_CUTOFF + 8);
     let d_len = BZ_CUTOFF + 8;
     let recursive_top_q = (d_len + 1) / 2;
     run::<FIT_N>("static t0 knuth", d_len, recursive_top_q - 1, 8900);
@@ -927,7 +952,8 @@ fn test_burnikel_ziegler_static_top_block_shapes() {
         8903,
     );
 
-    const LIMITED_N: usize = 250;
+    // Fit the operands, but not the padded 2*d_len BZ top block.
+    const LIMITED_N: usize = 2 * (BZ_CUTOFF + 8) - 1;
     run::<LIMITED_N>("static capacity fallback", d_len, recursive_top_q, 8904);
 }
 
@@ -1660,7 +1686,9 @@ fn test_knuth_div_rcp_seed_is_upper_biased() {
         assert!(!inc_buf(&mut exact));
 
         let mut seed = vec![0u64; r_len];
-        knuth_div_rcp_seed_dyn(&d, &mut seed);
+        let mut win = vec![u64::MAX; d_len];
+        knuth_rcp_normalized(&d, &mut seed, &mut win, 1);
+        assert!(!inc_buf(&mut seed));
         assert_eq!(
             exact, seed,
             "exact reciprocal + 1 vs Knuth division seed d_len={d_len} r_len={r_len}"
@@ -1903,4 +1931,44 @@ fn test_static_reciprocal_tiny_capacities() {
     let mut knuth = [0u64; 2];
     knuth_rcp_static::<2>(&[3], &mut knuth);
     assert_rcp_precision("static N=2 Knuth", &knuth, &exact);
+}
+
+#[test]
+fn test_sliding_reciprocal_seed_matches_power_numerator() {
+    for d_len in [2, 3, 7, 16, 65] {
+        for r_len in [1, 2, 3, 8, 17, 64] {
+            for pattern in 0..4 {
+                let mut d = rand_nonzero_vec(d_len, 19_000 + pattern);
+                d[d_len - 1] |= 1 << 63;
+                if pattern == 0 {
+                    d.fill(0);
+                    d[d_len - 1] = 1 << 63;
+                } else if pattern == 1 {
+                    d.fill(u64::MAX);
+                }
+                let mut power = vec![0; d_len + r_len];
+                *power.last_mut().unwrap() = 1;
+                let mut exact = vec![0; r_len + 1];
+                assert_eq!(div_buf_of(&mut power, &mut 0, &d, &mut exact), 0);
+                assert_eq!(exact.pop(), Some(0));
+                assert!(!inc_buf(&mut exact));
+
+                let mut sliding = vec![u64::MAX; r_len];
+                let mut win = vec![u64::MAX; d_len];
+                knuth_rcp_normalized(&d, &mut sliding, &mut win, 1);
+                assert!(!inc_buf(&mut sliding));
+                assert_eq!(sliding, exact, "d={d_len} r={r_len} pattern={pattern}");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_static_division_capacity_uses_factored_operands() {
+    // Physical inputs exceed N; removing the exact B^64 divisor factor leaves
+    // a 32-limb numerator and a 16-limb divisor, including supported NR shapes.
+    let mut d = vec![0; 64];
+    d.extend(rand_nonzero_vec(16, 20_200));
+    let n = rand_nonzero_vec(96, 20_201);
+    exercise_body_overflow_contract::<32>("tight factored operands", &n, &d);
 }

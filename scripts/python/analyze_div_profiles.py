@@ -204,7 +204,13 @@ def division_phase(stack: list[LogicalFrame]) -> str:
             continue
         if any(
             token in function
-            for token in ("nr_refine_rcp", "nr_rcp_chain", "nr_div_rcp", "nr_rcp_wrapper")
+            for token in (
+                "nr_refine_rcp",
+                "nr_rcp_chain",
+                "nr_rcp_attempt",
+                "nr_div_rcp",
+                "nr_rcp_wrapper",
+            )
         ):
             return "nr_reciprocal"
         if any(token in function for token in ("nr_refine_quo", "nr_quo_est")):

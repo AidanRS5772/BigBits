@@ -5,7 +5,12 @@ use crate::utils::sqrt::{
     zimmerman_sqrt_only_dyn, zimmerman_sqrt_only_static, zimmerman_sqrt_static,
 };
 use crate::utils::utils::{add_buf, cmp_buf, dec_buf, eq_buf, inc_buf, sub_buf};
-use crate::utils::ZIMMERMAN_SQRT_CUTOFF;
+use crate::utils::{
+    DYN_SQRT_APPROX_ZIMMERMAN_CUTOFF, DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF,
+    DYN_SQRT_REM_ZIMMERMAN_CUTOFF, STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF,
+    STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF, STATIC_SQRT_REM_ZIMMERMAN_CUTOFF,
+    ZIMMERMAN_SQRT_LEAF_CUTOFF,
+};
 
 /// Verify both outputs for
 /// `shifted_x = x * B^(2 * root.len() - x.len()) = root^2 + remainder`.
@@ -89,6 +94,78 @@ fn test_binom_sqrt_two_limb_root() {
             let mut x = rand_vec(x_len, seed);
             x[x_len - 1] |= 1 << 62;
             assert_sqrt_contract(&x, 2);
+        }
+    }
+}
+
+#[test]
+fn test_binom_sqrt_seed_remainder_boundaries() {
+    // Exercise both sides of the old c=0/1 branches and the rem=2*s_hi
+    // saturation branch, including the three-limb input's virtual low zero.
+    for h in [1 << 63, (1 << 63) + 1, u64::MAX - 1, u64::MAX] {
+        let h = h as u128;
+        for rem in [0, 1, h - 1, h, h + 1, 2 * h - 1, 2 * h] {
+            let hi = h * h + rem;
+            for x1 in [0, 1, 1 << 63, u64::MAX - 1, u64::MAX] {
+                for x0 in [0, 1, u64::MAX] {
+                    let x = [x0, x1, hi as u64, (hi >> 64) as u64];
+                    assert_sqrt_contract(&x, 2);
+                    if x0 == 0 {
+                        assert_sqrt_contract(&x[1..], 2);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_binom_sqrt_sub64_all_shapes_and_normalization() {
+    // Directly call binom_sqrt regardless of the dispatcher cutoff.
+    for root_len in 1..64 {
+        for x_len in root_len + 1..=2 * root_len {
+            for case in 0..4 {
+                let seed = 130_000 + 10_000 * root_len as u64 + 64 * x_len as u64 + case;
+                let mut x = rand_vec(x_len, seed);
+                x[x_len - 1] = match case {
+                    0 => x[x_len - 1] | (1 << 63),
+                    1 => 1,
+                    2 => 1 << ((root_len + x_len) % 64),
+                    _ => {
+                        x.fill(u64::MAX);
+                        u64::MAX
+                    }
+                };
+                assert_sqrt_contract(&x, root_len);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_binom_sqrt_sub64_square_boundaries() {
+    for root_len in [1, 2, 3, 4, 8, 16, 32, 63] {
+        for case in 0..8 {
+            let mut root = rand_vec(root_len, 1_000_000 + 32 * root_len as u64 + case);
+            root[root_len - 1] = match case {
+                0 => 1 << 63,
+                1 => {
+                    root.fill(u64::MAX);
+                    u64::MAX
+                }
+                _ => root[root_len - 1] | (1 << 63),
+            };
+            let square = mul_ref(&root, &root);
+            let mut below = square.clone();
+            assert!(!dec_buf(&mut below));
+            let mut above = square.clone();
+            assert!(!inc_buf(&mut above));
+            let mut below_next = square.clone();
+            assert!(!add_buf(&mut below_next, &root));
+            assert!(!add_buf(&mut below_next, &root));
+            for x in [&below, &square, &above, &below_next] {
+                assert_sqrt_contract(x, root_len);
+            }
         }
     }
 }
@@ -314,17 +391,20 @@ fn assert_sqrt_only_contract<const N: usize>(x: &[u64], root_len: usize) {
 
 #[test]
 fn test_sqrt_only_all_shapes_and_normalization_around_cutoff() {
-    let cutoff = ZIMMERMAN_SQRT_CUTOFF;
-    for root_len in [
-        1,
-        2,
-        3,
-        cutoff - 1,
-        cutoff,
-        cutoff + 1,
-        2 * cutoff - 1,
-        2 * cutoff + 1,
+    let leaf = ZIMMERMAN_SQRT_LEAF_CUTOFF;
+    let mut root_lens = vec![1, 2, 3, 2 * leaf - 1, 2 * leaf + 1];
+    for cutoff in [
+        leaf,
+        DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF,
+        DYN_SQRT_APPROX_ZIMMERMAN_CUTOFF,
+        STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF,
+        STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF,
     ] {
+        root_lens.extend([cutoff - 1, cutoff, cutoff + 1]);
+    }
+    root_lens.sort_unstable();
+    root_lens.dedup();
+    for root_len in root_lens {
         for x_len in root_len + 1..=2 * root_len {
             for case in 0..5 {
                 let mut x = rand_vec(
@@ -361,7 +441,9 @@ fn test_sqrt_only_square_boundaries_and_saturation() {
         for x_len in root_len + 1..=2 * root_len {
             // An all-ones high radicand has remainder 2*s_hi, exercising
             // quotient saturation in recursive and virtually padded stages.
-            assert_sqrt_only_contract::<256>(&vec![u64::MAX; x_len], root_len);
+            let x = vec![u64::MAX; x_len];
+            assert_sqrt_only_contract::<256>(&x, root_len);
+            assert_zimmerman_contract(&x, root_len);
         }
     }
 }
@@ -463,14 +545,18 @@ fn test_sqrt_static_exact_capacity() {
 
 #[test]
 fn test_sqrt_dispatch_root_remainder_all_shapes_around_cutoff() {
-    const N: usize = 2 * (ZIMMERMAN_SQRT_CUTOFF + 1);
-    for root_len in [
-        1,
-        2,
-        ZIMMERMAN_SQRT_CUTOFF - 1,
-        ZIMMERMAN_SQRT_CUTOFF,
-        ZIMMERMAN_SQRT_CUTOFF + 1,
+    const N: usize = 2 * (DYN_SQRT_REM_ZIMMERMAN_CUTOFF + STATIC_SQRT_REM_ZIMMERMAN_CUTOFF);
+    let mut root_lens = vec![1, 2];
+    for cutoff in [
+        ZIMMERMAN_SQRT_LEAF_CUTOFF,
+        DYN_SQRT_REM_ZIMMERMAN_CUTOFF,
+        STATIC_SQRT_REM_ZIMMERMAN_CUTOFF,
     ] {
+        root_lens.extend([cutoff - 1, cutoff, cutoff + 1]);
+    }
+    root_lens.sort_unstable();
+    root_lens.dedup();
+    for root_len in root_lens {
         for x_len in root_len + 1..=2 * root_len {
             for top in [1, 1 << 61, 1 << 62, u64::MAX] {
                 let mut x = rand_vec(x_len, 140_000 + 100 * root_len as u64 + x_len as u64);
@@ -485,14 +571,16 @@ fn test_sqrt_dispatch_root_remainder_all_shapes_around_cutoff() {
 #[test]
 #[cfg(debug_assertions)]
 fn test_sqrt_dispatch_static_capacity_applies_to_both_algorithms() {
-    const N: usize = ZIMMERMAN_SQRT_CUTOFF;
-    let entries: [fn(&mut [u64], &mut [u64]); 3] = [
-        sqrt_static::<N>,
-        sqrt_only_static::<N>,
-        sqrt_approx_static::<N>,
+    const N: usize = STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF;
+    let entries: [(fn(&mut [u64], &mut [u64]), usize); 3] = [
+        (sqrt_static::<N>, STATIC_SQRT_REM_ZIMMERMAN_CUTOFF),
+        (sqrt_only_static::<N>, STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF),
+        (sqrt_approx_static::<N>, STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF),
     ];
-    for root_len in [N - 1, N] {
-        for entry in entries {
+    for (entry, cutoff) in entries {
+        // Root widths on each side of the cutoff must both exceed capacity.
+        assert!(2 * (cutoff - 1) > N);
+        for root_len in [cutoff - 1, cutoff] {
             let result = std::panic::catch_unwind(|| {
                 entry(&mut vec![u64::MAX; 2 * root_len], &mut vec![0; root_len]);
             });
