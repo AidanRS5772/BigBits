@@ -1,11 +1,16 @@
 #![allow(dead_code)]
 
+use big_bits::utils::sqrt::{
+    binom_sqrt, sqrt_approx_dyn, sqrt_approx_static, sqrt_dyn, sqrt_only_dyn, sqrt_only_static,
+    sqrt_static, zimmerman_sqrt_dyn, zimmerman_sqrt_static,
+};
+use big_bits::utils::DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF;
 use big_bits::{utils::div::*, *};
 use criterion::{
     black_box, criterion_group, criterion_main, measurement::WallTime, BatchSize, BenchmarkGroup,
     BenchmarkId, Criterion, Throughput,
 };
-use rand::Rng;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 
 fn random_limbs(n: usize) -> Vec<u64> {
     let mut rng = rand::thread_rng();
@@ -16,6 +21,14 @@ fn random_normalized_limbs(n: usize) -> Vec<u64> {
     let mut limbs = random_limbs(n);
     if let Some(last) = limbs.last_mut() {
         *last |= 1 << 63;
+    }
+    limbs
+}
+
+fn random_unnormalized_limbs(n: usize) -> Vec<u64> {
+    let mut limbs = random_limbs(n);
+    if let Some(last) = limbs.last_mut() {
+        *last = (*last & ((1 << 48) - 1)) | (1 << 47);
     }
     limbs
 }
@@ -32,11 +45,48 @@ fn random_div() -> u64 {
 
 const ARCH: &'static str = std::env::consts::ARCH;
 
+fn bz_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) {
+    if let Some(request) = division_preflight(n, d, q) {
+        div_prepared_dyn(n, d, q, request, DivAlg::BZ);
+    }
+}
+
+fn nr_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) {
+    if let Some(request) = division_preflight(n, d, q) {
+        div_prepared_dyn(n, d, q, request, DivAlg::NR);
+    }
+}
+
+fn nr_div_rem_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) {
+    if let Some(request) = division_preflight(n, d, q) {
+        div_rem_prepared_dyn(n, d, q, request, DivAlg::NR);
+    }
+}
+
+fn nr_rcp_dyn(d: &[u64], rcp: &mut [u64]) {
+    if reciprocal_preflight(d, rcp) {
+        rcp_prepared_dyn(d, rcp, RcpAlg::NR);
+    }
+}
+
+fn knuth_rcp_dyn(d: &[u64], rcp: &mut [u64]) {
+    if reciprocal_preflight(d, rcp) {
+        rcp_prepared_dyn(d, rcp, RcpAlg::Knuth);
+    }
+}
+
 fn set_up_group(group: &mut BenchmarkGroup<'_, WallTime>) {
     group.sample_size(250); // default is 100
     group.sampling_mode(criterion::SamplingMode::Flat);
     group.warm_up_time(std::time::Duration::from_secs(5)); // default is 3s
     group.measurement_time(std::time::Duration::from_secs(15));
+}
+
+fn set_up_ratio_group(group: &mut BenchmarkGroup<'_, WallTime>) {
+    group.sample_size(100);
+    group.sampling_mode(criterion::SamplingMode::Flat);
+    group.warm_up_time(std::time::Duration::from_secs(1));
+    group.measurement_time(std::time::Duration::from_secs(3));
 }
 
 macro_rules! bench_static_sizes {
@@ -291,7 +341,6 @@ fn bench_fft_sqr(c: &mut Criterion) {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
             let a = random_limbs(n);
-            bench.iter(|| sqr_vec(black_box(&a)));
             let mut out = vec![0; 2 * n - 1];
             bench.iter(|| fft_sqr_entry(black_box(&a), black_box(&mut out)));
         });
@@ -336,8 +385,8 @@ fn bench_static_ntt_sqr(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_short_school_mul(c: &mut Criterion) {
-    let mut group = c.benchmark_group(format!("short_school_mul/{ARCH}"));
+fn bench_hi_school_mul(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("hi_school_mul/{ARCH}"));
     set_up_group(&mut group);
     let sizes: Vec<usize> = vec![112, 116, 120, 124, 128];
     for &n in &sizes {
@@ -346,14 +395,14 @@ fn bench_short_school_mul(c: &mut Criterion) {
             let a = random_limbs(n);
             let b = random_limbs(n);
             let mut out = vec![0; n];
-            bench.iter(|| short_mul_buf(black_box(&a), black_box(&b), black_box(&mut out)));
+            bench.iter(|| hi_mul_buf(black_box(&a), black_box(&b), black_box(&mut out)));
         });
     }
     group.finish();
 }
 
-fn bench_short_gen_mul(c: &mut Criterion) {
-    let mut group = c.benchmark_group(format!("short_gen_mul/{ARCH}"));
+fn bench_hi_gen_mul(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("hi_gen_mul/{ARCH}"));
     set_up_group(&mut group);
     let sizes: Vec<usize> = vec![112, 116, 120, 124, 128];
     for &n in &sizes {
@@ -362,14 +411,14 @@ fn bench_short_gen_mul(c: &mut Criterion) {
             let a = random_limbs(n);
             let b = random_limbs(n);
             let mut out = vec![0; n];
-            bench.iter(|| short_mul_dyn(black_box(&a), black_box(&b), black_box(&mut out)));
+            bench.iter(|| hi_mul_dyn(black_box(&a), black_box(&b), black_box(&mut out)));
         });
     }
     group.finish();
 }
 
-fn bench_short_school_sqr(c: &mut Criterion) {
-    let mut group = c.benchmark_group(format!("short_school_sqr/{ARCH}"));
+fn bench_hi_school_sqr(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("hi_school_sqr/{ARCH}"));
     set_up_group(&mut group);
     let sizes: Vec<usize> = vec![64, 80, 96, 112, 128];
     for &n in &sizes {
@@ -377,14 +426,14 @@ fn bench_short_school_sqr(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
             let a = random_limbs(n);
             let mut out = vec![0; n];
-            bench.iter(|| short_sqr_buf(black_box(&a), black_box(&mut out)));
+            bench.iter(|| hi_sqr_buf(black_box(&a), black_box(&mut out)));
         });
     }
     group.finish();
 }
 
-fn bench_short_gen_sqr(c: &mut Criterion) {
-    let mut group = c.benchmark_group(format!("short_gen_sqr/{ARCH}"));
+fn bench_hi_gen_sqr(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("hi_gen_sqr/{ARCH}"));
     set_up_group(&mut group);
     let sizes: Vec<usize> = vec![64, 80, 96, 112, 128];
     for &n in &sizes {
@@ -392,7 +441,7 @@ fn bench_short_gen_sqr(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
             let a = random_limbs(n);
             let mut out = vec![0; n];
-            bench.iter(|| short_sqr_dyn(black_box(&a), black_box(&mut out)));
+            bench.iter(|| hi_sqr_dyn(black_box(&a), black_box(&mut out)));
         });
     }
     group.finish();
@@ -425,6 +474,48 @@ fn bench_mid_fft(c: &mut Criterion) {
             let long = random_limbs(2 * n - 1);
             let mut out = vec![0; n];
             bench.iter(|| fft_mid_mul(black_box(&long), black_box(&short), black_box(&mut out)));
+        });
+    }
+    group.finish();
+}
+
+fn bench_mul_band_ratios(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("mul_band_ratio/{ARCH}"));
+    set_up_ratio_group(&mut group);
+    let sizes = [
+        8, 16, 32, 64, 89, 90, 114, 115, 128, 256, 1024, 4096, 16_384, 21_846, 21_847, 32_768,
+        32_769,
+    ];
+
+    for n in sizes {
+        let a = random_limbs(n);
+        let b = random_limbs(n);
+        let long = random_limbs(2 * n - 1);
+        let short = random_limbs(n);
+        let mut full_out = vec![0; 2 * n - 1];
+        let mut full_wide_out = vec![0; 3 * n - 2];
+        let mut hi_out = vec![0; n];
+        let mut mid_out = vec![0; n];
+
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::new("full", n), &n, |bench, _| {
+            bench.iter(|| mul_dyn(black_box(&a), black_box(&b), black_box(&mut full_out)));
+        });
+        group.bench_with_input(BenchmarkId::new("full_wide", n), &n, |bench, _| {
+            bench.iter(|| {
+                mul_dyn(
+                    black_box(&long),
+                    black_box(&short),
+                    black_box(&mut full_wide_out),
+                )
+            });
+        });
+        group.bench_with_input(BenchmarkId::new("hi", n), &n, |bench, _| {
+            bench.iter(|| hi_mul_dyn(black_box(&a), black_box(&b), black_box(&mut hi_out)));
+        });
+        group.bench_with_input(BenchmarkId::new("middle", n), &n, |bench, _| {
+            bench
+                .iter(|| mid_mul_dyn(black_box(&long), black_box(&short), black_box(&mut mid_out)));
         });
     }
     group.finish();
@@ -482,22 +573,25 @@ fn bench_bz_div(c: &mut Criterion) {
     let sizes: Vec<usize> = vec![4, 16, 64, 256, 1024, 4096];
     for &n in &sizes {
         group.throughput(Throughput::Elements(n as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
-            let short = random_normalized_limbs(n);
+        for (normalization, short) in [
+            ("normalized", random_normalized_limbs(n)),
+            ("unnormalized", random_unnormalized_limbs(n)),
+        ] {
             let long = random_limbs(2 * n);
-            bench.iter_batched_ref(
-                || (long.clone(), short.clone(), vec![0; n + 1]),
-                |data| {
-                    let (long, short, out) = data;
-                    bz_div_dyn(
-                        black_box(long.as_mut_slice()),
-                        black_box(short.as_mut_slice()),
-                        black_box(out.as_mut_slice()),
-                    )
-                },
-                BatchSize::LargeInput,
-            );
-        });
+            group.bench_with_input(BenchmarkId::new(normalization, n), &n, |bench, &_| {
+                bench.iter_batched_ref(
+                    || vec![0; n + 1],
+                    |out| {
+                        bz_div_dyn(
+                            black_box(long.as_slice()),
+                            black_box(short.as_slice()),
+                            black_box(out.as_mut_slice()),
+                        )
+                    },
+                    BatchSize::LargeInput,
+                );
+            });
+        }
     }
     group.finish();
 }
@@ -505,29 +599,239 @@ fn bench_bz_div(c: &mut Criterion) {
 fn bench_nr_div(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("nr_div_buf/{ARCH}"));
     set_up_group(&mut group);
-    let sizes: Vec<usize> = vec![4, 16, 64, 256, 1024, 4096];
+    let sizes: Vec<usize> = vec![16, 64, 256, 1024, 4096];
     for &n in &sizes {
         group.throughput(Throughput::Elements(n as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, &n| {
-            let short = random_normalized_limbs(n);
+        for (normalization, short) in [
+            ("normalized", random_normalized_limbs(n)),
+            ("unnormalized", random_unnormalized_limbs(n)),
+        ] {
             let long = random_limbs(2 * n);
-            bench.iter_batched_ref(
-                || (short.clone(), vec![0; n + 1]),
-                |data| {
-                    let (short, out) = data;
-                    nr_div_dyn(
-                        black_box(long.as_slice()),
-                        black_box(short.as_mut_slice()),
-                        black_box(out.as_mut_slice()),
-                    )
-                },
-                BatchSize::LargeInput,
-            );
-        });
+            group.bench_with_input(BenchmarkId::new(normalization, n), &n, |bench, &_| {
+                bench.iter_batched_ref(
+                    || vec![0; n + 1],
+                    |out| {
+                        nr_div_dyn(
+                            black_box(long.as_slice()),
+                            black_box(short.as_slice()),
+                            black_box(out.as_mut_slice()),
+                        )
+                    },
+                    BatchSize::LargeInput,
+                );
+            });
+        }
     }
     group.finish();
 }
 
-criterion_group!(benches, bench_nr_div);
+fn bench_nr_div_rem(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("nr_div_rem_buf/{ARCH}"));
+    set_up_group(&mut group);
+    let sizes: Vec<usize> = vec![16, 64, 256, 1024, 4096];
+    for &n in &sizes {
+        group.throughput(Throughput::Elements(n as u64));
+        for (normalization, short) in [
+            ("normalized", random_normalized_limbs(n)),
+            ("unnormalized", random_unnormalized_limbs(n)),
+        ] {
+            let long = random_limbs(2 * n);
+            group.bench_with_input(BenchmarkId::new(normalization, n), &n, |bench, &_| {
+                bench.iter_batched_ref(
+                    || (long.clone(), vec![0; n + 1]),
+                    |data| {
+                        let (num, out) = data;
+                        nr_div_rem_dyn(
+                            black_box(num.as_mut_slice()),
+                            black_box(short.as_slice()),
+                            black_box(out.as_mut_slice()),
+                        )
+                    },
+                    BatchSize::LargeInput,
+                );
+            });
+        }
+    }
+    group.finish();
+}
+
+fn bench_rcp_setup(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("rcp_setup/{ARCH}"));
+    set_up_group(&mut group);
+    let sizes: Vec<usize> = vec![16, 64, 256, 1024, 4096];
+    for &n in &sizes {
+        group.throughput(Throughput::Elements(n as u64));
+        for (algorithm, reciprocal) in [
+            ("knuth", knuth_rcp_dyn as fn(&[u64], &mut [u64])),
+            ("nr", nr_rcp_dyn as fn(&[u64], &mut [u64])),
+        ] {
+            for (normalization, input) in [
+                ("normalized", random_normalized_limbs(n)),
+                ("unnormalized", random_unnormalized_limbs(n)),
+            ] {
+                group.bench_with_input(
+                    BenchmarkId::new(format!("{algorithm}_{normalization}"), n),
+                    &n,
+                    |bench, &_| {
+                        bench.iter_batched_ref(
+                            || vec![0; n + 1],
+                            |out| {
+                                reciprocal(
+                                    black_box(input.as_slice()),
+                                    black_box(out.as_mut_slice()),
+                                )
+                            },
+                            BatchSize::LargeInput,
+                        );
+                    },
+                );
+            }
+        }
+    }
+    group.finish();
+}
+
+fn register_sqrt_size<const N: usize>(group: &mut BenchmarkGroup<'_, WallTime>, root_len: usize) {
+    let x_len = 2 * root_len;
+    assert_eq!(N, x_len);
+    let input = random_normalized_limbs(x_len);
+    group.throughput(Throughput::Elements(x_len as u64));
+
+    group.bench_with_input(
+        BenchmarkId::new("binom", root_len),
+        &root_len,
+        |bench, _| {
+            bench.iter_batched_ref(
+                || (input.clone(), vec![0; root_len]),
+                |data| {
+                    let (x, root) = data;
+                    binom_sqrt(black_box(x.as_mut_slice()), black_box(root.as_mut_slice()))
+                },
+                BatchSize::LargeInput,
+            );
+        },
+    );
+
+    group.bench_with_input(
+        BenchmarkId::new("zimmermann_dyn", root_len),
+        &root_len,
+        |bench, _| {
+            bench.iter_batched_ref(
+                || (input.clone(), vec![0; root_len]),
+                |data| {
+                    let (x, root) = data;
+                    zimmerman_sqrt_dyn(black_box(x.as_mut_slice()), black_box(root.as_mut_slice()))
+                },
+                BatchSize::LargeInput,
+            );
+        },
+    );
+
+    group.bench_with_input(
+        BenchmarkId::new(format!("zimmermann_static_n{N}"), root_len),
+        &root_len,
+        |bench, _| {
+            bench.iter_batched_ref(
+                || (input.clone(), vec![0; root_len]),
+                |data| {
+                    let (x, root) = data;
+                    zimmerman_sqrt_static::<N>(
+                        black_box(x.as_mut_slice()),
+                        black_box(root.as_mut_slice()),
+                    )
+                },
+                BatchSize::LargeInput,
+            );
+        },
+    );
+}
+
+fn bench_zimmermann_sqrt(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("zimmermann_sqrt/{ARCH}"));
+    set_up_group(&mut group);
+
+    register_sqrt_size::<32>(&mut group, 16);
+    register_sqrt_size::<64>(&mut group, 32);
+    register_sqrt_size::<128>(&mut group, 64);
+    register_sqrt_size::<256>(&mut group, 128);
+    register_sqrt_size::<512>(&mut group, 256);
+    register_sqrt_size::<1024>(&mut group, 512);
+    group.finish();
+}
+
+fn register_sqrt_only_size<const N: usize>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    root_len: usize,
+) {
+    assert_eq!(N, 2 * root_len);
+    let entries: [(&str, fn(&mut [u64], &mut [u64])); 6] = [
+        ("rem_dyn", sqrt_dyn),
+        ("only_dyn", sqrt_only_dyn),
+        ("approx_dyn", sqrt_approx_dyn),
+        ("rem_static", sqrt_static::<N>),
+        ("only_static", sqrt_only_static::<N>),
+        ("approx_static", sqrt_approx_static::<N>),
+    ];
+    for (shape, x_len) in [("full", 2 * root_len), ("padded", root_len + 1)] {
+        let mut rng = StdRng::seed_from_u64(0x5351_5254 ^ x_len as u64);
+        let inputs: Vec<Vec<u64>> = (0..8)
+            .map(|_| {
+                let mut x: Vec<u64> = (0..x_len).map(|_| rng.gen()).collect();
+                x[x_len - 1] |= 1 << 63;
+                x
+            })
+            .collect();
+        group.throughput(Throughput::Elements(x_len as u64));
+        for (name, entry) in entries {
+            group.bench_with_input(
+                BenchmarkId::new(format!("{name}/{shape}"), root_len),
+                &root_len,
+                |bench, &root_len| {
+                    let mut case = 0;
+                    bench.iter_batched_ref(
+                        || {
+                            let x = inputs[case].clone();
+                            case = (case + 1) % inputs.len();
+                            (x, vec![0; root_len])
+                        },
+                        |(x, root)| {
+                            entry(black_box(x.as_mut_slice()), black_box(root.as_mut_slice()))
+                        },
+                        BatchSize::LargeInput,
+                    );
+                },
+            );
+        }
+    }
+}
+
+fn bench_sqrt_only(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("sqrt_only/{ARCH}"));
+    set_up_group(&mut group);
+    register_sqrt_only_size::<{ 2 * (DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF - 1) }>(
+        &mut group,
+        DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF - 1,
+    );
+    register_sqrt_only_size::<{ 2 * DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF }>(&mut group, DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF);
+    register_sqrt_only_size::<{ 2 * (DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF + 1) }>(
+        &mut group,
+        DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF + 1,
+    );
+    register_sqrt_only_size::<64>(&mut group, 32);
+    register_sqrt_only_size::<256>(&mut group, 128);
+    register_sqrt_only_size::<1024>(&mut group, 512);
+    group.finish();
+}
+
+#[path = "probes/division_flow.rs"]
+mod division_flow;
+
+criterion_group!(
+    benches,
+    division_flow::bench_division_flow,
+    bench_zimmermann_sqrt,
+    bench_sqrt_only,
+    bench_mul_band_ratios
+);
 
 criterion_main!(benches);

@@ -1,5 +1,6 @@
 use super::{rand_vec, to_u128};
 use crate::utils::utils::*;
+use crate::utils::ScratchGuard;
 use std::cmp::Ordering::*;
 
 // ─── trim_lz ────────────────────────────────────────────────────────────────
@@ -318,6 +319,16 @@ fn test_signed_shl_shr_inverse() {
     }
 }
 
+#[test]
+fn test_signed_shifts_outside_limb_are_zero() {
+    assert_eq!(signed_shl(1, 64), 0);
+    assert_eq!(signed_shl(u64::MAX, -64), 0);
+    assert_eq!(signed_shr(u64::MAX, 64), 0);
+    assert_eq!(signed_shr(1, -64), 0);
+    assert_eq!(signed_shl(1, i32::MIN), 0);
+    assert_eq!(signed_shr(1, i32::MIN), 0);
+}
+
 // ─── lsb ────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -348,6 +359,13 @@ fn test_lsb_thirty_two_bits() {
 #[test]
 fn test_lsb_sixty_three_bits() {
     assert_eq!(lsb(u64::MAX, 63), 0x7FFF_FFFF_FFFF_FFFF);
+}
+
+#[test]
+fn test_lsb_whole_limb_or_more() {
+    let value = 0xDEAD_BEEF_CAFE_BABEu64;
+    assert_eq!(lsb(value, 64), value);
+    assert_eq!(lsb(value, i32::MAX), value);
 }
 
 #[test]
@@ -401,6 +419,12 @@ fn test_acc_add_empty_rhs() {
     assert_eq!(lhs, vec![u64::MAX]);
 }
 
+#[test]
+#[should_panic(expected = "lhs must be longer then rhs")]
+fn test_add_buf_rejects_short_lhs() {
+    add_buf(&mut [0], &[1, 2]);
+}
+
 // Subtraction (comp = 1): lhs ≥ rhs
 #[test]
 fn test_sub_buf_basic() {
@@ -432,6 +456,12 @@ fn test_sub_buf_underflow() {
     // result is in two's-complement form; twos_comp([u64::MAX - 1]) = [2]
     twos_comp(&mut lhs);
     assert_eq!(lhs, vec![2]);
+}
+
+#[test]
+#[should_panic(expected = "lhs must be longer then rhs")]
+fn test_sub_buf_rejects_short_lhs() {
+    sub_buf(&mut [0], &[1, 2]);
 }
 
 // ─── inc / dec ──────────────────────────────────────────────────────────────
@@ -511,6 +541,35 @@ fn test_inc_buf_dec_buf_roundtrip() {
     }
 }
 
+#[test]
+fn test_add_prim_carry_stays_within_slice() {
+    let mut storage = [u64::MAX, 7];
+    assert!(add_prim(&mut storage[..1], 1));
+    assert_eq!(storage, [0, 7]);
+
+    let mut storage = [u64::MAX, u64::MAX, 7];
+    assert!(add_prim(&mut storage[..2], 1));
+    assert_eq!(storage, [0, 0, 7]);
+}
+
+#[test]
+fn test_sub_prim_borrow_stays_within_slice() {
+    let mut storage = [0, 7];
+    assert!(sub_prim(&mut storage[..1], 1));
+    assert_eq!(storage, [u64::MAX, 7]);
+
+    let mut storage = [0, 0, 7];
+    assert!(sub_prim(&mut storage[..2], 1));
+    assert_eq!(storage, [u64::MAX, u64::MAX, 7]);
+}
+
+#[test]
+#[should_panic(expected = "scratch split size overflow")]
+fn test_scratch_splits_reject_size_overflow() {
+    let mut scratch = ScratchGuard::acquire();
+    let _ = scratch.get_splits([usize::MAX, 1]);
+}
+
 // ─── twos_comp ──────────────────────────────────────────────────────────────
 
 #[test]
@@ -567,6 +626,12 @@ fn test_shl_buf_zero_shift() {
     let c = shl_buf(&mut v, 0);
     assert_eq!(v, vec![1]);
     assert_eq!(c, 0);
+}
+
+#[test]
+#[should_panic(expected = "shift left must be less then 64")]
+fn test_shl_buf_rejects_whole_limb_shift() {
+    shl_buf(&mut [1], 64);
 }
 
 #[test]
@@ -635,6 +700,12 @@ fn test_shr_buf_zero_shift() {
     let c = shr_buf(&mut v, 0);
     assert_eq!(v, vec![2]);
     assert_eq!(c, 0);
+}
+
+#[test]
+#[should_panic(expected = "shift right must be less then 64")]
+fn test_shr_buf_rejects_whole_limb_shift() {
+    shr_buf(&mut [1], 64);
 }
 
 #[test]
@@ -710,6 +781,27 @@ fn test_shl_shr_roundtrip_multi_limb() {
         shr_buf(&mut v, 1);
         assert_eq!(v, orig, "roundtrip failed for seed {seed}");
     }
+}
+
+#[test]
+fn test_shl_top_copy_alignment_and_discarded_limb_carry() {
+    let mut short = [u64::MAX; 3];
+    shl_top_copy(&[0x8000_0000_0000_0001], &mut short, 1);
+    assert_eq!(short, [0, 0, 2]);
+
+    let mut equal = [0; 2];
+    shl_top_copy(&[u64::MAX, 1], &mut equal, 1);
+    assert_eq!(equal, [u64::MAX - 1, 3]);
+
+    let mut long = [0; 2];
+    shl_top_copy(&[99, 1 << 63, 5, 6], &mut long, 1);
+    assert_eq!(long, [11, 12]);
+
+    shl_top_copy(&[99, 2, 3, 4], &mut long, 63);
+    assert_eq!(long, [(1 << 63) | 1, 1]);
+
+    shl_top_copy(&[99, 1 << 63, 5, 6], &mut long, 0);
+    assert_eq!(long, [5, 6]);
 }
 
 // ─── to_u128 helper (self-test) ─────────────────────────────────────────────

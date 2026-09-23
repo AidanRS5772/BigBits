@@ -246,7 +246,7 @@ impl<const N: usize, T: Into<SmallBuf>> SubAssign<T> for UBitIntStatic<N> {
 impl<const N: usize> Mul for UBitIntStatic<N> {
     type Output = UBitIntStatic<N>;
     fn mul(self, rhs: Self) -> Self::Output {
-        let (data, c) = mul_arr(&self.data, &rhs.data).expect("attempt to multiply with overflow");
+        let (data, c) = mul_arr(&self.data, &rhs.data);
         debug_assert!(c == 0, "attempt to multiply with overflow");
         UBitIntStatic::<N> { data }
     }
@@ -276,7 +276,7 @@ impl_commutative!(const N, Mul, mul, UBitIntStatic, |x| x, u128, u64);
 
 impl<const N: usize> MulAssign for UBitIntStatic<N> {
     fn mul_assign(&mut self, rhs: Self) {
-        let (data, c) = mul_arr(&self.data, &rhs.data).expect("attempt to multiply with overflow");
+        let (data, c) = mul_arr(&self.data, &rhs.data);
         debug_assert!(c == 0, "attempt to multiply with overflow");
         self.data = data;
     }
@@ -298,7 +298,7 @@ impl<const N: usize> MulAssign<u64> for UBitIntStatic<N> {
 
 impl<const N: usize> Sqr for UBitIntStatic<N> {
     fn sqr(&self) -> Self {
-        let (data, c) = sqr_arr(&self.data).expect("attempt to multiply with overflow");
+        let (data, c) = sqr_arr(&self.data);
         debug_assert!(c == 0, "attempt to multiply with overflow");
         UBitIntStatic { data }
     }
@@ -351,8 +351,9 @@ impl<const N: usize> DivRem for UBitIntStatic<N> {
         let n_len = buf_len(&self.data);
         let mut n = self.data;
         let d_len = buf_len(&rhs.data);
-        let mut d = rhs.data;
-        let q = div_arr(&mut n[..n_len], &mut d[..d_len]);
+        let mut q = [0; N];
+        let q_len = div_quotient_len(n_len, d_len);
+        div_rem_static::<N>(&mut n[..n_len], &rhs.data[..d_len], &mut q[..q_len + 1]);
         (UBitIntStatic { data: q }, UBitIntStatic { data: n })
     }
 }
@@ -363,7 +364,10 @@ impl<const N: usize> DivRem<u128> for UBitIntStatic<N> {
     fn div_rem(self, rhs: u128) -> (Self::Q, Self::R) {
         let n_len = buf_len(&self.data);
         let mut n = self.data;
-        let q = div_arr(&mut n[..n_len], &mut SmallBuf::from(rhs));
+        let d = SmallBuf::from(rhs);
+        let mut q = [0; N];
+        let q_len = div_quotient_len(n_len, d.len());
+        div_rem_static::<N>(&mut n[..n_len], &d, &mut q[..q_len + 1]);
         (
             UBitIntStatic { data: q },
             SmallBuf::try_from(&n[..2]).unwrap().into(),
@@ -430,17 +434,22 @@ impl<const N: usize> RemAssign for UBitIntStatic<N> {
     fn rem_assign(&mut self, rhs: Self) {
         let n_len = buf_len(&self.data);
         let d_len = buf_len(&rhs.data);
-        let mut d = rhs.data;
-        div_arr::<N>(&mut self.data[..n_len], &mut d[..d_len]);
+        let mut q = [0; N];
+        let q_len = div_quotient_len(n_len, d_len);
+        div_rem_static::<N>(
+            &mut self.data[..n_len],
+            &rhs.data[..d_len],
+            &mut q[..q_len + 1],
+        );
     }
 }
 
 impl<const N: usize> PowI<usize> for UBitIntStatic<N> {
     type Output = UBitIntStatic<N>;
     fn powi(&self, rhs: usize) -> Self::Output {
-        UBitIntStatic {
-            data: powi_arr(&self.data, rhs).expect("attempt to take integer power with overflow"),
-        }
+        let mut data = [0; N];
+        powi_static_entry::<N>(&self.data, rhs, &mut data);
+        UBitIntStatic { data }
     }
 }
 

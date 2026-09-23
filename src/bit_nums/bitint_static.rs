@@ -336,7 +336,7 @@ impl<const N: usize, T: I> SubAssign<T> for BitIntStatic<N> {
 impl<const N: usize> Mul for BitIntStatic<N> {
     type Output = BitIntStatic<N>;
     fn mul(self, rhs: Self) -> Self::Output {
-        let (data, c) = mul_arr(&self.data, &rhs.data).expect("attempt to multiply with overflow");
+        let (data, c) = mul_arr(&self.data, &rhs.data);
         debug_assert!(c == 0, "attempt to multiply with overflow");
         BitIntStatic {
             data,
@@ -388,7 +388,7 @@ impl_commutative!(const N, Mul, mul, BitIntStatic, |x| x, i128, i64);
 
 impl<const N: usize> MulAssign for BitIntStatic<N> {
     fn mul_assign(&mut self, rhs: Self) {
-        let (data, c) = mul_arr(&self.data, &rhs.data).expect("attempt to multiply with overflow");
+        let (data, c) = mul_arr(&self.data, &rhs.data);
         debug_assert!(c == 0, "attempt to multiply with overflow");
         self.data = data;
         self.sign ^= rhs.sign;
@@ -419,7 +419,7 @@ impl<const N: usize> MulAssign<i64> for BitIntStatic<N> {
 
 impl<const N: usize> Sqr for BitIntStatic<N> {
     fn sqr(&self) -> Self {
-        let (data, c) = sqr_arr(&self.data).expect("attempt to multiply with overflow");
+        let (data, c) = sqr_arr(&self.data);
         debug_assert!(c == 0, "attempt to multiply with overflow");
         BitIntStatic { data, sign: false }
     }
@@ -472,8 +472,9 @@ impl<const N: usize> DivRem for BitIntStatic<N> {
         let n_len = buf_len(&self.data);
         let mut n = self.data;
         let d_len = buf_len(&rhs.data);
-        let mut d = rhs.data;
-        let q = div_arr::<N>(&mut n[..n_len], &mut d[..d_len]);
+        let mut q = [0; N];
+        let q_len = div_quotient_len(n_len, d_len);
+        div_rem_static::<N>(&mut n[..n_len], &rhs.data[..d_len], &mut q[..q_len + 1]);
         (
             BitIntStatic {
                 data: q,
@@ -493,8 +494,10 @@ impl<const N: usize> DivRem<i128> for BitIntStatic<N> {
     fn div_rem(self, rhs: i128) -> (Self::Q, Self::R) {
         let n_len = buf_len(&self.data);
         let mut n = self.data;
-        let mut d = SmallBuf::from(rhs.unsigned());
-        let q = div_arr::<N>(&mut n[..n_len], &mut d);
+        let d = SmallBuf::from(rhs.unsigned());
+        let mut q = [0; N];
+        let q_len = div_quotient_len(n_len, d.len());
+        div_rem_static::<N>(&mut n[..n_len], &d, &mut q[..q_len + 1]);
         let rem_u128: u128 = SmallBuf::try_from(&n[..2]).ok().unwrap().into();
         (
             BitIntStatic {
@@ -565,8 +568,10 @@ where
 impl<const N: usize> PowI<usize> for BitIntStatic<N> {
     type Output = BitIntStatic<N>;
     fn powi(&self, rhs: usize) -> Self::Output {
+        let mut data = [0; N];
+        powi_static_entry::<N>(&self.data, rhs, &mut data);
         BitIntStatic {
-            data: powi_arr(&self.data, rhs).expect("attempt to take integer power with overflow"),
+            data,
             sign: self.sign && (rhs % 2 == 1),
         }
     }

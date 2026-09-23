@@ -942,7 +942,7 @@ where
 fn mul_bf(lhs: &BitFloat, rhs: &BitFloat) -> BitFloat {
     let mut e = lhs.e + rhs.e;
     let p = lhs.m.len().min(rhs.m.len());
-    let (buf, c) = short_mul_vec(&lhs.m, &rhs.m, p + 1);
+    let (buf, c) = hi_mul_vec(&lhs.m, &rhs.m, p + 1);
     let mut m = Mantissa::make_take(buf);
     let mut gaurd = m.pull();
     if c > 0 {
@@ -1224,7 +1224,7 @@ impl MulVariants for BitFloat {
         let l = l.unwrap_or(self.m.len());
         let r = r.unwrap_or(rhs.m.len());
         let (mut vec, c) =
-            short_mul_vec(self.m.take(l), rhs.m.take(r), prec.unwrap_or(l + r - 1) + 1);
+            hi_mul_vec(self.m.take(l), rhs.m.take(r), prec.unwrap_or(l + r - 1) + 1);
         let mut m = Mantissa::make_take(vec);
         let mut gaurd = m.pull();
         if c > 0 {
@@ -1252,7 +1252,7 @@ impl MulVariants for BitFloat {
 impl Sqr for BitFloat {
     fn sqr(&self) -> Self {
         let mut e = 2 * self.e;
-        let (vec, c) = short_sqr_vec(&self.m, self.m.len() + 1);
+        let (vec, c) = hi_sqr_vec(&self.m, self.m.len() + 1);
         let mut m = Mantissa::make_take(vec);
         let mut gaurd = m.pull();
         if c > 0 {
@@ -1288,7 +1288,7 @@ impl SqrVariants for BitFloat {
         let mut e = 2 * self.e;
         let in_prec = in_prec.unwrap_or(self.m.len());
         let out_prec = out_prec.unwrap_or(2 * in_prec - 1);
-        let (vec, c) = short_sqr_vec(&self.m.take(in_prec), out_prec);
+        let (vec, c) = hi_sqr_vec(&self.m.take(in_prec), out_prec);
         let mut m = Mantissa::make_take(vec);
         let mut gaurd = m.pull();
         if c > 0 {
@@ -1319,7 +1319,10 @@ fn div_bf(mut n: BitFloat, mut d: BitFloat, p: usize) -> BitFloat {
     n.m.drain(nlen.saturating_sub(np));
     n.m.put_zeros((dp + p).saturating_sub(np));
 
-    let mut m = Mantissa::make_take(div_vec(&mut n.m, &mut d.m));
+    let q_len = div_quotient_len(n.m.len(), d.m.len()) + 1;
+    let mut q = vec![0; q_len];
+    div_rem_dyn(&mut n.m, &d.m, &mut q);
+    let mut m = Mantissa::make_take(q);
     let mut e = n.exp - d.exp + (nlen as i128 - dlen as i128) - p;
 
     let overflow = m[p] > 0;
