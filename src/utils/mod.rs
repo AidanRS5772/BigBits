@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 
+pub mod bin_split;
 pub mod div;
 pub mod mul;
 pub mod sqrt;
