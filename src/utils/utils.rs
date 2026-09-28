@@ -464,6 +464,206 @@ pub fn sub_prim(buf: &mut [u64], prim: u64) -> bool {
     };
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn add_mul_aarch(x: *mut u64, s: *const u64, d: u64, len: usize) -> u64 {
+    let carry: u64;
+    asm!(
+        "mov {mc}, xzr",
+        "2:",
+        "ldr {w}, [{dst}]",
+        "ldr {sv}, [{src}], #8",
+        "mul   {lo}, {sv}, {d}",
+        "umulh {hi}, {sv}, {d}",
+        "adds {lo}, {lo}, {mc}",
+        "adc  {mc}, {hi}, xzr",
+        "adds {w}, {w}, {lo}",
+        "cinc {mc}, {mc}, cs",
+        "str {w}, [{dst}], #8",
+        "sub {len}, {len}, #1",
+        "cbnz {len}, 2b",
+        dst = inout(reg) x => _,
+        src = inout(reg) s => _,
+        d = in(reg) d,
+        len = inout(reg) len => _,
+        mc = out(reg) carry,
+        w = out(reg) _,
+        sv = out(reg) _,
+        lo = out(reg) _,
+        hi = out(reg) _,
+        options(nostack),
+    );
+    carry
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sub_mul_aarch(x: *mut u64, s: *const u64, d: u64, len: usize) -> u64 {
+    let borrow: u64;
+    asm!(
+        "mov {mc}, xzr",
+        "2:",
+        "ldr {w}, [{dst}]",
+        "ldr {sv}, [{src}], #8",
+        "mul   {lo}, {sv}, {d}",
+        "umulh {hi}, {sv}, {d}",
+        "adds {lo}, {lo}, {mc}",
+        "adc  {mc}, {hi}, xzr",
+        "subs {w}, {w}, {lo}",
+        "cinc {mc}, {mc}, cc",
+        "str {w}, [{dst}], #8",
+        "sub {len}, {len}, #1",
+        "cbnz {len}, 2b",
+        dst = inout(reg) x => _,
+        src = inout(reg) s => _,
+        d = in(reg) d,
+        len = inout(reg) len => _,
+        mc = out(reg) borrow,
+        w = out(reg) _,
+        sv = out(reg) _,
+        lo = out(reg) _,
+        hi = out(reg) _,
+        options(nostack),
+    );
+    borrow
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn add_mul_x86(x: *mut u64, s: *const u64, d: u64, len: usize) -> u64 {
+    let carry: u64;
+    asm!(
+        "mov {mc}, 0",
+        "2:",
+        "mov rax, [{src}]",
+        "mul {d}",
+        "add rax, {mc}",
+        "adc rdx, 0",
+        "add QWORD PTR [{dst}], rax",
+        "adc rdx, 0",
+        "mov {mc}, rdx",
+        "lea {dst}, [{dst} + 8]",
+        "lea {src}, [{src} + 8]",
+        "dec {len}",
+        "jnz 2b",
+        dst = inout(reg) x => _,
+        src = inout(reg) s => _,
+        len = inout(reg) len => _,
+        d = in(reg) d,
+        mc = out(reg) carry,
+        out("rax") _,
+        out("rdx") _,
+        options(nostack),
+    );
+    carry
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn sub_mul_x86(x: *mut u64, s: *const u64, d: u64, len: usize) -> u64 {
+    let borrow: u64;
+    asm!(
+        "mov {mc}, 0",
+        "2:",
+        "mov rax, [{src}]",
+        "mul {d}",
+        "add rax, {mc}",
+        "adc rdx, 0",
+        "sub QWORD PTR [{dst}], rax",
+        "adc rdx, 0",
+        "mov {mc}, rdx",
+        "lea {dst}, [{dst} + 8]",
+        "lea {src}, [{src} + 8]",
+        "dec {len}",
+        "jnz 2b",
+        dst = inout(reg) x => _,
+        src = inout(reg) s => _,
+        len = inout(reg) len => _,
+        d = in(reg) d,
+        mc = out(reg) borrow,
+        out("rax") _,
+        out("rdx") _,
+        options(nostack),
+    );
+    borrow
+}
+
+#[inline(always)]
+unsafe fn add_mul_asm(x: *mut u64, s: *const u64, d: u64, len: usize) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        add_mul_aarch(x, s, d, len)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        add_mul_x86(x, s, d, len)
+    }
+}
+
+#[inline(always)]
+unsafe fn sub_mul_asm(x: *mut u64, s: *const u64, d: u64, len: usize) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        sub_mul_aarch(x, s, d, len)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        sub_mul_x86(x, s, d, len)
+    }
+}
+
+// Adds s * d into x (equal lengths) and returns the carry limb owed to x's next limb.
+#[inline(always)]
+pub fn add_mul_limb(x: &mut [u64], s: &[u64], d: u64) -> u64 {
+    let len = s.len();
+    assert!(x.len() == len, "x and s must have equal length");
+    if len == 0 {
+        return 0;
+    }
+    unsafe { add_mul_asm(x.as_mut_ptr(), s.as_ptr(), d, len) }
+}
+
+// Subtracts s * d from x (equal lengths) and returns the borrow limb owed by x's next limb.
+#[inline(always)]
+pub fn sub_mul_limb(x: &mut [u64], s: &[u64], d: u64) -> u64 {
+    let len = s.len();
+    assert!(x.len() == len, "x and s must have equal length");
+    if len == 0 {
+        return 0;
+    }
+    unsafe { sub_mul_asm(x.as_mut_ptr(), s.as_ptr(), d, len) }
+}
+
+// Adds s * d into x (x.len() >= s.len()), carrying through x's upper limbs, and
+// returns the carry limb out of the top of x.
+#[inline]
+pub fn add_mul(x: &mut [u64], s: &[u64], d: u64) -> u64 {
+    assert!(x.len() >= s.len(), "x must be at least as long as s");
+    let (lo, hi) = x.split_at_mut(s.len());
+    let carry = add_mul_limb(lo, s, d);
+    if hi.is_empty() {
+        carry
+    } else {
+        add_prim(hi, carry) as u64
+    }
+}
+
+// Subtracts s * d from x (x.len() >= s.len()), borrowing through x's upper limbs,
+// and returns the borrow limb owed by the limb above x.
+#[inline]
+pub fn sub_mul(x: &mut [u64], s: &[u64], d: u64) -> u64 {
+    assert!(x.len() >= s.len(), "x must be at least as long as s");
+    let (lo, hi) = x.split_at_mut(s.len());
+    let borrow = sub_mul_limb(lo, s, d);
+    if hi.is_empty() {
+        borrow
+    } else {
+        sub_prim(hi, borrow) as u64
+    }
+}
+
 pub fn twos_comp(buf: &mut [u64]) {
     for l in buf.iter_mut() {
         *l = !*l;

@@ -570,6 +570,274 @@ fn test_scratch_splits_reject_size_overflow() {
     let _ = scratch.get_splits([usize::MAX, 1]);
 }
 
+// ─── add_mul / sub_mul ──────────────────────────────────────────────────────
+
+fn add_mul_limb_ref(x: &mut [u64], s: &[u64], d: u64) -> u64 {
+    let mut carry = 0u64;
+    for (x0, &s0) in x.iter_mut().zip(s) {
+        let acc = s0 as u128 * d as u128 + *x0 as u128 + carry as u128;
+        *x0 = acc as u64;
+        carry = (acc >> 64) as u64;
+    }
+    carry
+}
+
+fn sub_mul_limb_ref(x: &mut [u64], s: &[u64], d: u64) -> u64 {
+    let mut borrow = 0u64;
+    for (x0, &s0) in x.iter_mut().zip(s) {
+        let p = s0 as u128 * d as u128 + borrow as u128;
+        let (r, b) = x0.overflowing_sub(p as u64);
+        *x0 = r;
+        borrow = (p >> 64) as u64 + b as u64;
+    }
+    borrow
+}
+
+fn add_mul_ref(x: &mut [u64], s: &[u64], d: u64) -> u64 {
+    let mut carry = add_mul_limb_ref(&mut x[..s.len()], s, d);
+    if x.len() == s.len() {
+        return carry;
+    }
+    for x0 in &mut x[s.len()..] {
+        let (r, c) = x0.overflowing_add(carry);
+        *x0 = r;
+        carry = c as u64;
+    }
+    carry
+}
+
+fn sub_mul_ref(x: &mut [u64], s: &[u64], d: u64) -> u64 {
+    let mut borrow = sub_mul_limb_ref(&mut x[..s.len()], s, d);
+    if x.len() == s.len() {
+        return borrow;
+    }
+    for x0 in &mut x[s.len()..] {
+        let (r, b) = x0.overflowing_sub(borrow);
+        *x0 = r;
+        borrow = b as u64;
+    }
+    borrow
+}
+
+const MUL_SWEEP_FACTORS: [u64; 5] = [1, 2, u64::MAX, u64::MAX - 1, 0x9E37_79B9_7F4A_7C15];
+
+#[test]
+fn test_mul_limb_empty_returns_zero() {
+    assert_eq!(add_mul_limb(&mut [], &[], u64::MAX), 0);
+    assert_eq!(sub_mul_limb(&mut [], &[], u64::MAX), 0);
+}
+
+#[test]
+#[should_panic(expected = "x and s must have equal length")]
+fn test_add_mul_limb_rejects_length_mismatch() {
+    add_mul_limb(&mut [0, 0], &[1], 1);
+}
+
+#[test]
+#[should_panic(expected = "x and s must have equal length")]
+fn test_sub_mul_limb_rejects_length_mismatch() {
+    sub_mul_limb(&mut [0], &[1, 2], 1);
+}
+
+#[test]
+fn test_mul_limb_max_operands() {
+    // (B^2 - 1) + (B^2 - 1)(B - 1) = B^3 - B = [0, MAX] + (B - 1)·B^2, so the carry limb is MAX.
+    let mut x = [u64::MAX; 2];
+    assert_eq!(add_mul_limb(&mut x, &[u64::MAX; 2], u64::MAX), u64::MAX);
+    assert_eq!(x, [0, u64::MAX]);
+
+    // 0 - (B^2 - 1)(B - 1) = [MAX, 0] - (B - 1)·B^2, so the borrow limb is MAX.
+    let mut x = [0u64; 2];
+    assert_eq!(sub_mul_limb(&mut x, &[u64::MAX; 2], u64::MAX), u64::MAX);
+    assert_eq!(x, [u64::MAX, 0]);
+}
+
+#[test]
+fn test_mul_limb_stays_within_slice() {
+    let mut storage = [u64::MAX, u64::MAX, 7];
+    add_mul_limb(&mut storage[..2], &[u64::MAX, u64::MAX], u64::MAX);
+    assert_eq!(storage[2], 7);
+
+    let mut storage = [0u64, 0, 7];
+    sub_mul_limb(&mut storage[..2], &[u64::MAX, u64::MAX], u64::MAX);
+    assert_eq!(storage[2], 7);
+}
+
+#[test]
+fn test_mul_limb_random_sweep() {
+    let mut seed = 100;
+    for len in 1..=40 {
+        for &d in &MUL_SWEEP_FACTORS {
+            seed += 1;
+            let s = rand_vec(len, seed);
+            let x0 = rand_vec(len, seed + 10_000);
+
+            let mut x = x0.clone();
+            let mut expected = x0.clone();
+            let expected_carry = add_mul_limb_ref(&mut expected, &s, d);
+            assert_eq!(add_mul_limb(&mut x, &s, d), expected_carry, "add len={len} d={d:#x}");
+            assert_eq!(x, expected, "add len={len} d={d:#x}");
+
+            let mut x = x0.clone();
+            let mut expected = x0;
+            let expected_borrow = sub_mul_limb_ref(&mut expected, &s, d);
+            assert_eq!(sub_mul_limb(&mut x, &s, d), expected_borrow, "sub len={len} d={d:#x}");
+            assert_eq!(x, expected, "sub len={len} d={d:#x}");
+        }
+    }
+}
+
+#[test]
+fn test_add_mul_zero_multiplier() {
+    let s = rand_vec(5, 1);
+    let x0 = rand_vec(7, 2);
+    let mut x = x0.clone();
+    assert_eq!(add_mul(&mut x, &s, 0), 0);
+    assert_eq!(x, x0);
+}
+
+#[test]
+fn test_add_mul_empty_s() {
+    let mut x = vec![1u64, 2];
+    assert_eq!(add_mul(&mut x, &[], u64::MAX), 0);
+    assert_eq!(x, vec![1, 2]);
+    assert_eq!(add_mul(&mut [], &[], u64::MAX), 0);
+}
+
+#[test]
+#[should_panic(expected = "x must be at least as long as s")]
+fn test_add_mul_rejects_shorter_x() {
+    let mut x = vec![0u64; 1];
+    add_mul(&mut x, &[1, 2], 3);
+}
+
+#[test]
+fn test_add_mul_equal_length_returns_carry_limb() {
+    let mut x = [u64::MAX; 2];
+    assert_eq!(add_mul(&mut x, &[u64::MAX; 2], u64::MAX), u64::MAX);
+    assert_eq!(x, [0, u64::MAX]);
+}
+
+#[test]
+fn test_add_mul_max_carry_single_extra_limb() {
+    let s = [u64::MAX; 4];
+    let mut x = vec![u64::MAX; 5];
+    let mut expected = x.clone();
+    let expected_carry = add_mul_ref(&mut expected, &s, u64::MAX);
+    assert_eq!(expected_carry, 1);
+    assert_eq!(add_mul(&mut x, &s, u64::MAX), expected_carry);
+    assert_eq!(x, expected);
+}
+
+#[test]
+fn test_add_mul_carry_ripples_through_tail() {
+    let mut x = vec![u64::MAX; 6];
+    assert_eq!(add_mul(&mut x, &[1], 1), 1);
+    assert_eq!(x, vec![0; 6]);
+
+    let mut x = vec![u64::MAX, u64::MAX, 5, 7];
+    assert_eq!(add_mul(&mut x, &[1], 1), 0);
+    assert_eq!(x, vec![0, 0, 6, 7]);
+}
+
+#[test]
+fn test_add_mul_stays_within_slice() {
+    let mut storage = [u64::MAX, u64::MAX, u64::MAX, 7];
+    assert_eq!(add_mul(&mut storage[..3], &[u64::MAX, u64::MAX], u64::MAX), 1);
+    assert_eq!(storage[3], 7);
+}
+
+#[test]
+fn test_sub_mul_zero_multiplier() {
+    let s = rand_vec(5, 3);
+    let x0 = rand_vec(7, 4);
+    let mut x = x0.clone();
+    assert_eq!(sub_mul(&mut x, &s, 0), 0);
+    assert_eq!(x, x0);
+}
+
+#[test]
+fn test_sub_mul_empty_s() {
+    let mut x = vec![1u64, 2];
+    assert_eq!(sub_mul(&mut x, &[], u64::MAX), 0);
+    assert_eq!(x, vec![1, 2]);
+    assert_eq!(sub_mul(&mut [], &[], u64::MAX), 0);
+}
+
+#[test]
+#[should_panic(expected = "x must be at least as long as s")]
+fn test_sub_mul_rejects_shorter_x() {
+    let mut x = vec![0u64; 1];
+    sub_mul(&mut x, &[1, 2], 3);
+}
+
+#[test]
+fn test_sub_mul_equal_length_returns_borrow_limb() {
+    let mut x = [0u64; 2];
+    assert_eq!(sub_mul(&mut x, &[u64::MAX; 2], u64::MAX), u64::MAX);
+    assert_eq!(x, [u64::MAX, 0]);
+}
+
+#[test]
+fn test_sub_mul_exact_no_borrow() {
+    let mut x = vec![21u64, 35, 0];
+    assert_eq!(sub_mul(&mut x, &[3, 5], 7), 0);
+    assert_eq!(x, vec![0, 0, 0]);
+}
+
+#[test]
+fn test_sub_mul_borrow_single_extra_limb() {
+    let mut x = vec![0u64, 0, 0];
+    assert_eq!(sub_mul(&mut x, &[1, 1], 1), 1);
+    assert_eq!(x, vec![u64::MAX, u64::MAX - 1, u64::MAX]);
+}
+
+#[test]
+fn test_sub_mul_borrow_ripples_through_tail() {
+    let mut x = vec![0u64; 6];
+    assert_eq!(sub_mul(&mut x, &[1], 1), 1);
+    assert_eq!(x, vec![u64::MAX; 6]);
+
+    let mut x = vec![0u64, 0, 5, 7];
+    assert_eq!(sub_mul(&mut x, &[1], 1), 0);
+    assert_eq!(x, vec![u64::MAX, u64::MAX, 4, 7]);
+}
+
+#[test]
+fn test_sub_mul_stays_within_slice() {
+    let mut storage = [0u64, 0, 0, 7];
+    assert_eq!(sub_mul(&mut storage[..3], &[u64::MAX, u64::MAX], u64::MAX), 1);
+    assert_eq!(storage[3], 7);
+}
+
+#[test]
+fn test_add_sub_mul_random_sweep() {
+    let mut seed = 200_000;
+    for s_len in 1..=40 {
+        for tail in 0..=4 {
+            for &d in &MUL_SWEEP_FACTORS {
+                seed += 1;
+                let s = rand_vec(s_len, seed);
+                let x0 = rand_vec(s_len + tail, seed + 10_000);
+
+                let mut x = x0.clone();
+                let mut expected = x0.clone();
+                let expected_carry = add_mul_ref(&mut expected, &s, d);
+                let carry = add_mul(&mut x, &s, d);
+                assert_eq!(x, expected, "add s_len={s_len} tail={tail} d={d:#x}");
+                assert_eq!(carry, expected_carry, "add s_len={s_len} tail={tail} d={d:#x}");
+
+                let mut x = x0.clone();
+                let mut expected = x0;
+                let expected_borrow = sub_mul_ref(&mut expected, &s, d);
+                let borrow = sub_mul(&mut x, &s, d);
+                assert_eq!(x, expected, "sub s_len={s_len} tail={tail} d={d:#x}");
+                assert_eq!(borrow, expected_borrow, "sub s_len={s_len} tail={tail} d={d:#x}");
+            }
+        }
+    }
+}
+
 // ─── twos_comp ──────────────────────────────────────────────────────────────
 
 #[test]

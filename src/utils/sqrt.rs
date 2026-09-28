@@ -5,7 +5,7 @@ use crate::utils::{
     },
     mul::{mul_elem, sqr_dyn, sqr_static},
     utils::{
-        add_buf, add_prim, buf_len, cmp_buf, combine_u64, dec_buf, end_mut, end_ref, inc_buf,
+        add_buf, add_mul, buf_len, cmp_buf, combine_u64, dec_buf, end_mut, end_ref, inc_buf,
         shl_buf, shr_buf, sub_buf, twos_comp,
     },
     ScratchGuard, DYN_SQRT_APPROX_ZIMMERMAN_CUTOFF, DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF,
@@ -136,17 +136,6 @@ pub fn binom_sqrt_core(x: &mut [u64], s: &mut [u64]) {
             s[j] -= 1;
         }
     }
-}
-
-fn add_mul(x: &mut [u64], s: &[u64], d: u64) -> bool {
-    assert!(x.len() > s.len(), "x needs at least one extra limb");
-    let mut carry = 0_u128;
-    for (x0, &s0) in x.iter_mut().zip(s) {
-        let acc = s0 as u128 * d as u128 + *x0 as u128 + carry;
-        *x0 = acc as u64;
-        carry = acc >> 64;
-    }
-    add_prim(&mut x[s.len()..], carry as u64)
 }
 
 fn sqrt_denormalization(x: &mut [u64], s: &mut [u64], sh: u8) {

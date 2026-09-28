@@ -609,6 +609,15 @@ pub fn rcp_prepared_static<const N: usize>(d: &[u64], rcp: &mut [u64], algorithm
     }
 }
 
+// Subtracts q * d from the window and folds the borrow limb into its separate
+// overflow limb; returns whether that limb borrowed.
+#[inline(always)]
+fn sub_mul_of(win: &mut [u64], of: &mut u64, d: &[u64], q: u64) -> bool {
+    let (r, borrow) = of.overflowing_sub(sub_mul_limb(win, d, q));
+    *of = r;
+    borrow
+}
+
 pub fn knuth_est(win: &mut [u64], of: &mut u64, d: &[u64], d1: u64, d0: u64) -> u64 {
     let (mut qhat, rhat_hi, rhat_lo) = if *of >= d1 {
         let (rhat_lo, c) = win.last().unwrap().overflowing_add(d1);
@@ -1640,96 +1649,6 @@ pub fn div_prim(buf: &mut [u64], prim: u64) -> u64 {
     }
 
     return r;
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn sub_mul_of_aarch(win: *mut u64, of: *mut u64, d: *const u64, q: u64, len: usize) -> bool {
-    let overflow: u64;
-    asm!(
-        "mov {mc}, xzr",
-        "2:",
-        "ldr {w}, [{win}]",
-        "ldr {dv}, [{den}], #8",
-        "mul   {lo}, {dv}, {q}",
-        "umulh {hi}, {dv}, {q}",
-        "adds {lo}, {lo}, {mc}",
-        "adc  {mc}, {hi}, xzr",
-        "subs {w}, {w}, {lo}",
-        "cinc {mc}, {mc}, cc",
-        "str {w}, [{win}], #8",
-        "subs {len}, {len}, #1",
-        "cbnz {len}, 2b",
-        "ldr {w}, [{ofp}]",
-        "subs {w}, {w}, {mc}",
-        "cset {overflow}, cc",
-        "str {w}, [{ofp}]",
-        win = inout(reg) win => _,
-        den = inout(reg) d => _,
-        ofp = in(reg) of,
-        q = in(reg) q,
-        len = inout(reg) len => _,
-        overflow = out(reg) overflow,
-        mc = out(reg) _,
-        w = out(reg) _,
-        dv = out(reg) _,
-        lo = out(reg) _,
-        hi = out(reg) _,
-        options(nostack),
-    );
-    overflow != 0
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn sub_mul_of_x86(win: *mut u64, of: *mut u64, d: *const u64, q: u64, len: usize) -> bool {
-    let borrow: u8;
-    asm!(
-        "mov {mc}, 0",
-        "2:",
-        "mov rax, [{den}]",
-        "mul {q}",
-        "add rax, {mc}",
-        "adc rdx, 0",
-        "sub QWORD PTR [{win}], rax",
-        "adc rdx, 0",
-        "mov {mc}, rdx",
-        "lea {win}, [{win} + 8]",
-        "lea {den}, [{den} + 8]",
-        "dec {len}",
-        "jnz 2b",
-        "sub QWORD PTR [{ofp}], {mc}",
-        "setc {b}",
-        win = inout(reg) win => _,
-        den = inout(reg) d => _,
-        len = inout(reg) len => _,
-        ofp = in(reg) of,
-        q = in(reg) q,
-        b = out(reg_byte) borrow,
-        mc = out(reg) _,
-        out("rax") _,
-        out("rdx") _,
-        options(nostack),
-    );
-    borrow != 0
-}
-
-#[inline(always)]
-unsafe fn sub_mul_of_asm(win: *mut u64, of: *mut u64, d: *const u64, q: u64, len: usize) -> bool {
-    #[cfg(target_arch = "aarch64")]
-    {
-        sub_mul_of_aarch(win, of, d, q, len)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        sub_mul_of_x86(win, of, d, q, len)
-    }
-}
-
-#[inline(always)]
-fn sub_mul_of(win: &mut [u64], of: &mut u64, d: &[u64], q: u64) -> bool {
-    unsafe { sub_mul_of_asm(win.as_mut_ptr(), of, d.as_ptr(), q, d.len()) }
 }
 
 #[cfg(target_arch = "x86_64")]

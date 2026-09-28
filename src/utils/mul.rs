@@ -82,7 +82,13 @@ pub fn mul_prim(buf: &mut [u64], prim: u64) -> u64 {
         buf.fill(0);
         return 0;
     }
-    let mut carry: u64 = 0;
+    mul_add_prim(buf, prim, 0)
+}
+
+// buf = buf * prim + add, returning the carry limb out of the top of buf.
+#[inline]
+pub fn mul_add_prim(buf: &mut [u64], prim: u64, add: u64) -> u64 {
+    let mut carry = add;
     for e in buf {
         let (lo, hi) = unsafe { mul_prim_carry_asm(*e, prim, carry) };
         *e = lo;
