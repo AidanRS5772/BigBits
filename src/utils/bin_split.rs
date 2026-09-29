@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use crate::utils::{
     div::{rcp_dyn, rcp_static},
     mul::{hi_mul_dyn, hi_mul_static, mul_add_prim, mul_dyn, mul_prim},
-    utils::{add_buf, add_mul, buf_len, shl_buf, shr_buf, trim_lz},
+    utils::{add_buf, add_mul, add_prim, buf_len, shl_buf, shr_buf, trim_lz},
     ScratchGuard, PARTIAL_MUL_CUTOFF,
 };
 
@@ -19,25 +19,47 @@ fn push(buf: &mut [u64], len: &mut usize, c: u64) {
 }
 
 fn prepend_shl(x: &mut [u64], x_len: &mut usize, sh: u64) -> u64 {
+    if *x_len == 0 {
+        return 0;
+    }
     let (sl, sb) = split_bits(sh);
-    x[..*x_len + sl].copy_within(..*x_len, sl);
-    x[..sl].fill(0);
-    *x_len += sl;
+    if sl != 0 {
+        x[..*x_len + sl].copy_within(..*x_len, sl);
+        x[..sl].fill(0);
+        *x_len += sl;
+    }
     shl_buf(&mut x[sl..*x_len], sb)
 }
 
 // Exact P and Q over the terms [a, b); p needs b - a + R(b - a) / 64 + 1 limbs
 // and q needs b - a.
 fn bbp_leaf_terms<S: BBPSeries>(a: u64, b: u64, p: &mut [u64], q: &mut [u64]) -> (usize, usize) {
-    p[0] = S::p(a);
-    q[0] = S::q(a);
-    let (mut p_len, mut q_len) = (1, 1);
-    for n in (a + 1)..b {
-        let u = S::q(n);
-        let v = S::p(n);
-        let c = mul_prim(&mut p[..p_len], u);
+    q[0] = 1;
+    let (mut p_len, mut q_len) = (0, 1);
+    let mut n = a;
+    while n < b {
+        let (mut u, mut v, mut j) = (S::q(n), S::p(n), 1);
+        n += 1;
+        while S::R < 64 && n < b {
+            let w = S::q(n) as u128;
+            let (uw, vw) = (u as u128 * w, v as u128 * w);
+            if (uw >> 64 | vw >> (64 - S::R)) != 0 {
+                break;
+            }
+            let vw = (vw << S::R) + u as u128 * S::p(n) as u128;
+            if vw >> 64 != 0 {
+                break;
+            }
+            (u, v, j) = (uw as u64, vw as u64, j + 1);
+            n += 1;
+        }
+        // P = (P * u) << Rj + Q * v, shifting u instead of P when the sub-limb
+        // shift fits.
+        let (sh, sb) = (S::R * j, (S::R * j % 64) as u32);
+        let f = if u.leading_zeros() >= sb { sb } else { 0 };
+        let c = mul_prim(&mut p[..p_len], u << f);
         push(p, &mut p_len, c);
-        let c = prepend_shl(p, &mut p_len, S::R);
+        let c = prepend_shl(p, &mut p_len, sh - f as u64);
         push(p, &mut p_len, c);
         p_len = p_len.max(q_len);
         let c = add_mul(&mut p[..p_len], &q[..q_len], v);
@@ -69,14 +91,18 @@ fn shl_or_drop(buf: &mut [u64], len: &mut usize, e: &mut usize, bits: u64) {
     }
     let (sl, sb) = split_bits(bits);
     let m = sl.min(buf.len() - *len);
-    buf.copy_within(..*len, m);
-    buf[..m].fill(0);
-    *len += m;
+    if m != 0 {
+        buf.copy_within(..*len, m);
+        buf[..m].fill(0);
+        *len += m;
+    }
     *e += sl - m;
     let c = shl_buf(&mut buf[..*len], sb);
     push_or_drop(buf, len, e, c);
 }
 
+// P / B^e and exact Q over the terms [a, b), returning (p_len, q_len, e). q
+// needs b - a limbs, and p keeps P exact (e = 0) with b - a + R(b - a) / 64 + 1.
 fn engel_leaf_terms<S: EngelSeries>(
     a: u64,
     b: u64,
@@ -102,15 +128,19 @@ fn engel_leaf_terms<S: EngelSeries>(
             (u, v, j) = (uw as u64, vw as u64, j + 1);
             n += 1;
         }
-        // P = (P * u) << Rj + v; v falls below P's precision once e > 0.
-        let add = if S::R == 0 && e == 0 { v } else { 0 };
-        let c = mul_add_prim(&mut p[..p_len], u, add);
+        // P = (P * u) << Rj + v, shifting u instead of P when the sub-limb shift
+        // fits; v falls below P's precision once e > 0.
+        let (sh, sb) = (S::R * j, (S::R * j % 64) as u32);
+        let f = if u.leading_zeros() >= sb { sb } else { 0 };
+        // With no shift left, v rides in as the multiply's carry.
+        let fused = sh == f as u64 || p_len == 0;
+        let add = if fused && e == 0 { v } else { 0 };
+        let c = mul_add_prim(&mut p[..p_len], u << f, add);
         push_or_drop(p, &mut p_len, &mut e, c);
-        if S::R != 0 {
-            shl_or_drop(p, &mut p_len, &mut e, S::R * j);
-            if e == 0 {
-                let c = mul_add_prim(&mut p[..p_len], 1, v);
-                push_or_drop(p, &mut p_len, &mut e, c);
+        if !fused {
+            shl_or_drop(p, &mut p_len, &mut e, sh - f as u64);
+            if e == 0 && add_prim(&mut p[..p_len], v) {
+                push_or_drop(p, &mut p_len, &mut e, 1);
             }
         }
         let c = mul_prim(&mut q[..q_len], u);
@@ -129,17 +159,32 @@ fn hyper_leaf_terms<S: HyperSeries>(
     q: &mut [u64],
     r: &mut [u64],
 ) -> (usize, usize, usize, usize) {
-    p[0] = S::p(a);
-    q[0] = S::q(a);
-    r[0] = S::r(a);
-    let (mut p_len, mut q_len, mut r_len, mut e) = (1, 1, 1, 0);
-    for n in (a + 1)..b {
-        let u = S::q(n);
-        let v = S::r(n);
-        let w = S::p(n);
-        let c = mul_prim(&mut p[..p_len], u);
+    (q[0], r[0]) = (1, 1);
+    let (mut p_len, mut q_len, mut r_len, mut e) = (0, 1, 1, 0);
+    let mut n = a;
+    while n < b {
+        let (mut u, mut v, mut w, mut j) = (S::q(n), S::r(n), S::p(n), 1);
+        n += 1;
+        while S::R < 64 && n < b {
+            let (x, y) = (S::q(n) as u128, S::r(n) as u128);
+            let (ux, vy, wx) = (u as u128 * x, v as u128 * y, w as u128 * x);
+            if (ux >> 64 | vy >> 64 | wx >> (64 - S::R)) != 0 {
+                break;
+            }
+            let wx = (wx << S::R) + v as u128 * S::p(n) as u128;
+            if wx >> 64 != 0 {
+                break;
+            }
+            (u, v, w, j) = (ux as u64, vy as u64, wx as u64, j + 1);
+            n += 1;
+        }
+        // P = (P * u) << Rj + R * w, shifting u instead of P when the sub-limb
+        // shift fits.
+        let (sh, sb) = (S::R * j, (S::R * j % 64) as u32);
+        let f = if u.leading_zeros() >= sb { sb } else { 0 };
+        let c = mul_prim(&mut p[..p_len], u << f);
         push_or_drop(p, &mut p_len, &mut e, c);
-        shl_or_drop(p, &mut p_len, &mut e, S::R);
+        shl_or_drop(p, &mut p_len, &mut e, sh - f as u64);
         // R * w joins P at B^e; dropping R's low e limbs first errs by under
         // w < B, so only P's lowest limb is inexact.
         let rs = &r[e.min(r_len)..r_len];
@@ -201,7 +246,7 @@ fn ratio_to_fraction(
     debug_assert!(x.len() == len + 2 && y.len() >= len + 3);
     out.fill(0);
     if p.is_empty() || len == 0 {
-        return;
+        return
     }
 
     // x ≈ B^(q.len() + x.len() - 1) / q, so p * x / 2^bits = S * B^len, with
@@ -246,7 +291,7 @@ pub trait Node {
     fn finalize(&self, out: &mut [u64]);
 }
 
-fn bin_split<N, const CUTOFF: u64>(a: u64, b: u64) -> N
+pub fn bin_split<N, const CUTOFF: u64>(a: u64, b: u64) -> N
 where
     N: Node,
 {
@@ -343,12 +388,7 @@ impl<const N: usize, S: BBPSeries> Node for StaticNodeBBP<N, S> {
     fn leaf(a: u64, b: u64) -> Self {
         let (mut p, mut q) = ([0; N], [0; N]);
         let (p_len, mut q_len) = bbp_leaf_terms::<S>(a, b, &mut p, &mut q);
-
-        let (sl, sb) = split_bits(S::R * (b - a));
-        q.copy_within(..q_len, sl);
-        q[..sl].fill(0);
-        q_len += sl;
-        let c = shl_buf(&mut q[sl..q_len], sb);
+        let c = prepend_shl(&mut q, &mut q_len, S::R * (b - a));
         push(&mut q, &mut q_len, c);
 
         StaticNodeBBP {
