@@ -151,7 +151,8 @@ fn engel_leaf_terms<S: EngelSeries>(
 
 // P / B^e and exact Q and R over the terms [a, b), returning (p_len, q_len,
 // r_len, e). q and r need b - a limbs, and p keeps P exact (e = 0) with
-// b - a + R(b - a) / 64 + 1.
+// b - a + R(b - a) / 64 + 1. R is always formed since P needs its running
+// product; a caller that doesn't keep R can pass scratch for it.
 fn hyper_leaf_terms<S: HyperSeries>(
     a: u64,
     b: u64,
@@ -246,7 +247,7 @@ fn ratio_to_fraction(
     debug_assert!(x.len() == len + 2 && y.len() >= len + 3);
     out.fill(0);
     if p.is_empty() || len == 0 {
-        return
+        return;
     }
 
     // x ≈ B^(q.len() + x.len() - 1) / q, so p * x / 2^bits = S * B^len, with
@@ -285,25 +286,35 @@ fn ratio_to_fraction_static<const N: usize>(p: &[u64], q: &[u64], shift: i64, ou
     ratio_to_fraction(p, q, shift, out, x, y, rcp_static::<N>, hi_mul_static::<N>);
 }
 
-pub trait Node {
+pub trait Node: Sized {
     fn merge(l: Self, r: Self) -> Self;
-    fn leaf(a: u64, b: u64) -> Self;
+    fn leaf(a: u64, b: u64, last: bool) -> Self;
     fn finalize(&self, out: &mut [u64]);
 }
 
-pub fn bin_split<N, const CUTOFF: u64>(a: u64, b: u64) -> N
+// The node over [a, b), split down to leaves of under CUTOFF terms. last marks a
+// range that ends the sum, whose node is only finalized or merged as a right child.
+pub fn bin_split_tree<N, const CUTOFF: u64>(a: u64, b: u64, last: bool) -> N
 where
     N: Node,
 {
     const { assert!(CUTOFF != 0) };
     debug_assert!(a < b);
     if b - a < CUTOFF {
-        return N::leaf(a, b);
+        return N::leaf(a, b, last);
     }
     let m = (a + b) / 2;
-    let l = bin_split::<N, CUTOFF>(a, m);
-    let r = bin_split::<N, CUTOFF>(m, b);
+    let l = bin_split_tree::<N, CUTOFF>(a, m, false);
+    let r = bin_split_tree::<N, CUTOFF>(m, b, last);
     N::merge(l, r)
+}
+
+// The node for the whole sum over [a, b), ready to finalize.
+pub fn bin_split<N, const CUTOFF: u64>(a: u64, b: u64) -> N
+where
+    N: Node,
+{
+    bin_split_tree::<N, CUTOFF>(a, b, true)
 }
 
 pub trait BBPSeries {
@@ -322,7 +333,7 @@ pub struct DynNodeBBP<S: BBPSeries> {
 }
 
 impl<S: BBPSeries> Node for DynNodeBBP<S> {
-    fn leaf(a: u64, b: u64) -> Self {
+    fn leaf(a: u64, b: u64, _: bool) -> Self {
         let terms = (b - a) as usize;
         let words = split_bits(S::R * (b - a)).0 + 1;
         let (mut p, mut q) = (vec![0; terms + words], vec![0; terms]);
@@ -385,7 +396,7 @@ pub struct StaticNodeBBP<const N: usize, S: BBPSeries> {
 }
 
 impl<const N: usize, S: BBPSeries> Node for StaticNodeBBP<N, S> {
-    fn leaf(a: u64, b: u64) -> Self {
+    fn leaf(a: u64, b: u64, _: bool) -> Self {
         let (mut p, mut q) = ([0; N], [0; N]);
         let (p_len, mut q_len) = bbp_leaf_terms::<S>(a, b, &mut p, &mut q);
         let c = prepend_shl(&mut q, &mut q_len, S::R * (b - a));
@@ -467,7 +478,7 @@ pub struct DynNodeEngel<S: EngelSeries> {
 }
 
 impl<S: EngelSeries> Node for DynNodeEngel<S> {
-    fn leaf(a: u64, b: u64) -> Self {
+    fn leaf(a: u64, b: u64, _: bool) -> Self {
         let terms = (b - a) as usize;
         let words = split_bits(S::R * (b - a)).0 + 1;
         let (mut p, mut q) = (vec![0; terms + words], vec![0; terms]);
@@ -527,7 +538,7 @@ pub struct StaticNodeEngel<const N: usize, S: EngelSeries> {
 }
 
 impl<const N: usize, S: EngelSeries> Node for StaticNodeEngel<N, S> {
-    fn leaf(a: u64, b: u64) -> Self {
+    fn leaf(a: u64, b: u64, _: bool) -> Self {
         let (mut p, mut q) = ([0; N], [0; N]);
         let (p_len, q_len, ep) = engel_leaf_terms::<S>(a, b, &mut p, &mut q);
         StaticNodeEngel {
@@ -599,6 +610,8 @@ impl<const N: usize, S: EngelSeries> Node for StaticNodeEngel<N, S> {
     }
 }
 
+
+
 pub trait HyperSeries {
     const R: u64;
     fn p(n: u64) -> u64;
@@ -612,20 +625,31 @@ pub struct DynNodeHyper<S: HyperSeries> {
     b: u64,
     p: Vec<u64>,
     q: Vec<u64>,
-    r: Vec<u64>,
+    r: Option<Vec<u64>>,
     _s: PhantomData<S>,
 }
 
 impl<S: HyperSeries> Node for DynNodeHyper<S> {
-    fn leaf(a: u64, b: u64) -> Self {
+    fn leaf(a: u64, b: u64, last: bool) -> Self {
         let terms = (b - a) as usize;
         let words = split_bits(S::R * (b - a)).0 + 1;
-        let (mut p, mut q, mut r) = (vec![0; terms + words], vec![0; terms], vec![0; terms]);
-        let (p_len, q_len, r_len, e) = hyper_leaf_terms::<S>(a, b, &mut p, &mut q, &mut r);
+        let (mut p, mut q) = (vec![0; terms + words], vec![0; terms]);
+        // P needs R's running product, so a leaf that ends the sum still forms
+        // R, but in scratch rather than a buffer it keeps.
+        let (p_len, q_len, r, e) = if last {
+            let mut scratch = ScratchGuard::acquire();
+            let r = scratch.get(terms);
+            let (p_len, q_len, _, e) = hyper_leaf_terms::<S>(a, b, &mut p, &mut q, r);
+            (p_len, q_len, None, e)
+        } else {
+            let mut r = vec![0; terms];
+            let (p_len, q_len, r_len, e) = hyper_leaf_terms::<S>(a, b, &mut p, &mut q, &mut r);
+            r.truncate(r_len);
+            (p_len, q_len, Some(r), e)
+        };
         debug_assert_eq!(e, 0);
         p.truncate(p_len);
         q.truncate(q_len);
-        r.truncate(r_len);
         DynNodeHyper {
             a,
             b,
@@ -637,18 +661,20 @@ impl<S: HyperSeries> Node for DynNodeHyper<S> {
     }
 
     fn merge(left: Self, right: Self) -> Self {
+        let lr = left
+            .r
+            .expect("a node that ends the sum can't merge as a left child");
         let (sl, sb) = split_bits(S::R * (right.b - right.a));
-        let tl = right.p.len() + left.r.len();
+        let tl = right.p.len() + lr.len();
         let pl = left.p.len() + right.q.len();
         let ql = left.q.len() + right.q.len();
-        let rl = left.r.len() + right.r.len();
 
         let mut p = vec![0; (sl + pl + 1).max(tl) + 1];
         mul_dyn(&left.p, &right.q, &mut p[sl..sl + pl]);
         p[sl + pl] = shl_buf(&mut p[sl..sl + pl], sb);
 
         let mut t = fit(left.p, tl);
-        mul_dyn(&right.p, &left.r, &mut t);
+        mul_dyn(&right.p, &lr, &mut t);
         let carry = add_buf(&mut p, &t);
         debug_assert!(!carry);
         trim_lz(&mut p);
@@ -657,9 +683,13 @@ impl<S: HyperSeries> Node for DynNodeHyper<S> {
         mul_dyn(&left.q, &right.q, &mut q);
         trim_lz(&mut q);
 
-        let mut r = fit(right.p, rl);
-        mul_dyn(&left.r, &right.r, &mut r);
-        trim_lz(&mut r);
+        // A right child without R ends the sum, and so does the merged node.
+        let r = right.r.map(|rr| {
+            let mut r = fit(right.p, lr.len() + rr.len());
+            mul_dyn(&lr, &rr, &mut r);
+            trim_lz(&mut r);
+            r
+        });
 
         DynNodeHyper {
             a: left.a,
@@ -681,34 +711,36 @@ impl<S: HyperSeries> Node for DynNodeHyper<S> {
 pub struct StaticNodeHyper<const N: usize, S: HyperSeries> {
     a: u64,
     b: u64,
-    ep: usize,
-    eq: usize,
-    er: usize,
     p: [u64; N],
     p_len: usize,
+    ep: usize,
     q: [u64; N],
     q_len: usize,
-    r: [u64; N],
-    r_len: usize,
+    eq: usize,
+    r: Option<[u64; N]>,
+    r_len: Option<usize>,
+    er: Option<usize>,
     _s: PhantomData<S>,
 }
 
 impl<const N: usize, S: HyperSeries> Node for StaticNodeHyper<N, S> {
-    fn leaf(a: u64, b: u64) -> Self {
+    fn leaf(a: u64, b: u64, last: bool) -> Self {
         let (mut p, mut q, mut r) = ([0; N], [0; N], [0; N]);
         let (p_len, q_len, r_len, ep) = hyper_leaf_terms::<S>(a, b, &mut p, &mut q, &mut r);
+        // P needs R's running product, but a leaf that ends the sum doesn't keep it.
+        let keep = !last;
         StaticNodeHyper {
             a,
             b,
-            ep,
-            eq: 0,
-            er: 0,
             p,
             p_len,
+            ep,
             q,
             q_len,
-            r,
-            r_len,
+            eq: 0,
+            r: keep.then_some(r),
+            r_len: keep.then_some(r_len),
+            er: keep.then_some(0),
             _s: PhantomData,
         }
     }
@@ -716,19 +748,15 @@ impl<const N: usize, S: HyperSeries> Node for StaticNodeHyper<N, S> {
     fn merge(mut left: Self, mut right: Self) -> Self {
         const { assert!(N >= 2) };
         let (sl, sb) = split_bits(S::R * (right.b - right.a));
-        let (lp, lq, lr) = (
-            &left.p[..left.p_len],
-            &left.q[..left.q_len],
-            &left.r[..left.r_len],
-        );
-        let (rp, rq, rr) = (
-            &right.p[..right.p_len],
-            &right.q[..right.q_len],
-            &right.r[..right.r_len],
-        );
+        let (lp, lq) = (&left.p[..left.p_len], &left.q[..left.q_len]);
+        let (rp, rq) = (&right.p[..right.p_len], &right.q[..right.q_len]);
+        let (lr, ler) = match (&left.r, left.r_len, left.er) {
+            (Some(r), Some(len), Some(e)) => (&r[..len], e),
+            _ => panic!("a node that ends the sum can't merge as a left child"),
+        };
 
         let (t_len, u_len) = (mul_len(lp, rq), mul_len(rp, lr));
-        let (t_e, u_e) = (left.ep + right.eq + sl, right.ep + left.er);
+        let (t_e, u_e) = (left.ep + right.eq + sl, right.ep + ler);
         let t_top = if t_len == 0 {
             0
         } else {
@@ -760,21 +788,29 @@ impl<const N: usize, S: HyperSeries> Node for StaticNodeHyper<N, S> {
 
         let kq = mul_len(lq, rq).saturating_sub(N);
         let q_len = hi_mul_drop::<N>(lq, rq, kq, &mut right.p);
-        let kr = mul_len(lr, rr).saturating_sub(N);
-        let r_len = hi_mul_drop::<N>(lr, rr, kr, &mut left.p);
+        // A right child without R ends the sum, and so does the merged node.
+        let (r_len, er) = match (&right.r, right.r_len, right.er) {
+            (Some(r), Some(len), Some(e)) => {
+                let rr = &r[..len];
+                let kr = mul_len(lr, rr).saturating_sub(N);
+                let r_len = hi_mul_drop::<N>(lr, rr, kr, &mut left.p);
+                (Some(r_len), Some(ler + e + kr))
+            }
+            _ => (None, None),
+        };
 
         StaticNodeHyper {
             a: left.a,
             b: right.b,
-            ep,
-            eq: left.eq + right.eq + kq,
-            er: left.er + right.er + kr,
             p,
             p_len,
+            ep,
             q: right.p,
             q_len,
-            r: left.p,
+            eq: left.eq + right.eq + kq,
+            r: r_len.map(|_| left.p),
             r_len,
+            er,
             _s: PhantomData,
         }
     }
