@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 
 pub mod bin_split;
+pub mod constant;
 pub mod div;
 pub mod mul;
 pub mod sqrt;
@@ -62,6 +63,8 @@ pub const DYN_SQRT_APPROX_ZIMMERMAN_CUTOFF: usize = 15;
 pub const STATIC_SQRT_REM_ZIMMERMAN_CUTOFF: usize = 20;
 pub const STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF: usize = 15;
 pub const STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF: usize = 14;
+
+pub const LN2_TERM_CUTOFF: u64 = 384;
 
 thread_local! {
     static SCRATCH_POOL: RefCell<Vec<Vec<u64>>> = RefCell::new(Vec::new());

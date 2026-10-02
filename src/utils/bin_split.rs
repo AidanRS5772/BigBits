@@ -3,13 +3,9 @@ use std::marker::PhantomData;
 use crate::utils::{
     div::{rcp_dyn, rcp_static},
     mul::{hi_mul_dyn, hi_mul_static, mul_add_prim, mul_dyn, mul_prim, sqr_dyn},
-    utils::{add_buf, add_mul, add_prim, buf_len, shl_buf, shr_buf, trim_lz},
+    utils::{add_buf, add_mul, add_prim, buf_len, shl_buf, shr_buf, split_sh, trim_lz},
     ScratchGuard, PARTIAL_MUL_CUTOFF,
 };
-
-fn split_bits(bits: u64) -> (usize, u8) {
-    ((bits / 64) as usize, (bits % 64) as u8)
-}
 
 fn push(buf: &mut [u64], len: &mut usize, c: u64) {
     if c != 0 {
@@ -22,7 +18,7 @@ fn prepend_shl(x: &mut [u64], x_len: &mut usize, sh: u64) -> u64 {
     if *x_len == 0 || sh == 0 {
         return 0;
     }
-    let (sl, sb) = split_bits(sh);
+    let (sl, sb) = split_sh(sh);
     if sl != 0 {
         x[..*x_len + sl].copy_within(..*x_len, sl);
         x[..sl].fill(0);
@@ -31,8 +27,6 @@ fn prepend_shl(x: &mut [u64], x_len: &mut usize, sh: u64) -> u64 {
     shl_buf(&mut x[sl..*x_len], sb)
 }
 
-// Exact P and Q over the terms [a, b); p needs b - a + shift(b - a) / 64 + 1
-// limbs and q needs b - a.
 fn bbp_leaf_terms<S: BBPSeries>(
     a: u64,
     b: u64,
@@ -78,7 +72,6 @@ fn bbp_leaf_terms<S: BBPSeries>(
     (buf_len(&p[..p_len]), q_len)
 }
 
-// Like push, but once buf is full the lowest limb is dropped into e.
 fn push_or_drop(buf: &mut [u64], len: &mut usize, e: &mut usize, c: u64) {
     if c == 0 {
         return;
@@ -92,12 +85,11 @@ fn push_or_drop(buf: &mut [u64], len: &mut usize, e: &mut usize, c: u64) {
     *len += 1;
 }
 
-// buf[..len] <<= bits, moving whole limbs into e once buf is full.
 fn shl_or_drop(buf: &mut [u64], len: &mut usize, e: &mut usize, bits: u64) {
     if *len == 0 || bits == 0 {
         return;
     }
-    let (sl, sb) = split_bits(bits);
+    let (sl, sb) = split_sh(bits);
     let m = sl.min(buf.len() - *len);
     if m != 0 {
         buf.copy_within(..*len, m);
@@ -109,9 +101,6 @@ fn shl_or_drop(buf: &mut [u64], len: &mut usize, e: &mut usize, bits: u64) {
     push_or_drop(buf, len, e, c);
 }
 
-// P / B^e and exact Q over the terms [a, b), returning (p_len, q_len, e). q
-// needs b - a limbs, and p keeps P exact (e = 0) with b - a + shift(b - a) / 64
-// + 1.
 fn engel_leaf_terms<S: EngelSeries>(
     a: u64,
     b: u64,
@@ -161,10 +150,6 @@ fn engel_leaf_terms<S: EngelSeries>(
     (p_len, q_len, e)
 }
 
-// P / B^e and exact Q and R over the terms [a, b), returning (p_len, q_len,
-// r_len, e). q and r need b - a limbs, and p keeps P exact (e = 0) with
-// b - a + shift(b - a) / 64 + 1. R is always formed since P needs its running
-// product; a caller that doesn't keep R can pass scratch for it.
 fn hyper_leaf_terms<S: HyperSeries>(
     a: u64,
     b: u64,
@@ -215,9 +200,6 @@ fn hyper_leaf_terms<S: HyperSeries>(
     (buf_len(&p[..p_len]), q_len, r_len, e)
 }
 
-// P += T * w for P held as P / B^e and T as T / B^et. A T reaching past p's end
-// first drops P's low limbs to make room; T's limbs below P's precision are
-// dropped, erring by under w < B at P's lowest limb.
 fn add_mul_at(p: &mut [u64], p_len: &mut usize, e: &mut usize, t: &[u64], et: usize, w: u64) {
     if t.is_empty() {
         return;
@@ -240,11 +222,6 @@ fn add_mul_at(p: &mut [u64], p_len: &mut usize, e: &mut usize, t: &[u64], et: us
     push_or_drop(p, p_len, e, c);
 }
 
-// P / B^e over the terms [a, b) with multi-limb x, returning (p_len, e). Every
-// term brings a factor of x, so P advances one term at a time with T = R * x^j,
-// held as T / B^et, as its multiplier. hi_mul(a, b, drop, out) forms a * b less
-// its low drop limbs, and both t and tmp need room for T * x, past which T
-// starts dropping limbs.
 fn hyper_x_leaf_terms<'t, S: HyperSeries>(
     a: u64,
     b: u64,
@@ -280,7 +257,6 @@ fn hyper_x_leaf_terms<'t, S: HyperSeries>(
     (buf_len(&p[..p_len]), e)
 }
 
-// hi_mul_drop's contract for buffers that always hold the full product.
 fn mul_exact(a: &[u64], b: &[u64], drop: usize, out: &mut [u64]) -> usize {
     debug_assert_eq!(drop, 0);
     if a.is_empty() || b.is_empty() {
@@ -291,8 +267,6 @@ fn mul_exact(a: &[u64], b: &[u64], drop: usize, out: &mut [u64]) -> usize {
     buf_len(&out[..n])
 }
 
-// Exact product of f(n) over the terms [a, b) into buf, which needs b - a limbs,
-// folding runs of terms into single limbs.
 fn prod_terms(a: u64, b: u64, f: impl Fn(u64) -> u64, buf: &mut [u64]) -> usize {
     buf[0] = 1;
     let (mut len, mut n) = (1, a);
@@ -313,13 +287,10 @@ fn prod_terms(a: u64, b: u64, f: impl Fn(u64) -> u64, buf: &mut [u64]) -> usize 
     len
 }
 
-// Entries x^(2^j) covering every power-of-two left child of a split under terms.
 fn pow_levels(terms: u64) -> usize {
     (64 - terms.saturating_sub(1).leading_zeros()).max(1) as usize
 }
 
-// Splits [a, b) so the left child has power-of-two length, the largest below
-// b - a, so merges only ever need x^(2^j).
 fn pow2_split(a: u64, b: u64) -> u64 {
     a + (1 << (63 - (b - a - 1).leading_zeros()))
 }
@@ -379,7 +350,7 @@ fn ratio_to_fraction(
     rcp(q, x);
     let bits = 64 * (q.len() + x.len() - 1 - len) as i64 + shift;
     debug_assert!(bits >= 128, "finalize needs w >= 2 whole limbs");
-    let (w, v) = split_bits(bits as u64);
+    let (w, v) = split_sh(bits as u64);
     let full = p.len() + x.len();
     if full < w {
         return;
@@ -395,14 +366,14 @@ fn ratio_to_fraction(
     debug_assert!(y[n..].iter().all(|&l| l == 0), "finalize expects S < 1");
 }
 
-fn ratio_to_fraction_dyn(p: &[u64], q: &[u64], shift: i64, out: &mut [u64]) {
+pub fn ratio_to_fraction_dyn(p: &[u64], q: &[u64], shift: i64, out: &mut [u64]) {
     let len = out.len();
     let mut scratch = ScratchGuard::acquire();
     let [x, y] = scratch.get_splits([len + 2, len + 3]);
     ratio_to_fraction(p, q, shift, out, x, y, rcp_dyn, hi_mul_dyn);
 }
 
-fn ratio_to_fraction_static<const N: usize>(p: &[u64], q: &[u64], shift: i64, out: &mut [u64]) {
+pub fn ratio_to_fraction_static<const N: usize>(p: &[u64], q: &[u64], shift: i64, out: &mut [u64]) {
     let len = out.len();
     assert!(len + 3 <= N, "finalize output needs out.len() + 3 <= N");
     let (mut x, mut y) = ([0; N], [0; N]);
@@ -422,8 +393,6 @@ pub trait Node: Sized {
     }
 }
 
-// The node over [a, b), split down to leaves of under CUTOFF terms. last marks a
-// range that ends the sum, whose node is only finalized or merged as a right child.
 pub fn bin_split_tree<N, const CUTOFF: u64>(ctx: &N::Ctx, a: u64, b: u64, last: bool) -> N
 where
     N: Node,
@@ -439,7 +408,6 @@ where
     N::merge(ctx, l, r)
 }
 
-// The node for the whole sum over [a, b), ready to finalize.
 pub fn bin_split<N, const CUTOFF: u64>(ctx: &N::Ctx, a: u64, b: u64) -> N
 where
     N: Node,
@@ -447,12 +415,9 @@ where
     bin_split_tree::<N, CUTOFF>(ctx, a, b, true)
 }
 
-// The per-term shift, the only runtime state BBP and Engel splits need.
 #[derive(Debug, Clone, Copy)]
 pub struct Shift(pub u64);
 
-// S = sum of p(n) / q(n) / 2^(shift(n - a + 1)) over the terms [a, b), with
-// the shift from the split's context.
 pub trait BBPSeries {
     fn p(n: u64) -> u64;
     fn q(n: u64) -> u64;
@@ -460,10 +425,10 @@ pub trait BBPSeries {
 
 #[derive(Debug, Clone)]
 pub struct DynNodeBBP<S: BBPSeries> {
-    a: u64,
-    b: u64,
-    p: Vec<u64>,
-    q: Vec<u64>,
+    pub a: u64,
+    pub b: u64,
+    pub p: Vec<u64>,
+    pub q: Vec<u64>,
     _s: PhantomData<S>,
 }
 
@@ -472,7 +437,7 @@ impl<S: BBPSeries> Node for DynNodeBBP<S> {
 
     fn leaf(ctx: &Shift, a: u64, b: u64, _: bool) -> Self {
         let terms = (b - a) as usize;
-        let words = split_bits(ctx.0 * (b - a)).0 + 1;
+        let words = split_sh(ctx.0 * (b - a)).0 + 1;
         let (mut p, mut q) = (vec![0; terms + words], vec![0; terms]);
         let (p_len, q_len) = bbp_leaf_terms::<S>(a, b, ctx.0, &mut p, &mut q);
         p.truncate(p_len);
@@ -487,7 +452,7 @@ impl<S: BBPSeries> Node for DynNodeBBP<S> {
     }
 
     fn merge(ctx: &Shift, l: Self, r: Self) -> Self {
-        let (sl, sb) = split_bits(ctx.0 * (r.b - r.a)); // r(b - m)
+        let (sl, sb) = split_sh(ctx.0 * (r.b - r.a)); // r(b - m)
         let pl = l.p.len() + r.q.len();
         let ql = l.q.len() + r.q.len();
 
@@ -554,7 +519,7 @@ impl<const N: usize, S: BBPSeries> Node for StaticNodeBBP<N, S> {
 
     fn merge(ctx: &Shift, mut l: Self, mut r: Self) -> Self {
         const { assert!(N >= 2) };
-        let (sl, sb) = split_bits(ctx.0 * (l.b - l.a)); // r(m - a)
+        let (sl, sb) = split_sh(ctx.0 * (l.b - l.a)); // r(m - a)
         let (lp, lq) = (&l.p[..l.p_len], &l.q[..l.q_len]);
         let (rp, rq) = (&r.p[..r.p_len], &r.q[..r.q_len]);
 
@@ -601,8 +566,6 @@ impl<const N: usize, S: BBPSeries> Node for StaticNodeBBP<N, S> {
     }
 }
 
-// S = sum of p(n) / prod(q(j), a <= j <= n) / 2^(shift(n - a + 1)) over the
-// terms [a, b), with the shift from the split's context.
 pub trait EngelSeries {
     fn p(n: u64) -> u64;
     fn q(n: u64) -> u64;
@@ -622,7 +585,7 @@ impl<S: EngelSeries> Node for DynNodeEngel<S> {
 
     fn leaf(ctx: &Shift, a: u64, b: u64, _: bool) -> Self {
         let terms = (b - a) as usize;
-        let words = split_bits(ctx.0 * (b - a)).0 + 1;
+        let words = split_sh(ctx.0 * (b - a)).0 + 1;
         let (mut p, mut q) = (vec![0; terms + words], vec![0; terms]);
         let (p_len, q_len, e) = engel_leaf_terms::<S>(a, b, ctx.0, &mut p, &mut q);
         debug_assert_eq!(e, 0);
@@ -638,7 +601,7 @@ impl<S: EngelSeries> Node for DynNodeEngel<S> {
     }
 
     fn merge(ctx: &Shift, l: Self, r: Self) -> Self {
-        let (sl, sb) = split_bits(ctx.0 * (r.b - r.a));
+        let (sl, sb) = split_sh(ctx.0 * (r.b - r.a));
         let pl = l.p.len() + r.q.len();
 
         let mut p = vec![0; (sl + pl + 1).max(r.p.len()) + 1];
@@ -700,7 +663,7 @@ impl<const N: usize, S: EngelSeries> Node for StaticNodeEngel<N, S> {
 
     fn merge(ctx: &Shift, mut l: Self, r: Self) -> Self {
         const { assert!(N >= 2) };
-        let (sl, sb) = split_bits(ctx.0 * (r.b - r.a));
+        let (sl, sb) = split_sh(ctx.0 * (r.b - r.a));
         let (lp, lq) = (&l.p[..l.p_len], &l.q[..l.q_len]);
         let (rp, rq) = (&r.p[..r.p_len], &r.q[..r.q_len]);
 
@@ -754,18 +717,12 @@ impl<const N: usize, S: EngelSeries> Node for StaticNodeEngel<N, S> {
     }
 }
 
-// S = sum of p(n) * prod(r(j) * x, a <= j < n) / prod(q(j), a <= j <= n) /
-// 2^(shift(n - a + 1)) over the terms [a, b), where the multi-limb integer x
-// and the shift come from the split's context.
 pub trait HyperSeries {
     fn p(n: u64) -> u64;
     fn q(n: u64) -> u64;
     fn r(n: u64) -> u64;
 }
 
-// The multi-limb x in every Hyper term's ratio and the per-term shift, with the
-// powers x^(2^j) that merges multiply in. With x = 1, splits stay at the
-// midpoint and leaves keep their single-limb grouping.
 #[derive(Debug, Clone)]
 pub struct DynHyperCtx {
     shift: u64,
@@ -808,9 +765,6 @@ impl DynHyperCtx {
     }
 }
 
-// DynHyperCtx for StaticNodeHyper, holding each power as its top N limbs and the
-// limbs dropped below them. Squaring a truncated power roughly doubles its
-// relative error, so the last of J levels loses about J low bits.
 #[derive(Debug, Clone)]
 pub struct StaticHyperCtx<const N: usize, const L: usize = 32> {
     shift: u64,
@@ -888,7 +842,7 @@ impl<S: HyperSeries> Node for DynNodeHyper<S> {
 
     fn leaf(ctx: &DynHyperCtx, a: u64, b: u64, last: bool) -> Self {
         let terms = (b - a) as usize;
-        let words = split_bits(ctx.shift * (b - a)).0 + 1;
+        let words = split_sh(ctx.shift * (b - a)).0 + 1;
         let mut q = vec![0; terms];
         let (p, q_len, r) = match ctx.x() {
             None => {
@@ -948,7 +902,7 @@ impl<S: HyperSeries> Node for DynNodeHyper<S> {
         let lr = left
             .r
             .expect("a node that ends the sum can't merge as a left child");
-        let (sl, sb) = split_bits(ctx.shift * (right.b - right.a));
+        let (sl, sb) = split_sh(ctx.shift * (right.b - right.a));
         // The left child's whole ratio product, its r's times x^len(left).
         let lt_buf;
         let lt = match ctx.x_pow(left.b - left.a) {
@@ -1089,7 +1043,7 @@ impl<const N: usize, S: HyperSeries, const L: usize> Node for StaticNodeHyper<N,
 
     fn merge(ctx: &StaticHyperCtx<N, L>, mut left: Self, mut right: Self) -> Self {
         const { assert!(N >= 2) };
-        let (sl, sb) = split_bits(ctx.shift * (right.b - right.a));
+        let (sl, sb) = split_sh(ctx.shift * (right.b - right.a));
         let (lp, lq) = (&left.p[..left.p_len], &left.q[..left.q_len]);
         let (rp, rq) = (&right.p[..right.p_len], &right.q[..right.q_len]);
         let (lr, ler) = match (&left.r, left.r_len, left.er) {

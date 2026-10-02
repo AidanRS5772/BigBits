@@ -763,6 +763,10 @@ pub(crate) fn shl_top_copy(src: &[u64], out: &mut [u64], sh: u8) {
     }
 }
 
+pub(crate) fn split_sh(bits: u64) -> (usize, u8) {
+    ((bits / 64) as usize, (bits % 64) as u8)
+}
+
 #[inline(always)]
 pub fn end_ref(buf: &[u64], idx: usize) -> &[u64] {
     &buf[buf.len().saturating_sub(idx)..]
