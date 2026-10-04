@@ -66,6 +66,12 @@ pub const STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF: usize = 14;
 
 pub const LN2_TERM_CUTOFF: u64 = 384;
 
+// Dynamic binary splitting builds a split's two halves in parallel from this
+// many terms, and a merge's independent products once its Q reaches this many
+// limbs.
+pub const DYN_BIN_SPLIT_PAR_CUTOFF: u64 = 2048;
+pub const DYN_BIN_SPLIT_MERGE_PAR_CUTOFF: usize = 256;
+
 thread_local! {
     static SCRATCH_POOL: RefCell<Vec<Vec<u64>>> = RefCell::new(Vec::new());
 }

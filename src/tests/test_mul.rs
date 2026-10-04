@@ -3141,3 +3141,40 @@ fn test_karatsuba_mul_prim_dispatch_ignores_stale_out_tail() {
         );
     }
 }
+
+// ─── Section 10: NTT Re-entrancy Under Rayon ────────────────────────────────
+
+// A thread blocked in an NTT's rayon::join can run another caller's NTT, so the
+// twiddle caches must not stay borrowed across a convolution.
+#[test]
+fn test_ntt_entry_dyn_nested_in_rayon() {
+    use rayon::prelude::*;
+    let n = 40_000;
+    let cases: Vec<_> = (0..24u64)
+        .map(|s| {
+            (
+                rand_nonzero_vec(n + s as usize, s),
+                rand_nonzero_vec(n, s + 100),
+            )
+        })
+        .collect();
+    let expect: Vec<_> = cases
+        .iter()
+        .map(|(a, b)| {
+            let mut out = vec![0u64; a.len() + b.len()];
+            ntt_entry_dyn(a, b, &mut out);
+            out
+        })
+        .collect();
+    for _ in 0..4 {
+        let got: Vec<_> = cases
+            .par_iter()
+            .map(|(a, b)| {
+                let mut out = vec![0u64; a.len() + b.len()];
+                ntt_entry_dyn(a, b, &mut out);
+                out
+            })
+            .collect();
+        assert_eq!(got, expect);
+    }
+}

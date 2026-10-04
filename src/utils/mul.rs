@@ -12,6 +12,7 @@ use std::ffi::c_short;
 use std::marker::PhantomData;
 use std::ops::*;
 use std::sync::{Arc, LazyLock};
+use std::thread::LocalKey;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -1843,10 +1844,22 @@ impl<P: NTTPrime> MulAssign for Montgomery<P> {
     }
 }
 
+// The table is shared, so a handle cloned out of the cache stays valid while
+// the cache grows it for a larger transform.
 struct DynNTTTwidles<P: NTTPrime> {
-    tw: Vec<Montgomery<P>>,
+    tw: Arc<Vec<Montgomery<P>>>,
     max_n: usize,
     n: usize,
+}
+
+impl<P: NTTPrime> Clone for DynNTTTwidles<P> {
+    fn clone(&self) -> Self {
+        DynNTTTwidles {
+            tw: Arc::clone(&self.tw),
+            max_n: self.max_n,
+            n: self.n,
+        }
+    }
 }
 
 impl<P: NTTPrime> DynNTTTwidles<P> {
@@ -1858,7 +1871,11 @@ impl<P: NTTPrime> DynNTTTwidles<P> {
             tw.push(acc);
             acc *= w;
         }
-        DynNTTTwidles { tw, max_n: n, n: n }
+        DynNTTTwidles {
+            tw: Arc::new(tw),
+            max_n: n,
+            n: n,
+        }
     }
 
     fn ensure(&mut self, new_n: usize) {
@@ -1868,7 +1885,7 @@ impl<P: NTTPrime> DynNTTTwidles<P> {
             debug_assert!(growth.is_power_of_two());
             let mut new_tw = Vec::<Montgomery<P>>::with_capacity(new_n);
             let w = Montgomery::G.pow((P::P - 1) / (new_n as u64));
-            for &tw in &self.tw {
+            for &tw in self.tw.iter() {
                 let mut acc = tw;
                 new_tw.push(acc);
                 for _ in 1..growth {
@@ -1876,7 +1893,7 @@ impl<P: NTTPrime> DynNTTTwidles<P> {
                     new_tw.push(acc);
                 }
             }
-            self.tw = new_tw;
+            self.tw = Arc::new(new_tw);
             self.max_n = new_n;
         }
         self.n = new_n;
@@ -1990,10 +2007,29 @@ impl<P: NTTPrime> NTTTwidles<P> for DynNTTTwidles<P> {
     }
 }
 
+type DynNTTCache<P> = RefCell<HashMap<usize, DynNTTTwidles<P>>>;
+
 thread_local! {
-    static DYN_NTT_CACHE_P1: RefCell<HashMap<usize, DynNTTTwidles<P1>>> = RefCell::new(HashMap::new());
-    static DYN_NTT_CACHE_P2: RefCell<HashMap<usize, DynNTTTwidles<P2>>> = RefCell::new(HashMap::new());
-    static DYN_NTT_CACHE_P3: RefCell<HashMap<usize, DynNTTTwidles<P3>>> = RefCell::new(HashMap::new());
+    static DYN_NTT_CACHE_P1: DynNTTCache<P1> = RefCell::new(HashMap::new());
+    static DYN_NTT_CACHE_P2: DynNTTCache<P2> = RefCell::new(HashMap::new());
+    static DYN_NTT_CACHE_P3: DynNTTCache<P3> = RefCell::new(HashMap::new());
+}
+
+// Twiddles for an n-point transform as a handle that holds no borrow of the
+// cache: a thread blocked in a convolution's rayon::join may run another
+// convolution that needs the same cache.
+fn dyn_twiddles<P: NTTPrime>(
+    cache: &'static LocalKey<DynNTTCache<P>>,
+    n: usize,
+) -> DynNTTTwidles<P> {
+    cache.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        let tw = cache
+            .entry(n >> n.trailing_zeros())
+            .or_insert_with(|| DynNTTTwidles::build(n));
+        tw.ensure(n);
+        tw.clone()
+    })
 }
 
 fn ntt<P: NTTPrime, D: NTTDir>(
@@ -2542,40 +2578,22 @@ pub fn ntt_entry_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
         let (r1, r2, r3) = (&mut *res1, &mut *res2, &mut *res3);
 
         let mut conv1 = move || {
-            DYN_NTT_CACHE_P1.with(|cell| {
-                let mut g = ScratchGuard::acquire();
-                let [bs, ns] = g.get_splits([n1, ntt_convolution_scratch_len(n1)]);
-                let cache = &mut *cell.borrow_mut();
-                let tw = cache
-                    .entry(n1 >> n1.trailing_zeros())
-                    .or_insert_with(|| DynNTTTwidles::build(n1));
-                tw.ensure(n1);
-                ntt_convolution::<P1>(a, b, r1, tw, bs, ns);
-            });
+            let tw = dyn_twiddles(&DYN_NTT_CACHE_P1, n1);
+            let mut g = ScratchGuard::acquire();
+            let [bs, ns] = g.get_splits([n1, ntt_convolution_scratch_len(n1)]);
+            ntt_convolution::<P1>(a, b, r1, &tw, bs, ns);
         };
         let mut conv2 = move || {
-            DYN_NTT_CACHE_P2.with(|cell| {
-                let mut g = ScratchGuard::acquire();
-                let [bs, ns] = g.get_splits([n2, ntt_convolution_scratch_len(n2)]);
-                let cache = &mut *cell.borrow_mut();
-                let tw = cache
-                    .entry(n2 >> n2.trailing_zeros())
-                    .or_insert_with(|| DynNTTTwidles::build(n2));
-                tw.ensure(n2);
-                ntt_convolution::<P2>(a, b, r2, tw, bs, ns);
-            });
+            let tw = dyn_twiddles(&DYN_NTT_CACHE_P2, n2);
+            let mut g = ScratchGuard::acquire();
+            let [bs, ns] = g.get_splits([n2, ntt_convolution_scratch_len(n2)]);
+            ntt_convolution::<P2>(a, b, r2, &tw, bs, ns);
         };
         let mut conv3 = move || {
-            DYN_NTT_CACHE_P3.with(|cell| {
-                let mut g = ScratchGuard::acquire();
-                let [bs, ns] = g.get_splits([n3, ntt_convolution_scratch_len(n3)]);
-                let cache = &mut *cell.borrow_mut();
-                let tw = cache
-                    .entry(n3 >> n3.trailing_zeros())
-                    .or_insert_with(|| DynNTTTwidles::build(n3));
-                tw.ensure(n3);
-                ntt_convolution::<P3>(a, b, r3, tw, bs, ns);
-            });
+            let tw = dyn_twiddles(&DYN_NTT_CACHE_P3, n3);
+            let mut g = ScratchGuard::acquire();
+            let [bs, ns] = g.get_splits([n3, ntt_convolution_scratch_len(n3)]);
+            ntt_convolution::<P3>(a, b, r3, &tw, bs, ns);
         };
 
         if out_len > NTT_PAR_CUTOFF_NTT_CONV {
@@ -3298,7 +3316,7 @@ pub fn fft_sqr_entry(buf: &[u64], out: &mut [u64]) -> u64 {
 fn ntt_sqr_convolution<P: NTTPrime>(
     buf: &[u64],
     res: &mut [u64],
-    tw: &mut impl NTTTwidles<P>,
+    tw: &impl NTTTwidles<P>,
     ntt_scratch: &mut [u64],
 ) {
     res[..buf.len()].copy_from_slice(buf);
@@ -3338,40 +3356,22 @@ pub fn ntt_sqr_entry_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
         let (r1, r2, r3) = (&mut *res1, &mut *res2, &mut *res3);
 
         let mut conv1 = move || {
-            DYN_NTT_CACHE_P1.with(|cell| {
-                let mut g = ScratchGuard::acquire();
-                let ns = g.get(ntt_scratch_len(n1));
-                let cache = &mut *cell.borrow_mut();
-                let tw = cache
-                    .entry(n1 >> n1.trailing_zeros())
-                    .or_insert_with(|| DynNTTTwidles::build(n1));
-                tw.ensure(n1);
-                ntt_sqr_convolution::<P1>(buf, r1, tw, ns);
-            });
+            let tw = dyn_twiddles(&DYN_NTT_CACHE_P1, n1);
+            let mut g = ScratchGuard::acquire();
+            let ns = g.get(ntt_scratch_len(n1));
+            ntt_sqr_convolution::<P1>(buf, r1, &tw, ns);
         };
         let mut conv2 = move || {
-            DYN_NTT_CACHE_P2.with(|cell| {
-                let mut g = ScratchGuard::acquire();
-                let ns = g.get(ntt_scratch_len(n2));
-                let cache = &mut *cell.borrow_mut();
-                let tw = cache
-                    .entry(n2 >> n2.trailing_zeros())
-                    .or_insert_with(|| DynNTTTwidles::build(n2));
-                tw.ensure(n2);
-                ntt_sqr_convolution::<P2>(buf, r2, tw, ns);
-            });
+            let tw = dyn_twiddles(&DYN_NTT_CACHE_P2, n2);
+            let mut g = ScratchGuard::acquire();
+            let ns = g.get(ntt_scratch_len(n2));
+            ntt_sqr_convolution::<P2>(buf, r2, &tw, ns);
         };
         let mut conv3 = move || {
-            DYN_NTT_CACHE_P3.with(|cell| {
-                let mut g = ScratchGuard::acquire();
-                let ns = g.get(ntt_scratch_len(n3));
-                let cache = &mut *cell.borrow_mut();
-                let tw = cache
-                    .entry(n3 >> n3.trailing_zeros())
-                    .or_insert_with(|| DynNTTTwidles::build(n3));
-                tw.ensure(n3);
-                ntt_sqr_convolution::<P3>(buf, r3, tw, ns);
-            });
+            let tw = dyn_twiddles(&DYN_NTT_CACHE_P3, n3);
+            let mut g = ScratchGuard::acquire();
+            let ns = g.get(ntt_scratch_len(n3));
+            ntt_sqr_convolution::<P3>(buf, r3, &tw, ns);
         };
 
         if out_len > NTT_PAR_CUTOFF_NTT_CONV {
@@ -4043,41 +4043,23 @@ pub fn ntt_mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u6
         let (r1, r2, r3) = (&mut *res1, &mut *res2, &mut *res3);
 
         let mut conv1 = move || {
-            DYN_NTT_CACHE_P1.with(|cell| {
-                let mut g = ScratchGuard::acquire();
-                let [bs, ns] = g.get_splits([n1, ntt_convolution_scratch_len(n1)]);
-                let cache = &mut *cell.borrow_mut();
-                let tw = cache
-                    .entry(n1 >> n1.trailing_zeros())
-                    .or_insert_with(|| DynNTTTwidles::build(n1));
-                tw.ensure(n1);
-                ntt_convolution::<P1>(long, short, r1, tw, bs, ns);
-            });
+            let tw = dyn_twiddles(&DYN_NTT_CACHE_P1, n1);
+            let mut g = ScratchGuard::acquire();
+            let [bs, ns] = g.get_splits([n1, ntt_convolution_scratch_len(n1)]);
+            ntt_convolution::<P1>(long, short, r1, &tw, bs, ns);
         };
 
         let mut conv2 = move || {
-            DYN_NTT_CACHE_P2.with(|cell| {
-                let mut g = ScratchGuard::acquire();
-                let [bs, ns] = g.get_splits([n2, ntt_convolution_scratch_len(n2)]);
-                let cache = &mut *cell.borrow_mut();
-                let tw = cache
-                    .entry(n2 >> n2.trailing_zeros())
-                    .or_insert_with(|| DynNTTTwidles::build(n2));
-                tw.ensure(n2);
-                ntt_convolution::<P2>(long, short, r2, tw, bs, ns);
-            });
+            let tw = dyn_twiddles(&DYN_NTT_CACHE_P2, n2);
+            let mut g = ScratchGuard::acquire();
+            let [bs, ns] = g.get_splits([n2, ntt_convolution_scratch_len(n2)]);
+            ntt_convolution::<P2>(long, short, r2, &tw, bs, ns);
         };
         let mut conv3 = move || {
-            DYN_NTT_CACHE_P3.with(|cell| {
-                let mut g = ScratchGuard::acquire();
-                let [bs, ns] = g.get_splits([n3, ntt_convolution_scratch_len(n3)]);
-                let cache = &mut *cell.borrow_mut();
-                let tw = cache
-                    .entry(n3 >> n3.trailing_zeros())
-                    .or_insert_with(|| DynNTTTwidles::build(n3));
-                tw.ensure(n3);
-                ntt_convolution::<P3>(long, short, r3, tw, bs, ns);
-            });
+            let tw = dyn_twiddles(&DYN_NTT_CACHE_P3, n3);
+            let mut g = ScratchGuard::acquire();
+            let [bs, ns] = g.get_splits([n3, ntt_convolution_scratch_len(n3)]);
+            ntt_convolution::<P3>(long, short, r3, &tw, bs, ns);
         };
 
         if 2 * sz - 1 > NTT_PAR_CUTOFF_NTT_CONV {

@@ -1,3 +1,4 @@
+mod test_bin_split;
 mod test_div;
 mod test_mul;
 mod test_sqrt;

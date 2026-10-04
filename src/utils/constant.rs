@@ -28,7 +28,7 @@ impl BBPSeries for Ln2S2 {
         1
     }
     fn q(n: u64) -> u64 {
-        2*n+1
+        2 * n + 1
     }
 }
 
@@ -38,7 +38,7 @@ impl BBPSeries for Ln2S3 {
         1
     }
     fn q(n: u64) -> u64 {
-        4*n+1
+        4 * n + 1
     }
 }
 
@@ -48,7 +48,7 @@ impl BBPSeries for Ln2S4 {
         1
     }
     fn q(n: u64) -> u64 {
-        4*n+3
+        4 * n + 3
     }
 }
 
@@ -91,10 +91,10 @@ impl DynLn2 {
 
         // Each term adds 4 bits.
         let n = 1 + 16 * len as u64 + TERM_GAURD;
-        let s1 = extend(&mut self.s1, n);
-        let s2 = extend(&mut self.s2, n);
-        let s3 = extend(&mut self.s3, n);
-        let s4 = extend(&mut self.s4, n);
+        let ((s1, s2), (s3, s4)) = rayon::join(
+            || rayon::join(|| extend(&mut self.s1, n), || extend(&mut self.s2, n)),
+            || rayon::join(|| extend(&mut self.s3, n), || extend(&mut self.s4, n)),
+        );
 
         // T = P / (Q * 2^k) for each node.
         let k = LN2_CTX.0 * (s1.b - s1.a);
@@ -145,7 +145,6 @@ fn extend<S: BBPSeries>(node: &mut Option<DynNodeBBP<S>>, n: u64) -> &DynNodeBBP
     node.insert(s)
 }
 
-// acc += floor(P / (Q * 2^shift) * B^acc.len()), using t (acc's length) as scratch.
 fn add_series<S: BBPSeries>(s: &DynNodeBBP<S>, shift: u64, acc: &mut [u64], t: &mut [u64]) {
     ratio_to_fraction_dyn(&s.p, &s.q, shift as i64, t);
     let carry = add_buf(acc, t);
@@ -167,5 +166,22 @@ pub fn ln2_dyn(out: &mut [u64]) {
             return;
         }
     }
-    ln2_write().request(out);
+    let mut work = {
+        let mut cache = ln2_write();
+        if cache.get(out) {
+            return;
+        }
+        DynLn2 {
+            s1: cache.s1.take(),
+            s2: cache.s2.take(),
+            s3: cache.s3.take(),
+            s4: cache.s4.take(),
+            buf: Vec::new(),
+        }
+    };
+    work.request(out);
+    let mut cache = ln2_write();
+    if work.buf.len() > cache.buf.len() {
+        *cache = work;
+    }
 }

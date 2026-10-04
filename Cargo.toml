@@ -52,3 +52,7 @@ harness = false
 [[bench]]
 name = "binom_sqrt_profile"
 harness = false
+
+[[bench]]
+name = "bin_split_profile"
+harness = false
