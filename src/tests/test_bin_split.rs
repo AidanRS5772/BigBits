@@ -1,6 +1,7 @@
 use crate::utils::bin_split::*;
-use crate::utils::constant::ln2_dyn;
+use crate::utils::consts::consts::{ln2_dyn, ln2_static, LN2_LIMBS};
 use crate::utils::utils::{add_prim, cmp_buf, sub_buf, trim_lz};
+use crate::utils::LN2_TERM_CUTOFF;
 use std::marker::PhantomData;
 
 // A small leaf cutoff gives deep trees, so most work runs through merges.
@@ -161,6 +162,41 @@ fn test_ln2_dyn_concurrent_requests() {
     assert_eq!(&big[big.len() - 600..], &full[..]);
 }
 
+// ln2.bin is ln2_dyn's output at LN2_LIMBS, and the static cache serves any
+// request up to that length from it whatever N is.
+#[test]
+fn test_ln2_static_table() {
+    let mut full = vec![0; LN2_LIMBS];
+    ln2_dyn(&mut full);
+    assert_eq!(&full[LN2_LIMBS - 32..], &LN2_32[..]);
+    for l in [0, 1, 31, 32, 33, 500, LN2_LIMBS - 1, LN2_LIMBS] {
+        let mut out = vec![0; l];
+        ln2_static::<8>(&mut out);
+        assert_eq!(&out[..], &full[LN2_LIMBS - l..], "ln2 at {l} limbs");
+    }
+}
+
+// Past the table the static cache sums the series itself, and its guard limb
+// absorbs the static nodes' truncation, so it matches ln2_dyn exactly.
+#[test]
+fn test_ln2_static_past_table() {
+    fn check<const N: usize>(l: usize) {
+        let (mut want, mut out) = (vec![0; l], vec![0; l]);
+        ln2_dyn(&mut want);
+        ln2_static::<N>(&mut out);
+        assert_eq!(out, want, "ln2 at {l} limbs, N = {N}");
+    }
+    check::<{ LN2_LIMBS + 5 }>(LN2_LIMBS + 1);
+    check::<{ LN2_LIMBS + 16 }>(LN2_LIMBS + 1);
+    check::<{ LN2_LIMBS + 16 }>(LN2_LIMBS + 7);
+}
+
+#[test]
+#[should_panic(expected = "out.len() + 4 <= N")]
+fn test_ln2_static_past_table_small_n() {
+    ln2_static::<{ LN2_LIMBS + 4 }>(&mut [0; LN2_LIMBS + 1]);
+}
+
 // Static nodes keep only their top N limbs, so their finalize can differ from
 // the exact dynamic one only in rounding: by at most one in the lowest limb.
 fn check_static<D, S>(dyn_ctx: &D::Ctx, static_ctx: &S::Ctx, a: u64, b: u64)
@@ -170,10 +206,28 @@ where
     D::Ctx: Sync,
     S::Ctx: Sync,
 {
-    let (mut want, mut got) = (vec![0u64; 13], vec![0u64; 13]);
-    let want_neg = bin_split::<D, C>(dyn_ctx, a, b).finalize(dyn_ctx, &mut want);
-    let got_neg = bin_split::<S, C>(static_ctx, a, b).finalize(static_ctx, &mut got);
-    assert_eq!(got_neg, want_neg, "static [{a}, {b}) has the wrong sign");
+    check_static_at::<D, S, C>(dyn_ctx, static_ctx, a, b, 13, true);
+}
+
+// check_static with the static tree split at cutoff CUT into len limbs.
+fn check_static_at<D, S, const CUT: u64>(
+    dyn_ctx: &D::Ctx,
+    static_ctx: &S::Ctx,
+    a: u64,
+    b: u64,
+    len: usize,
+    last: bool,
+) where
+    D: Node + Send,
+    S: Node + Send,
+    D::Ctx: Sync,
+    S::Ctx: Sync,
+{
+    let (mut want, mut got) = (vec![0u64; len], vec![0u64; len]);
+    let want_neg = bin_split_tree::<D, C>(dyn_ctx, a, b, last).finalize(dyn_ctx, &mut want);
+    let got_neg = bin_split_tree::<S, CUT>(static_ctx, a, b, last).finalize(static_ctx, &mut got);
+    let what = format!("static [{a}, {b}) at cutoff {CUT}, {len} limbs");
+    assert_eq!(got_neg, want_neg, "{what} has the wrong sign");
     // Limbs are little-endian, so order them from the top.
     let (lo, hi) = if got.iter().rev().le(want.iter().rev()) {
         (&got, &want)
@@ -182,10 +236,7 @@ where
     };
     let mut lo = lo.clone();
     add_prim(&mut lo, 1);
-    assert!(
-        got == want || &lo == hi,
-        "static [{a}, {b}) is off by more than one"
-    );
+    assert!(got == want || &lo == hi, "{what} is off by more than one");
 }
 
 #[test]
@@ -466,6 +517,152 @@ fn test_static_signed_nodes_match_dyn() {
             check_static::<DynNodeHyper<H3>, StaticNodeHyper<64, H3>>(&d, &s64, 0, b);
         }
     }
+}
+
+// The ln(2) series with the largest terms, sum 1 / ((4n + 1) 16^n).
+struct Ln2Like;
+impl BBPSeries for Ln2Like {
+    fn p(_: u64) -> u64 {
+        1
+    }
+    fn q(n: u64) -> u64 {
+        4 * n + 1
+    }
+}
+
+// u64::MAX makes [a, b) a single leaf, so all splitting happens inside it.
+fn check_static_cutoffs<D, S>(dyn_ctx: &D::Ctx, static_ctx: &S::Ctx, a: u64, b: u64, len: usize)
+where
+    D: Node + Send,
+    S: Node + Send,
+    D::Ctx: Sync,
+    S::Ctx: Sync,
+{
+    check_static_at::<D, S, 2>(dyn_ctx, static_ctx, a, b, len, true);
+    check_static_at::<D, S, 3>(dyn_ctx, static_ctx, a, b, len, true);
+    check_static_at::<D, S, LN2_TERM_CUTOFF>(dyn_ctx, static_ctx, a, b, len, true);
+    check_static_at::<D, S, { u64::MAX }>(dyn_ctx, static_ctx, a, b, len, true);
+}
+
+fn static_any_cutoff_at<const N: usize>() {
+    let len = N - 3;
+    type L3 = Signed<BbpLin, 3>;
+    let ctx = Shift(4);
+    for (a, b) in [(1, 2), (1, 300), (1, 2500), (900, 1400)] {
+        check_static_cutoffs::<DynNodeBBP<BbpLin>, StaticNodeBBP<N, BbpLin>>(&ctx, &ctx, a, b, len);
+        check_static_cutoffs::<DynNodeBBP<Ln2Like>, StaticNodeBBP<N, Ln2Like>>(
+            &ctx, &ctx, a, b, len,
+        );
+        check_static_cutoffs::<DynNodeBBP<L3>, StaticNodeBBP<N, L3>>(&ctx, &ctx, a, b, len);
+    }
+    check_static_cutoffs::<DynNodeBBP<BbpQuad>, StaticNodeBBP<N, BbpQuad>>(
+        &ctx, &ctx, 1, 1000, len,
+    );
+    type E3 = Signed<EngelFact, 3>;
+    let ctx = Shift(1);
+    for (a, b) in [(2, 3), (2, 300), (2, 2500), (900, 1400)] {
+        check_static_cutoffs::<DynNodeEngel<EngelFact>, StaticNodeEngel<N, EngelFact>>(
+            &ctx, &ctx, a, b, len,
+        );
+        check_static_cutoffs::<DynNodeEngel<E3>, StaticNodeEngel<N, E3>>(&ctx, &ctx, a, b, len);
+    }
+    type H3 = Signed<Hyp, 3>;
+    for (x, shift) in [
+        (vec![1u64], 8u64),
+        (vec![12345], 20),
+        (vec![0x9e37_79b9_7f4a_7c15, 0xff_ffff_ffff], 112),
+    ] {
+        let d = DynHyperCtx::new(&x, shift);
+        let s = StaticHyperCtx::<N>::new(&x, shift);
+        for b in [2, 50, 2500] {
+            check_static_cutoffs::<DynNodeHyper<Hyp>, StaticNodeHyper<N, Hyp>>(&d, &s, 0, b, len);
+            check_static_cutoffs::<DynNodeHyper<H3>, StaticNodeHyper<N, H3>>(&d, &s, 0, b, len);
+        }
+    }
+}
+
+// Static leaves too big for N limbs split themselves, so every cutoff >= 2 is
+// valid at every N.
+#[test]
+fn test_static_nodes_any_cutoff() {
+    static_any_cutoff_at::<4>();
+    static_any_cutoff_at::<8>();
+    static_any_cutoff_at::<16>();
+    static_any_cutoff_at::<64>();
+}
+
+// Leaves that overflowed their N limbs before static leaves could split.
+#[test]
+fn test_static_large_leaf_regressions() {
+    let ctx = Shift(4);
+    type D = DynNodeBBP<Ln2Like>;
+    check_static_at::<D, StaticNodeBBP<8, Ln2Like>, LN2_TERM_CUTOFF>(&ctx, &ctx, 1, 53, 5, true);
+    check_static_at::<D, StaticNodeBBP<64, Ln2Like>, LN2_TERM_CUTOFF>(
+        &ctx, &ctx, 149, 501, 61, true,
+    );
+    let ctx = Shift(1);
+    check_static_at::<DynNodeEngel<EngelFact>, StaticNodeEngel<8, EngelFact>, 384>(
+        &ctx, &ctx, 2, 300, 5, true,
+    );
+    let (d, s) = (DynHyperCtx::new(&[1], 1), StaticHyperCtx::<8>::new(&[1], 1));
+    check_static_at::<DynNodeHyper<Hyp>, StaticNodeHyper<8, Hyp>, 384>(&d, &s, 0, 300, 5, true);
+}
+
+// A fit bound that undercounts would overflow exactly at the size limit, so
+// build a single leaf of every size from one term to well past it.
+fn sweep_leaves<D, S>(
+    dyn_ctx: &D::Ctx,
+    static_ctx: &S::Ctx,
+    a: u64,
+    max_t: u64,
+    len: usize,
+    last: bool,
+) where
+    D: Node + Send,
+    S: Node + Send,
+    D::Ctx: Sync,
+    S::Ctx: Sync,
+{
+    for t in 1..=max_t {
+        check_static_at::<D, S, { u64::MAX }>(dyn_ctx, static_ctx, a, a + t, len, last);
+    }
+}
+
+fn static_leaf_sweep_at<const N: usize>() {
+    // Every term below costs at least 2 bits of Q, so 32N + 8 terms never fit.
+    let (len, max_t) = (N - 3, 32 * N as u64 + 8);
+    type L3 = Signed<BbpLin, 3>;
+    type Q0 = Signed<BbpQuad, 0>;
+    let ctx = Shift(4);
+    for a in [1, 1000] {
+        sweep_leaves::<DynNodeBBP<Ln2Like>, StaticNodeBBP<N, Ln2Like>>(
+            &ctx, &ctx, a, max_t, len, true,
+        );
+        sweep_leaves::<DynNodeBBP<L3>, StaticNodeBBP<N, L3>>(&ctx, &ctx, a, max_t, len, true);
+        sweep_leaves::<DynNodeBBP<Q0>, StaticNodeBBP<N, Q0>>(&ctx, &ctx, a, max_t, len, true);
+    }
+    type E3 = Signed<EngelFact, 3>;
+    let ctx = Shift(1);
+    for a in [2, 1000] {
+        sweep_leaves::<DynNodeEngel<E3>, StaticNodeEngel<N, E3>>(&ctx, &ctx, a, max_t, len, true);
+    }
+    type H3 = Signed<Hyp, 3>;
+    for (x, shift) in [(vec![1u64], 8u64), (vec![12345], 20)] {
+        let d = DynHyperCtx::new(&x, shift);
+        let s = StaticHyperCtx::<N>::new(&x, shift);
+        // Only Hyper leaves depend on last: they keep R for a later merge.
+        for last in [true, false] {
+            sweep_leaves::<DynNodeHyper<H3>, StaticNodeHyper<N, H3>>(&d, &s, 0, max_t, len, last);
+        }
+    }
+}
+
+#[test]
+fn test_static_leaf_size_sweep() {
+    static_leaf_sweep_at::<4>();
+    static_leaf_sweep_at::<5>();
+    static_leaf_sweep_at::<8>();
+    static_leaf_sweep_at::<16>();
 }
 
 // ln(3/2) = sum_{n >= 1} (-1)^(n + 1) / (n 2^n).

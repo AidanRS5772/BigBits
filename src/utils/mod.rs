@@ -1,11 +1,12 @@
 use std::cell::RefCell;
 
 pub mod bin_split;
-pub mod constant;
+pub mod consts;
 pub mod div;
 pub mod mul;
 pub mod sqrt;
 pub mod utils;
+pub mod trans;
 
 pub const CHUNKING_KARATSUBA_CUTOFF: usize = 22;
 pub const KARATSUBA_CUTOFF: f64 = 17.0;
@@ -64,7 +65,7 @@ pub const STATIC_SQRT_REM_ZIMMERMAN_CUTOFF: usize = 20;
 pub const STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF: usize = 15;
 pub const STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF: usize = 14;
 
-pub const LN2_TERM_CUTOFF: u64 = 384;
+pub const LN2_TERM_CUTOFF: u64 = 640;
 
 // Dynamic binary splitting builds a split's two halves in parallel from this
 // many terms, and a merge's independent products once its Q reaches this many

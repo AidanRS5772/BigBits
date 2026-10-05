@@ -363,6 +363,23 @@ fn prod_terms(a: u64, b: u64, f: impl Fn(u64) -> u64, buf: &mut [u64]) -> usize 
     len
 }
 
+fn bit_len(x: u64) -> u64 {
+    (64 - x.leading_zeros()) as u64
+}
+
+// Whether prod f(n) over [a, b) fits in cap bits, bounding each product's
+// length by the sum of its factors' lengths.
+fn prod_fits(a: u64, b: u64, f: impl Fn(u64) -> u64, cap: u64) -> bool {
+    let mut bits = 0;
+    for n in a..b {
+        bits += bit_len(f(n));
+        if bits > cap {
+            return false;
+        }
+    }
+    true
+}
+
 fn mul_len(a: &[u64], b: &[u64]) -> usize {
     if a.is_empty() || b.is_empty() {
         return 0;
@@ -557,27 +574,39 @@ impl<S: BBPSeries> Node for DynNodeBBP<S> {
 
 #[derive(Debug, Clone)]
 pub struct StaticNodeBBP<const N: usize, S: BBPSeries> {
-    a: u64,
-    b: u64,
-    p: [u64; N],
-    p_len: usize,
-    q: [u64; N],
-    q_len: usize,
-    neg: bool,
+    pub(crate) a: u64,
+    pub(crate) b: u64,
+    pub(crate) p: [u64; N],
+    pub(crate) p_len: usize,
+    pub(crate) q: [u64; N],
+    pub(crate) q_len: usize,
+    pub(crate) neg: bool,
     _s: PhantomData<fn() -> S>,
 }
 
-impl<const N: usize, S: BBPSeries> Node for StaticNodeBBP<N, S> {
-    type Ctx = Shift;
+impl<const N: usize, S: BBPSeries> StaticNodeBBP<N, S> {
+    // Whether [a, b)'s exact P and Q * 2^(shift t) fit N limbs, where
+    // |P| <= prod q * 2^(shift (t - 1)) * t * max p.
+    fn leaf_fits(shift: u64, a: u64, b: u64) -> bool {
+        let t = b - a;
+        let cap = 64 * N as u64;
+        let (mut bits, mut p_bits) = (shift * t + bit_len(t), 0);
+        for n in a..b {
+            bits += bit_len(S::q(n));
+            p_bits = p_bits.max(bit_len(S::p(n)));
+            if bits + p_bits > cap {
+                return false;
+            }
+        }
+        true
+    }
 
-    fn leaf(ctx: &Shift, a: u64, b: u64, _: bool) -> Self {
+    #[inline(never)]
+    fn exact_leaf(shift: u64, a: u64, b: u64) -> Self {
         let (mut p, mut q) = ([0; N], [0; N]);
-        let (p_len, mut q_len, mut e, neg) = bbp_leaf_terms::<S>(a, b, ctx.0, &mut p, &mut q);
-        mul_shl(&mut q, &mut q_len, &mut e, 1, ctx.0 * (b - a), 0);
-        assert_eq!(
-            e, 0,
-            "a leaf's P and Q * 2^(shift * terms) must fit N limbs"
-        );
+        let (p_len, mut q_len, mut e, neg) = bbp_leaf_terms::<S>(a, b, shift, &mut p, &mut q);
+        mul_shl(&mut q, &mut q_len, &mut e, 1, shift * (b - a), 0);
+        assert_eq!(e, 0, "one term's P and Q * 2^shift must fit N limbs");
 
         StaticNodeBBP {
             a,
@@ -589,6 +618,23 @@ impl<const N: usize, S: BBPSeries> Node for StaticNodeBBP<N, S> {
             neg,
             _s: PhantomData,
         }
+    }
+}
+
+impl<const N: usize, S: BBPSeries> Node for StaticNodeBBP<N, S> {
+    type Ctx = Shift;
+
+    // Only merges drop limbs, so a leaf too big for N limbs splits itself.
+    fn leaf(ctx: &Shift, a: u64, b: u64, last: bool) -> Self {
+        if b - a > 1 && !Self::leaf_fits(ctx.0, a, b) {
+            let m = a + (b - a) / 2;
+            return Self::merge(
+                ctx,
+                Self::leaf(ctx, a, m, false),
+                Self::leaf(ctx, m, b, last),
+            );
+        }
+        Self::exact_leaf(ctx.0, a, b)
     }
 
     fn merge(ctx: &Shift, mut l: Self, mut r: Self) -> Self {
@@ -737,12 +783,16 @@ pub struct StaticNodeEngel<const N: usize, S: EngelSeries> {
     _s: PhantomData<fn() -> S>,
 }
 
-impl<const N: usize, S: EngelSeries> Node for StaticNodeEngel<N, S> {
-    type Ctx = Shift;
+impl<const N: usize, S: EngelSeries> StaticNodeEngel<N, S> {
+    // P drops limbs on its own, but [a, b)'s exact Q must fit N limbs.
+    fn leaf_fits(a: u64, b: u64) -> bool {
+        prod_fits(a, b, S::q, 64 * N as u64)
+    }
 
-    fn leaf(ctx: &Shift, a: u64, b: u64, _: bool) -> Self {
+    #[inline(never)]
+    fn exact_leaf(shift: u64, a: u64, b: u64) -> Self {
         let (mut p, mut q) = ([0; N], [0; N]);
-        let (p_len, q_len, ep, neg) = engel_leaf_terms::<S>(a, b, ctx.0, &mut p, &mut q);
+        let (p_len, q_len, ep, neg) = engel_leaf_terms::<S>(a, b, shift, &mut p, &mut q);
         StaticNodeEngel {
             a,
             b,
@@ -755,6 +805,23 @@ impl<const N: usize, S: EngelSeries> Node for StaticNodeEngel<N, S> {
             neg,
             _s: PhantomData,
         }
+    }
+}
+
+impl<const N: usize, S: EngelSeries> Node for StaticNodeEngel<N, S> {
+    type Ctx = Shift;
+
+    // Only merges drop Q's limbs, so a leaf too big for N limbs splits itself.
+    fn leaf(ctx: &Shift, a: u64, b: u64, last: bool) -> Self {
+        if b - a > 1 && !Self::leaf_fits(a, b) {
+            let m = a + (b - a) / 2;
+            return Self::merge(
+                ctx,
+                Self::leaf(ctx, a, m, false),
+                Self::leaf(ctx, m, b, last),
+            );
+        }
+        Self::exact_leaf(ctx.0, a, b)
     }
 
     fn merge(ctx: &Shift, mut l: Self, r: Self) -> Self {
@@ -1014,12 +1081,16 @@ impl<const N: usize, S: HyperSeries> StaticNodeHyper<N, S> {
         r[..t.len()].copy_from_slice(t);
         (p_len, prod_terms(a, b, S::q, q), t.len(), ep, er, neg)
     }
-}
 
-impl<const N: usize, S: HyperSeries> Node for StaticNodeHyper<N, S> {
-    type Ctx = StaticHyperCtx<N>;
+    // P drops limbs on its own, and so does R when x != 1, but [a, b)'s exact
+    // Q, and R when x = 1, must fit N limbs.
+    fn leaf_fits(ctx: &StaticHyperCtx<N>, a: u64, b: u64) -> bool {
+        let cap = 64 * N as u64;
+        prod_fits(a, b, S::q, cap) && (ctx.x.is_some() || prod_fits(a, b, S::r, cap))
+    }
 
-    fn leaf(ctx: &StaticHyperCtx<N>, a: u64, b: u64, last: bool) -> Self {
+    #[inline(never)]
+    fn exact_leaf(ctx: &StaticHyperCtx<N>, a: u64, b: u64, last: bool) -> Self {
         let (mut p, mut q, mut r) = ([0; N], [0; N], [0; N]);
         let (p_len, q_len, r_len, ep, er, neg) = match &ctx.x {
             None => {
@@ -1044,6 +1115,23 @@ impl<const N: usize, S: HyperSeries> Node for StaticNodeHyper<N, S> {
             neg,
             _s: PhantomData,
         }
+    }
+}
+
+impl<const N: usize, S: HyperSeries> Node for StaticNodeHyper<N, S> {
+    type Ctx = StaticHyperCtx<N>;
+
+    // Only merges drop Q's limbs, so a leaf too big for N limbs splits itself.
+    fn leaf(ctx: &StaticHyperCtx<N>, a: u64, b: u64, last: bool) -> Self {
+        if b - a > 1 && !Self::leaf_fits(ctx, a, b) {
+            let m = a + (b - a) / 2;
+            return Self::merge(
+                ctx,
+                Self::leaf(ctx, a, m, false),
+                Self::leaf(ctx, m, b, last),
+            );
+        }
+        Self::exact_leaf(ctx, a, b, last)
     }
 
     fn merge(ctx: &StaticHyperCtx<N>, mut left: Self, mut right: Self) -> Self {
