@@ -2,6 +2,7 @@ mod test_bin_split;
 mod test_div;
 mod test_mul;
 mod test_sqrt;
+mod test_trans;
 mod test_utils;
 
 use crate::utils::mul::{mul_buf, mul_vec};

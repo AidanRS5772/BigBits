@@ -280,8 +280,9 @@ pub fn karatsuba_core(
 
     sub_buf(cross, z0);
     sub_buf(cross, &z2[..z2_len]);
+    // overflow is the product limb at z2.len(), not at z2's trimmed length.
     if overflow > 0 {
-        sub_prim(&mut cross[z2_len..], overflow);
+        sub_prim(&mut cross[z2.len()..], overflow);
     }
     let out_cross = &mut out[half..];
     if out_cross.len() >= cross.len() {
@@ -3698,6 +3699,9 @@ pub fn hi_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u
 // HIGH SQUARING
 
 pub fn hi_sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
+    if buf.is_empty() {
+        return 0;
+    }
     let d = (2 * buf.len() - 1).saturating_sub(out.len());
     let (mut acc0, mut acc1, mut acc2) = (0, 0, 0);
     if d >= 2 {

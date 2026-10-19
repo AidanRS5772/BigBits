@@ -67,6 +67,9 @@ pub const STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF: usize = 14;
 
 pub const LN2_TERM_CUTOFF: u64 = 640;
 
+// ln(2) computes its four series in parallel from this many output limbs.
+pub const LN2_PAR_CUTOFF: usize = 40;
+
 // Dynamic binary splitting builds a split's two halves in parallel from this
 // many terms, and a merge's independent products once its Q reaches this many
 // limbs.

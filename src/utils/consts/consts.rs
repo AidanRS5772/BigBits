@@ -1,13 +1,16 @@
-use std::sync::{RwLock, RwLockWriteGuard};
+use std::{
+    panic,
+    sync::{RwLock, RwLockWriteGuard},
+    thread::{self, Scope, ScopedJoinHandle},
+};
 
 use crate::utils::{
     bin_split::{
-        bin_split, ratio_to_fraction_dyn, ratio_to_fraction_static, BBPSeries, DynNodeBBP, Node,
-        Shift, StaticNodeBBP,
+        bin_split, join2, ratio_to_fraction_dyn, ratio_to_fraction_static, BBPSeries, DynNodeBBP,
+        Node, Shift, StaticNodeBBP,
     },
-    mul::mul_prim,
-    utils::{add_buf, buf_len, shl_buf, split_sh},
-    ScratchGuard, LN2_TERM_CUTOFF,
+    utils::add_buf,
+    ScratchGuard, LN2_PAR_CUTOFF, LN2_TERM_CUTOFF,
 };
 
 //$ ln(2) = \frac{2}{3} + 1/2  \sum^{\infty}_{n=1} \left(\frac{1}{2n} + \frac{1}{4n+1}+\frac{1}{8n+4}+\frac{1}{16n+12}\right)16^{-n}$
@@ -111,37 +114,22 @@ impl DynLn2 {
 
         // Each term adds 4 bits.
         let n = 1 + 16 * len as u64 + TERM_GAURD;
-        let ((s1, s2), (s3, s4)) = rayon::join(
-            || rayon::join(|| extend(&mut self.s1, n), || extend(&mut self.s2, n)),
-            || rayon::join(|| extend(&mut self.s3, n), || extend(&mut self.s4, n)),
+        let par = len >= LN2_PAR_CUTOFF;
+        let ((s1, s2), (s3, s4)) = join2(
+            par,
+            || join2(par, || extend(&mut self.s1, n), || extend(&mut self.s2, n)),
+            || join2(par, || extend(&mut self.s3, n), || extend(&mut self.s4, n)),
         );
 
         let k = LN2_CTX.0 * (s1.b - s1.a);
-        let (p1, q1) = (&s1.p, &s1.q);
-        let (sl, sb) = split_sh(k + 3);
-        let num_len = (sl + q1.len() + 1).max(p1.len() + 1) + 1;
 
         let mut scratch = ScratchGuard::acquire();
-        let [num, p3, den, t] = scratch.get_splits([num_len, p1.len() + 1, q1.len() + 1, len]);
-
-        num.fill(0);
-        num[sl..sl + q1.len()].copy_from_slice(q1);
-        num[sl + q1.len()] = shl_buf(&mut num[sl..sl + q1.len()], sb);
-        p3[..p1.len()].copy_from_slice(p1);
-        p3[p1.len()] = mul_prim(&mut p3[..p1.len()], 3);
-        add_buf(num, p3);
-        den[..q1.len()].copy_from_slice(q1);
-        den[q1.len()] = mul_prim(&mut den[..q1.len()], 3);
+        let t = scratch.get(len);
 
         self.buf.clear();
-        self.buf.resize(len, 0);
-        ratio_to_fraction_dyn(
-            &num[..buf_len(num)],
-            &den[..buf_len(den)],
-            (k + 2) as i64,
-            &mut self.buf,
-        );
+        self.buf.resize(len, 0xAAAA_AAAA_AAAA_AAAA);
 
+        add_series(s1, k + 2, &mut self.buf, t);
         add_series(s2, k + 3, &mut self.buf, t);
         add_series(s3, k + 1, &mut self.buf, t);
         add_series(s4, k + 3, &mut self.buf, t);
@@ -215,8 +203,29 @@ impl<const N: usize> StaticLn2<N> {
             debug_assert!(!carry, "ln(2) < 1");
         }
 
+        #[inline(never)]
         fn split<const N: usize, S: BBPSeries>(n: u64) -> StaticNodeBBP<N, S> {
             bin_split::<StaticNodeBBP<N, S>, LN2_TERM_CUTOFF>(&LN2_CTX, 1, n)
+        }
+
+        fn spawn_split<'s, const N: usize, S: BBPSeries + 's>(
+            sc: &'s Scope<'s, '_>,
+            n: u64,
+        ) -> Option<ScopedJoinHandle<'s, StaticNodeBBP<N, S>>> {
+            thread::Builder::new()
+                .stack_size(1024 * N + (1 << 20))
+                .spawn_scoped(sc, move || split::<N, S>(n))
+                .ok()
+        }
+
+        fn join_split<const N: usize, S: BBPSeries>(
+            h: Option<ScopedJoinHandle<'_, StaticNodeBBP<N, S>>>,
+            n: u64,
+        ) -> StaticNodeBBP<N, S> {
+            match h {
+                Some(h) => h.join().unwrap_or_else(|e| panic::resume_unwind(e)),
+                None => split::<N, S>(n),
+            }
         }
 
         if Self::get(out) {
@@ -228,11 +237,23 @@ impl<const N: usize> StaticLn2<N> {
             "ln(2) past the table needs out.len() + 4 <= N"
         );
 
-        // Each term adds 4 bits. The splits run serially on the caller's stack,
-        // as a rayon worker blocked in join can steal and stack another split.
+        // Each term adds 4 bits.
         let n = 1 + 16 * len as u64 + TERM_GAURD;
-        let (s1, s2) = (split::<N, Ln2S1>(n), split::<N, Ln2S2>(n));
-        let (s3, s4) = (split::<N, Ln2S3>(n), split::<N, Ln2S4>(n));
+        let (s1, s2, s3, s4) = if len >= LN2_PAR_CUTOFF {
+            thread::scope(|sc| {
+                let (h1, h2, h3, h4) = (
+                    spawn_split::<N, Ln2S1>(sc, n),
+                    spawn_split::<N, Ln2S2>(sc, n),
+                    spawn_split::<N, Ln2S3>(sc, n),
+                    spawn_split::<N, Ln2S4>(sc, n),
+                );
+                (join_split(h1, n), join_split(h2, n), join_split(h3, n), join_split(h4, n))
+            })
+        } else {
+            let (s1, s2) = (split::<N, Ln2S1>(n), split::<N, Ln2S2>(n));
+            let (s3, s4) = (split::<N, Ln2S3>(n), split::<N, Ln2S4>(n));
+            (s1, s2, s3, s4)
+        };
 
         let (mut buf, mut t) = ([0xAAAA_AAAA_AAAA_AAAA; N], [0; N]);
         let (buf, t) = (&mut buf[..len], &mut t[..len]);

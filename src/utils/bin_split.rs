@@ -13,7 +13,7 @@ fn merge_par(q_len: usize) -> bool {
     q_len >= DYN_BIN_SPLIT_MERGE_PAR_CUTOFF && rayon::current_thread_index().is_some()
 }
 
-fn join2<A: Send, B: Send>(
+pub(crate) fn join2<A: Send, B: Send>(
     par: bool,
     a: impl FnOnce() -> A + Send,
     b: impl FnOnce() -> B + Send,

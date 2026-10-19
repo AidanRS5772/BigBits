@@ -2904,8 +2904,161 @@ fn test_karatsuba_static_chunking_scratch_fallback() {
     check::<69>(47, 23, 12_100, "static chunking fallback boundary");
 
     // Exercise more than one full short-sized chunk before the remainder.
-    assert!(find_karatsuba_scratch(150, 50) > 199);
-    check::<199>(150, 50, 12_200, "static chunking fallback multiple chunks");
+    assert_eq!(find_karatsuba_scratch(150, 50), 178);
+    check::<177>(150, 50, 12_200, "static chunking fallback multiple chunks");
+}
+
+// ─── Section 17b: Karatsuba Overflow Offset ─────────────────────────────────
+
+// karatsuba_core subtracts z2's overflow limb (the product limb at z2.len()) from
+// the cross term. It used to subtract it at buf_len(z2), which is lower whenever
+// z2's top limb is zero, silently corrupting the product. Random operands almost
+// never give a sub-product a zero top limb, so these engineer one.
+#[test]
+fn test_karatsuba_core_overflow_offset_zero_top() {
+    for n in 19..=80 {
+        for (ta, tb) in [
+            (1u64 << 58, 1u64 << 58),
+            (1 << 58, 3 << 50),
+            (1 << 63, 1 << 63),
+        ] {
+            let mut a = vec![0u64; n];
+            let mut b = vec![0u64; n];
+            a[n - 1] = ta;
+            b[n - 1] = tb;
+            let (expected, exp_carry) = mul_ref_parts(&a, &b);
+            let label = format!("n={n} tops=({ta:#x}, {tb:#x})");
+
+            let mut out = vec![0u64; 2 * n - 1];
+            let carry = mul_dyn(&a, &b, &mut out);
+            assert_eq_result(
+                &out,
+                carry,
+                &expected,
+                exp_carry,
+                &format!("mul_dyn {label}"),
+            );
+
+            let mut out = vec![0u64; 2 * n - 1];
+            let carry = mul_static::<256>(&a, &b, &mut out);
+            assert_eq_result(
+                &out,
+                carry,
+                &expected,
+                exp_carry,
+                &format!("mul_static {label}"),
+            );
+        }
+    }
+}
+
+// A real 151x151 pair (a series numerator and an rcp_dyn output, as multiplied by
+// hi_mul_dyn inside ratio_to_fraction_dyn) whose recursion hits the overflow offset
+// bug three levels down.
+#[test]
+fn test_karatsuba_structured_operands() {
+    #[rustfmt::skip]
+    const A: [u64; 151] = [
+        0xf9c5d2359f895e80, 0xbfeb85e0df2f2382, 0x9f4cb777f133a92e, 0x31d989cce1c8b3b7,
+        0xd9b99ece02d1085b, 0xaa750735a1cb4108, 0xdf3ff2571219c2ba, 0x01b0e20c1b7c45ba,
+        0xd65f9516521ebc55, 0x3bb14d1fa8e36dd9, 0xfa2f86013b35da40, 0xa1e995576b69239f,
+        0x115214722498fe63, 0x550db0b554e957d7, 0x659f9bde6a265ad6, 0xc47309814cc228e4,
+        0xac2c9e3e4b0b4d81, 0xbc32d3f28b845c84, 0xfff239cc48fd553e, 0xbb419656e73e9bae,
+        0xddca6ab6038bdae1, 0x1de29b87e62d337d, 0x7c3035c1b475854f, 0xf5b238c98ed6ff7d,
+        0x787d70ec71b7ec31, 0x98e09206bd12be8a, 0xd7edf7c10f46e238, 0x491ef9019b09b7da,
+        0x46eb8f34a3436c92, 0xe08e506a63c9524f, 0x74b5fc11929871c8, 0x7e96bb509ccb1d69,
+        0x2fab0ca1c5dc6460, 0x75f4337e0752ad6b, 0x0518bcd027ab160d, 0x486b57201f452b99,
+        0x6aabf3007db74683, 0x9c95aea6cc250fa0, 0xe45c25995b1c0374, 0x98b4323ffba007b1,
+        0x9b765bf1663afc44, 0x23a482f91769925e, 0x545456701793739e, 0x27214ec58e63e466,
+        0x2c3e097568ff58ca, 0xedfaa2c0fb3cc1f3, 0x0f30676e4c83857a, 0xd270c2936cc97281,
+        0x1ed88a6221111e2a, 0x95fab255a940e8d2, 0x7da7d27a44f5be26, 0x42b5d17a8c33c9d8,
+        0xd508cccc22c0e9fc, 0xf0c5599da2b03c39, 0xf35ee5ac1d773697, 0x9b46d18e4d1aebe1,
+        0x85a05eba7266c39f, 0x605a2aab967e4eda, 0xdfae0b9e39b4b506, 0x440cfd5bf008eea7,
+        0x735e9d853d85d9ee, 0xc1aaecf5118baebc, 0xa8cb32ebc0398409, 0x88b48e5912b42d62,
+        0x12fd1814221c0439, 0xf544e792c616300a, 0x2950aff9ed6dc579, 0xa87ad8e9e455ec21,
+        0x43d238a64f959966, 0x18b3b38e68903893, 0xacf14e507018793d, 0xb3ad17f642ea2ecd,
+        0x8473fb9fcad98ef9, 0x3165d6af85d8eb2c, 0x859a7556eebba172, 0x5d95dcb06c1a0406,
+        0xc92299a8e6acb18f, 0x3ec744010db33159, 0x260bae334257256b, 0x7371ddaf9267b72a,
+        0x3ec1f7e990ef2ef6, 0x9b52aa9c0f51e592, 0x711c9da397fce966, 0xa656faad4d0467c5,
+        0xc61d191f8a2c2f54, 0x898b4750c2e0522a, 0x63f3d20abedfe4ff, 0x76dbc21f29bd3959,
+        0x9365fcb2e12c5336, 0xd5b5f77079dbefd3, 0x6bc8df5c4c5fe036, 0xac0e567a7503e736,
+        0x0bfee1d101951892, 0xc0bfcf0c75c3b0c4, 0xd4428aa5e6a229df, 0x6c5fb9bf20e5cf5a,
+        0x1069b83f8f710a06, 0x2cd82f077108c12b, 0xdf88164987a6b66d, 0x315e5c9967a73487,
+        0x044ec9cc284ebb9a, 0xd278602e941ba44b, 0x23f802ea36e1144b, 0x214304817611b6fe,
+        0x1e50e0092435b491, 0x0bb28ed4a5a3cc56, 0x67ec5619376e9ce4, 0x1d3edef9814fac71,
+        0x9efc4c69235bc96c, 0x5069db30f0d0849e, 0x18b64dbe53ee24fe, 0x6c2730889accbeb4,
+        0xba418f3b10406a0e, 0xcbe7ac78817af727, 0x821f2e4b92e37289, 0x47d765feb8088836,
+        0x3d44428b7f3f7d3e, 0xe16d57cbcffeae77, 0x2ad54bc989a47de6, 0xfb6f40139f2afa24,
+        0xb40255232c0db6ec, 0x6a5cacda5eae3d17, 0x958544d93870bec3, 0xd16bc09cc1481f26,
+        0xf6bca7a55c38f04a, 0xd999688476ae442d, 0x3e384ccb2308b60c, 0x4ed5c27742d4f5c5,
+        0x2b901375ab253996, 0x68c974727cb1ea85, 0x57133d2bf3a6632b, 0xe949e04c722fe1f4,
+        0x85e7f2c8f7e88880, 0x9439703bff81efc0, 0xbab577cd728c67b7, 0x489bc3fb6815cd77,
+        0x781e1321403e2c74, 0x40be3a10f20cfa92, 0x87e7eb41b466b101, 0xe3c1ddc044255816,
+        0x993ea4b8ca78daaa, 0x61a38935eb96a3ee, 0x2ebdc7ef91e6d161, 0x40c08ef85260b34f,
+        0x5db52d4e874341cb, 0x60c17539218dda7a, 0xcefcb85d142746c9, 0x7b08274021d72f86,
+        0xef6169a5e475bfb1, 0xa3df4c061bccfd88, 0x00000000034fc67c,
+    ];
+    #[rustfmt::skip]
+    const B: [u64; 151] = [
+        0xc13958ce99bca870, 0x2cfd935e7f5ac8d4, 0x6730e958a4d8f2a3, 0x9ebb0e51099548cd,
+        0xfc2896cb1be28a52, 0x516927fa56818f90, 0x32a2dc13423c2c0f, 0x9e7e5e614eb32554,
+        0x00b2408373ee6594, 0xdecaf7264f60e7d5, 0xf2abf67fb9c0186b, 0x2bd8e61e2fab237b,
+        0x8afecc7731316c3b, 0x2a2a3276810b4437, 0x01a63b0a38ff8f0e, 0xeea81b11e219c7a9,
+        0x4255a67d595901c3, 0xc58f53e7f490aacf, 0x4cac68b401199bcd, 0x5f87b7a0218aa7b7,
+        0xde74aeb992efad18, 0xcd6222650f8e53d9, 0x0ea600b78598424f, 0x9b5832809c972f58,
+        0x5f79238dd2e0e88d, 0xa7324ce2ed372d88, 0x7c2d18d4c6990ae0, 0xeb57ce690c3723fb,
+        0x3a165a49cdf71a66, 0x7ef867edbed99cea, 0x2a09b75734afb991, 0x9f24013d66eee9fe,
+        0x8f898358266f4886, 0xaf2f14ee4ad00d7f, 0x4c78c5d8f08a9980, 0x047df4bba903fd00,
+        0x70040869f1634763, 0x38679328d958f8bb, 0xf56d2cc02a34fd64, 0x0425b09dba74f910,
+        0xb81708f09f9d0a49, 0xff84cf16a80c841d, 0xf1d5ed09e01cad5d, 0x710b0511653a8b99,
+        0x2195adcd1b7d24c6, 0x4d154daac20bcc69, 0x6f1fa723ce8f3dfe, 0x0d4b2fa73c45507b,
+        0xafa5d16979a48025, 0xd96e91209e0a232f, 0x399ad46c28d36eb1, 0x50b746ebfda6a5c2,
+        0xbab391caa777d73f, 0xe7ca3c2e3d8b981c, 0x6c0232522627d062, 0x812331d0c31410cc,
+        0x5059154c38383a38, 0x3631e09a9ef6d170, 0x6897f224334a2da1, 0x4741bffdab215caf,
+        0x56d2ec0895966274, 0xaf2a283047d9ad1c, 0x77b98e70c7520e24, 0xa05cbb596d667657,
+        0x5333083ccaf46fca, 0x0457411b2d8a702f, 0xd9f2d4929bcdbe56, 0xc5f3a38728ccdf5c,
+        0x70726ddfd0aed392, 0x9d003fd58bc1b607, 0xe50053107f23fb82, 0x9875a9b476fa233b,
+        0x878c632d4fa0abb5, 0xdaa6a43538b513af, 0x5c4f52a897b2215f, 0x719a1fa0621a5ef2,
+        0x6b70bda27de5c177, 0x068f97ba15fa45ba, 0xecd672879878e84e, 0x6e91fa32c4a57d2d,
+        0xf571df5171940435, 0x4464cec71536a5c1, 0x841507c477c45a55, 0x9082a40168eca465,
+        0x5df27a19d5c4cfb2, 0xfce5661a46f8c7a6, 0x2a408ed16ef40600, 0xe7cb76b3020241b5,
+        0x45804af18d239e72, 0xe660a82aeedcec47, 0x6ec265cc72fbb062, 0x8e0a56c474983c6f,
+        0x5f6b4dd3f1808527, 0x1bc801c5610928de, 0xbdfd60fe6be557e3, 0x9de13b3e9feefd39,
+        0x0e2321596354550c, 0x42965623a57c135d, 0x7cecb000041b9eb9, 0xc1a9aca0fd553bbe,
+        0x4db1aee969ab76d7, 0x625795a56abe56d9, 0xe1b06e0013553470, 0x432d03f0a6ee7fb7,
+        0xb3b550c20c60e8cf, 0xc8dabba553e659fb, 0x17b7de6ebbc213de, 0x1f603cf826bc961e,
+        0xfd3e64cc07beeb0b, 0x670c3c0354c9c3b5, 0xb09a1d0015df3021, 0xf9a3ee905a97316c,
+        0x9201749be20b957b, 0x5fb4be3848951190, 0x0952856252772629, 0x5e1159e9dff95f7e,
+        0x48cff3014144195d, 0x3ad86f8a7af53600, 0x5610b013528f934f, 0xf601c274a493e190,
+        0x092486f2ddd6123d, 0xc89dd152eaaa3839, 0x5f40dc97fff11227, 0x0da6ae1885eb560c,
+        0x86f8c3c53b434aeb, 0x6c11ecbd61c5f4fc, 0x4712d93997ce0505, 0xac550bfe87283dbb,
+        0xdcc8c0569bffe0a6, 0x764fad5cf81d96e9, 0xeda12dcdd3384cbd, 0x5f28e7dd7246efc2,
+        0x4d964240eaf2804a, 0xe3ab2f1a5b67d2d3, 0xaa39d26270f7efc2, 0x234f2a8d22f9cd16,
+        0x571c1665e0a2e370, 0xfe7aa9c5fb50b5e3, 0x158504cd156ac531, 0xf16cf0847a707789,
+        0x804978df420ec974, 0xa6433cb48bed045c, 0xa97e806f2d369846, 0x704712c8d46d7cb3,
+        0x4a86f33c2aa4901f, 0x2c918b54a2dc4b8b, 0xd25a41d53035661d, 0x8fb1ecd762de6b4a,
+        0xac65b15cfb097eb8, 0x795888ab562e6f7b, 0x00001c628765ab75,
+    ];
+
+    let (expected, exp_carry) = mul_ref_parts(&A, &B);
+    let mut out = vec![0u64; A.len() + B.len() - 1];
+    let carry = mul_dyn(&A, &B, &mut out);
+    assert_eq_result(
+        &out,
+        carry,
+        &expected,
+        exp_carry,
+        "mul_dyn structured 151x151",
+    );
+    let mut out = vec![0u64; A.len() + B.len() - 1];
+    let carry = karatsuba_entry_dyn(&A, &B, &mut out);
+    assert_eq_result(
+        &out,
+        carry,
+        &expected,
+        exp_carry,
+        "karatsuba_entry_dyn structured 151x151",
+    );
 }
 
 // ─── Section 18: hi_mul_static Above Cutoff ─────────────────────────────────
@@ -3177,4 +3330,52 @@ fn test_ntt_entry_dyn_nested_in_rayon() {
             .collect();
         assert_eq!(got, expect);
     }
+}
+
+// Random tests almost never give a Karatsuba sub-product a zero top limb. Biasing
+// limbs toward zeros and powers of two does: this found 571 bad products in 6000 trials
+// with the old overflow offset in karatsuba_core.
+#[test]
+fn test_mul_structured_operand_fuzz() {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(424242);
+    let tops = [1u64, 1 << 32, 1 << 58, 1 << 63, 3 << 50, u64::MAX];
+    let (mut trials, mut bad) = (0, 0);
+    for _ in 0..2000 {
+        let l = rng.gen_range(3..320usize);
+        let s = rng.gen_range(3..=l);
+        let mut gen = |n: usize, rng: &mut StdRng| {
+            let zp = [0.0, 0.3, 0.7, 0.95][rng.gen_range(0..4)];
+            let mut v: Vec<u64> = (0..n)
+                .map(|_| {
+                    if rng.gen_bool(zp) {
+                        0
+                    } else if rng.gen_bool(0.2) {
+                        tops[rng.gen_range(0..tops.len())]
+                    } else {
+                        rng.gen()
+                    }
+                })
+                .collect();
+            v[n - 1] = tops[rng.gen_range(0..tops.len())];
+            v
+        };
+        let a = gen(l, &mut rng);
+        let b = gen(s, &mut rng);
+        let (expected, exp_carry) = mul_ref_parts(&a, &b);
+        let mut out = vec![0xdead_beef_u64; l + s - 1];
+        let c1 = mul_dyn(&a, &b, &mut out);
+        let ok1 = out == expected && c1 == exp_carry;
+        let mut out = vec![0u64; l + s - 1];
+        let c2 = mul_static::<1024>(&a, &b, &mut out);
+        let ok2 = out == expected && c2 == exp_carry;
+        trials += 1;
+        if !(ok1 && ok2) {
+            bad += 1;
+            if bad < 5 {
+                println!("structured product wrong: l={l} s={s} dyn={ok1} static={ok2}");
+            }
+        }
+    }
+    assert_eq!(bad, 0, "{bad}/{trials} structured products wrong");
 }
