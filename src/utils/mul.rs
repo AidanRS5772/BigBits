@@ -3576,6 +3576,54 @@ pub fn sqr_arr<const N: usize>(buf: &[u64]) -> ([u64; N], u64) {
 // Gets only the top part of a multiplication, only optimized for small inputs asymptotically same
 // computation as a full product other then truncating inputs dynamically.
 
+// Operand limbs kept below the output window when truncating. Cutting an
+// operand to exactly out.len() limbs drops partial products worth up to ~2B
+// ulps of the result (a whole wrong low limb); each guard limb shrinks that
+// by a factor of B, so two leave at most one ulp of carry error, matching
+// hi_mul_buf. Newton iterations square incoming error, so the full-limb
+// version blew up rcp_dyn at high precision.
+const HI_MUL_GUARD_LIMBS: usize = 2;
+
+// Splits x into (guard, core): its top `core` limbs and up to `guard` limbs
+// directly below them.
+fn hi_guard_split(x: &[u64], core: usize, guard: usize) -> (&[u64], &[u64]) {
+    let core_start = x.len().saturating_sub(core);
+    let guard_start = core_start.saturating_sub(guard);
+    (&x[guard_start..core_start], &x[core_start..])
+}
+
+// Completes full = (a_t * B^|a_g| + a_g)(b_t * B^|b_g| + b_g), overflow limb
+// included, given a_t * b_t already in full[|a_g| + |b_g|..]. The guard
+// operands have at most HI_MUL_GUARD_LIMBS limbs, so these terms are linear
+// add_mul passes and the core multiply keeps its unguarded size; growing it by
+// the guard can land it just past an FFT/NTT transform size (up to ~2x slower).
+fn add_hi_guard_terms(full: &mut [u64], a_g: &[u64], a_t: &[u64], b_g: &[u64], b_t: &[u64]) {
+    full[..a_g.len() + b_g.len()].fill(0);
+    for (j, &limb) in b_g.iter().enumerate() {
+        let carry = add_mul(&mut full[a_g.len() + j..], a_t, limb);
+        debug_assert_eq!(carry, 0);
+    }
+    for (i, &limb) in a_g.iter().enumerate() {
+        let carry = add_mul(&mut full[b_g.len() + i..], b_t, limb);
+        debug_assert_eq!(carry, 0);
+        let carry = add_mul(&mut full[i..], b_g, limb);
+        debug_assert_eq!(carry, 0);
+    }
+}
+
+// Static guard, clamped so the split paths' low buffers (up to
+// out_len + 2 * guard - 1 limbs) still fit N. Operands have at most N limbs,
+// so from out_len = N - 1 the clamped guard still keeps them whole (an exact
+// window), and at N - 2 one guard limb leaves at most 2 ulps.
+const fn hi_mul_static_guard<const N: usize>(out_len: usize) -> usize {
+    let fit = (N + 1).saturating_sub(out_len) / 2;
+    if fit < HI_MUL_GUARD_LIMBS {
+        fit
+    } else {
+        HI_MUL_GUARD_LIMBS
+    }
+}
+
 pub fn hi_mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     if a.is_empty() || b.is_empty() {
         return 0;
@@ -3605,14 +3653,17 @@ pub fn hi_mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     if out.len() <= PARTIAL_MUL_CUTOFF {
         return hi_mul_buf(a, b, out);
     }
-    let trunc_a = &a[a.len().saturating_sub(out.len())..];
-    let trunc_b = &b[b.len().saturating_sub(out.len())..];
+    let out_len = out.len();
+    let (a_g, a_t) = hi_guard_split(a, out_len, HI_MUL_GUARD_LIMBS);
+    let (b_g, b_t) = hi_guard_split(b, out_len, HI_MUL_GUARD_LIMBS);
+    let low = a_g.len() + b_g.len();
+    let full_len = low + a_t.len() + b_t.len();
     let mut scratch = ScratchGuard::acquire();
-    let tmp_len = trunc_a.len() + trunc_b.len() - 1;
-    let tmp = scratch.get(tmp_len);
-    let of = mul_dyn(trunc_a, trunc_b, tmp);
-    out.copy_from_slice(&tmp[tmp_len - out.len()..]);
-    return of;
+    let full = scratch.get(full_len);
+    mul_dyn(a_t, b_t, &mut full[low..]);
+    add_hi_guard_terms(full, a_g, a_t, b_g, b_t);
+    out.copy_from_slice(&full[full_len - 1 - out_len..full_len - 1]);
+    return full[full_len - 1];
 }
 
 pub fn hi_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
@@ -3633,15 +3684,23 @@ pub fn hi_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u
         return hi_mul_buf(a, b, out);
     }
 
-    let trunc_a = &a[a.len().saturating_sub(out_len)..];
-    let trunc_b = &b[b.len().saturating_sub(out_len)..];
-    let tmp_len = trunc_a.len() + trunc_b.len() - 1;
-    if trunc_a.len() + trunc_b.len() - 1 <= N {
-        let mut tmp = [0; N];
-        let of = mul_static::<N>(trunc_a, trunc_b, &mut tmp[..tmp_len]);
-        out.copy_from_slice(&tmp[tmp_len - out_len..tmp_len]);
-        return of;
+    let guard = hi_mul_static_guard::<N>(out_len);
+    let (a_g, a_t) = hi_guard_split(a, out_len, guard);
+    let (b_g, b_t) = hi_guard_split(b, out_len, guard);
+    let low = a_g.len() + b_g.len();
+    let full_len = low + a_t.len() + b_t.len();
+    if full_len <= N {
+        let mut full = [0; N];
+        mul_static::<N>(a_t, b_t, &mut full[low..full_len]);
+        add_hi_guard_terms(&mut full[..full_len], a_g, a_t, b_g, b_t);
+        out.copy_from_slice(&full[full_len - 1 - out_len..full_len - 1]);
+        return full[full_len - 1];
     }
+
+    // Too wide for one N-limb product: build the same guarded window from
+    // split sub-products.
+    let trunc_a = &a[a.len() - a_g.len() - a_t.len()..];
+    let trunc_b = &b[b.len() - b_g.len() - b_t.len()..];
 
     let (long, short) = if trunc_a.len() > trunc_b.len() {
         (trunc_a, trunc_b)
@@ -3682,13 +3741,15 @@ pub fn hi_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u
     }
 
     if !s0.is_empty() {
-        let tmp2_len = l1.len() + s0.len();
+        // Like tmp1, keep the top limb out of the buffer: l1 * s0 can have
+        // N + 1 limbs when out_len == N.
+        let tmp2_len = l1.len() + s0.len() - 1;
         let mut tmp2 = [0; N];
         let tmp2_of = mul_static::<N>(l1, s0, &mut tmp2[..tmp2_len]);
-        debug_assert_eq!(tmp2_of, 0);
 
         low_carry += add_buf(&mut low[l0.len()..low_len], &tmp2[..s0.len()]) as u64;
         of += add_buf(out, &tmp2[s0.len()..tmp2_len]) as u64;
+        of += add_prim(&mut out[tmp2_len - s0.len()..], tmp2_of) as u64;
     }
 
     of += add_prim(out, low_carry) as u64;
@@ -3726,13 +3787,16 @@ pub fn hi_sqr_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
     if out.len() <= PARTIAL_SQR_CUTOFF {
         return hi_sqr_buf(buf, out);
     }
-    let trunc_buf = &buf[buf.len().saturating_sub(out.len())..];
+    let out_len = out.len();
+    let (x_g, x_t) = hi_guard_split(buf, out_len, HI_MUL_GUARD_LIMBS);
+    let low = 2 * x_g.len();
+    let full_len = low + 2 * x_t.len();
     let mut scratch = ScratchGuard::acquire();
-    let tmp_len = 2 * trunc_buf.len() - 1;
-    let tmp = scratch.get(tmp_len);
-    let of = sqr_dyn(trunc_buf, tmp);
-    out.copy_from_slice(&tmp[tmp_len - out.len()..]);
-    return of;
+    let full = scratch.get(full_len);
+    sqr_dyn(x_t, &mut full[low..]);
+    add_hi_guard_terms(full, x_g, x_t, x_g, x_t);
+    out.copy_from_slice(&full[full_len - 1 - out_len..full_len - 1]);
+    return full[full_len - 1];
 }
 
 pub fn hi_sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
@@ -3752,14 +3816,21 @@ pub fn hi_sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
         return hi_sqr_buf(buf, out);
     }
 
-    let trunc_buf = &buf[buf.len().saturating_sub(out.len())..];
-    let tmp_len = 2 * trunc_buf.len() - 1;
-    if tmp_len <= N {
-        let mut tmp = [0; N];
-        let of = sqr_static::<N>(trunc_buf, &mut tmp[..tmp_len]);
-        out.copy_from_slice(&tmp[tmp_len - out.len()..tmp_len]);
-        return of;
+    let (x_g, x_t) = hi_guard_split(buf, out_len, hi_mul_static_guard::<N>(out_len));
+    let low = 2 * x_g.len();
+    let full_len = low + 2 * x_t.len();
+    if full_len <= N {
+        let mut full = [0; N];
+        sqr_static::<N>(x_t, &mut full[low..full_len]);
+        add_hi_guard_terms(&mut full[..full_len], x_g, x_t, x_g, x_t);
+        out.copy_from_slice(&full[full_len - 1 - out_len..full_len - 1]);
+        return full[full_len - 1];
     }
+
+    // Too wide for one N-limb square: build the same guarded window from
+    // split sub-products.
+    let trunc_buf = &buf[buf.len() - x_g.len() - x_t.len()..];
+    let tmp_len = 2 * trunc_buf.len() - 1;
 
     let h = (out_len + 1) / 2;
     let (x0, x1) = trunc_buf.split_at(trunc_buf.len() - h);

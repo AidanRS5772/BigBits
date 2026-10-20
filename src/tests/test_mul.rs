@@ -3379,3 +3379,165 @@ fn test_mul_structured_operand_fuzz() {
     }
     assert_eq!(bad, 0, "{bad}/{trials} structured products wrong");
 }
+
+// Numeric error of a high product (out plus returned top limb) against the
+// exact top window of the full product, as an unsigned limb buffer.
+fn hi_window_error(a: &[u64], b: &[u64], out: &[u64], of: u64) -> Vec<u64> {
+    let (full, full_of) = mul_ref_parts(a, b);
+    let d = full.len().saturating_sub(out.len());
+    let mut exact = full[d..].to_vec();
+    exact.push(full_of);
+    let mut got = out.to_vec();
+    got.push(of);
+    let mut err = if crate::utils::utils::cmp_buf(&got, &exact).is_lt() {
+        crate::utils::utils::sub_buf(&mut exact, &got);
+        exact
+    } else {
+        crate::utils::utils::sub_buf(&mut got, &exact);
+        got
+    };
+    trim_lz(&mut err);
+    err
+}
+
+fn assert_hi_window_ulps(a: &[u64], b: &[u64], out: &[u64], of: u64, msg: &str) {
+    let err = hi_window_error(a, b, out, of);
+    assert!(
+        err.len() <= 1 && err.first().map_or(true, |&e| e <= 2),
+        "{msg}: high product off by more than 2 ulps; err={err:?}"
+    );
+}
+
+// Truncating operands to exactly out.len() limbs used to leave the whole low
+// output limb wrong (~B ulps), which rcp_dyn's Newton chain squared into
+// multi-limb reciprocal errors from R = 727.
+#[test]
+fn test_hi_mul_truncation_error_is_a_few_ulps() {
+    let shapes = [
+        (92usize, 92usize, 91usize),
+        (183, 183, 182),
+        (365, 367, 366),
+        (729, 729, 728),
+        (400, 120, 150),
+        (200, 50, 100),
+    ];
+    for (idx, &(a_len, b_len, out_len)) in shapes.iter().enumerate() {
+        for seed in 0..3u64 {
+            let mut a = rand_nonzero_vec(a_len, 20_000 + 31 * idx as u64 + seed);
+            let b = rand_nonzero_vec(b_len, 21_000 + 37 * idx as u64 + seed);
+            if seed == 2 {
+                // Saturated low limbs maximize the dropped carry.
+                a.iter_mut().take(4).for_each(|l| *l = u64::MAX);
+            }
+            let mut out = vec![0u64; out_len];
+            let of = hi_mul_dyn(&a, &b, &mut out);
+            assert_hi_window_ulps(&a, &b, &out, of, &format!("hi_mul_dyn {a_len}x{b_len}->{out_len}"));
+
+            let of = hi_mul_static::<1024>(&a, &b, &mut out);
+            assert_hi_window_ulps(&a, &b, &out, of, &format!("hi_mul_static {a_len}x{b_len}->{out_len}"));
+
+            let mut out = vec![0u64; out_len];
+            let of = hi_sqr_dyn(&a, &mut out);
+            assert_hi_window_ulps(&a, &a, &out, of, &format!("hi_sqr_dyn {a_len}->{out_len}"));
+
+            let of = hi_sqr_static::<1024>(&a, &mut out);
+            assert_hi_window_ulps(&a, &a, &out, of, &format!("hi_sqr_static {a_len}->{out_len}"));
+        }
+    }
+}
+
+// The static guard shrinks as out_len approaches N so the split paths' low
+// buffers still fit. Operands are at most N limbs, so from out_len = N - 1 the
+// clamped guard keeps them whole and the window must be exact. out_len == N
+// with two N-limb operands used to index past N in the split path (even N),
+// and N - 1 used to get no guard at all (a whole wrong low limb).
+#[test]
+fn test_hi_mul_static_near_capacity() {
+    fn check<const N: usize>() {
+        for out_len in N - 4..=N {
+            let half = N / 2 + 7;
+            let shapes = [(N, N), (N, N - 1), (N - 1, N), (N - 1, N - 1), (N, half), (half, N), (N, 3)];
+            for (idx, &(a_len, b_len)) in shapes.iter().enumerate() {
+                let seed = (N * 100 + out_len * 10 + idx) as u64;
+                let mut a = rand_nonzero_vec(a_len, 22_000 + seed);
+                let b = rand_nonzero_vec(b_len, 23_000 + seed);
+                if seed % 2 == 1 {
+                    a.iter_mut().filter(|l| **l & 1 == 0).for_each(|l| *l = u64::MAX);
+                }
+                let exact = out_len + 1 >= N;
+                let msg = format!("N={N} out={out_len} a={a_len} b={b_len}");
+
+                let mut out = vec![0u64; out_len];
+                let of = hi_mul_static::<N>(&a, &b, &mut out);
+                if exact {
+                    assert!(hi_window_error(&a, &b, &out, of).is_empty(), "hi_mul_static {msg}: not exact");
+                } else {
+                    assert_hi_window_ulps(&a, &b, &out, of, &format!("hi_mul_static {msg}"));
+                }
+
+                if b_len == N {
+                    let of = hi_sqr_static::<N>(&a, &mut out);
+                    if exact {
+                        assert!(hi_window_error(&a, &a, &out, of).is_empty(), "hi_sqr_static {msg}: not exact");
+                    } else {
+                        assert_hi_window_ulps(&a, &a, &out, of, &format!("hi_sqr_static {msg}"));
+                    }
+                }
+            }
+        }
+    }
+    check::<96>();
+    check::<97>();
+    check::<160>();
+    check::<161>();
+    check::<512>();
+}
+
+// hi_mul_*/hi_sqr_* compute their unguarded core product and add the guard
+// limbs' terms separately (add_hi_guard_terms). The result must equal, bit for
+// bit, the top window of the exact product of the guarded operands, for dyn and
+// static alike, including operands narrower than the window and saturated or
+// zero-heavy limbs that stress the carry chains.
+#[test]
+fn test_hi_mul_guard_terms_match_exact_window() {
+    fn guarded_ref(a: &[u64], b: &[u64], k: usize) -> (Vec<u64>, u64) {
+        let ta = &a[a.len().saturating_sub(k + 2)..];
+        let tb = &b[b.len().saturating_sub(k + 2)..];
+        let mut full = vec![0u64; ta.len() + tb.len()];
+        mul_buf(ta, tb, &mut full);
+        let l = full.len();
+        (full[l - 1 - k..l - 1].to_vec(), full[l - 1])
+    }
+    for seed in 0..200u64 {
+        let k = PARTIAL_MUL_CUTOFF + 1 + (seed as usize * 37) % 500;
+        let a_len = [k - 50, k, k + 1, k + 2, k + 3, k + 40][(seed % 6) as usize];
+        let b_len = [k + 2, k + 1, k + 7, k, k + 300, 3][(seed / 6 % 6) as usize];
+        if a_len + b_len - 1 <= k {
+            continue;
+        }
+        let mut a = rand_nonzero_vec(a_len, 30_000 + seed);
+        let mut b = rand_nonzero_vec(b_len, 31_000 + seed);
+        if seed % 3 == 0 {
+            a.iter_mut().filter(|l| **l & 3 == 0).for_each(|l| *l = u64::MAX);
+        }
+        if seed % 5 == 0 {
+            b.iter_mut().filter(|l| **l & 3 == 0).for_each(|l| *l = 0);
+        }
+        let msg = format!("seed={seed} k={k} a={a_len} b={b_len}");
+
+        let expected = guarded_ref(&a, &b, k);
+        let mut out = vec![0u64; k];
+        let of = hi_mul_dyn(&a, &b, &mut out);
+        assert_eq!((&out, of), (&expected.0, expected.1), "hi_mul_dyn {msg}");
+        let of = hi_mul_static::<2048>(&a, &b, &mut out);
+        assert_eq!((&out, of), (&expected.0, expected.1), "hi_mul_static {msg}");
+
+        if 2 * a_len - 1 > k {
+            let expected = guarded_ref(&a, &a, k);
+            let of = hi_sqr_dyn(&a, &mut out);
+            assert_eq!((&out, of), (&expected.0, expected.1), "hi_sqr_dyn {msg}");
+            let of = hi_sqr_static::<2048>(&a, &mut out);
+            assert_eq!((&out, of), (&expected.0, expected.1), "hi_sqr_static {msg}");
+        }
+    }
+}

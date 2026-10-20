@@ -1,17 +1,12 @@
-use big_bits::utils::{
-    bin_split::{
-        bin_split, BBPSeries, DynHyperCtx, DynNodeBBP, DynNodeEngel, DynNodeHyper, EngelSeries,
-        HyperSeries, Node, Shift,
-    },
-    LN2_TERM_CUTOFF,
+use big_bits::utils::bin_split::{
+    bin_split, BBPSeries, DynHyperCtx, DynNodeBBP, DynNodeEngel, DynNodeHyper, EngelSeries,
+    HyperSeries, Node, Shift, SplitCutoffs,
 };
 use std::{
     env,
     hint::black_box,
     time::{Duration, Instant},
 };
-
-const CUTOFF: u64 = LN2_TERM_CUTOFF;
 
 // The four ln(2) series, sum 1 / (q(n) 16^n).
 struct Ln2A;
@@ -85,7 +80,8 @@ struct Times {
 
 // Time only the leaves of the same tree bin_split builds.
 fn leaf_time<N: Node>(ctx: &N::Ctx, a: u64, b: u64, last: bool) -> Duration {
-    if b - a < CUTOFF {
+    let cut = SplitCutoffs::of::<N>();
+    if b - a <= cut.leaf_terms.max(1) || N::limbs(ctx, a, b) < cut.leaf_limbs {
         let s = Instant::now();
         black_box(N::leaf(ctx, a, b, last));
         return s.elapsed();
@@ -106,7 +102,7 @@ where
     };
     for _ in 0..reps {
         let s = Instant::now();
-        let node = bin_split::<N, CUTOFF>(ctx, a, b);
+        let node = bin_split::<N>(ctx, a, b);
         let built = s.elapsed().as_secs_f64();
         let f = Instant::now();
         node.finalize(ctx, &mut out);
@@ -161,8 +157,11 @@ fn main() {
         sizes
     };
     println!(
-        "rayon threads: {}, leaf cutoff: {CUTOFF}",
-        rayon::current_num_threads()
+        "rayon threads: {}, leaf cutoffs: BBP {:?}, Engel {:?}, Hyper {:?}",
+        rayon::current_num_threads(),
+        SplitCutoffs::of::<DynNodeBBP<Ln2A>>(),
+        SplitCutoffs::of::<DynNodeEngel<EMinus2>>(),
+        SplitCutoffs::of::<DynNodeHyper<Hyp>>(),
     );
 
     for &limbs in &sizes {

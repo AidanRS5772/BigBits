@@ -10,7 +10,7 @@ use crate::utils::{
         Node, Shift, StaticNodeBBP,
     },
     utils::add_buf,
-    ScratchGuard, LN2_PAR_CUTOFF, LN2_TERM_CUTOFF,
+    ScratchGuard, LN2_PAR_CUTOFF,
 };
 
 //$ ln(2) = \frac{2}{3} + 1/2  \sum^{\infty}_{n=1} \left(\frac{1}{2n} + \frac{1}{4n+1}+\frac{1}{8n+4}+\frac{1}{16n+12}\right)16^{-n}$
@@ -99,10 +99,10 @@ impl DynLn2 {
         fn extend<S: BBPSeries>(node: &mut Option<DynNodeBBP<S>>, n: u64) -> &DynNodeBBP<S> {
             let s = match node.take() {
                 Some(old) => {
-                    let new = bin_split::<DynNodeBBP<S>, LN2_TERM_CUTOFF>(&LN2_CTX, old.b, n);
+                    let new = bin_split::<DynNodeBBP<S>>(&LN2_CTX, old.b, n);
                     DynNodeBBP::merge(&LN2_CTX, old, new)
                 }
-                None => bin_split::<DynNodeBBP<S>, LN2_TERM_CUTOFF>(&LN2_CTX, 1, n),
+                None => bin_split::<DynNodeBBP<S>>(&LN2_CTX, 1, n),
             };
             node.insert(s)
         }
@@ -205,7 +205,7 @@ impl<const N: usize> StaticLn2<N> {
 
         #[inline(never)]
         fn split<const N: usize, S: BBPSeries>(n: u64) -> StaticNodeBBP<N, S> {
-            bin_split::<StaticNodeBBP<N, S>, LN2_TERM_CUTOFF>(&LN2_CTX, 1, n)
+            bin_split::<StaticNodeBBP<N, S>>(&LN2_CTX, 1, n)
         }
 
         fn spawn_split<'s, const N: usize, S: BBPSeries + 's>(

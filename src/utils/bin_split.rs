@@ -1,12 +1,15 @@
 use std::marker::PhantomData;
 
 use crate::utils::{
-    div::{rcp_dyn, rcp_static},
-    mul::{hi_mul_dyn, hi_mul_static, mul_add_prim, mul_dyn, mul_prim},
+    div::{div_dyn, rcp_static},
+    mul::{hi_mul_static, mul_add_prim, mul_dyn, mul_prim},
     utils::{
         add_buf, add_mul, add_prim, buf_len, inc_buf, shl_buf, shr_buf, split_sh, sub_mul, trim_lz,
     },
-    ScratchGuard, DYN_BIN_SPLIT_MERGE_PAR_CUTOFF, DYN_BIN_SPLIT_PAR_CUTOFF, PARTIAL_MUL_CUTOFF,
+    ScratchGuard, DYN_BBP_LEAF_LIMBS, DYN_BIN_SPLIT_MERGE_PAR_CUTOFF, DYN_BIN_SPLIT_PAR_CUTOFF,
+    DYN_ENGEL_LEAF_LIMBS, DYN_HYPER_LEAF_LIMBS, DYN_HYPER_LEAF_TERMS, PARTIAL_MUL_CUTOFF,
+    STATIC_BBP_LEAF_LIMBS, STATIC_ENGEL_LEAF_LIMBS, STATIC_HYPER_LEAF_LIMBS,
+    STATIC_HYPER_LEAF_TERMS,
 };
 
 fn merge_par(q_len: usize) -> bool {
@@ -404,24 +407,59 @@ fn hi_mul_drop<const N: usize>(a: &[u64], b: &[u64], drop: usize, out: &mut [u64
     buf_len(out)
 }
 
-fn ratio_to_fraction(
-    p: &[u64],
-    q: &[u64],
-    shift: i64,
-    out: &mut [u64],
-    x: &mut [u64],
-    y: &mut [u64],
-    rcp: impl FnOnce(&[u64], &mut [u64]),
-    hi_mul: impl FnOnce(&[u64], &[u64], &mut [u64]) -> u64,
-) {
+// out = floor(p * 2^(64 out.len() - shift) / q) up to truncation error. Only the
+// top out.len() + 2 limbs of p and q can reach out, which bounds the error below
+// 2^-64 of out's last limb, so the division is sized by out rather than by p and q.
+pub fn ratio_to_fraction_dyn(p: &[u64], q: &[u64], shift: i64, out: &mut [u64]) {
     let len = out.len();
-    debug_assert!(x.len() == len + 2 && y.len() >= len + 3);
     out.fill(0);
     if p.is_empty() || len == 0 {
         return;
     }
 
-    rcp(q, x);
+    let keep = len + 2;
+    let (kp, kq) = (p.len().saturating_sub(keep), q.len().saturating_sub(keep));
+    let (p, q) = (&p[kp..], &q[kq..]);
+    let e = 64 * (len + kp) as i64 - 64 * kq as i64 - shift;
+
+    let mut scratch = ScratchGuard::acquire();
+    let n = if e >= 0 {
+        let (w, v) = split_sh(e as u64);
+        let n = scratch.get(w + p.len() + 1);
+        n.fill(0);
+        n[w..w + p.len()].copy_from_slice(p);
+        shl_buf(&mut n[w..], v);
+        n
+    } else {
+        let (w, v) = split_sh(e.unsigned_abs());
+        if w >= p.len() {
+            return;
+        }
+        let n = scratch.get(p.len() - w);
+        n.copy_from_slice(&p[w..]);
+        shr_buf(n, v);
+        n
+    };
+    let n = &n[..buf_len(n)];
+    debug_assert!(n.len() <= q.len() + len, "finalize expects S < 1");
+    let top = div_dyn(n, q, out);
+    debug_assert_eq!(top, 0, "finalize expects S < 1");
+}
+
+// Same result as ratio_to_fraction_dyn, but a division sized by out would need a
+// numerator of about 2 out.len() limbs, past N. Instead multiply p by a
+// (len + 2)-limb reciprocal of q, which only reads q's top window.
+pub fn ratio_to_fraction_static<const N: usize>(p: &[u64], q: &[u64], shift: i64, out: &mut [u64]) {
+    let len = out.len();
+    assert!(len + 3 <= N, "finalize output needs out.len() + 3 <= N");
+    out.fill(0);
+    if p.is_empty() || len == 0 {
+        return;
+    }
+
+    let (mut x, mut y) = ([0; N], [0; N]);
+    let (x, y) = (&mut x[..len + 2], &mut y[..len + 3]);
+    rcp_static::<N>(q, x);
     let bits = 64 * (q.len() + x.len() - 1 - len) as i64 + shift;
     debug_assert!(bits >= 128, "finalize needs w >= 2 whole limbs");
     let (w, v) = split_sh(bits as u64);
@@ -432,7 +470,7 @@ fn ratio_to_fraction(
 
     let y = &mut y[..full - w + 1];
     let core = y.len() - 1;
-    y[core] = hi_mul(p, x, &mut y[..core]);
+    y[core] = hi_mul_static::<N>(p, x, &mut y[..core]);
     shr_buf(y, v);
     let y = &y[1..];
     let n = y.len().min(len);
@@ -440,54 +478,85 @@ fn ratio_to_fraction(
     debug_assert!(y[n..].iter().all(|&l| l == 0), "finalize expects S < 1");
 }
 
-pub fn ratio_to_fraction_dyn(p: &[u64], q: &[u64], shift: i64, out: &mut [u64]) {
-    let len = out.len();
-    let mut scratch = ScratchGuard::acquire();
-    let [x, y] = scratch.get_splits([len + 2, len + 3]);
-    ratio_to_fraction(p, q, shift, out, x, y, rcp_dyn, hi_mul_dyn);
-}
-
-pub fn ratio_to_fraction_static<const N: usize>(p: &[u64], q: &[u64], shift: i64, out: &mut [u64]) {
-    let len = out.len();
-    assert!(len + 3 <= N, "finalize output needs out.len() + 3 <= N");
-    let (mut x, mut y) = ([0; N], [0; N]);
-    let (x, y) = (&mut x[..len + 2], &mut y[..len + 3]);
-    ratio_to_fraction(p, q, shift, out, x, y, rcp_static::<N>, hi_mul_static::<N>);
+// Estimated limbs of b - a terms that each add about bits(f(m)) + shift bits, with
+// m the midpoint.
+fn est_limbs(a: u64, b: u64, f: impl Fn(u64) -> u64, shift: u64) -> u64 {
+    let bits = bit_len(f(a + (b - a) / 2)) + shift;
+    (b - a).saturating_mul(bits).div_ceil(64)
 }
 
 pub trait Node: Sized {
     type Ctx;
+    // A tree splits [a, b) while it has more than LEAF_TERMS terms and its node
+    // has an estimated LEAF_LIMBS limbs or more.
+    const LEAF_LIMBS: u64;
+    const LEAF_TERMS: u64 = 1;
+    const PARALLEL: bool = false;
+    // Estimated limbs of the largest part of the node [a, b) builds. It only
+    // shapes the tree, so it never changes the result.
+    fn limbs(ctx: &Self::Ctx, a: u64, b: u64) -> u64;
     fn merge(ctx: &Self::Ctx, l: Self, r: Self) -> Self;
     fn leaf(ctx: &Self::Ctx, a: u64, b: u64, last: bool) -> Self;
     fn finalize(&self, ctx: &Self::Ctx, out: &mut [u64]) -> bool;
-    const PARALLEL: bool = false;
 }
 
-pub fn bin_split_tree<N, const CUTOFF: u64>(ctx: &N::Ctx, a: u64, b: u64, last: bool) -> N
+// Where a tree stops splitting, and from what size it builds a split's halves in
+// parallel (only for Node::PARALLEL).
+#[derive(Debug, Clone, Copy)]
+pub struct SplitCutoffs {
+    pub leaf_limbs: u64,
+    pub leaf_terms: u64,
+    pub par_limbs: u64,
+}
+
+impl SplitCutoffs {
+    pub const fn of<N: Node>() -> Self {
+        SplitCutoffs {
+            leaf_limbs: N::LEAF_LIMBS,
+            leaf_terms: N::LEAF_TERMS,
+            par_limbs: DYN_BIN_SPLIT_PAR_CUTOFF,
+        }
+    }
+}
+
+// bin_split_tree with explicit cutoffs, for tests and tuning.
+#[doc(hidden)]
+pub fn bin_split_tree_at<N>(ctx: &N::Ctx, a: u64, b: u64, last: bool, cut: SplitCutoffs) -> N
 where
     N: Node + Send,
     N::Ctx: Sync,
 {
-    const { assert!(CUTOFF >= 2) };
     debug_assert!(a < b);
-    if b - a < CUTOFF {
+    if b - a <= cut.leaf_terms.max(1) {
+        return N::leaf(ctx, a, b, last);
+    }
+    let limbs = N::limbs(ctx, a, b);
+    if limbs < cut.leaf_limbs {
         return N::leaf(ctx, a, b, last);
     }
     let m = (a + b) / 2;
     let (l, r) = join2(
-        N::PARALLEL && b - a >= DYN_BIN_SPLIT_PAR_CUTOFF,
-        || bin_split_tree::<N, CUTOFF>(ctx, a, m, false),
-        || bin_split_tree::<N, CUTOFF>(ctx, m, b, last),
+        N::PARALLEL && limbs >= cut.par_limbs,
+        || bin_split_tree_at::<N>(ctx, a, m, false, cut),
+        || bin_split_tree_at::<N>(ctx, m, b, last, cut),
     );
     N::merge(ctx, l, r)
 }
 
-pub fn bin_split<N, const CUTOFF: u64>(ctx: &N::Ctx, a: u64, b: u64) -> N
+pub fn bin_split_tree<N>(ctx: &N::Ctx, a: u64, b: u64, last: bool) -> N
 where
     N: Node + Send,
     N::Ctx: Sync,
 {
-    bin_split_tree::<N, CUTOFF>(ctx, a, b, true)
+    bin_split_tree_at::<N>(ctx, a, b, last, SplitCutoffs::of::<N>())
+}
+
+pub fn bin_split<N>(ctx: &N::Ctx, a: u64, b: u64) -> N
+where
+    N: Node + Send,
+    N::Ctx: Sync,
+{
+    bin_split_tree::<N>(ctx, a, b, true)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -516,7 +585,13 @@ pub struct DynNodeBBP<S: BBPSeries> {
 
 impl<S: BBPSeries> Node for DynNodeBBP<S> {
     type Ctx = Shift;
+    const LEAF_LIMBS: u64 = DYN_BBP_LEAF_LIMBS;
     const PARALLEL: bool = true;
+
+    // P, about Q * 2^(shift t).
+    fn limbs(ctx: &Shift, a: u64, b: u64) -> u64 {
+        est_limbs(a, b, S::q, ctx.0)
+    }
 
     fn leaf(ctx: &Shift, a: u64, b: u64, _: bool) -> Self {
         let terms = (b - a) as usize;
@@ -623,6 +698,11 @@ impl<const N: usize, S: BBPSeries> StaticNodeBBP<N, S> {
 
 impl<const N: usize, S: BBPSeries> Node for StaticNodeBBP<N, S> {
     type Ctx = Shift;
+    const LEAF_LIMBS: u64 = STATIC_BBP_LEAF_LIMBS;
+
+    fn limbs(ctx: &Shift, a: u64, b: u64) -> u64 {
+        est_limbs(a, b, S::q, ctx.0).min(N as u64)
+    }
 
     // Only merges drop limbs, so a leaf too big for N limbs splits itself.
     fn leaf(ctx: &Shift, a: u64, b: u64, last: bool) -> Self {
@@ -717,7 +797,13 @@ pub struct DynNodeEngel<S: EngelSeries> {
 
 impl<S: EngelSeries> Node for DynNodeEngel<S> {
     type Ctx = Shift;
+    const LEAF_LIMBS: u64 = DYN_ENGEL_LEAF_LIMBS;
     const PARALLEL: bool = true;
+
+    // P, about Q * 2^(shift t).
+    fn limbs(ctx: &Shift, a: u64, b: u64) -> u64 {
+        est_limbs(a, b, S::q, ctx.0)
+    }
 
     fn leaf(ctx: &Shift, a: u64, b: u64, _: bool) -> Self {
         let terms = (b - a) as usize;
@@ -810,6 +896,11 @@ impl<const N: usize, S: EngelSeries> StaticNodeEngel<N, S> {
 
 impl<const N: usize, S: EngelSeries> Node for StaticNodeEngel<N, S> {
     type Ctx = Shift;
+    const LEAF_LIMBS: u64 = STATIC_ENGEL_LEAF_LIMBS;
+
+    fn limbs(ctx: &Shift, a: u64, b: u64) -> u64 {
+        est_limbs(a, b, S::q, ctx.0).min(N as u64)
+    }
 
     // Only merges drop Q's limbs, so a leaf too big for N limbs splits itself.
     fn leaf(ctx: &Shift, a: u64, b: u64, last: bool) -> Self {
@@ -887,11 +978,21 @@ pub trait HyperSeries {
     }
 }
 
+// Bits x^n adds per term: none when x = 1.
+fn x_bits(x: &[u64]) -> u64 {
+    if x == [1] {
+        0
+    } else {
+        64 * (x.len() - 1) as u64 + bit_len(x[x.len() - 1])
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DynHyperCtx {
     shift: u64,
     // None when x = 1.
     x: Option<Vec<u64>>,
+    x_bits: u64,
 }
 
 impl DynHyperCtx {
@@ -903,6 +1004,7 @@ impl DynHyperCtx {
         DynHyperCtx {
             shift,
             x: (x != [1]).then(|| x.to_vec()),
+            x_bits: x_bits(x),
         }
     }
 }
@@ -911,6 +1013,7 @@ impl DynHyperCtx {
 pub struct StaticHyperCtx<const N: usize> {
     shift: u64,
     x: Option<([u64; N], usize)>,
+    x_bits: u64,
 }
 
 impl<const N: usize> StaticHyperCtx<N> {
@@ -925,6 +1028,7 @@ impl<const N: usize> StaticHyperCtx<N> {
         StaticHyperCtx {
             shift,
             x: (x != [1]).then_some((limbs, x.len())),
+            x_bits: x_bits(x),
         }
     }
 }
@@ -942,7 +1046,14 @@ pub struct DynNodeHyper<S: HyperSeries> {
 
 impl<S: HyperSeries> Node for DynNodeHyper<S> {
     type Ctx = DynHyperCtx;
+    const LEAF_LIMBS: u64 = DYN_HYPER_LEAF_LIMBS;
+    const LEAF_TERMS: u64 = DYN_HYPER_LEAF_TERMS;
     const PARALLEL: bool = true;
+
+    // P, about the larger of Q * 2^(shift t) and R x^t.
+    fn limbs(ctx: &DynHyperCtx, a: u64, b: u64) -> u64 {
+        est_limbs(a, b, S::q, ctx.shift).max(est_limbs(a, b, S::r, ctx.x_bits))
+    }
 
     fn leaf(ctx: &DynHyperCtx, a: u64, b: u64, last: bool) -> Self {
         let terms = (b - a) as usize;
@@ -1120,6 +1231,13 @@ impl<const N: usize, S: HyperSeries> StaticNodeHyper<N, S> {
 
 impl<const N: usize, S: HyperSeries> Node for StaticNodeHyper<N, S> {
     type Ctx = StaticHyperCtx<N>;
+    const LEAF_LIMBS: u64 = STATIC_HYPER_LEAF_LIMBS;
+    const LEAF_TERMS: u64 = STATIC_HYPER_LEAF_TERMS;
+
+    fn limbs(ctx: &StaticHyperCtx<N>, a: u64, b: u64) -> u64 {
+        let est = est_limbs(a, b, S::q, ctx.shift).max(est_limbs(a, b, S::r, ctx.x_bits));
+        est.min(N as u64)
+    }
 
     // Only merges drop Q's limbs, so a leaf too big for N limbs splits itself.
     fn leaf(ctx: &StaticHyperCtx<N>, a: u64, b: u64, last: bool) -> Self {

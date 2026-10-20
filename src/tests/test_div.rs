@@ -1972,3 +1972,47 @@ fn test_static_division_capacity_uses_factored_operands() {
     let n = rand_nonzero_vec(96, 20_201);
     exercise_body_overflow_contract::<32>("tight factored operands", &n, &d);
 }
+
+// rcp_dyn/rcp_static used to break the error contract from R = 727 upward
+// (R % 8 == 7 first, then runs past ~1450): hi_mul_dyn/hi_mul_static cut
+// operands to exactly out.len() limbs, injecting ~B ulps into an untruncated
+// Newton step, and each later step squared it. The old sweeps stopped at R = 200.
+#[test]
+fn test_nr_reciprocal_high_precision_regressions() {
+    let precisions = (720usize..=760).chain([1449, 1450, 1451, 1452, 1453, 1454, 1455, 1456, 2047]);
+    for r in precisions {
+        let mut normalized = rand_nonzero_vec(r, 13_000 + r as u64);
+        normalized[r - 1] |= 1 << 63;
+        let exact = exact_rcp_reference(&normalized, r);
+        let mut rcp = vec![0u64; r];
+        nr_rcp_dyn(&normalized, &mut rcp);
+        assert_rcp_precision(&format!("newton-raphson r={r}"), &rcp, &exact);
+        rcp_dyn(&normalized, &mut rcp);
+        assert_rcp_precision(&format!("dispatcher r={r}"), &rcp, &exact);
+    }
+
+    // Unnormalized and longer-than-precision divisors take the shifted path
+    // and the high-window trim.
+    for &(d_len, r) in &[(727usize, 727usize), (1600, 1455), (3000, 743), (5, 1455)] {
+        let mut d = rand_nonzero_vec(d_len, 13_500 + (d_len * 7 + r) as u64);
+        d[d_len - 1] = (d[d_len - 1] >> 37) | 1;
+        let exact = exact_rcp_reference(&d, r);
+        let mut rcp = vec![0u64; r];
+        nr_rcp_dyn(&d, &mut rcp);
+        assert_rcp_precision(&format!("newton-raphson d={d_len} r={r}"), &rcp, &exact);
+    }
+}
+
+#[test]
+fn test_nr_reciprocal_static_high_precision_regressions() {
+    for r in [727usize, 735, 743, 1455] {
+        let mut d = rand_nonzero_vec(r, 14_000 + r as u64);
+        d[r - 1] |= 1 << 63;
+        let exact = exact_rcp_reference(&d, r);
+        let mut rcp = vec![0u64; r];
+        nr_rcp_static::<2048>(&d, &mut rcp);
+        assert_rcp_precision(&format!("static newton-raphson r={r}"), &rcp, &exact);
+        rcp_static::<2048>(&d, &mut rcp);
+        assert_rcp_precision(&format!("static dispatcher r={r}"), &rcp, &exact);
+    }
+}

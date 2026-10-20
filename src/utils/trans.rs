@@ -103,20 +103,18 @@ fn exp_zero_limbs(t: u64) -> usize {
     (t.saturating_sub(1) / 64) as usize
 }
 
-const FIRST_EXP_CUTOFF: u64 = 32;
 fn first_exp_series_dyn(k: u64, w: usize, out: &mut [u64]) {
     let ctx = Shift(k);
     let n = minimize_terms(exp_err, k, w as u64);
-    let node = bin_split::<DynNodeEngel<FirstExp>, FIRST_EXP_CUTOFF>(&ctx, 1, n + GAURD_TERMS);
+    let node = bin_split::<DynNodeEngel<FirstExp>>(&ctx, 1, n + GAURD_TERMS);
     let z = (w - out.len()) as i64;
     ratio_to_fraction_dyn(&node.p, &node.q, (k * (node.b - node.a)) as i64 - 64 * z, out);
 }
 
-const EXP_CUTOFF: u64 = 32;
 fn exp_series_dyn(t: u64, k: u64, r: &[u64], w: usize, out: &mut [u64]) {
     let ctx = DynHyperCtx::new(r, k);
     let n = minimize_terms(exp_err, t, w as u64);
-    let node = bin_split::<DynNodeHyper<Exp>, EXP_CUTOFF>(&ctx, 1, n + GAURD_TERMS);
+    let node = bin_split::<DynNodeHyper<Exp>>(&ctx, 1, n + GAURD_TERMS);
     let mut scratch = ScratchGuard::acquire();
     let pr = scratch.get(node.p.len() + r.len());
     mul_dyn(&node.p, r, pr);

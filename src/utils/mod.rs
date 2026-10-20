@@ -65,15 +65,27 @@ pub const STATIC_SQRT_REM_ZIMMERMAN_CUTOFF: usize = 20;
 pub const STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF: usize = 15;
 pub const STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF: usize = 14;
 
-pub const LN2_TERM_CUTOFF: u64 = 640;
-
 // ln(2) computes its four series in parallel from this many output limbs.
 pub const LN2_PAR_CUTOFF: usize = 40;
 
+// Binary splitting builds a range as one leaf once its node's estimated size
+// (Node::limbs) drops below LEAF_LIMBS, or it has at most LEAF_TERMS terms.
+// Hyper's terms can each multiply by a wide x, which makes its leaves cost
+// more per limb, so it also keeps a few terms per leaf. See
+// docs/bin_split_cutoff_tuning.md.
+pub const DYN_BBP_LEAF_LIMBS: u64 = 64;
+pub const STATIC_BBP_LEAF_LIMBS: u64 = 512;
+pub const DYN_ENGEL_LEAF_LIMBS: u64 = 96;
+pub const STATIC_ENGEL_LEAF_LIMBS: u64 = 128;
+pub const DYN_HYPER_LEAF_LIMBS: u64 = 48;
+pub const DYN_HYPER_LEAF_TERMS: u64 = 8;
+pub const STATIC_HYPER_LEAF_LIMBS: u64 = 64;
+pub const STATIC_HYPER_LEAF_TERMS: u64 = 8;
+
 // Dynamic binary splitting builds a split's two halves in parallel from this
-// many terms, and a merge's independent products once its Q reaches this many
-// limbs.
-pub const DYN_BIN_SPLIT_PAR_CUTOFF: u64 = 2048;
+// many estimated limbs, and a merge's independent products once its Q reaches
+// this many limbs.
+pub const DYN_BIN_SPLIT_PAR_CUTOFF: u64 = 256;
 pub const DYN_BIN_SPLIT_MERGE_PAR_CUTOFF: usize = 256;
 
 thread_local! {

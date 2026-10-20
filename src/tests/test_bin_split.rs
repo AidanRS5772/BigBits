@@ -1,11 +1,24 @@
 use crate::utils::bin_split::*;
 use crate::utils::consts::consts::{ln2_dyn, ln2_static, LN2_LIMBS};
 use crate::utils::utils::{add_prim, cmp_buf, sub_buf, trim_lz};
-use crate::utils::LN2_TERM_CUTOFF;
 use std::marker::PhantomData;
 
-// A small leaf cutoff gives deep trees, so most work runs through merges.
-const C: u64 = 16;
+// Small leaves give deep trees, so most work runs through merges, and the
+// low parallel cutoff runs most of the splits of a large tree in parallel.
+const C: SplitCutoffs = SplitCutoffs {
+    leaf_limbs: 2,
+    leaf_terms: 1,
+    par_limbs: 64,
+};
+
+// Serial cutoffs with leaves of at most leaf_terms terms, or below leaf_limbs.
+fn leaves(leaf_limbs: u64, leaf_terms: u64) -> SplitCutoffs {
+    SplitCutoffs {
+        leaf_limbs,
+        leaf_terms,
+        par_limbs: u64::MAX,
+    }
+}
 
 // Dynamic nodes are exact, unreduced fractions, so any split of [a, b), serial
 // or parallel, must match one leaf summing the whole range bit for bit.
@@ -57,7 +70,7 @@ fn check_bbp<S: BBPSeries>(shift: u64, a: u64, b: u64) {
     let ctx = Shift(shift);
     let want = DynNodeBBP::<S>::leaf(&ctx, a, b, true);
     for _ in 0..3 {
-        let got = bin_split::<DynNodeBBP<S>, C>(&ctx, a, b);
+        let got = bin_split_tree_at::<DynNodeBBP<S>>(&ctx, a, b, true, C);
         assert_eq!((got.a, got.b), (want.a, want.b));
         assert!(got.p == want.p && got.q == want.q, "BBP [{a}, {b}) differs");
     }
@@ -78,7 +91,7 @@ fn test_engel_tree_matches_single_leaf() {
         let ctx = Shift(1);
         let want = DynNodeEngel::<EngelFact>::leaf(&ctx, 2, b, true);
         for _ in 0..3 {
-            let got = bin_split::<DynNodeEngel<EngelFact>, C>(&ctx, 2, b);
+            let got = bin_split_tree_at::<DynNodeEngel<EngelFact>>(&ctx, 2, b, true, C);
             assert!(got.p == want.p && got.q == want.q, "Engel [2, {b}) differs");
         }
     }
@@ -89,7 +102,7 @@ fn check_hyper(x: &[u64], shift: u64, b: u64) {
     for last in [true, false] {
         let want = DynNodeHyper::<Hyp>::leaf(&ctx, 0, b, last);
         for _ in 0..3 {
-            let got = bin_split_tree::<DynNodeHyper<Hyp>, C>(&ctx, 0, b, last);
+            let got = bin_split_tree_at::<DynNodeHyper<Hyp>>(&ctx, 0, b, last, C);
             assert!(
                 got.p == want.p && got.q == want.q && got.r == want.r,
                 "Hyper x={x:?} [0, {b}) last={last} differs"
@@ -206,17 +219,18 @@ where
     D::Ctx: Sync,
     S::Ctx: Sync,
 {
-    check_static_at::<D, S, C>(dyn_ctx, static_ctx, a, b, 13, true);
+    check_static_at::<D, S>(dyn_ctx, static_ctx, a, b, 13, true, C);
 }
 
-// check_static with the static tree split at cutoff CUT into len limbs.
-fn check_static_at<D, S, const CUT: u64>(
+// check_static with the static tree split at cut into len limbs.
+fn check_static_at<D, S>(
     dyn_ctx: &D::Ctx,
     static_ctx: &S::Ctx,
     a: u64,
     b: u64,
     len: usize,
     last: bool,
+    cut: SplitCutoffs,
 ) where
     D: Node + Send,
     S: Node + Send,
@@ -224,9 +238,9 @@ fn check_static_at<D, S, const CUT: u64>(
     S::Ctx: Sync,
 {
     let (mut want, mut got) = (vec![0u64; len], vec![0u64; len]);
-    let want_neg = bin_split_tree::<D, C>(dyn_ctx, a, b, last).finalize(dyn_ctx, &mut want);
-    let got_neg = bin_split_tree::<S, CUT>(static_ctx, a, b, last).finalize(static_ctx, &mut got);
-    let what = format!("static [{a}, {b}) at cutoff {CUT}, {len} limbs");
+    let want_neg = bin_split_tree_at::<D>(dyn_ctx, a, b, last, C).finalize(dyn_ctx, &mut want);
+    let got_neg = bin_split_tree_at::<S>(static_ctx, a, b, last, cut).finalize(static_ctx, &mut got);
+    let what = format!("static [{a}, {b}) at {cut:?}, {len} limbs");
     assert_eq!(got_neg, want_neg, "{what} has the wrong sign");
     // Limbs are little-endian, so order them from the top.
     let (lo, hi) = if got.iter().rev().le(want.iter().rev()) {
@@ -360,10 +374,10 @@ fn assert_signed(p: &[u64], neg: bool, want: (Vec<u64>, bool), what: &str) {
 
 fn check_signed_bbp<const K: u8>(shift: u64, a: u64, b: u64) {
     let ctx = Shift(shift);
-    let pos = bin_split::<DynNodeBBP<SBbp<K, 1>>, C>(&ctx, a, b);
-    let neg = bin_split::<DynNodeBBP<SBbp<K, 2>>, C>(&ctx, a, b);
+    let pos = bin_split_tree_at::<DynNodeBBP<SBbp<K, 1>>>(&ctx, a, b, true, C);
+    let neg = bin_split_tree_at::<DynNodeBBP<SBbp<K, 2>>>(&ctx, a, b, true, C);
     let want = signed_diff(&pos.p, &neg.p);
-    let tree = bin_split::<DynNodeBBP<SBbp<K, 0>>, C>(&ctx, a, b);
+    let tree = bin_split_tree_at::<DynNodeBBP<SBbp<K, 0>>>(&ctx, a, b, true, C);
     let leaf = DynNodeBBP::<SBbp<K, 0>>::leaf(&ctx, a, b, true);
     for (got, how) in [(&tree, "tree"), (&leaf, "leaf")] {
         let what = format!("BBP K={K} shift={shift} [{a}, {b}) {how}");
@@ -374,10 +388,10 @@ fn check_signed_bbp<const K: u8>(shift: u64, a: u64, b: u64) {
 
 fn check_signed_engel<const K: u8>(shift: u64, a: u64, b: u64) {
     let ctx = Shift(shift);
-    let pos = bin_split::<DynNodeEngel<SEngel<K, 1>>, C>(&ctx, a, b);
-    let neg = bin_split::<DynNodeEngel<SEngel<K, 2>>, C>(&ctx, a, b);
+    let pos = bin_split_tree_at::<DynNodeEngel<SEngel<K, 1>>>(&ctx, a, b, true, C);
+    let neg = bin_split_tree_at::<DynNodeEngel<SEngel<K, 2>>>(&ctx, a, b, true, C);
     let want = signed_diff(&pos.p, &neg.p);
-    let tree = bin_split::<DynNodeEngel<SEngel<K, 0>>, C>(&ctx, a, b);
+    let tree = bin_split_tree_at::<DynNodeEngel<SEngel<K, 0>>>(&ctx, a, b, true, C);
     let leaf = DynNodeEngel::<SEngel<K, 0>>::leaf(&ctx, a, b, true);
     for (got, how) in [(&tree, "tree"), (&leaf, "leaf")] {
         let what = format!("Engel K={K} shift={shift} [{a}, {b}) {how}");
@@ -389,10 +403,10 @@ fn check_signed_engel<const K: u8>(shift: u64, a: u64, b: u64) {
 fn check_signed_hyper<const K: u8>(x: &[u64], shift: u64, b: u64) {
     let ctx = DynHyperCtx::new(x, shift);
     for last in [true, false] {
-        let pos = bin_split_tree::<DynNodeHyper<SHyp<K, 1>>, C>(&ctx, 0, b, last);
-        let neg = bin_split_tree::<DynNodeHyper<SHyp<K, 2>>, C>(&ctx, 0, b, last);
+        let pos = bin_split_tree_at::<DynNodeHyper<SHyp<K, 1>>>(&ctx, 0, b, last, C);
+        let neg = bin_split_tree_at::<DynNodeHyper<SHyp<K, 2>>>(&ctx, 0, b, last, C);
         let want = signed_diff(&pos.p, &neg.p);
-        let tree = bin_split_tree::<DynNodeHyper<SHyp<K, 0>>, C>(&ctx, 0, b, last);
+        let tree = bin_split_tree_at::<DynNodeHyper<SHyp<K, 0>>>(&ctx, 0, b, last, C);
         let leaf = DynNodeHyper::<SHyp<K, 0>>::leaf(&ctx, 0, b, last);
         for (got, how) in [(&tree, "tree"), (&leaf, "leaf")] {
             let what = format!("Hyper K={K} x={x:?} [0, {b}) last={last} {how}");
@@ -530,7 +544,9 @@ impl BBPSeries for Ln2Like {
     }
 }
 
-// u64::MAX makes [a, b) a single leaf, so all splitting happens inside it.
+// Single-term leaves, leaves of up to two terms, the default cutoffs, and
+// u64::MAX limbs, which makes [a, b) a single leaf so all splitting happens
+// inside it.
 fn check_static_cutoffs<D, S>(dyn_ctx: &D::Ctx, static_ctx: &S::Ctx, a: u64, b: u64, len: usize)
 where
     D: Node + Send,
@@ -538,10 +554,14 @@ where
     D::Ctx: Sync,
     S::Ctx: Sync,
 {
-    check_static_at::<D, S, 2>(dyn_ctx, static_ctx, a, b, len, true);
-    check_static_at::<D, S, 3>(dyn_ctx, static_ctx, a, b, len, true);
-    check_static_at::<D, S, LN2_TERM_CUTOFF>(dyn_ctx, static_ctx, a, b, len, true);
-    check_static_at::<D, S, { u64::MAX }>(dyn_ctx, static_ctx, a, b, len, true);
+    for cut in [
+        leaves(0, 1),
+        leaves(0, 2),
+        SplitCutoffs::of::<S>(),
+        leaves(u64::MAX, 1),
+    ] {
+        check_static_at::<D, S>(dyn_ctx, static_ctx, a, b, len, true, cut);
+    }
 }
 
 fn static_any_cutoff_at<const N: usize>() {
@@ -581,8 +601,8 @@ fn static_any_cutoff_at<const N: usize>() {
     }
 }
 
-// Static leaves too big for N limbs split themselves, so every cutoff >= 2 is
-// valid at every N.
+// Static leaves too big for N limbs split themselves, so every cutoff is valid
+// at every N.
 #[test]
 fn test_static_nodes_any_cutoff() {
     static_any_cutoff_at::<4>();
@@ -591,21 +611,21 @@ fn test_static_nodes_any_cutoff() {
     static_any_cutoff_at::<64>();
 }
 
-// Leaves that overflowed their N limbs before static leaves could split.
+// Leaves that overflowed their N limbs before static leaves could split, each
+// built as one leaf as the old term cutoffs did.
 #[test]
 fn test_static_large_leaf_regressions() {
+    let one = leaves(u64::MAX, 1);
     let ctx = Shift(4);
     type D = DynNodeBBP<Ln2Like>;
-    check_static_at::<D, StaticNodeBBP<8, Ln2Like>, LN2_TERM_CUTOFF>(&ctx, &ctx, 1, 53, 5, true);
-    check_static_at::<D, StaticNodeBBP<64, Ln2Like>, LN2_TERM_CUTOFF>(
-        &ctx, &ctx, 149, 501, 61, true,
-    );
+    check_static_at::<D, StaticNodeBBP<8, Ln2Like>>(&ctx, &ctx, 1, 53, 5, true, one);
+    check_static_at::<D, StaticNodeBBP<64, Ln2Like>>(&ctx, &ctx, 149, 501, 61, true, one);
     let ctx = Shift(1);
-    check_static_at::<DynNodeEngel<EngelFact>, StaticNodeEngel<8, EngelFact>, 384>(
-        &ctx, &ctx, 2, 300, 5, true,
+    check_static_at::<DynNodeEngel<EngelFact>, StaticNodeEngel<8, EngelFact>>(
+        &ctx, &ctx, 2, 300, 5, true, one,
     );
     let (d, s) = (DynHyperCtx::new(&[1], 1), StaticHyperCtx::<8>::new(&[1], 1));
-    check_static_at::<DynNodeHyper<Hyp>, StaticNodeHyper<8, Hyp>, 384>(&d, &s, 0, 300, 5, true);
+    check_static_at::<DynNodeHyper<Hyp>, StaticNodeHyper<8, Hyp>>(&d, &s, 0, 300, 5, true, one);
 }
 
 // A fit bound that undercounts would overflow exactly at the size limit, so
@@ -624,7 +644,8 @@ fn sweep_leaves<D, S>(
     S::Ctx: Sync,
 {
     for t in 1..=max_t {
-        check_static_at::<D, S, { u64::MAX }>(dyn_ctx, static_ctx, a, a + t, len, last);
+        let one = leaves(u64::MAX, 1);
+        check_static_at::<D, S>(dyn_ctx, static_ctx, a, a + t, len, last, one);
     }
 }
 
@@ -731,28 +752,84 @@ fn top4(out: &[u64]) -> Vec<u64> {
     out.iter().rev().take(4).copied().collect()
 }
 
+// The sum over [a, b) through a deep tree into out, returning its sign.
+fn split_sum<N>(ctx: &N::Ctx, a: u64, b: u64, out: &mut [u64]) -> bool
+where
+    N: Node + Send,
+    N::Ctx: Sync,
+{
+    bin_split_tree_at::<N>(ctx, a, b, true, C).finalize(ctx, out)
+}
+
 #[test]
 fn test_signed_series_values() {
     let mut out = vec![0u64; 8];
     let ctx = Shift(1);
-    assert!(!bin_split::<DynNodeBBP<Ln3Over2>, C>(&ctx, 1, 600).finalize(&ctx, &mut out));
+    assert!(!split_sum::<DynNodeBBP<Ln3Over2>>(&ctx, 1, 600, &mut out));
     assert_eq!(top4(&out), LN3_2_TOP);
-    assert!(!bin_split::<StaticNodeBBP<16, Ln3Over2>, C>(&ctx, 1, 600).finalize(&ctx, &mut out));
+    assert!(!split_sum::<StaticNodeBBP<16, Ln3Over2>>(&ctx, 1, 600, &mut out));
     assert_eq!(top4(&out), LN3_2_TOP);
-    assert!(bin_split::<DynNodeBBP<NegLn3Over2>, C>(&ctx, 1, 600).finalize(&ctx, &mut out));
+    assert!(split_sum::<DynNodeBBP<NegLn3Over2>>(&ctx, 1, 600, &mut out));
     assert_eq!(top4(&out), LN3_2_TOP);
-    assert!(bin_split::<StaticNodeBBP<16, NegLn3Over2>, C>(&ctx, 1, 600).finalize(&ctx, &mut out));
+    assert!(split_sum::<StaticNodeBBP<16, NegLn3Over2>>(&ctx, 1, 600, &mut out));
     assert_eq!(top4(&out), LN3_2_TOP);
 
     let ctx = DynHyperCtx::new(&[1], 1);
-    assert!(!bin_split::<DynNodeHyper<ExpHalf>, C>(&ctx, 0, 200).finalize(&ctx, &mut out));
+    assert!(!split_sum::<DynNodeHyper<ExpHalf>>(&ctx, 0, 200, &mut out));
     assert_eq!(top4(&out), EXP_HALF_TOP);
     // With x = 2^64 and 65 bits of shift per term, S is e^(-1/2) / 2 / 2^64.
     let ctx = DynHyperCtx::new(&[0, 1], 65);
-    assert!(!bin_split::<DynNodeHyper<ExpHalf>, C>(&ctx, 0, 200).finalize(&ctx, &mut out));
+    assert!(!split_sum::<DynNodeHyper<ExpHalf>>(&ctx, 0, 200, &mut out));
     assert_eq!(out[7], 0);
     assert_eq!(top4(&out)[1..], EXP_HALF_TOP[..3]);
     let ctx = StaticHyperCtx::<16>::new(&[0, 1], 65);
-    assert!(!bin_split::<StaticNodeHyper<16, ExpHalf>, C>(&ctx, 0, 200).finalize(&ctx, &mut out));
+    assert!(!split_sum::<StaticNodeHyper<16, ExpHalf>>(&ctx, 0, 200, &mut out));
     assert_eq!(top4(&out)[1..], EXP_HALF_TOP[..3]);
+}
+
+// Node::limbs only shapes the tree, but an estimate far from the real size
+// would silently move every cutoff.
+fn check_estimate(what: &str, est: u64, parts: &[usize]) {
+    let real = *parts.iter().max().unwrap() as u64;
+    assert!(
+        est <= 2 * real && real <= 2 * est,
+        "{what}: estimated {est} limbs, built {real}"
+    );
+}
+
+#[test]
+fn test_leaf_limb_estimates() {
+    for (shift, a, b) in [(4, 1, 2000), (4, 5000, 6000), (70, 5, 500)] {
+        let ctx = Shift(shift);
+        let n = DynNodeBBP::<Ln2Like>::leaf(&ctx, a, b, true);
+        let est = DynNodeBBP::<Ln2Like>::limbs(&ctx, a, b);
+        check_estimate(&format!("BBP shift {shift} [{a}, {b})"), est, &[n.p.len(), n.q.len()]);
+    }
+    let ctx = Shift(4);
+    let n = DynNodeBBP::<BbpQuad>::leaf(&ctx, 1, 1000, true);
+    let est = DynNodeBBP::<BbpQuad>::limbs(&ctx, 1, 1000);
+    check_estimate("BBP quadratic q", est, &[n.p.len(), n.q.len()]);
+
+    for (shift, a, b) in [(0, 2, 2000), (1, 1000, 3000), (70, 2, 500)] {
+        let ctx = Shift(shift);
+        let n = DynNodeEngel::<EngelFact>::leaf(&ctx, a, b, true);
+        let est = DynNodeEngel::<EngelFact>::limbs(&ctx, a, b);
+        check_estimate(&format!("Engel shift {shift} [{a}, {b})"), est, &[n.p.len(), n.q.len()]);
+    }
+
+    let x8: Vec<u64> = (1..=8u64).map(|i| i.wrapping_mul(0x9e37_79b9_7f4a_7c15)).collect();
+    let xs: [(&[u64], u64, u64); 4] = [
+        (&[1], 8, 2000),
+        (&[12345], 20, 2000),
+        (&[0x9e37_79b9_7f4a_7c15, 0xff_ffff_ffff], 112, 500),
+        (&x8, 520, 100),
+    ];
+    for (x, shift, b) in xs {
+        let ctx = DynHyperCtx::new(x, shift);
+        let n = DynNodeHyper::<Hyp>::leaf(&ctx, 0, b, false);
+        let est = DynNodeHyper::<Hyp>::limbs(&ctx, 0, b);
+        let r = n.r.as_ref().map_or(0, |r| r.len());
+        let what = format!("Hyper {}-limb x shift {shift} [0, {b})", x.len());
+        check_estimate(&what, est, &[n.p.len(), n.q.len(), r]);
+    }
 }
