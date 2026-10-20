@@ -4,7 +4,9 @@
 //       [--par 256,max] [--cands 0/31/max,64/1/max] [--rounds 9] [--sizes 256,1024]
 //
 // Families: bbp, engel, hyper, sbbp, sengel, shyper (leaf sweeps, serial), par (parallel
-// cutoff, all threads, default leaves) and e2e (old term cutoffs against the defaults).
+// cutoff, all threads, default leaves), exp (exp_dyn's first-chunk width from --limbs and
+// chunk-parallel gate from --par, defaulting to the current constants) and e2e (old term
+// cutoffs against the defaults).
 // Each candidate times a tree build only: finalize doesn't depend on the tree's shape.
 // Candidates alternate within each round and each one reports its median over rounds,
 // relative to the workload's best; the summary is the geometric mean over workloads.
@@ -12,13 +14,14 @@
 use big_bits::utils::{
     bin_split::{
         bin_split_tree_at, BBPSeries, DynHyperCtx, DynNodeBBP, DynNodeEngel, DynNodeHyper,
-        EngelSeries, HyperSeries, Node, Shift, SplitCutoffs, StaticHyperCtx, StaticNodeBBP,
-        StaticNodeEngel, StaticNodeHyper,
+        HyperSeries, Node, Shift, SplitCutoffs, StaticHyperCtx, StaticNodeBBP, StaticNodeEngel,
+        StaticNodeHyper,
     },
-    trans::exp_dyn,
+    trans::{exp_dyn, exp_dyn_at, exp_terms, Exp, ExpCutoffs},
+    DYN_EXP_CHUNK_MIN_BITS, DYN_EXP_CHUNK_PAR_WORK,
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use std::{env, f64::consts::E, f64::consts::PI, hint::black_box, time::Instant};
+use std::{env, hint::black_box, time::Instant};
 
 // The four ln(2) series, sum 1 / (q(n) 16^n).
 struct Ln2A;
@@ -58,29 +61,6 @@ impl BBPSeries for Ln2D {
     }
 }
 
-// e^x's series: Engel 1 / n! for the first chunk, Hyper x^n / n! for the rest.
-struct FirstExp;
-impl EngelSeries for FirstExp {
-    fn p(_: u64) -> u64 {
-        1
-    }
-    fn q(n: u64) -> u64 {
-        n
-    }
-}
-struct Exp;
-impl HyperSeries for Exp {
-    fn p(_: u64) -> u64 {
-        1
-    }
-    fn q(n: u64) -> u64 {
-        n
-    }
-    fn r(_: u64) -> u64 {
-        1
-    }
-}
-
 // Ratio (2n + 1) / (2n + 4) per term.
 struct Hyp;
 impl HyperSeries for Hyp {
@@ -93,32 +73,6 @@ impl HyperSeries for Hyp {
     fn r(n: u64) -> u64 {
         2 * n + 1
     }
-}
-
-// trans.rs's term count: the first n whose remainder drops below 2^(-64 w).
-fn exp_err(n: u64, s: u64) -> u64 {
-    let e1 = E.log2();
-    let e2 = (e1 - PI.log2() - 1.0) * 0.5;
-    let nf = n as f64;
-    n * s + ((nf + 0.5) * nf.log2() - nf * e1 - e2).max(0.0).floor() as u64
-}
-
-fn exp_terms(s: u64, w: usize) -> u64 {
-    let p = 64 * w as u64;
-    let mut n = 1;
-    while exp_err(n, s) < p {
-        n <<= 1;
-    }
-    let (mut a, mut b) = (n / 2, n);
-    while b - a > 1 {
-        let m = (a + b) / 2;
-        if exp_err(m, s) >= p {
-            b = m;
-        } else {
-            a = m;
-        }
-    }
-    b + 1
 }
 
 fn ln2_terms(limbs: usize) -> u64 {
@@ -214,12 +168,12 @@ fn engel_workloads(args: &Args) -> Vec<Workload> {
     for k in [0u64, 1, 8, 64, 512] {
         for l in sizes_or(args, &[256, 1024, 4096, 16384]) {
             // k = 0 is e - 2; k > 0 is exp's first chunk at shift k.
-            let n = exp_terms(k.max(1), l);
+            let n = exp_terms(k.max(1), l) + 1;
             if n < 8 {
                 continue;
             }
             v.push(workload(format!("engel k={k} {l}"), move |c| {
-                tree::<DynNodeEngel<FirstExp>>(&Shift(k), 1, n, c)
+                tree::<DynNodeEngel<Exp>>(&Shift(k), 1, n, c)
             }));
         }
     }
@@ -237,7 +191,7 @@ fn hyper_workloads(args: &Args) -> Vec<Workload> {
     }
     for xb in [8u64, 32, 128, 512, 2048, 8192] {
         for l in sizes_or(args, &[256, 1024, 4096]) {
-            let n = exp_terms(xb, l);
+            let n = exp_terms(xb, l) + 1;
             if n < 8 {
                 continue;
             }
@@ -257,9 +211,9 @@ fn sbbp_at<const N: usize>(v: &mut Vec<Workload>) {
 
 fn sengel_at<const N: usize>(v: &mut Vec<Workload>) {
     for k in [0u64, 1, 64] {
-        let n = exp_terms(k.max(1), N - 3);
+        let n = exp_terms(k.max(1), N - 3) + 1;
         v.push(workload(format!("engel k={k} N={N}"), move |c| {
-            tree::<StaticNodeEngel<N, FirstExp>>(&Shift(k), 1, n, c)
+            tree::<StaticNodeEngel<N, Exp>>(&Shift(k), 1, n, c)
         }));
     }
 }
@@ -271,7 +225,7 @@ fn shyper_at<const N: usize>(v: &mut Vec<Workload>) {
         tree::<StaticNodeHyper<N, Hyp>>(&StaticHyperCtx::<N>::new(&[1], 8), 0, n, c)
     }));
     for xb in [32u64, 512] {
-        let n = exp_terms(xb, N - 3);
+        let n = exp_terms(xb, N - 3) + 1;
         if n < 8 {
             continue;
         }
@@ -315,17 +269,49 @@ fn par_workloads(args: &Args) -> Vec<Workload> {
         v.push(workload(format!("ln2 {l}"), move |c| {
             ln2_dyn_tree(n, with_leaves::<DynNodeBBP<Ln2A>>(c))
         }));
-        let n = exp_terms(1, l);
+        let n = exp_terms(1, l) + 1;
         v.push(workload(format!("engel k=1 {l}"), move |c| {
-            tree::<DynNodeEngel<FirstExp>>(&Shift(1), 1, n, with_leaves::<DynNodeEngel<FirstExp>>(c))
+            tree::<DynNodeEngel<Exp>>(&Shift(1), 1, n, with_leaves::<DynNodeEngel<Exp>>(c))
         }));
         for xb in [32u64, 512] {
-            let n = exp_terms(xb, l);
+            let n = exp_terms(xb, l) + 1;
             let ctx = DynHyperCtx::new(&rand_x(xb, &mut rng), 2 * xb);
             v.push(workload(format!("exp xb={xb} {l}"), move |c| {
                 tree::<DynNodeHyper<Exp>>(&ctx, 1, n, with_leaves::<DynNodeHyper<Exp>>(c))
             }));
         }
+    }
+    v
+}
+
+// exp_dyn's schedule cutoffs: whole exp_dyn calls over precision l and leading zero
+// limbs m, which together set the chunk count. A candidate's leaf_limbs is the first
+// chunk's minimum width in bits, and its par_limbs the parallel gate's chunks * v.
+fn exp_workloads(args: &Args) -> Vec<Workload> {
+    let mut v = Vec::new();
+    let mut rng = StdRng::seed_from_u64(19);
+    let mut shapes = Vec::new();
+    for l in sizes_or(args, &[4, 8, 12, 16, 24, 32, 48, 64, 128, 256, 1024, 4096]) {
+        let lm = l as u64;
+        let mut ms = vec![0, 1, 2, 4, lm / 8, lm / 4, lm / 2, lm];
+        ms.sort();
+        ms.dedup();
+        shapes.extend(ms.into_iter().map(|m| (l, m)));
+    }
+    if args.sizes.is_none() {
+        // Where the narrow chunks near x's top cost the most.
+        shapes.push((16384, 0));
+    }
+    for (l, m) in shapes {
+        let x = rand_x(64 * l as u64 - 1, &mut rng);
+        let out = std::cell::RefCell::new(vec![0; l]);
+        v.push(workload(format!("l={l} m={m}"), move |c| {
+            let cut = ExpCutoffs {
+                chunk_min_bits: c.leaf_limbs,
+                par_work: c.par_limbs as usize,
+            };
+            black_box(exp_dyn_at(&x, m, &mut out.borrow_mut(), cut));
+        }));
     }
     v
 }
@@ -374,11 +360,13 @@ fn parse_list(s: &str) -> Vec<u64> {
 
 fn args() -> Args {
     let mut it = env::args().skip(1).filter(|a| a != "--bench");
+    let family = it.next().expect("family");
+    let exp = family == "exp";
     let mut a = Args {
-        family: it.next().expect("family"),
-        limbs: (1..=11).map(|i| 1 << i).collect(),
+        limbs: if exp { vec![DYN_EXP_CHUNK_MIN_BITS] } else { (1..=11).map(|i| 1 << i).collect() },
         terms: vec![1],
-        par: vec![u64::MAX],
+        par: vec![if exp { DYN_EXP_CHUNK_PAR_WORK as u64 } else { u64::MAX }],
+        family,
         cands: None,
         rounds: 9,
         sizes: None,
@@ -505,15 +493,15 @@ fn e2e(args: &Args) {
     }
     for l in sizes_or(args, &[256, 1024, 4096]) {
         // exp_dyn's series: the Engel first chunk, then every Hyper chunk.
-        let first = exp_terms(1, l);
+        let first = exp_terms(1, l) + 1;
         let chunks: Vec<(DynHyperCtx, u64)> = exp_chunks(l)
             .into_iter()
-            .map(|(xb, shift, s)| (DynHyperCtx::new(&rand_x(xb, &mut rng), shift), exp_terms(s, l)))
+            .map(|(xb, shift, s)| (DynHyperCtx::new(&rand_x(xb, &mut rng), shift), exp_terms(s, l) + 1))
             .collect();
-        let new = (serial::<DynNodeEngel<FirstExp>>(), serial::<DynNodeHyper<Exp>>());
+        let new = (serial::<DynNodeEngel<Exp>>(), serial::<DynNodeHyper<Exp>>());
         let w = workload(format!("exp chunks {l}"), move |c| {
             let (ce, ch) = if c.leaf_limbs == 0 { (c, c) } else { new };
-            tree::<DynNodeEngel<FirstExp>>(&Shift(1), 1, first, ce);
+            tree::<DynNodeEngel<Exp>>(&Shift(1), 1, first, ce);
             for (ctx, n) in &chunks {
                 tree::<DynNodeHyper<Exp>>(ctx, 1, *n, ch);
             }
@@ -602,6 +590,10 @@ fn main() {
         "engel" => sweep(&engel_workloads(&a), &cands, a.rounds),
         "hyper" => sweep(&hyper_workloads(&a), &cands, a.rounds),
         "par" => sweep(&par_workloads(&a), &cands, a.rounds),
+        "exp" => {
+            println!("exp: leaf limbs = first-chunk min bits, par limbs = parallel chunks * v");
+            sweep(&exp_workloads(&a), &cands, a.rounds)
+        }
         "e2e" => e2e(&a),
         f @ ("sbbp" | "sengel" | "shyper") => {
             // Static trees need far more stack than the main thread has.

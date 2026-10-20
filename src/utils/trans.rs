@@ -1,65 +1,17 @@
-use std::f64::consts::{E, PI};
-use std::sync::OnceLock;
-use crate::utils::ScratchGuard;
+use rayon::prelude::*;
+use std::f64::consts::{LOG2_E, PI};
+use crate::utils::{ScratchGuard, DYN_EXP_CHUNK_MIN_BITS, DYN_EXP_CHUNK_PAR_WORK};
 use crate::utils::bin_split::{
-    bin_split, ratio_to_fraction_dyn, DynHyperCtx, DynNodeEngel, DynNodeHyper, EngelSeries,
-    HyperSeries, Shift,
+    bin_split, ratio_to_fraction_dyn, DynHyperCtx, DynNodeEngel, DynNodeHyper,
+    EngelSeries, HyperSeries, Shift,
 };
 use crate::utils::mul::{hi_mul_dyn, mul_dyn};
 use crate::utils::utils::{add_buf, buf_len, shr_buf, split_sh};
 
-// R ~ remainder series function
-// N ~ number of terms
-// $E(N, s) = -log_2(R_{N}(2^{-s}))$
-fn minimize_terms(e: fn(u64, u64) -> u64, s: u64, p: u64) -> u64 {
-    let p = 64 * p;
-    let mut n = 1;
-    while e(n, s) < p {
-        n <<= 1;
-    }
-    let (mut a, mut b) = (n / 2, n);
-    while b - a > 1 {
-        let m = (a + b) / 2;
-        if e(m, s) >= p {
-            b = m;
-        } else {
-            a = m;
-        }
-    }
-    return b;
-}
+const EXP_GUARD_LIMBS: usize = 1;
 
-// out <- bits [idx, min(idx + sz, end)) of buf as an integer, with bits counted
-// down from buf's top bit and bits at or past end treated as zero.
-// returns length of effective buffer
-fn bit_chunks(idx: u64, end: u64, sz: u64, buf: &[u64], out: &mut [u64]) -> usize {
-    debug_assert!(sz <= 64 * (out.len() as u64));
-    let total = 64 * buf.len() as u64;
-    let hi = (idx + sz).min(end).min(total);
-    if idx >= hi {
-        return 0;
-    }
-
-    // The chunk's lowest bit sits at little-endian bit total - hi.
-    let (l, sh) = split_sh(total - hi);
-    let (n, top) = split_sh(hi - idx);
-    let len = n + (top != 0) as usize;
-    for i in 0..len {
-        let next = buf.get(l + i + 1).copied().unwrap_or(0);
-        out[i] = if sh == 0 {
-            buf[l + i]
-        } else {
-            buf[l + i] >> sh | next << (64 - sh)
-        };
-    }
-    if top != 0 {
-        out[len - 1] &= (1 << top) - 1;
-    }
-    buf_len(&out[..len])
-}
-
-struct FirstExp;
-impl EngelSeries for FirstExp {
+pub struct Exp;
+impl EngelSeries for Exp {
     fn p(_: u64) -> u64 {
         1
     }
@@ -67,8 +19,6 @@ impl EngelSeries for FirstExp {
         n
     }
 }
-
-struct Exp;
 impl HyperSeries for Exp {
     fn p(_: u64) -> u64 {
         1
@@ -81,114 +31,145 @@ impl HyperSeries for Exp {
     }
 }
 
-
-fn exp_err(n: u64, s: u64) -> u64 {
-    static CONSTS: OnceLock<(f64, f64)> = OnceLock::new();
-    let (exp_err1, exp_err2) = *CONSTS.get_or_init(|| {
-        let e1 = E.log2();
-        let e2 = (e1 - PI.log2() - 1.0) * 0.5;
-        (e1, e2)
-    });
-    let nf = n as f64;
-    n * s
-        + ((nf + 0.5) * nf.log2() - nf * exp_err1 - exp_err2)
-            .max(0.0)
-            .floor() as u64
+pub fn exp_terms(s: u64, w: usize) -> u64 {
+    let c = (LOG2_E - PI.log2() - 1.0) * 0.5;
+    let p = 64 * w as u64;
+    // E(a) < p <= E(b): E(0) = 0 and E(n) >= n s.
+    let (mut a, mut b) = (0, p.div_ceil(s));
+    while b - a > 1 {
+        let n = (a + b) / 2;
+        let nf = n as f64;
+        if n * s + ((nf + 0.5) * nf.log2() - nf * LOG2_E - c) as u64 >= p {
+            b = n;
+        } else {
+            a = n;
+        }
+    }
+    b
 }
-
-const GAURD_TERMS: u64 = 1;
-const EXP_GUARD_LIMBS: usize = 1;
 
 fn exp_zero_limbs(t: u64) -> usize {
     (t.saturating_sub(1) / 64) as usize
 }
 
-fn first_exp_series_dyn(k: u64, w: usize, out: &mut [u64]) {
-    let ctx = Shift(k);
-    let n = minimize_terms(exp_err, k, w as u64);
-    let node = bin_split::<DynNodeEngel<FirstExp>>(&ctx, 1, n + GAURD_TERMS);
-    let z = (w - out.len()) as i64;
-    ratio_to_fraction_dyn(&node.p, &node.q, (k * (node.b - node.a)) as i64 - 64 * z, out);
+fn chunk_bits<'r>(
+    x: &[u64],
+    e: u64,
+    s: u64,
+    width: u64,
+    out: &'r mut [u64],
+) -> Option<(&'r [u64], u64, u64)> {
+    let (l, sh) = split_sh(e - s - width);
+    let n = width.div_ceil(64) as usize;
+    let c = (n + 1).min(x.len() - l);
+    out[..c].copy_from_slice(&x[l..l + c]);
+    shr_buf(&mut out[..c], sh);
+    out[n - 1] &= u64::MAX >> (64 * n as u64 - width);
+    let skip = out[..n].iter().position(|&l| l != 0)?;
+    let tz = out[skip].trailing_zeros();
+    let r = &mut out[skip..n];
+    shr_buf(r, tz as u8);
+    let r = &r[..buf_len(r)];
+    let k = s + width - 64 * skip as u64 - tz as u64;
+    Some((r, k - (64 * r.len() as u64 - r[r.len() - 1].leading_zeros() as u64), k))
 }
 
-fn exp_series_dyn(t: u64, k: u64, r: &[u64], w: usize, out: &mut [u64]) {
-    let ctx = DynHyperCtx::new(r, k);
-    let n = minimize_terms(exp_err, t, w as u64);
-    let node = bin_split::<DynNodeHyper<Exp>>(&ctx, 1, n + GAURD_TERMS);
-    let mut scratch = ScratchGuard::acquire();
-    let pr = scratch.get(node.p.len() + r.len());
-    mul_dyn(&node.p, r, pr);
-    let pr = &pr[..buf_len(pr)];
-    let z = (w - out.len()) as i64;
-    ratio_to_fraction_dyn(pr, &node.q, (k * (node.b - node.a)) as i64 - 64 * z, out);
+fn exp_chunks(mut s: u64, end: u64, mut min: u64) -> impl Iterator<Item = (u64, u64)> {
+    std::iter::from_fn(move || {
+        let width = (s & !1).max(2).max(std::mem::take(&mut min)).min(end.saturating_sub(s));
+        (width != 0).then(|| {
+            s += width;
+            (s - width, width)
+        })
+    })
 }
 
-// (1 + a)(1 + b) = 1 + (a + b + ab). a and b hold A and B at scale 2^-64w with their top
-// limbs left off: z of them for a, more for b. c needs b.len() - z + 1 limbs.
+fn exp_series(r: &[u64], t: u64, k: u64, w: usize, out: &mut [u64]) {
+    let n = exp_terms(t, w);
+    let shift = (k * n) as i64 - 64 * (w - out.len()) as i64;
+    if r == [1] {
+        let node = bin_split::<DynNodeEngel<Exp>>(&Shift(k), 1, n + 1);
+        ratio_to_fraction_dyn(&node.p, &node.q, shift, out);
+    } else {
+        let node = bin_split::<DynNodeHyper<Exp>>(&DynHyperCtx::new(r, k), 1, n + 1);
+        let mut scratch = ScratchGuard::acquire();
+        let pr = scratch.get(node.p.len() + r.len());
+        mul_dyn(&node.p, r, pr);
+        ratio_to_fraction_dyn(&pr[..buf_len(pr)], &node.q, shift, out);
+    }
+}
+
 fn exp_combine(a: &mut [u64], b: &[u64], z: usize, c: &mut [u64]) {
-    let bl = b.len();
+    let o = b.len().saturating_sub(z);
     let mut carry = false;
-    if bl > z {
-        let o = bl - z;
+    if o != 0 {
         c[o] = hi_mul_dyn(a, b, &mut c[..o]);
         carry = add_buf(a, &c[1..=o]);
     }
-    carry |= add_buf(a, b);
-    if carry {
+    if add_buf(a, b) | carry {
         // Only rounding can reach 2^-64z.
         a.fill(u64::MAX);
     }
 }
 
-// input x : 0 <= x < ln(2), as x * 2^(64 (x.len() + m)) with the m leading zero limbs omitted.
-// out <- e^x - 1 with its z leading zero limbs omitted, returning z:
-// e^x = 1 + out * 2^(-64 (out.len() + z)), and out's top limb is nonzero.
-pub fn exp_dyn(x: &[u64], m: u64, out: &mut [u64]) -> u64 {
-    assert!(x.last() != Some(&0));
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct ExpCutoffs {
+    pub chunk_min_bits: u64,
+    pub par_work: usize,
+}
 
-    let base = 64 * m;
-    let bit_start = x.last().copied().unwrap().leading_zeros() as u64;
-    let bit_end = 64 * x.len() as u64 - x.first().copied().unwrap().trailing_zeros() as u64;
-    let mut s = base + bit_start;
+impl ExpCutoffs {
+    pub const DEFAULT: Self = ExpCutoffs {
+        chunk_min_bits: DYN_EXP_CHUNK_MIN_BITS,
+        par_work: DYN_EXP_CHUNK_PAR_WORK,
+    };
+}
+
+pub fn exp_dyn(x: &[u64], m: u64, out: &mut [u64]) -> u64 {
+    exp_dyn_at(x, m, out, ExpCutoffs::DEFAULT)
+}
+
+#[doc(hidden)]
+pub fn exp_dyn_at(x: &[u64], m: u64, out: &mut [u64], cut: ExpCutoffs) -> u64 {
+    assert!(x.last().is_some_and(|&l| l != 0));
+
+    let e = 64 * (m + x.len() as u64);
+    let s = 64 * m + x[x.len() - 1].leading_zeros() as u64;
     let z = exp_zero_limbs(s);
     let extra = (s != 0 && s % 64 == 0) as usize;
     let v = out.len() + EXP_GUARD_LIMBS + extra;
     let w = v + z;
-    let end = (base + bit_end).min(64 * w as u64);
+    let end = (e - x[0].trailing_zeros() as u64).min(64 * w as u64);
 
+    let slot = |width: u64| width.div_ceil(64) as usize + 1;
+    let chunks = || exp_chunks(s + 1, end, cut.chunk_min_bits);
     let mut scratch = ScratchGuard::acquire();
-    let [a, b, c, chunk] = scratch.get_splits([v, v, v + 1, x.len().min(v)]);
-    first_exp_series_dyn(s + 1, w, a);
-    s += 1;
-
-    // A chunk's term count depends on its position, not its width, so start the doubling at
-    // the chunk's own offset: [s, ~2s), [~2s, ~4s), ...
-    let mut sz = (s / 2).max(1);
-    while s < end {
-        let width = (2 * sz).min(end - s);
-        let len = bit_chunks(s - base, end - base, width, x, chunk);
-        if len != 0 {
-            let skip = chunk[..len].iter().take_while(|&&l| l == 0).count();
-            let r = &mut chunk[skip..len];
-            let tz = r[0].trailing_zeros();
-            shr_buf(r, tz as u8);
-            let r = &r[..buf_len(r)];
-            let k = s + width - 64 * skip as u64 - tz as u64;
-            let t = k - (64 * r.len() as u64 - r[r.len() - 1].leading_zeros() as u64);
-            let bl = w - exp_zero_limbs(t);
-            exp_series_dyn(t, k, r, w, &mut b[..bl]);
-            exp_combine(a, &b[..bl], z, c);
-        }
-        sz *= 2;
-        s += sz;
+    let [a, c, mut rs] = scratch.get_splits([v, v + 1, chunks().map(|(_, wd)| slot(wd)).sum()]);
+    let mut series = Vec::new();
+    for (s, width) in chunks() {
+        let (r, rest) = std::mem::take(&mut rs).split_at_mut(slot(width));
+        rs = rest;
+        series.extend(chunk_bits(x, e, s, width, r));
     }
 
-    let (top, z) = if extra == 1 && a[v - 1] == 0 {
-        (v - 1, z + 1)
+    exp_series(&[1], s + 1, s + 1, w, a);
+    let n = series.len();
+    let par = cut.par_work == 0
+        || (n >= 2 && n * v >= cut.par_work && rayon::current_num_threads() > 1);
+    let mut results = ScratchGuard::acquire();
+    let mut bs = results.get_split_vec(series.iter().map(|&(_, t, _)| w - exp_zero_limbs(t)));
+    if par {
+        series.par_iter().zip(&mut bs).for_each(|(&(r, t, k), b)| exp_series(r, t, k, w, b));
     } else {
-        (v, z)
-    };
-    out.copy_from_slice(&a[top - out.len()..top]);
-    z as u64
-}
+        series.iter().zip(&mut bs).for_each(|(&(r, t, k), b)| exp_series(r, t, k, w, b));
+    }
+    for b in &bs {
+        exp_combine(a, b, z, c);
+    }
 
+    // With the slack limb, e^x - 1 may have one more leading zero limb.
+    let d = (extra == 1 && a[v - 1] == 0) as usize;
+    out.copy_from_slice(&a[v - d - out.len()..v - d]);
+    (z + d) as u64
+}

@@ -88,6 +88,17 @@ pub const STATIC_HYPER_LEAF_TERMS: u64 = 8;
 pub const DYN_BIN_SPLIT_PAR_CUTOFF: u64 = 256;
 pub const DYN_BIN_SPLIT_MERGE_PAR_CUTOFF: usize = 256;
 
+// exp_dyn evaluates its chunk series in parallel once it has at least two chunks
+// and chunks * working limbs reaches this, on a pool of two or more threads. Chunks
+// cost about the same at a given precision, so this is one decision for the whole
+// loop. See docs/bin_split_cutoff_tuning.md.
+pub const DYN_EXP_CHUNK_PAR_WORK: usize = 512;
+
+// exp_dyn's first chunk after x's top bit spans at least this many bits; later chunks
+// each span [s, ~2s). Narrower chunks near the top all sum about as many terms, so each
+// costs about as much as a wide one. See docs/bin_split_cutoff_tuning.md.
+pub const DYN_EXP_CHUNK_MIN_BITS: u64 = 16;
+
 thread_local! {
     static SCRATCH_POOL: RefCell<Vec<Vec<u64>>> = RefCell::new(Vec::new());
 }
@@ -124,6 +135,22 @@ impl ScratchGuard {
             offset += sizes[i];
             s
         })
+    }
+
+    // get_splits for a count known only at run time.
+    pub fn get_split_vec(&mut self, sizes: impl Iterator<Item = usize> + Clone) -> Vec<&mut [u64]> {
+        let tot = sizes
+            .clone()
+            .try_fold(0usize, |sum, size| sum.checked_add(size))
+            .expect("scratch split size overflow");
+        let mut rest = self.get(tot);
+        sizes
+            .map(|size| {
+                let (s, r) = std::mem::take(&mut rest).split_at_mut(size);
+                rest = r;
+                s
+            })
+            .collect()
     }
 }
 

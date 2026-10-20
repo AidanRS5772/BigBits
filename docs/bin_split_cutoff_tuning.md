@@ -185,3 +185,102 @@ The production callers had already been tuned by hand, so they stay within noise
 gain is that new series and shapes need no tuning: the ln(2) cutoff lost up to 5× on
 other series, and the exp cutoff lost up to 1.21× on exp's own wide chunks
 (exp xb=2048 1024) and 1.37× on dense Engel.
+
+## exp_dyn's schedule: first-chunk width and chunk parallelism
+
+`exp_dyn` sums one Engel series for x's top bit, then a series per chunk of x's
+remaining bits (Engel when a chunk is a single bit, Hyper otherwise), and multiplies
+the results. Each chunk spans `[s, ~2s)` of its own offset, so the widths double, but
+the first chunk is at least `DYN_EXP_CHUNK_MIN_BITS` (16) wide.
+
+Every chunk's bits are extracted up front into one pre-sized scratch buffer. The first
+series then runs on its own. The chunks then fill one slot each (`Σ bl` limbs, carved
+from one scratch acquisition), either serially or all at once on rayon. Either way they
+combine in chunk order, so the output is bit-identical. The parallel choice is made
+once per call:
+
+    chunks >= 2  &&  chunks * v >= DYN_EXP_CHUNK_PAR_WORK (512)  &&  threads >= 2
+
+Here `v` is the result's working limbs (`out.len()` + guard).
+
+The harness is `cargo bench-bin-split exp`. It times whole `exp_dyn_at` calls at
+precision `l` = 4–4096 with `m ∈ {0, 1, 2, 4, l/8, l/4, l/2, l}` leading zero limbs,
+plus `l` = 16384 at m = 0 (86 workloads, 9 rounds). `--limbs` sets candidate min
+widths, and `--par` candidate gates. A larger `m`, as argument reduction produces,
+means fewer chunks: 7–17 at m = 0, 1 at m = l.
+
+### First-chunk width
+
+Near x's top a chunk's term count is set by the factorial, not by its offset, so the
+plain doubling's 2-, 4- and 8-bit chunks each cost about as much as a wide one. At
+16384 limbs, the chunks inside x's top limb were ~42% of serial time. Merging them
+saves trees, finalizations and combines, but widens the merged chunk's P.
+
+The width only matters at m = 0. Once m ≥ 1, the doubling's first chunk is already
+about 64m bits wide. Geometric means over the m = 0 rows (0 is the plain doubling; since
+the schedule became `[s, ~2s)` per chunk, widths 0–2 add one 2-bit chunk when x ≥ 1/2,
+which these random x never are):
+
+| min bits | 0 | 8 | **16** | 24 | 32 | 48 | 64 | 96 | 128 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 thread | 1.144 | 1.087 | **1.021** | 1.025 | 1.033 | 1.148 | 1.294 | 1.713 | 2.171 |
+| 8 threads (gate 512) | 1.138 | 1.085 | **1.028** | 1.045 | 1.045 | 1.176 | 1.335 | 1.734 | 2.249 |
+
+There is no trend with precision. The per-row best lands on 16–32 at every l from 4 to
+16384, so a constant fits:
+
+| l (m = 0, 1 thread) | 0 | 8 | 16 | 24 | 32 | 48 | 64 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 1.184 | 1.163 | 1.047 | 1.020 | 1.000 | 1.096 | 1.134 |
+| 16 | 1.271 | 1.149 | 1.000 | 1.074 | 1.112 | 1.187 | 1.402 |
+| 64 | 1.069 | 1.075 | 1.050 | 1.000 | 1.087 | 1.262 | 1.494 |
+| 256 | 1.193 | 1.043 | 1.000 | 1.017 | 1.037 | 1.151 | 1.248 |
+| 1024 | 1.189 | 1.087 | 1.017 | 1.077 | 1.000 | 1.143 | 1.139 |
+| 4096 | 1.067 | 1.074 | 1.013 | 1.035 | 1.000 | 1.047 | 1.060 |
+| 16384 | 1.100 | 1.063 | 1.000 | 1.031 | 1.010 | 1.098 | 1.088 |
+
+This run shared the machine with a browser using about one core, and the load average
+reached 6.6. The m ≥ 1 rows run identical schedules for every width ≤ 64, so they
+measure the noise floor: their geometric means agree within 0.2% across candidates
+(1.014–1.016). That is far below the gaps above.
+
+### Parallel gate
+
+Re-fit at a min width of 16 (candidates `--par 0,max`, i.e. always against never). Each
+rule chooses per workload; scores are the geometric mean of the chosen path's time over
+the best path's, at the rule's best threshold:
+
+| Rule | 8 threads | worst row | 4 threads | worst row |
+|---|---:|---:|---:|---:|
+| `chunks >= 2 && v >= 96` | 1.004 | 1.204 | 1.005 | 1.215 |
+| `chunks >= 3 && chunks * v >= 512` | 1.005 | 1.182 | 1.008 | 1.268 |
+| **`chunks >= 2 && chunks * v >= 512`** | **1.001** | **1.050** | **1.003** | 1.268 |
+
+448 and 512 tie, and 384–768 stay within 0.7%. An earlier fit, before the min width
+(whose first series overlapped the chunks), also chose 512.
+
+Why not precision alone:
+- **Per-chunk cost depends on m, not just on precision.** In the earlier sweep, at
+  w = 129, `l=128 m=0` took 0.299 ms but `l=64 m=64` 0.017 ms. With m > 0 each chunk sums
+  only a few terms.
+- **The break-even precision falls as chunks grow:** l ≈ 48–64 at 9 chunks, ≈ 128
+  at 2–4. That is a roughly constant total `chunks * v`.
+- **A lone chunk has nothing to run beside,** so `chunks >= 2`. Forcing one chunk
+  parallel costs about nothing now (0.96–1.02×).
+
+### End to end
+
+`exp_dyn` with random x and m = 0. Mean ms per call, best of 3 runs alternating against
+the parent commit (`1ffd2ee`), with a browser using about one core:
+
+| limbs | 8 threads before | after | speedup | 1 thread before | after | speedup |
+|---:|---:|---:|---:|---:|---:|---:|
+| 16 | 0.018 | 0.017 | 1.06× | 0.018 | 0.017 | 1.06× |
+| 64 | 0.153 | 0.115 | 1.33× | 0.153 | 0.129 | 1.19× |
+| 256 | 1.574 | 0.651 | 2.42× | 1.345 | 1.142 | 1.18× |
+| 1024 | 8.139 | 3.624 | 2.25× | 9.370 | 8.554 | 1.10× |
+| 4096 | 44.21 | 22.44 | 1.97× | 64.12 | 60.41 | 1.06× |
+| 16384 | 264.1 | 140.8 | 1.88× | 427.8 | 381.9 | 1.12× |
+
+On one thread the gain is the min width alone. The combine is still serial, at about
+30% of the remaining wall time in parallel mode.
