@@ -105,7 +105,7 @@ where
         let node = bin_split::<N>(ctx, a, b);
         let built = s.elapsed().as_secs_f64();
         let f = Instant::now();
-        node.finalize(ctx, &mut out);
+        node.finalize(ctx, 0, &mut out);
         let fin = f.elapsed().as_secs_f64();
         black_box(&out);
         t.total = t.total.min(built + fin);

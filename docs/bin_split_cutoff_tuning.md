@@ -203,11 +203,12 @@ once per call:
 
 Here `v` is the result's working limbs (`out.len()` + guard).
 
-The harness is `cargo bench-bin-split exp`. It times whole `exp_dyn_at` calls at
-precision `l` = 4–4096 with `m ∈ {0, 1, 2, 4, l/8, l/4, l/2, l}` leading zero limbs,
-plus `l` = 16384 at m = 0 (86 workloads, 9 rounds). `--limbs` sets candidate min
-widths, and `--par` candidate gates. A larger `m`, as argument reduction produces,
-means fewer chunks: 7–17 at m = 0, 1 at m = l.
+Both values are now plain constants in `src/utils/mod.rs`. The tuning harness, a
+`bench-bin-split exp` family that overrode them per call, was removed once the fit
+below was done. It timed whole exp calls at precision `l` = 4–4096 with
+`m ∈ {0, 1, 2, 4, l/8, l/4, l/2, l}` leading zero limbs, plus `l` = 16384 at m = 0
+(86 workloads, 9 rounds). A larger `m`, as argument reduction produces, means fewer
+chunks: 7–17 at m = 0, 1 at m = l.
 
 ### First-chunk width
 

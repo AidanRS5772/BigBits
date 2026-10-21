@@ -3344,7 +3344,7 @@ fn test_mul_structured_operand_fuzz() {
     for _ in 0..2000 {
         let l = rng.gen_range(3..320usize);
         let s = rng.gen_range(3..=l);
-        let mut gen = |n: usize, rng: &mut StdRng| {
+        let gen = |n: usize, rng: &mut StdRng| {
             let zp = [0.0, 0.3, 0.7, 0.95][rng.gen_range(0..4)];
             let mut v: Vec<u64> = (0..n)
                 .map(|_| {

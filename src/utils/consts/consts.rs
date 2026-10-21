@@ -6,8 +6,8 @@ use std::{
 
 use crate::utils::{
     bin_split::{
-        bin_split, join2, ratio_to_fraction_dyn, ratio_to_fraction_static, BBPSeries, DynNodeBBP,
-        Node, Shift, StaticNodeBBP,
+        bin_split, join2, ratio_to_fraction_dyn, ratio_to_fraction_static, static_split_stack,
+        BBPSeries, DynNodeBBP, Node, Shift, StaticNodeBBP,
     },
     utils::add_buf,
     ScratchGuard, LN2_PAR_CUTOFF,
@@ -213,7 +213,7 @@ impl<const N: usize> StaticLn2<N> {
             n: u64,
         ) -> Option<ScopedJoinHandle<'s, StaticNodeBBP<N, S>>> {
             thread::Builder::new()
-                .stack_size(1024 * N + (1 << 20))
+                .stack_size(static_split_stack(N))
                 .spawn_scoped(sc, move || split::<N, S>(n))
                 .ok()
         }

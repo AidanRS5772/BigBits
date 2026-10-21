@@ -238,8 +238,8 @@ fn check_static_at<D, S>(
     S::Ctx: Sync,
 {
     let (mut want, mut got) = (vec![0u64; len], vec![0u64; len]);
-    let want_neg = bin_split_tree_at::<D>(dyn_ctx, a, b, last, C).finalize(dyn_ctx, &mut want);
-    let got_neg = bin_split_tree_at::<S>(static_ctx, a, b, last, cut).finalize(static_ctx, &mut got);
+    let want_neg = bin_split_tree_at::<D>(dyn_ctx, a, b, last, C).finalize(dyn_ctx, 0, &mut want);
+    let got_neg = bin_split_tree_at::<S>(static_ctx, a, b, last, cut).finalize(static_ctx, 0, &mut got);
     let what = format!("static [{a}, {b}) at {cut:?}, {len} limbs");
     assert_eq!(got_neg, want_neg, "{what} has the wrong sign");
     // Limbs are little-endian, so order them from the top.
@@ -758,7 +758,7 @@ where
     N: Node + Send,
     N::Ctx: Sync,
 {
-    bin_split_tree_at::<N>(ctx, a, b, true, C).finalize(ctx, out)
+    bin_split_tree_at::<N>(ctx, a, b, true, C).finalize(ctx, 0, out)
 }
 
 #[test]
@@ -777,14 +777,14 @@ fn test_signed_series_values() {
     let ctx = DynHyperCtx::new(&[1], 1);
     assert!(!split_sum::<DynNodeHyper<ExpHalf>>(&ctx, 0, 200, &mut out));
     assert_eq!(top4(&out), EXP_HALF_TOP);
-    // With x = 2^64 and 65 bits of shift per term, S is e^(-1/2) / 2 / 2^64.
+    // With x = 2^64 and 65 bits of shift per term, each term gains x / 2^65 = 1/2,
+    // just as with x = 1 and one bit, so S is e^(-1/2) / 2 again.
     let ctx = DynHyperCtx::new(&[0, 1], 65);
     assert!(!split_sum::<DynNodeHyper<ExpHalf>>(&ctx, 0, 200, &mut out));
-    assert_eq!(out[7], 0);
-    assert_eq!(top4(&out)[1..], EXP_HALF_TOP[..3]);
+    assert_eq!(top4(&out), EXP_HALF_TOP);
     let ctx = StaticHyperCtx::<16>::new(&[0, 1], 65);
     assert!(!split_sum::<StaticNodeHyper<16, ExpHalf>>(&ctx, 0, 200, &mut out));
-    assert_eq!(top4(&out)[1..], EXP_HALF_TOP[..3]);
+    assert_eq!(top4(&out), EXP_HALF_TOP);
 }
 
 // Node::limbs only shapes the tree, but an estimate far from the real size

@@ -286,12 +286,15 @@ fn hyper_x_leaf_terms<'t, S: HyperSeries>(
     mut t: &'t mut [u64],
     mut tmp: &'t mut [u64],
     hi_mul: impl Fn(&[u64], &[u64], usize, &mut [u64]) -> usize,
-    full: bool,
 ) -> (usize, usize, &'t [u64], usize, bool) {
     t[0] = 1;
     let (mut p_len, mut e, mut t_len, mut et, mut pn) = (0, 0, 1, 0usize, false);
     for n in a..b {
         debug_assert!(S::SIGNED || !S::neg(n), "negative terms need SIGNED");
+        let drop = mul_len(&t[..t_len], x).saturating_sub(tmp.len());
+        t_len = hi_mul(&t[..t_len], x, drop, tmp);
+        std::mem::swap(&mut t, &mut tmp);
+        et += drop;
         mul_shl(p, &mut p_len, &mut e, S::q(n), shift, 0);
         if t_len != 0 {
             let top = (et + t_len + 1).saturating_sub(e);
@@ -315,15 +318,8 @@ fn hyper_x_leaf_terms<'t, S: HyperSeries>(
             };
             push_or_drop(p, &mut p_len, &mut e, c);
         }
-        if n + 1 == b && !full {
-            break;
-        }
         let c = mul_prim(&mut t[..t_len], S::r(n));
         push_or_drop(t, &mut t_len, &mut et, c);
-        let drop = mul_len(&t[..t_len], x).saturating_sub(tmp.len());
-        t_len = hi_mul(&t[..t_len], x, drop, tmp);
-        std::mem::swap(&mut t, &mut tmp);
-        et += drop;
     }
     let t: &'t [u64] = t;
     (buf_len(&p[..p_len]), e, &t[..t_len], et, pn)
@@ -389,6 +385,11 @@ fn mul_len(a: &[u64], b: &[u64]) -> usize {
     }
     let (x, y) = (a[a.len() - 1] as u128, b[b.len() - 1] as u128);
     a.len() + b.len() - (x * y + x + y < 1 << 64) as usize
+}
+
+// Stack for a thread that builds a static tree: about 640 bytes per limb of N.
+pub(crate) const fn static_split_stack(n: usize) -> usize {
+    1024 * n + (1 << 20)
 }
 
 fn hi_mul_drop<const N: usize>(a: &[u64], b: &[u64], drop: usize, out: &mut [u64]) -> usize {
@@ -497,7 +498,9 @@ pub trait Node: Sized {
     fn limbs(ctx: &Self::Ctx, a: u64, b: u64) -> u64;
     fn merge(ctx: &Self::Ctx, l: Self, r: Self) -> Self;
     fn leaf(ctx: &Self::Ctx, a: u64, b: u64, last: bool) -> Self;
-    fn finalize(&self, ctx: &Self::Ctx, out: &mut [u64]) -> bool;
+    // out <- the sum's limbs below its top zeros limbs, which the caller knows are
+    // zero: S * 2^(64 (out.len() + zeros)). Returns whether S is negative.
+    fn finalize(&self, ctx: &Self::Ctx, zeros: usize, out: &mut [u64]) -> bool;
 }
 
 // Where a tree stops splitting, and from what size it builds a split's halves in
@@ -641,8 +644,9 @@ impl<S: BBPSeries> Node for DynNodeBBP<S> {
         }
     }
 
-    fn finalize(&self, ctx: &Shift, out: &mut [u64]) -> bool {
-        ratio_to_fraction_dyn(&self.p, &self.q, (ctx.0 * (self.b - self.a)) as i64, out);
+    fn finalize(&self, ctx: &Shift, zeros: usize, out: &mut [u64]) -> bool {
+        let shift = (ctx.0 * (self.b - self.a)) as i64 - 64 * zeros as i64;
+        ratio_to_fraction_dyn(&self.p, &self.q, shift, out);
         S::SIGNED && self.neg && !self.p.is_empty()
     }
 }
@@ -767,8 +771,9 @@ impl<const N: usize, S: BBPSeries> Node for StaticNodeBBP<N, S> {
         }
     }
 
-    fn finalize(&self, _: &Shift, out: &mut [u64]) -> bool {
-        ratio_to_fraction_static::<N>(&self.p[..self.p_len], &self.q[..self.q_len], 0, out);
+    fn finalize(&self, _: &Shift, zeros: usize, out: &mut [u64]) -> bool {
+        let shift = -64 * zeros as i64;
+        ratio_to_fraction_static::<N>(&self.p[..self.p_len], &self.q[..self.q_len], shift, out);
         S::SIGNED && self.neg && self.p_len != 0
     }
 }
@@ -849,8 +854,9 @@ impl<S: EngelSeries> Node for DynNodeEngel<S> {
         }
     }
 
-    fn finalize(&self, ctx: &Shift, out: &mut [u64]) -> bool {
-        ratio_to_fraction_dyn(&self.p, &self.q, (ctx.0 * (self.b - self.a)) as i64, out);
+    fn finalize(&self, ctx: &Shift, zeros: usize, out: &mut [u64]) -> bool {
+        let shift = (ctx.0 * (self.b - self.a)) as i64 - 64 * zeros as i64;
+        ratio_to_fraction_dyn(&self.p, &self.q, shift, out);
         S::SIGNED && self.neg && !self.p.is_empty()
     }
 }
@@ -959,8 +965,9 @@ impl<const N: usize, S: EngelSeries> Node for StaticNodeEngel<N, S> {
         }
     }
 
-    fn finalize(&self, ctx: &Shift, out: &mut [u64]) -> bool {
-        let shift = (ctx.0 * (self.b - self.a)) as i64 + 64 * (self.eq as i64 - self.ep as i64);
+    fn finalize(&self, ctx: &Shift, zeros: usize, out: &mut [u64]) -> bool {
+        let e = self.eq as i64 - self.ep as i64 - zeros as i64;
+        let shift = (ctx.0 * (self.b - self.a)) as i64 + 64 * e;
         ratio_to_fraction_static::<N>(&self.p[..self.p_len], &self.q[..self.q_len], shift, out);
         S::SIGNED && self.neg && self.p_len != 0
     }
@@ -1070,12 +1077,12 @@ impl<S: HyperSeries> Node for DynNodeHyper<S> {
                 (p, q_len, (!last).then_some(r), neg)
             }
             Some(x) => {
-                let cap = terms * (x.len() + 1) + 1;
+                let cap = (terms + 1) * (x.len() + 1) + 1;
                 let mut p = vec![0; cap + words];
                 let mut scratch = ScratchGuard::acquire();
                 let [t, tmp] = scratch.get_splits([cap + x.len(); 2]);
                 let (p_len, e, t, et, neg) =
-                    hyper_x_leaf_terms::<S>(a, b, ctx.shift, x, &mut p, t, tmp, mul_exact, !last);
+                    hyper_x_leaf_terms::<S>(a, b, ctx.shift, x, &mut p, t, tmp, mul_exact);
                 debug_assert_eq!(e + et, 0);
                 p.truncate(p_len);
                 let q_len = prod_terms(a, b, S::q, &mut q);
@@ -1148,13 +1155,9 @@ impl<S: HyperSeries> Node for DynNodeHyper<S> {
         }
     }
 
-    fn finalize(&self, ctx: &DynHyperCtx, out: &mut [u64]) -> bool {
-        ratio_to_fraction_dyn(
-            &self.p,
-            &self.q,
-            (ctx.shift * (self.b - self.a)) as i64,
-            out,
-        );
+    fn finalize(&self, ctx: &DynHyperCtx, zeros: usize, out: &mut [u64]) -> bool {
+        let shift = (ctx.shift * (self.b - self.a)) as i64 - 64 * zeros as i64;
+        ratio_to_fraction_dyn(&self.p, &self.q, shift, out);
         S::SIGNED && self.neg && !self.p.is_empty()
     }
 }
@@ -1181,14 +1184,13 @@ impl<const N: usize, S: HyperSeries> StaticNodeHyper<N, S> {
         b: u64,
         shift: u64,
         x: &[u64],
-        last: bool,
         p: &mut [u64; N],
         q: &mut [u64; N],
         r: &mut [u64; N],
     ) -> (usize, usize, usize, usize, usize, bool) {
         let (mut t, mut tmp) = ([0; N], [0; N]);
         let (p_len, ep, t, er, neg) =
-            hyper_x_leaf_terms::<S>(a, b, shift, x, p, &mut t, &mut tmp, hi_mul_drop::<N>, !last);
+            hyper_x_leaf_terms::<S>(a, b, shift, x, p, &mut t, &mut tmp, hi_mul_drop::<N>);
         r[..t.len()].copy_from_slice(t);
         (p_len, prod_terms(a, b, S::q, q), t.len(), ep, er, neg)
     }
@@ -1210,7 +1212,7 @@ impl<const N: usize, S: HyperSeries> StaticNodeHyper<N, S> {
                 (p_len, q_len, r_len, ep, 0, neg)
             }
             Some((x, len)) => {
-                Self::x_leaf(a, b, ctx.shift, &x[..*len], last, &mut p, &mut q, &mut r)
+                Self::x_leaf(a, b, ctx.shift, &x[..*len], &mut p, &mut q, &mut r)
             }
         };
         StaticNodeHyper {
@@ -1313,8 +1315,9 @@ impl<const N: usize, S: HyperSeries> Node for StaticNodeHyper<N, S> {
         }
     }
 
-    fn finalize(&self, ctx: &StaticHyperCtx<N>, out: &mut [u64]) -> bool {
-        let shift = (ctx.shift * (self.b - self.a)) as i64 + 64 * (self.eq as i64 - self.ep as i64);
+    fn finalize(&self, ctx: &StaticHyperCtx<N>, zeros: usize, out: &mut [u64]) -> bool {
+        let e = self.eq as i64 - self.ep as i64 - zeros as i64;
+        let shift = (ctx.shift * (self.b - self.a)) as i64 + 64 * e;
         ratio_to_fraction_static::<N>(&self.p[..self.p_len], &self.q[..self.q_len], shift, out);
         S::SIGNED && self.neg && self.p_len != 0
     }

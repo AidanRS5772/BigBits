@@ -99,6 +99,13 @@ pub const DYN_EXP_CHUNK_PAR_WORK: usize = 512;
 // costs about as much as a wide one. See docs/bin_split_cutoff_tuning.md.
 pub const DYN_EXP_CHUNK_MIN_BITS: u64 = 16;
 
+// exp_static's counterparts: it gives each chunk series its own scoped thread once
+// it has at least two chunks and chunks * working limbs reaches this. A thread
+// costs about 10 us to start, far more than a rayon task: threads tied at 585 and
+// won from 774 (0.67x) to 13325 (0.34x).
+pub const STATIC_EXP_CHUNK_PAR_WORK: usize = 768;
+pub const STATIC_EXP_CHUNK_MIN_BITS: u64 = 16;
+
 thread_local! {
     static SCRATCH_POOL: RefCell<Vec<Vec<u64>>> = RefCell::new(Vec::new());
 }

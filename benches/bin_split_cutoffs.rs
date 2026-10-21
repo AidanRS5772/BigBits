@@ -4,9 +4,7 @@
 //       [--par 256,max] [--cands 0/31/max,64/1/max] [--rounds 9] [--sizes 256,1024]
 //
 // Families: bbp, engel, hyper, sbbp, sengel, shyper (leaf sweeps, serial), par (parallel
-// cutoff, all threads, default leaves), exp (exp_dyn's first-chunk width from --limbs and
-// chunk-parallel gate from --par, defaulting to the current constants) and e2e (old term
-// cutoffs against the defaults).
+// cutoff, all threads, default leaves) and e2e (old term cutoffs against the defaults).
 // Each candidate times a tree build only: finalize doesn't depend on the tree's shape.
 // Candidates alternate within each round and each one reports its median over rounds,
 // relative to the workload's best; the summary is the geometric mean over workloads.
@@ -17,8 +15,7 @@ use big_bits::utils::{
         HyperSeries, Node, Shift, SplitCutoffs, StaticHyperCtx, StaticNodeBBP, StaticNodeEngel,
         StaticNodeHyper,
     },
-    trans::{exp_dyn, exp_dyn_at, exp_terms, Exp, ExpCutoffs},
-    DYN_EXP_CHUNK_MIN_BITS, DYN_EXP_CHUNK_PAR_WORK,
+    trans::{exp_dyn, exp_terms, Exp},
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{env, hint::black_box, time::Instant};
@@ -284,38 +281,6 @@ fn par_workloads(args: &Args) -> Vec<Workload> {
     v
 }
 
-// exp_dyn's schedule cutoffs: whole exp_dyn calls over precision l and leading zero
-// limbs m, which together set the chunk count. A candidate's leaf_limbs is the first
-// chunk's minimum width in bits, and its par_limbs the parallel gate's chunks * v.
-fn exp_workloads(args: &Args) -> Vec<Workload> {
-    let mut v = Vec::new();
-    let mut rng = StdRng::seed_from_u64(19);
-    let mut shapes = Vec::new();
-    for l in sizes_or(args, &[4, 8, 12, 16, 24, 32, 48, 64, 128, 256, 1024, 4096]) {
-        let lm = l as u64;
-        let mut ms = vec![0, 1, 2, 4, lm / 8, lm / 4, lm / 2, lm];
-        ms.sort();
-        ms.dedup();
-        shapes.extend(ms.into_iter().map(|m| (l, m)));
-    }
-    if args.sizes.is_none() {
-        // Where the narrow chunks near x's top cost the most.
-        shapes.push((16384, 0));
-    }
-    for (l, m) in shapes {
-        let x = rand_x(64 * l as u64 - 1, &mut rng);
-        let out = std::cell::RefCell::new(vec![0; l]);
-        v.push(workload(format!("l={l} m={m}"), move |c| {
-            let cut = ExpCutoffs {
-                chunk_min_bits: c.leaf_limbs,
-                par_work: c.par_limbs as usize,
-            };
-            black_box(exp_dyn_at(&x, m, &mut out.borrow_mut(), cut));
-        }));
-    }
-    v
-}
-
 // A parallel-cutoff candidate with N's default leaves.
 fn with_leaves<N: Node>(c: SplitCutoffs) -> SplitCutoffs {
     SplitCutoffs {
@@ -360,13 +325,11 @@ fn parse_list(s: &str) -> Vec<u64> {
 
 fn args() -> Args {
     let mut it = env::args().skip(1).filter(|a| a != "--bench");
-    let family = it.next().expect("family");
-    let exp = family == "exp";
     let mut a = Args {
-        limbs: if exp { vec![DYN_EXP_CHUNK_MIN_BITS] } else { (1..=11).map(|i| 1 << i).collect() },
+        family: it.next().expect("family"),
+        limbs: (1..=11).map(|i| 1 << i).collect(),
         terms: vec![1],
-        par: vec![if exp { DYN_EXP_CHUNK_PAR_WORK as u64 } else { u64::MAX }],
-        family,
+        par: vec![u64::MAX],
         cands: None,
         rounds: 9,
         sizes: None,
@@ -590,10 +553,6 @@ fn main() {
         "engel" => sweep(&engel_workloads(&a), &cands, a.rounds),
         "hyper" => sweep(&hyper_workloads(&a), &cands, a.rounds),
         "par" => sweep(&par_workloads(&a), &cands, a.rounds),
-        "exp" => {
-            println!("exp: leaf limbs = first-chunk min bits, par limbs = parallel chunks * v");
-            sweep(&exp_workloads(&a), &cands, a.rounds)
-        }
         "e2e" => e2e(&a),
         f @ ("sbbp" | "sengel" | "shyper") => {
             // Static trees need far more stack than the main thread has.

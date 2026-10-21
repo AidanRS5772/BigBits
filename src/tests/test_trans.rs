@@ -2,7 +2,7 @@ use super::rand_vec;
 use crate::utils::consts::consts::ln2_dyn;
 use crate::utils::div::div_prim;
 use crate::utils::mul::mul_buf;
-use crate::utils::trans::{exp_dyn, exp_dyn_at, ExpCutoffs};
+use crate::utils::trans::{exp_dyn, exp_static};
 use crate::utils::utils::{cmp_buf, sub_buf, trim_lz};
 
 // e^x - 1 as a p-limb fraction by summing x^n / n! directly, with no binary splitting.
@@ -147,21 +147,18 @@ fn test_exp_dyn_large() {
 }
 
 // Parallel chunks combine in the same order as the serial loop, so the two paths must
-// agree bit for bit.
-fn check_par_matches_serial(x: &[u64], m: u64, l: usize) {
-    for chunk_min_bits in [0, 64, 200] {
-        let at = |par_work| ExpCutoffs { chunk_min_bits, par_work };
-        let (mut par, mut ser) = (vec![0; l], vec![0; l]);
-        let zp = exp_dyn_at(x, m, &mut par, at(0));
-        let zs = exp_dyn_at(x, m, &mut ser, at(usize::MAX));
-        let what = format!("x.len()={} m={m} l={l} min={chunk_min_bits}", x.len());
-        assert_eq!(zp, zs, "{what}: z");
-        assert_eq!(par, ser, "{what}: out");
-    }
-}
-
+// agree bit for bit. A one-thread pool always takes the serial path.
 #[test]
 fn test_exp_dyn_parallel_matches_serial() {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let check_par_matches_serial = |x: &[u64], m: u64, l: usize| {
+        let (mut par, mut ser) = (vec![0; l], vec![0; l]);
+        let zp = exp_dyn(x, m, &mut par);
+        let zs = pool.install(|| exp_dyn(x, m, &mut ser));
+        let what = format!("x.len()={} m={m} l={l}", x.len());
+        assert_eq!(zp, zs, "{what}: z");
+        assert_eq!(par, ser, "{what}: out");
+    };
     let mut seed = 2000;
     for l in (1..=64).chain([150, 300, 1000]) {
         for m in [0, 1, l as u64, 40] {
@@ -180,46 +177,71 @@ fn test_exp_dyn_parallel_matches_serial() {
     }
     // A single-bit x has no chunks, only the first series.
     check_par_matches_serial(&[1 << 62], 0, 8);
-
-    // Forcing the parallel path must also work on a one-thread pool.
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
-    pool.install(|| {
-        let mut x = rand_vec(200, 77);
-        *x.last_mut().unwrap() >>= 1;
-        check_par_matches_serial(&x, 0, 200);
-    });
 }
 
-// Any first-chunk width is valid, from none (0) to one chunk covering all of x
-// (u64::MAX).
-#[test]
-fn test_exp_dyn_chunk_min_widths() {
-    for chunk_min_bits in [0, 1, 2, 16, 64, 200, u64::MAX] {
-        let exp = |x: &[u64], m: u64, out: &mut [u64]| {
-            exp_dyn_at(x, m, out, ExpCutoffs { chunk_min_bits, ..ExpCutoffs::DEFAULT })
-        };
-        let mut seed = 3000;
-        for l in 1..=24 {
-            for m in [0, 1, 3] {
+// exp_static against the oracle at N, from one limb to the most N allows, over the
+// shapes the dynamic tests use.
+fn static_at<const N: usize>() {
+    let exp = exp_static::<N>;
+    let mut seed = 5000;
+    let mut ls = vec![1, N / 2, N - 4];
+    ls.retain(|&l| l + 4 <= N);
+    ls.sort();
+    ls.dedup();
+    for &l in &ls {
+        for m in [0, 1, 3, l + 1, 40] {
+            for xl in [1, l, l + 3] {
                 seed += 1;
-                let mut x = rand_vec(l + 1, seed);
+                let mut x = rand_vec(xl, seed);
                 if m == 0 {
                     *x.last_mut().unwrap() >>= 1;
                 }
                 check(&x, m, l, exp);
             }
+            let mut sparse = vec![0; l + 2];
+            sparse[0] = 1;
+            sparse[l / 2] = 1 << 40;
+            sparse[l + 1] = 1 << 61;
+            check(&sparse, m, l, exp);
+            check(&[1 << 60], m, l, exp);
+            if m > 0 {
+                let mut x = rand_vec(l + 1, seed);
+                *x.last_mut().unwrap() |= 1 << 63;
+                check(&x, m, l, exp);
+                check(&vec![u64::MAX; l + 1], m, l, exp);
+            }
         }
-        // Sparse x, a lone top bit, and a top bit on a limb boundary.
-        for l in [1, 5, 17] {
-            let mut x = vec![0; 4];
-            x[3] = 1 << 61;
+        for xl in [1, l, l + 2] {
+            let mut x = vec![0; xl];
+            ln2_dyn(&mut x);
             check(&x, 0, l, exp);
-            x[0] = 1;
-            x[1] = 1 << 40;
-            check(&x, 0, l, exp);
-            let mut x = rand_vec(l + 1, l as u64);
-            *x.last_mut().unwrap() |= 1 << 63;
-            check(&x, 1, l, exp);
         }
     }
+}
+
+#[test]
+fn test_exp_static() {
+    static_at::<5>();
+    static_at::<6>();
+    static_at::<8>();
+    static_at::<16>();
+    static_at::<64>();
+}
+
+// Wide enough that exp_static gives its chunks their own threads.
+#[test]
+fn test_exp_static_threaded() {
+    for (m, seed) in [(0, 6000), (1, 6001)] {
+        let mut x = rand_vec(296, seed);
+        if m == 0 {
+            *x.last_mut().unwrap() >>= 1;
+        }
+        check(&x, m, 296, exp_static::<300>);
+    }
+}
+
+#[test]
+#[should_panic(expected = "out.len() + 4 <= N")]
+fn test_exp_static_small_n() {
+    exp_static::<8>(&[1 << 62], 0, &mut [0; 5]);
 }
