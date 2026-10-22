@@ -285,3 +285,61 @@ the parent commit (`1ffd2ee`), with a browser using about one core:
 
 On one thread the gain is the min width alone. The combine is still serial, at about
 30% of the remaining wall time in parallel mode.
+
+## Static nodes: bit-level normalization
+
+Static parts used to keep limb exponents, so a truncated part kept its top N limbs
+whatever its top limb held. A merge also reserved a spare carry limb, a whole limb when
+the shift had bits, and `hi_mul_drop` zeroed the window's lowest limb about half the
+time. Each part is now `m · 2^e` with e in bits: exact while it fits N limbs, then its
+top 64N bits (P within two, leaf parts one spare bit once they drop). BBP keeps separate
+P and Q exponents, so Q no longer carries 2^(shift·t).
+
+Bits a node's P / Q loses below 64N (worst case), and static finalize's error at the
+N − 2 bound against dyn, over BBP, Engel and Hyper series (signed and unsigned, deep,
+default and single-leaf trees) at N = 4–256:
+
+| Series | Bits lost before | after | N − 2 error before | after |
+|---|---:|---:|---:|---:|
+| BBP | 68–109 | 2–5 | 0 | 0 |
+| Engel | 186–191 | 0–3 | up to 2^63 ulps | 0 |
+| Hyper | 184–191 | 7–11 | up to 2^56 ulps | 0 |
+
+`test_static_nodes_keep_bits` holds the loss to 16 bits, and the any-cutoff and leaf-size
+sweeps now check within 1 ulp at N − 2 instead of N − 3. Finalize's own `len + 2 <= N`
+bound comes from its reciprocal, so the public bounds don't change.
+
+Cost, as new / old time, the min of 8 runs alternating the two builds (`bench` profile,
+a browser using one to two cores):
+
+| Workload | new / old |
+|---|---|
+| Static BBP trees, ln2 at N = 64–4096 | 0.89–0.92 |
+| `ln2_static` past its table, N = 1028–4096 | 0.91–0.96 |
+| Static Engel trees, N = 64–1024 | 0.99–1.02 |
+| Static Hyper trees, N = 64–1024 | 0.67–1.10, geomean 0.98 |
+| `exp_static_entry`, N = 8 / 16 / 32 / 64–1024 | 1.11 / 1.05 / 0.95 / 1.00–1.03 |
+| `exp_static`, N = 16 / 64–1024 | 1.06 / 1.00–1.02 |
+| Single leaves that drop bits nearly every term, N = 8–64 | 1.02–1.40 |
+| Dynamic trees and `exp_dyn_entry` (shared leaf kernels) | 0.99–1.02 |
+
+- BBP is faster because Q no longer holds 2^(shift·t), so its products are smaller.
+- The leftover cost is in parts that drop bits: a drop is now a bit shift where it used
+  to be a whole-limb memmove. That shows only at small N, where a whole exp series is
+  one leaf, and in the drop-heavy test shapes.
+- Hyper at N = 256, xb = 512 (1.10): the 2 extra limbs P keeps make one product's
+  window 129 limbs instead of 127, which pushes `hi_mul_static`'s guarded product past
+  N limbs onto its split path.
+
+What kept the cost down:
+- Each merge takes P's exponent from its operands' bit lengths first, and computes each
+  product only down to it. Full 64N-bit windows for every product made merges up to 2×
+  slower.
+- `mul_shl` reads P's top limb only when a shift won't fit the free limbs. Waiting on it
+  serialized the shift behind the multiply's carry chain, costing 30% on Engel at
+  shift 64.
+- A leaf adds a term at a bit offset by splitting the multiplier w·2^s across two limbs
+  instead of shifting a copy of the term, inline when the offset is a whole number of
+  limbs.
+- The last x-leaf of a sum keeps its running term t only from P's exponent up, since t
+  never becomes R. That took `exp_static_entry` at N = 16 from +12% to +4%.

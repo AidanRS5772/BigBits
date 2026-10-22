@@ -4005,12 +4005,14 @@ pub fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
     return of;
 }
 
+// out[0] is coefficient lo of the convolution: s - 1 for a canonical middle
+// product, lower when the static path drops long's low zero limbs.
 fn ntt_mid_accumulate_scaled(
     res1: &mut [u64],
     res2: &mut [u64],
     res3: &mut [u64],
     out: &mut [u64], // len == s
-    s: usize,
+    lo: usize,
     n1: usize,
     n2: usize,
     n3: usize,
@@ -4019,7 +4021,8 @@ fn ntt_mid_accumulate_scaled(
     let inv_n2 = Montgomery::to(n2 as u64).pow(P2::P - 2);
     let inv_n3 = Montgomery::to(n3 as u64).pow(P3::P - 2);
 
-    for i in s - 3..2 * s - 1 {
+    let hi = lo + out.len();
+    for i in lo - 2..hi {
         CRT.crt(
             &mut res1[i],
             &mut res2[i],
@@ -4030,12 +4033,12 @@ fn ntt_mid_accumulate_scaled(
         );
     }
 
-    out.copy_from_slice(&res1[s - 1..2 * s - 1]);
-    let of1 = add_buf(out, &res2[s - 2..2 * s - 2]) as u64;
-    let of2 = add_buf(out, &res3[s - 3..2 * s - 3]) as u64;
+    out.copy_from_slice(&res1[lo..hi]);
+    let of1 = add_buf(out, &res2[lo - 1..hi - 1]) as u64;
+    let of2 = add_buf(out, &res3[lo - 2..hi - 2]) as u64;
 
-    let lo = res2[2 * s - 2] as u128 + res3[2 * s - 3] as u128 + of1 as u128 + of2 as u128;
-    (lo as u64, res3[2 * s - 2].wrapping_add((lo >> 64) as u64))
+    let top = res2[hi - 1] as u128 + res3[hi - 2] as u128 + of1 as u128 + of2 as u128;
+    (top as u64, res3[hi - 1].wrapping_add((top >> 64) as u64))
 }
 
 fn acc_scaled_cyclic_convolution<const N: usize, P: NTTPrime>(
@@ -4145,26 +4148,35 @@ pub fn ntt_mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u6
             conv3();
         }
     }
-    let mut of = ntt_mid_accumulate_scaled(res1, res2, res3, out, sz, n1, n2, n3);
+    let mut of = ntt_mid_accumulate_scaled(res1, res2, res3, out, sz - 1, n1, n2, n3);
     let (c0, c1) = middle_correction(long, short);
     add_mid_overflow(&mut of, add_prim(out, c0));
     add_mid_overflow(&mut of, add_prim(&mut out[1..], c1));
     return of;
 }
 
+// long may pass N only by low zero padding (a reciprocal's divisor window wider
+// than its divisor). long = T * B^z, so the convolution runs on T alone and the
+// band sits z coefficients lower. The transform keeps its 2s - 1 size: a smaller
+// one would wrap T's top products onto the band.
 pub fn ntt_mid_mul_static<const N: usize>(
     long: &[u64],
     short: &[u64],
     out: &mut [u64],
 ) -> (u64, u64) {
     debug_assert_mid_mul_shape(long, short, out);
-    debug_assert!(long.len() <= N);
     debug_assert!(short.len() <= N);
     debug_assert!(out.len() <= N);
 
-    if short.len() < 3 {
+    let z = long.len().saturating_sub(N);
+    if short.len() < z + 3 {
         return mid_mul_buf(long, short, out);
     }
+    let (pad, long_top) = long.split_at(z);
+    assert!(
+        pad.iter().all(|&l| l == 0),
+        "static middle product: long past N must be low zero padding"
+    );
 
     let sz = short.len();
     let n1 = find_ntt_size::<P1>(2 * sz - 1);
@@ -4180,7 +4192,7 @@ pub fn ntt_mid_mul_static<const N: usize>(
             let mut buf_scratch = [0; N];
             let mut ntt_scratch = [0; N];
             ntt_mid_static_convolution::<N, P1>(
-                long,
+                long_top,
                 short,
                 &mut res1,
                 n1,
@@ -4193,7 +4205,7 @@ pub fn ntt_mid_mul_static<const N: usize>(
             let mut buf_scratch = [0; N];
             let mut ntt_scratch = [0; N];
             ntt_mid_static_convolution::<N, P2>(
-                long,
+                long_top,
                 short,
                 &mut res2,
                 n2,
@@ -4206,7 +4218,7 @@ pub fn ntt_mid_mul_static<const N: usize>(
             let mut buf_scratch = [0; N];
             let mut ntt_scratch = [0; N];
             ntt_mid_static_convolution::<N, P3>(
-                long,
+                long_top,
                 short,
                 &mut res3,
                 n3,
@@ -4220,7 +4232,7 @@ pub fn ntt_mid_mul_static<const N: usize>(
         let mut buf_scratch = [0; N];
         let mut ntt_scratch = [0; N];
         ntt_mid_static_convolution::<N, P1>(
-            long,
+            long_top,
             short,
             &mut res1,
             n1,
@@ -4228,7 +4240,7 @@ pub fn ntt_mid_mul_static<const N: usize>(
             &mut ntt_scratch,
         );
         ntt_mid_static_convolution::<N, P2>(
-            long,
+            long_top,
             short,
             &mut res2,
             n2,
@@ -4236,7 +4248,7 @@ pub fn ntt_mid_mul_static<const N: usize>(
             &mut ntt_scratch,
         );
         ntt_mid_static_convolution::<N, P3>(
-            long,
+            long_top,
             short,
             &mut res3,
             n3,
@@ -4253,7 +4265,7 @@ pub fn ntt_mid_mul_static<const N: usize>(
         &mut res2[..res2_len],
         &mut res3[..res3_len],
         out,
-        sz,
+        sz - 1 - z,
         n1,
         n2,
         n3,

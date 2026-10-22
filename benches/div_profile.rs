@@ -408,6 +408,26 @@ const CASES: &[ProfileCase] = &[
         "nr/ntt-middle",
         1,
     ),
+    // R near N: guard limbs and the last divisor window pass N, and the window's
+    // zero limbs past N are dropped by the static middle product.
+    static_case(
+        "static_rcp_nr_near_capacity",
+        Operation::Rcp,
+        4096,
+        4095,
+        4096,
+        "nr/ntt-middle, padded window",
+        1,
+    ),
+    static_case(
+        "static_rcp_nr_full_capacity",
+        Operation::Rcp,
+        4096,
+        4096,
+        4096,
+        "nr/ntt-middle, padded window",
+        1,
+    ),
 ];
 
 struct Workload {

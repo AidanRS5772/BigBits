@@ -15,7 +15,7 @@ use big_bits::utils::{
         HyperSeries, Node, Shift, SplitCutoffs, StaticHyperCtx, StaticNodeBBP, StaticNodeEngel,
         StaticNodeHyper,
     },
-    trans::{exp_dyn, exp_terms, Exp},
+    trans::{exp_dyn_entry, exp_terms, Exp},
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{env, hint::black_box, time::Instant};
@@ -85,7 +85,7 @@ fn rand_x(bits: u64, rng: &mut StdRng) -> Vec<u64> {
     x
 }
 
-// exp_dyn's chunk schedule for a normalized w-limb x: chunk i covers bits
+// exp_dyn_entry's chunk schedule for a normalized w-limb x: chunk i covers bits
 // [s, s + width) with width = 2^(i + 1), so its series has shift s + width and its
 // terms shrink by about s bits each. Returns (x bits, shift, per-term bits).
 fn exp_chunks(w: usize) -> Vec<(u64, u64, u64)> {
@@ -435,7 +435,7 @@ fn serial<N: Node>() -> SplitCutoffs {
     }
 }
 
-// Old term cutoffs (ln2 640, exp 32) against the defaults, serial, plus exp_dyn
+// Old term cutoffs (ln2 640, exp 32) against the defaults, serial, plus exp_dyn_entry
 // itself with the defaults for scale.
 fn e2e(args: &Args) {
     let mut rng = StdRng::seed_from_u64(17);
@@ -455,7 +455,7 @@ fn e2e(args: &Args) {
         row(w.name, t[0], t[1]);
     }
     for l in sizes_or(args, &[256, 1024, 4096]) {
-        // exp_dyn's series: the Engel first chunk, then every Hyper chunk.
+        // exp_dyn_entry's series: the Engel first chunk, then every Hyper chunk.
         let first = exp_terms(1, l) + 1;
         let chunks: Vec<(DynHyperCtx, u64)> = exp_chunks(l)
             .into_iter()
@@ -477,11 +477,11 @@ fn e2e(args: &Args) {
         let s = Instant::now();
         let reps = 5;
         for _ in 0..reps {
-            black_box(exp_dyn(&x, 0, &mut out));
+            black_box(exp_dyn_entry(&x, 0, &mut out));
         }
         println!(
             "{:<22} {:>10} {:>10.3}",
-            format!("exp_dyn {l}"),
+            format!("exp_dyn_entry {l}"),
             "",
             s.elapsed().as_secs_f64() / reps as f64 * 1e3
         );

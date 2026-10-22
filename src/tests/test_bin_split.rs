@@ -1,6 +1,8 @@
 use crate::utils::bin_split::*;
 use crate::utils::consts::consts::{ln2_dyn, ln2_static, LN2_LIMBS};
-use crate::utils::utils::{add_prim, cmp_buf, sub_buf, trim_lz};
+use crate::utils::div::div_dyn;
+use crate::utils::mul::mul_dyn;
+use crate::utils::utils::{add_buf, add_prim, cmp_buf, sub_buf, trim_lz};
 use std::marker::PhantomData;
 
 // Small leaves give deep trees, so most work runs through merges, and the
@@ -199,18 +201,93 @@ fn test_ln2_static_past_table() {
         ln2_static::<N>(&mut out);
         assert_eq!(out, want, "ln2 at {l} limbs, N = {N}");
     }
-    check::<{ LN2_LIMBS + 5 }>(LN2_LIMBS + 1);
+    check::<{ LN2_LIMBS + 4 }>(LN2_LIMBS + 1);
     check::<{ LN2_LIMBS + 16 }>(LN2_LIMBS + 1);
     check::<{ LN2_LIMBS + 16 }>(LN2_LIMBS + 7);
 }
 
 #[test]
-#[should_panic(expected = "out.len() + 4 <= N")]
+#[should_panic(expected = "out.len() + 3 <= N")]
 fn test_ln2_static_past_table_small_n() {
-    ln2_static::<{ LN2_LIMBS + 4 }>(&mut [0; LN2_LIMBS + 1]);
+    ln2_static::<{ LN2_LIMBS + 3 }>(&mut [0; LN2_LIMBS + 1]);
 }
 
-// Static nodes keep only their top N limbs, so their finalize can differ from
+// floor(p 2^(64 len - shift) / q) by one exact division of the full operands.
+fn exact_fraction(p: &[u64], q: &[u64], shift: i64, len: usize) -> Vec<u64> {
+    let e = 64 * len as i64 - shift;
+    assert!(e >= 0);
+    let (w, v) = ((e / 64) as usize, (e % 64) as u32);
+    let mut n = vec![0; w + p.len() + 1];
+    n[w..w + p.len()].copy_from_slice(p);
+    if v != 0 {
+        for i in (w..n.len()).rev() {
+            n[i] = (n[i] << v) | if i > w { n[i - 1] >> (64 - v) } else { 0 };
+        }
+    }
+    trim_lz(&mut n);
+    let mut quo = vec![0; n.len().saturating_sub(q.len()) + 1];
+    div_dyn(&n, q, &mut quo);
+    assert!(
+        quo[len.min(quo.len())..].iter().all(|&l| l == 0),
+        "S must be below 1"
+    );
+    quo.resize(len, 0);
+    quo
+}
+
+// Static finalize up to its out.len() + 2 <= N bound, against the exact quotient
+// of the same P and Q (so no node truncation): a reciprocal of len + 2 limbs and
+// a high product stay within one of it. The last two cases put the high
+// product's overflow limb past len + 1 limbs, where it has no slot.
+#[test]
+fn test_ratio_to_fraction_static_up_to_bound() {
+    fn check<const N: usize>(seed: u64) {
+        let mut seed = seed;
+        let mut rand = |len: usize, top: u64| {
+            seed += 1;
+            let mut x = crate::tests::rand_vec(len, seed);
+            x[len - 1] = top;
+            x
+        };
+        for len in N - 4..=N - 2 {
+            let cases = [
+                (rand(N, 1 << 62), rand(N, 1 << 63 | 3), 0),
+                (rand(N - 2, u64::MAX), rand(N, 3), -64),
+                (rand(N, u64::MAX / 3), rand(N, u64::MAX), 7),
+                (rand(N, 1 << 61 | 9), rand(N - 1, 1 << 63 | 1), 63),
+                (rand(N, 1), rand(N - 1, u64::MAX), 1),
+            ];
+            for (i, (p, q, shift)) in cases.into_iter().enumerate() {
+                let want = exact_fraction(&p, &q, shift, len);
+                let mut got = vec![0; len];
+                ratio_to_fraction_static::<N>(&p, &q, shift, &mut got);
+                let (lo, hi) = if got.iter().rev().le(want.iter().rev()) {
+                    (&got, &want)
+                } else {
+                    (&want, &got)
+                };
+                let mut lo = lo.clone();
+                add_prim(&mut lo, 1);
+                assert!(
+                    got == want || &lo == hi,
+                    "N = {N}, len = {len}, case {i} is off by more than one"
+                );
+            }
+        }
+    }
+    check::<16>(30_000);
+    check::<64>(30_100);
+    check::<419>(30_200);
+    check::<2048>(30_300);
+}
+
+#[test]
+#[should_panic(expected = "out.len() + 2 <= N")]
+fn test_ratio_to_fraction_static_past_bound() {
+    ratio_to_fraction_static::<16>(&[1], &[2], 0, &mut [0; 15]);
+}
+
+// Static nodes keep only their top 64 N bits, so their finalize can differ from
 // the exact dynamic one only in rounding: by at most one in the lowest limb.
 fn check_static<D, S>(dyn_ctx: &D::Ctx, static_ctx: &S::Ctx, a: u64, b: u64)
 where
@@ -565,7 +642,7 @@ where
 }
 
 fn static_any_cutoff_at<const N: usize>() {
-    let len = N - 3;
+    let len = N - 2;
     type L3 = Signed<BbpLin, 3>;
     let ctx = Shift(4);
     for (a, b) in [(1, 2), (1, 300), (1, 2500), (900, 1400)] {
@@ -602,7 +679,7 @@ fn static_any_cutoff_at<const N: usize>() {
 }
 
 // Static leaves too big for N limbs split themselves, so every cutoff is valid
-// at every N.
+// at every N, up to finalize's N - 2 bound.
 #[test]
 fn test_static_nodes_any_cutoff() {
     static_any_cutoff_at::<4>();
@@ -651,7 +728,7 @@ fn sweep_leaves<D, S>(
 
 fn static_leaf_sweep_at<const N: usize>() {
     // Every term below costs at least 2 bits of Q, so 32N + 8 terms never fit.
-    let (len, max_t) = (N - 3, 32 * N as u64 + 8);
+    let (len, max_t) = (N - 2, 32 * N as u64 + 8);
     type L3 = Signed<BbpLin, 3>;
     type Q0 = Signed<BbpQuad, 0>;
     let ctx = Shift(4);
@@ -684,6 +761,129 @@ fn test_static_leaf_size_sweep() {
     static_leaf_sweep_at::<5>();
     static_leaf_sweep_at::<8>();
     static_leaf_sweep_at::<16>();
+}
+
+// A single BBP term whose shift is past N limbs used to overflow its leaf, which folded
+// 2^shift into Q. Each term here shrinks by more than N limbs, so the sum's top limbs are
+// zero, and finalize skips them.
+#[test]
+fn test_static_bbp_shift_past_n() {
+    fn check<const N: usize>(shift: u64, b: u64) {
+        let ctx = Shift(shift);
+        let zeros = (shift / 64) as usize;
+        for cut in [leaves(u64::MAX, 1), C] {
+            let (mut want, mut got) = (vec![0; N - 2], vec![0; N - 2]);
+            bin_split_tree_at::<DynNodeBBP<Ln2Like>>(&ctx, 1, b, true, C).finalize(&ctx, zeros, &mut want);
+            let s = bin_split_tree_at::<StaticNodeBBP<N, Ln2Like>>(&ctx, 1, b, true, cut);
+            s.finalize(&ctx, zeros, &mut got);
+            assert!(want.iter().any(|&l| l != 0), "shift {shift}: zeros skip the whole sum");
+            let (lo, hi) = if got.iter().rev().le(want.iter().rev()) {
+                (&got, &want)
+            } else {
+                (&want, &got)
+            };
+            let mut lo = lo.clone();
+            add_prim(&mut lo, 1);
+            assert!(got == want || &lo == hi, "N = {N}, shift {shift}, {cut:?}");
+        }
+    }
+    check::<4>(64 * 4 + 10, 2);
+    check::<4>(64 * 4 + 10, 6);
+    check::<8>(64 * 9 + 33, 40);
+    check::<16>(64 * 20, 300);
+}
+
+// Static parts keep their top 64 N bits once they drop any, so a node's P / Q stays
+// within a few bits of rounding of 2^-64N relative to the exact ratio. Both sides divide
+// exactly at N + 4 limbs, so only the node's own error shows.
+trait StaticRatio: Node {
+    fn ratio_of(&self, ctx: &Self::Ctx) -> (&[u64], &[u64], i64);
+}
+impl<const N: usize, S: WideBBPSeries> StaticRatio for StaticNodeBBP<N, S> {
+    fn ratio_of(&self, ctx: &Shift) -> (&[u64], &[u64], i64) {
+        self.ratio(ctx)
+    }
+}
+impl<const N: usize, S: WideEngelSeries> StaticRatio for StaticNodeEngel<N, S> {
+    fn ratio_of(&self, ctx: &Shift) -> (&[u64], &[u64], i64) {
+        self.ratio(ctx)
+    }
+}
+impl<const N: usize, S: WideHyperSeries> StaticRatio for StaticNodeHyper<N, S> {
+    fn ratio_of(&self, ctx: &StaticHyperCtx<N>) -> (&[u64], &[u64], i64) {
+        self.ratio(ctx)
+    }
+}
+
+// Bits a static node loses below 64 N, the most observed being 10.
+const STATIC_BITS_SLACK: i64 = 16;
+
+fn check_bits<D, S>(dyn_ctx: &D::Ctx, static_ctx: &S::Ctx, a: u64, b: u64, n: usize)
+where
+    D: Node + Send,
+    S: StaticRatio + Send,
+    D::Ctx: Sync,
+    S::Ctx: Sync,
+{
+    let bits = |x: &[u64]| {
+        let x = &x[..x.iter().rposition(|&l| l != 0).map_or(0, |i| i + 1)];
+        x.last().map_or(0, |&t| 64 * x.len() as i64 - t.leading_zeros() as i64)
+    };
+    let l = n + 4;
+    let mut want = vec![0; l];
+    bin_split_tree_at::<D>(dyn_ctx, a, b, true, C).finalize(dyn_ctx, 0, &mut want);
+    for cut in [C, leaves(0, 2), SplitCutoffs::of::<S>(), leaves(u64::MAX, 1)] {
+        let node = bin_split_tree_at::<S>(static_ctx, a, b, true, cut);
+        let (p, q, shift) = node.ratio_of(static_ctx);
+        let mut got = vec![0; l];
+        ratio_to_fraction_dyn(p, q, shift, &mut got);
+        let (mut err, small) = if cmp_buf(&got, &want) == std::cmp::Ordering::Less {
+            (want.clone(), &got)
+        } else {
+            (got.clone(), &want)
+        };
+        sub_buf(&mut err, small);
+        if err.iter().any(|&l| l != 0) {
+            let lost = 64 * n as i64 - (bits(&want) - bits(&err));
+            assert!(
+                lost <= STATIC_BITS_SLACK,
+                "static [{a}, {b}) at {cut:?}, N = {n}: lost {lost} bits"
+            );
+        }
+    }
+}
+
+fn static_bits_at<const N: usize>() {
+    let ctx = Shift(4);
+    type L3 = Signed<BbpLin, 3>;
+    for (a, b) in [(1, 300), (1, 2500)] {
+        check_bits::<DynNodeBBP<BbpLin>, StaticNodeBBP<N, BbpLin>>(&ctx, &ctx, a, b, N);
+        check_bits::<DynNodeBBP<L3>, StaticNodeBBP<N, L3>>(&ctx, &ctx, a, b, N);
+    }
+    check_bits::<DynNodeBBP<Ln2Like>, StaticNodeBBP<N, Ln2Like>>(&ctx, &ctx, 900, 1400, N);
+    check_bits::<DynNodeBBP<BbpQuad>, StaticNodeBBP<N, BbpQuad>>(&ctx, &ctx, 1, 1000, N);
+    let ctx = Shift(1);
+    check_bits::<DynNodeEngel<EngelFact>, StaticNodeEngel<N, EngelFact>>(&ctx, &ctx, 2, 2500, N);
+    check_bits::<DynNodeEngel<EngelFact>, StaticNodeEngel<N, EngelFact>>(&ctx, &ctx, 900, 1400, N);
+    type H3 = Signed<Hyp, 3>;
+    for (x, shift) in [
+        (vec![1u64], 8u64),
+        (vec![12345], 20),
+        (vec![0x9e37_79b9_7f4a_7c15, 0xff_ffff_ffff], 112),
+    ] {
+        let d = DynHyperCtx::new(&x, shift);
+        let s = StaticHyperCtx::<N>::new(&x, shift);
+        check_bits::<DynNodeHyper<Hyp>, StaticNodeHyper<N, Hyp>>(&d, &s, 0, 2500, N);
+        check_bits::<DynNodeHyper<H3>, StaticNodeHyper<N, H3>>(&d, &s, 0, 2500, N);
+    }
+}
+
+#[test]
+fn test_static_nodes_keep_bits() {
+    static_bits_at::<4>();
+    static_bits_at::<8>();
+    static_bits_at::<16>();
+    static_bits_at::<64>();
 }
 
 // ln(3/2) = sum_{n >= 1} (-1)^(n + 1) / (n 2^n).
@@ -832,4 +1032,322 @@ fn test_leaf_limb_estimates() {
         let what = format!("Hyper {}-limb x shift {shift} [0, {b})", x.len());
         check_estimate(&what, est, &[n.p.len(), n.q.len(), r]);
     }
+
+    let ctx = DynHyperCtx::new(&[1], 15);
+    let n = DynNodeHyper::<Chud>::leaf(&ctx, 1, 400, false);
+    let est = DynNodeHyper::<Chud>::limbs(&ctx, 1, 400);
+    let r = n.r.as_ref().map_or(0, |r| r.len());
+    check_estimate("wide Chudnovsky [1, 400)", est, &[n.p.len(), n.q.len(), r]);
+}
+
+fn prod(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let mut v = vec![0; a.len() + b.len()];
+    mul_dyn(a, b, &mut v);
+    trim_lz(&mut v);
+    v
+}
+
+fn shl(x: &[u64], k: u64) -> Vec<u64> {
+    let (w, v) = ((k / 64) as usize, (k % 64) as u32);
+    let mut out = vec![0; w + x.len() + 1];
+    for (i, &l) in x.iter().enumerate() {
+        out[w + i] |= l << v;
+        if v != 0 {
+            out[w + i + 1] |= l >> (64 - v);
+        }
+    }
+    trim_lz(&mut out);
+    out
+}
+
+// A dyn node's P, Q, term count and sign.
+trait DynParts: Node {
+    fn parts(&self) -> (&[u64], &[u64], u64, bool);
+}
+impl<S: WideBBPSeries> DynParts for DynNodeBBP<S> {
+    fn parts(&self) -> (&[u64], &[u64], u64, bool) {
+        (&self.p, &self.q, self.b - self.a, self.neg)
+    }
+}
+impl<S: WideEngelSeries> DynParts for DynNodeEngel<S> {
+    fn parts(&self) -> (&[u64], &[u64], u64, bool) {
+        (&self.p, &self.q, self.b - self.a, self.neg)
+    }
+}
+impl<S: WideHyperSeries> DynParts for DynNodeHyper<S> {
+    fn parts(&self) -> (&[u64], &[u64], u64, bool) {
+        (&self.p, &self.q, self.b - self.a, self.neg)
+    }
+}
+
+// Whether two dyn nodes' sums S = P / (Q 2^(shift t)) are equal, exactly, with no
+// division: P1 Q2 2^(s2 t2) = P2 Q1 2^(s1 t1), and their signs agree.
+fn same_sum<A: DynParts, B: DynParts>(x: &A, x_shift: u64, y: &B, y_shift: u64) -> bool {
+    let ((p1, q1, t1, n1), (p2, q2, t2, n2)) = (x.parts(), y.parts());
+    let (a, b) = (x_shift * t1, y_shift * t2);
+    let m = a.min(b);
+    let equal = shl(&prod(p1, q2), b - m) == shl(&prod(p2, q1), a - m);
+    equal && (p1.is_empty() || n1 == n2)
+}
+
+// Wide twins sum the same S as a narrow series, with terms from M on scaled by a 70-bit
+// K in p and q (and r), which leaves each term as it was. Leaves below M run narrow,
+// leaves past it wide, and leaves across it wide.
+const K: u128 = (1 << 69) + 0x9e37;
+fn k_at<const M: u64>(n: u128) -> u128 {
+    if n < M as u128 {
+        1
+    } else {
+        K
+    }
+}
+
+struct Twin<S, const M: u64>(PhantomData<S>);
+impl<S: BBPSeries, const M: u64> WideBBPSeries for Twin<S, M> {
+    const SIGNED: bool = S::SIGNED;
+    fn p(n: u128) -> u128 {
+        S::p(n as u64) as u128 * k_at::<M>(n)
+    }
+    fn q(n: u128) -> u128 {
+        S::q(n as u64) as u128 * k_at::<M>(n)
+    }
+    fn neg(n: u128) -> bool {
+        S::neg(n as u64)
+    }
+}
+impl<S: HyperSeries, const M: u64> WideHyperSeries for Twin<S, M> {
+    const SIGNED: bool = S::SIGNED;
+    fn p(n: u128) -> u128 {
+        S::p(n as u64) as u128 * k_at::<M>(n)
+    }
+    fn q(n: u128) -> u128 {
+        S::q(n as u64) as u128 * k_at::<M>(n)
+    }
+    fn r(n: u128) -> u128 {
+        S::r(n as u64) as u128 * k_at::<M>(n)
+    }
+    fn neg(n: u128) -> bool {
+        S::neg(n as u64)
+    }
+}
+
+// An Engel series' q(n) 2^58 at shift k sums what q(n) does at shift k + 58. With
+// q(n) = n it goes wide from n = 64.
+struct Shifted58<S>(PhantomData<S>);
+impl<S: EngelSeries> WideEngelSeries for Shifted58<S> {
+    const SIGNED: bool = S::SIGNED;
+    fn p(n: u128) -> u128 {
+        S::p(n as u64) as u128
+    }
+    fn q(n: u128) -> u128 {
+        (S::q(n as u64) as u128) << 58
+    }
+    fn neg(n: u128) -> bool {
+        S::neg(n as u64)
+    }
+}
+
+// A wide twin's sum equals its narrow series' exactly at every cutoff, whichever of its
+// leaves run narrow or wide.
+fn check_twin<N, W>(
+    n_ctx: &N::Ctx,
+    n_shift: u64,
+    w_ctx: &W::Ctx,
+    w_shift: u64,
+    a: u64,
+    b: u64,
+    last: bool,
+) where
+    N: DynParts + Send,
+    W: DynParts + Send,
+    N::Ctx: Sync,
+    W::Ctx: Sync,
+{
+    let narrow = bin_split_tree_at::<N>(n_ctx, a, b, last, C);
+    for cut in [
+        C,
+        leaves(0, 2),
+        SplitCutoffs::of::<W>(),
+        leaves(u64::MAX, 1),
+    ] {
+        let wide = bin_split_tree_at::<W>(w_ctx, a, b, last, cut);
+        assert!(
+            same_sum(&wide, w_shift, &narrow, n_shift),
+            "wide twin {} [{a}, {b}) last={last} at {cut:?}",
+            std::any::type_name::<W>()
+        );
+    }
+}
+
+#[test]
+fn test_wide_twins_match_narrow() {
+    type L3 = Signed<BbpLin, 3>;
+    let ctx = Shift(4);
+    for b in [2, 300, 2500] {
+        check_twin::<DynNodeBBP<BbpLin>, DynNodeBBP<Twin<BbpLin, 0>>>(&ctx, 4, &ctx, 4, 1, b, true);
+        check_twin::<DynNodeBBP<BbpLin>, DynNodeBBP<Twin<BbpLin, 150>>>(
+            &ctx, 4, &ctx, 4, 1, b, true,
+        );
+        check_twin::<DynNodeBBP<L3>, DynNodeBBP<Twin<L3, 150>>>(&ctx, 4, &ctx, 4, 1, b, true);
+    }
+    check_twin::<DynNodeBBP<BbpQuad>, DynNodeBBP<Twin<BbpQuad, 400>>>(
+        &ctx, 4, &ctx, 4, 1, 1000, true,
+    );
+
+    // From a = 64 every term is wide.
+    type E3 = Signed<EngelFact, 3>;
+    for (k, a, b) in [(1, 2, 300), (1, 2, 2500), (1, 64, 600), (70, 2, 500)] {
+        let (nc, wc) = (Shift(k + 58), Shift(k));
+        type W<S> = DynNodeEngel<Shifted58<S>>;
+        check_twin::<DynNodeEngel<EngelFact>, W<EngelFact>>(&nc, k + 58, &wc, k, a, b, true);
+        check_twin::<DynNodeEngel<E3>, W<E3>>(&nc, k + 58, &wc, k, a, b, true);
+    }
+
+    type H3 = Signed<Hyp, 3>;
+    for (x, shift) in [
+        (vec![1u64], 8u64),
+        (vec![12345], 20),
+        (vec![0x9e37_79b9_7f4a_7c15, 0xff_ffff_ffff], 112),
+    ] {
+        let d = DynHyperCtx::new(&x, shift);
+        for last in [true, false] {
+            for b in [50, 2500] {
+                type T<S, const M: u64> = DynNodeHyper<Twin<S, M>>;
+                check_twin::<DynNodeHyper<Hyp>, T<Hyp, 0>>(&d, shift, &d, shift, 0, b, last);
+                check_twin::<DynNodeHyper<Hyp>, T<Hyp, 100>>(&d, shift, &d, shift, 0, b, last);
+                check_twin::<DynNodeHyper<H3>, T<H3, 100>>(&d, shift, &d, shift, 0, b, last);
+            }
+        }
+    }
+}
+
+// Static wide twins match their narrow series' dyn sum within 1 ulp up to finalize's
+// N - 2 bound, and keep all but a few bits of 64N.
+fn static_wide_at<const N: usize>() {
+    let len = N - 2;
+    type L3 = Signed<BbpLin, 3>;
+    let ctx = Shift(4);
+    check_static_cutoffs::<DynNodeBBP<BbpLin>, StaticNodeBBP<N, Twin<BbpLin, 150>>>(
+        &ctx, &ctx, 1, 2500, len,
+    );
+    check_static_cutoffs::<DynNodeBBP<L3>, StaticNodeBBP<N, Twin<L3, 150>>>(
+        &ctx, &ctx, 1, 2500, len,
+    );
+    check_bits::<DynNodeBBP<BbpLin>, StaticNodeBBP<N, Twin<BbpLin, 150>>>(&ctx, &ctx, 1, 2500, N);
+
+    type E3 = Signed<EngelFact, 3>;
+    let (nc, wc) = (Shift(59), Shift(1));
+    type W<const N: usize, S> = StaticNodeEngel<N, Shifted58<S>>;
+    for a in [2, 64] {
+        check_static_cutoffs::<DynNodeEngel<EngelFact>, W<N, EngelFact>>(&nc, &wc, a, 2500, len);
+        check_static_cutoffs::<DynNodeEngel<E3>, W<N, E3>>(&nc, &wc, a, 2500, len);
+        check_bits::<DynNodeEngel<EngelFact>, W<N, EngelFact>>(&nc, &wc, a, 2500, N);
+    }
+
+    type H3 = Signed<Hyp, 3>;
+    for (x, shift) in [
+        (vec![1u64], 8u64),
+        (vec![12345], 20),
+        (vec![0x9e37_79b9_7f4a_7c15, 0xff_ffff_ffff], 112),
+    ] {
+        let d = DynHyperCtx::new(&x, shift);
+        let s = StaticHyperCtx::<N>::new(&x, shift);
+        type T<const N: usize, S> = StaticNodeHyper<N, Twin<S, 100>>;
+        check_static_cutoffs::<DynNodeHyper<Hyp>, T<N, Hyp>>(&d, &s, 0, 2500, len);
+        check_static_cutoffs::<DynNodeHyper<H3>, T<N, H3>>(&d, &s, 0, 2500, len);
+        check_bits::<DynNodeHyper<Hyp>, T<N, Hyp>>(&d, &s, 0, 2500, N);
+    }
+}
+
+#[test]
+fn test_static_wide_twins() {
+    static_wide_at::<4>();
+    static_wide_at::<8>();
+    static_wide_at::<16>();
+    static_wide_at::<64>();
+}
+
+// Chudnovsky's series for 1/π from n = 1, with 640320³ / 24 = 2^15 10005³ / 3: term n is
+// (-1)^n (13591409 + 545140134 n) prod_{j <= n} (6j - 5)(2j - 1)(6j - 1) / (j³ 640320³ / 24).
+// Its p passes 2^64 at about n = 146 and its q at n = 381, so leaves go from narrow to
+// wide.
+struct Chud;
+impl WideHyperSeries for Chud {
+    const SIGNED: bool = true;
+    fn p(n: u128) -> u128 {
+        Self::r(n) * (13591409 + 545140134 * n)
+    }
+    fn q(n: u128) -> u128 {
+        n.pow(3) * 333_833_583_375
+    }
+    fn r(n: u128) -> u128 {
+        (6 * n - 5) * (2 * n - 1) * (6 * n - 1)
+    }
+    fn neg(n: u128) -> bool {
+        n % 2 == 1
+    }
+}
+
+// Chud's sum over [1, b) as (P, Q, sign) with S = P / (Q 2^(15 (b - 1))), term by term with
+// plain bignum products: P_n = P_(n-1) q(n) 2^15 ± a(n) R_n, R_n = R_(n-1) r(n) and
+// Q_n = Q_(n-1) q(n). None of it runs through a leaf kernel.
+fn chud_naive(b: u64) -> (Vec<u64>, Vec<u64>, bool) {
+    let mul = |x: &[u64], m: u128| {
+        let mut v = vec![0; x.len() + 2];
+        mul_dyn(x, &[m as u64, (m >> 64) as u64], &mut v);
+        trim_lz(&mut v);
+        v
+    };
+    let add = |x: &[u64], y: &[u64]| {
+        let (long, short) = if x.len() >= y.len() { (x, y) } else { (y, x) };
+        let mut v = long.to_vec();
+        v.push(0);
+        add_buf(&mut v, short);
+        trim_lz(&mut v);
+        v
+    };
+    let (mut p, mut neg, mut q, mut r) = (vec![], false, vec![1u64], vec![1u64]);
+    for n in 1..b as u128 {
+        p = mul(&p, Chud::q(n) << 15);
+        q = mul(&q, Chud::q(n));
+        r = mul(&r, Chud::r(n));
+        let t = mul(&r, 13591409 + 545140134 * n);
+        (p, neg) = if p.is_empty() || neg == Chud::neg(n) {
+            (add(&p, &t), Chud::neg(n))
+        } else if neg {
+            signed_diff(&t, &p)
+        } else {
+            signed_diff(&p, &t)
+        };
+    }
+    (p, q, neg)
+}
+
+#[test]
+fn test_chudnovsky_wide() {
+    let d = DynHyperCtx::new(&[1], 15);
+    let (p, q, neg) = chud_naive(500);
+    for last in [true, false] {
+        let leaf = DynNodeHyper::<Chud>::leaf(&d, 1, 500, last);
+        let (lp, lq, _, ln) = leaf.parts();
+        assert!(
+            prod(lp, &q) == prod(&p, lq) && ln == neg,
+            "Chudnovsky [1, 500) single leaf against the naive sum"
+        );
+        for cut in [C, leaves(0, 2), SplitCutoffs::of::<DynNodeHyper<Chud>>()] {
+            let tree = bin_split_tree_at::<DynNodeHyper<Chud>>(&d, 1, 500, last, cut);
+            assert!(
+                same_sum(&tree, 15, &leaf, 15),
+                "Chudnovsky [1, 500) last={last} at {cut:?}"
+            );
+        }
+    }
+    let s16 = StaticHyperCtx::<16>::new(&[1], 15);
+    check_static_cutoffs::<DynNodeHyper<Chud>, StaticNodeHyper<16, Chud>>(&d, &s16, 1, 500, 14);
+    check_bits::<DynNodeHyper<Chud>, StaticNodeHyper<16, Chud>>(&d, &s16, 1, 500, 16);
+    let s64 = StaticHyperCtx::<64>::new(&[1], 15);
+    check_static_cutoffs::<DynNodeHyper<Chud>, StaticNodeHyper<64, Chud>>(&d, &s64, 1, 500, 62);
+    check_bits::<DynNodeHyper<Chud>, StaticNodeHyper<64, Chud>>(&d, &s64, 1, 500, 64);
+    let s400 = StaticHyperCtx::<400>::new(&[1], 15);
+    check_static_cutoffs::<DynNodeHyper<Chud>, StaticNodeHyper<400, Chud>>(&d, &s400, 1, 500, 398);
 }

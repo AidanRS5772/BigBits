@@ -298,13 +298,10 @@ pub fn reciprocal_preflight(d: &[u64], rcp: &[u64]) -> bool {
 
 /// Selects the part of the divisor that can affect the requested reciprocal
 /// precision. Removing low zero limbs is exact. Keeping one limb beyond the
-/// output precision bounds input-truncation error to the final output limb;
-/// static drivers may keep only `precision` limbs when their capacity is
-/// tight, which still bounds the numeric error to less than one whole limb.
-fn reciprocal_divisor_window(d: &[u64], precision: usize, capacity: usize) -> &[u64] {
-    debug_assert!(precision != 0 && capacity != 0);
-    let max_window_len = d.len().min(precision.saturating_add(1)).min(capacity);
-    let window = &d[d.len() - max_window_len..];
+/// output precision bounds input-truncation error to the final output limb.
+fn reciprocal_divisor_window(d: &[u64], precision: usize) -> &[u64] {
+    debug_assert!(precision != 0);
+    let window = &d[d.len() - d.len().min(precision.saturating_add(1))..];
     let first_nonzero = window.iter().position(|&limb| limb != 0).unwrap();
     &window[first_nonzero..]
 }
@@ -562,7 +559,7 @@ pub fn div_rem_prepared_static<const N: usize>(
 
 /// Executes a nonempty reciprocal request after [`reciprocal_preflight`].
 pub fn rcp_prepared_dyn(d: &[u64], rcp: &mut [u64], algorithm: RcpAlg) {
-    let d = reciprocal_divisor_window(d, rcp.len(), usize::MAX);
+    let d = reciprocal_divisor_window(d, rcp.len());
     if algorithm == RcpAlg::NR && nr_rcp_attempt_dyn(d, rcp) {
         return;
     }
@@ -584,11 +581,12 @@ pub fn rcp_prepared_dyn(d: &[u64], rcp: &mut [u64], algorithm: RcpAlg) {
     }
 }
 
-/// Static counterpart of [`rcp_prepared_dyn`], with capacity measured against
-/// the prepared divisor window and requested precision.
+/// Static counterpart of [`rcp_prepared_dyn`]. Like every static entry, it
+/// requires the divisor and the output to fit N limbs each.
 pub fn rcp_prepared_static<const N: usize>(d: &[u64], rcp: &mut [u64], algorithm: RcpAlg) {
+    assert!(d.len() <= N, "reciprocal divisor exceeds static capacity");
     assert!(rcp.len() <= N, "reciprocal output exceeds static capacity");
-    let d = reciprocal_divisor_window(d, rcp.len(), N);
+    let d = reciprocal_divisor_window(d, rcp.len());
     if algorithm == RcpAlg::NR && nr_rcp_attempt_static::<N>(d, rcp) {
         return;
     }
@@ -1155,10 +1153,20 @@ fn nr_exact_correction(
 // err = d·q_hi − n around the cancellation point, and assembles q with the
 // correction x·err. Reports failure on band rejection or quotient wrap;
 // otherwise the top guard limb determines whether exact correction is needed.
+//
+// The band is a middle product, which drops the carries from the product's
+// columns below it: up to about (h + 1) B at its base. Dividing by d scales that
+// by B / top limb, and for odd q_len the base lines up with the top guard limb,
+// so the band uses the normalized windows d_top and n_top of d 2^sh and n 2^sh
+// and pairs with x_norm, the reciprocal of d 2^sh (x_norm err_norm = x err).
+// Then the dropped carry costs at most about 2 (h + 1) ulps of the second guard
+// limb. x, the reciprocal of d itself, only forms the estimate hq.
 fn nr_refine_quo(
     n: &[u64],
+    n_top: &[u64],
     d_top: &[u64],
     x: &[u64],
+    x_norm: &[u64],
     hq: &mut [u64],
     err: &mut [u64],
     corr: &mut [u64],
@@ -1170,8 +1178,7 @@ fn nr_refine_quo(
 ) -> NrEstimate {
     hq[h + 2] = short(n, x, &mut hq[..h + 2]);
     let y = end_ref(hq, h + 1);
-    let Some((neg, e_len)) = nr_err_band(d_top, y, end_ref(n, 2 * h + 1), err, h, h + 3, mid)
-    else {
+    let Some((neg, e_len)) = nr_err_band(d_top, y, n_top, err, h, h + 3, mid) else {
         return NrEstimate::Failed;
     };
 
@@ -1179,9 +1186,9 @@ fn nr_refine_quo(
     // k floats with e_len while the digit alignment stays fixed.
     let k = e_len + l - h + 1;
     let c = &mut corr[..k + 1];
-    c[k] = short(x, &err[..e_len], &mut c[..k]);
+    c[k] = short(x_norm, &err[..e_len], &mut c[..k]);
     if neg {
-        sub_buf(&mut c[1..], end_ref(x, k));
+        sub_buf(&mut c[1..], end_ref(x_norm, k));
         twos_comp(c);
     }
 
@@ -1247,17 +1254,20 @@ fn nr_quo_est_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> NrEstimate {
     let d_len = 2 * pen_p + 1;
     let rcp_err_len = d_len + 1;
     let mut scratch = ScratchGuard::acquire();
-    let [x, hq, err, corr, rcp_err, rcp_cor, seed_n, d_work, d_top] = scratch.get_splits([
-        x_len,
-        h + 3,
-        h + 4,
-        l + 5,
-        rcp_err_len,
-        rcp_err_len,
-        4,
-        d_len,
-        2 * h + 1,
-    ]);
+    let [x, x_norm, hq, err, corr, rcp_err, rcp_cor, seed_n, d_work, d_top, n_top] = scratch
+        .get_splits([
+            x_len,
+            x_len,
+            h + 3,
+            h + 4,
+            l + 5,
+            rcp_err_len,
+            rcp_err_len,
+            4,
+            d_len,
+            2 * h + 1,
+            2 * h + 1,
+        ]);
 
     let sh = d[d.len() - 1].leading_zeros() as u8;
     x.fill(0);
@@ -1278,16 +1288,20 @@ fn nr_quo_est_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> NrEstimate {
         knuth_rcp_normalized(d_work, x, &mut rcp_err[..d_len], 1);
         inc_buf(x);
     }
+    x_norm.copy_from_slice(x);
     if shl_buf(x, sh) != 0 {
         return NrEstimate::Failed;
     }
 
-    shl_top_copy(d, d_top, 0);
+    shl_top_copy(d, d_top, sh);
+    shl_top_copy(n, n_top, sh);
 
     nr_refine_quo(
         n,
+        n_top,
         d_top,
         x,
+        x_norm,
         hq,
         err,
         corr,
@@ -1344,21 +1358,27 @@ fn nr_quo_est_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) -> NrE
         // to the complete Burnikel-Ziegler division.
         return NrEstimate::Failed;
     }
+    let mut x_norm = [0u64; N];
+    let x_norm = &mut x_norm[..x.len()];
+    x_norm.copy_from_slice(x);
     if shl_buf(x, sh) != 0 {
         return NrEstimate::Failed;
     }
 
-    let mut d_top = [0u64; N];
-    let d_top = &mut d_top[..2 * h + 1];
-    shl_top_copy(d, d_top, 0);
+    let (mut d_top, mut n_top) = ([0u64; N], [0u64; N]);
+    let (d_top, n_top) = (&mut d_top[..2 * h + 1], &mut n_top[..2 * h + 1]);
+    shl_top_copy(d, d_top, sh);
+    shl_top_copy(n, n_top, sh);
 
     let mut hq = [0u64; N];
     let mut err = [0u64; N];
     let mut corr = [0u64; N];
     nr_refine_quo(
         n,
+        n_top,
         d_top,
         x,
+        x_norm,
         &mut hq[..h + 3],
         &mut err[..h + 4],
         &mut corr[..l + 5],
@@ -1568,20 +1588,24 @@ fn nr_rcp_attempt_static<const N: usize>(d: &[u64], rcp: &mut [u64]) -> bool {
         .checked_mul(2)
         .and_then(|len| len.checked_add(1))
         .expect("reciprocal size overflow");
-    let err_len = d_len.checked_add(1).expect("reciprocal size overflow");
-
-    // Guard precision and schedule parity can make the widest refinement band
-    // several limbs larger than the requested reciprocal. Tight static buffers
-    // use Knuth instead of slicing beyond N.
-    if work_len > N || d_len > N || err_len > N {
+    // Guard limbs and schedule parity put work and the last divisor window up to
+    // 3 limbs past R, so up to N + 3. The window's limbs past N are always low
+    // zero padding (d has at most N limbs), which mid_mul_static accepts. Error
+    // bands stop a couple of limbs past p + 1, so capping them at N limbs keeps
+    // hi_mul_static's operands within N and only rejects bands that never occur.
+    // Only tiny N leaves no room for a band to grow, and Knuth retries.
+    debug_assert!(d.len() <= N);
+    let err_len = (d_len + 1).min(N);
+    if pen_p + 2 > err_len {
         return false;
     }
 
-    let mut work = [0u64; N];
+    let mut work = [[0u64; N]; 2];
+    let mut d_work = [[0u64; N]; 2];
+    let (work, d_work) = (work.as_flattened_mut(), d_work.as_flattened_mut());
     let mut err = [0u64; N];
     let mut cor = [0u64; N];
     let mut seed_n = [0u64; 4];
-    let mut d_work = [0u64; N];
     shl_top_copy(d, &mut d_work[..d_len], sh);
 
     if !nr_rcp_chain(

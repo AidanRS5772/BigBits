@@ -1,5 +1,5 @@
 mod test_bin_split;
-mod test_div;
+pub(crate) mod test_div;
 mod test_mul;
 mod test_sqrt;
 mod test_trans;

@@ -2431,6 +2431,53 @@ fn test_ntt_mid_mul_static_split_matches_dyn() {
     }
 }
 
+// A long operand that passes N by low zero limbs (a reciprocal's padded divisor
+// window) runs the convolution on its nonzero part and must match the dynamic
+// product of the materialized operand exactly.
+#[test]
+fn test_ntt_mid_mul_static_zero_padded_long_matches_dyn() {
+    fn run<const N: usize>(z: usize, seed: u64) {
+        let n = (N + 1 + z) / 2;
+        assert_eq!(2 * n - 1, N + z);
+        let mut long = vec![0u64; z];
+        long.extend(rand_nonzero_vec(N, seed));
+        let short = rand_nonzero_vec(n, seed + 1);
+
+        let mut out_dyn = vec![0u64; n];
+        let c_dyn = ntt_mid_mul_dyn(&long, &short, &mut out_dyn);
+        let mut out_st = vec![0u64; n];
+        let c_st = ntt_mid_mul_static::<N>(&long, &short, &mut out_st);
+        let what = format!("padded ntt_mid_mul_static N={N} z={z}");
+        assert_eq_mid_result(&out_st, c_st, &out_dyn, c_dyn, &what);
+
+        let mut out_school = vec![0u64; n];
+        let c_school = mid_mul_buf(&long, &short, &mut out_school);
+        assert_approx_mid_result(&out_st, c_st, &out_school, c_school, &what);
+        // mid_mul_static routes it the same way.
+        let mut out_entry = vec![0u64; n];
+        assert_eq!(mid_mul_static::<N>(&long, &short, &mut out_entry), c_st);
+        assert_eq!(out_entry, out_st, "{what}: mid_mul_static entry");
+    }
+    for seed in [8500, 8510] {
+        run::<408>(1, seed);
+        run::<407>(2, seed);
+        run::<406>(3, seed);
+        // N = 2043 isn't 5-smooth, so its sub-transforms are clamped smaller.
+        run::<2043>(2, seed);
+        run::<2044>(3, seed);
+    }
+}
+
+#[test]
+#[should_panic(expected = "long past N must be low zero padding")]
+fn test_ntt_mid_mul_static_rejects_nonzero_long_past_n() {
+    const N: usize = 406;
+    let long = rand_nonzero_vec(N + 3, 8600);
+    let short = rand_nonzero_vec((N + 4) / 2, 8601);
+    let mut out = vec![0u64; short.len()];
+    ntt_mid_mul_static::<N>(&long, &short, &mut out);
+}
+
 #[test]
 fn test_ntt_mid_mul_dyn_matches_full_product_approximately() {
     for &n in &[FFT_MID_CUTOFF, FFT_MID_CUTOFF + 30, NTT_MID_CUTOFF] {

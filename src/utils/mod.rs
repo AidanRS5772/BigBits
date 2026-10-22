@@ -88,18 +88,18 @@ pub const STATIC_HYPER_LEAF_TERMS: u64 = 8;
 pub const DYN_BIN_SPLIT_PAR_CUTOFF: u64 = 256;
 pub const DYN_BIN_SPLIT_MERGE_PAR_CUTOFF: usize = 256;
 
-// exp_dyn evaluates its chunk series in parallel once it has at least two chunks
+// exp_dyn_entry evaluates its chunk series in parallel once it has at least two chunks
 // and chunks * working limbs reaches this, on a pool of two or more threads. Chunks
 // cost about the same at a given precision, so this is one decision for the whole
 // loop. See docs/bin_split_cutoff_tuning.md.
 pub const DYN_EXP_CHUNK_PAR_WORK: usize = 512;
 
-// exp_dyn's first chunk after x's top bit spans at least this many bits; later chunks
+// exp_dyn_entry's first chunk after x's top bit spans at least this many bits; later chunks
 // each span [s, ~2s). Narrower chunks near the top all sum about as many terms, so each
 // costs about as much as a wide one. See docs/bin_split_cutoff_tuning.md.
 pub const DYN_EXP_CHUNK_MIN_BITS: u64 = 16;
 
-// exp_static's counterparts: it gives each chunk series its own scoped thread once
+// exp_static_entry's counterparts: it gives each chunk series its own scoped thread once
 // it has at least two chunks and chunks * working limbs reaches this. A thread
 // costs about 10 us to start, far more than a rayon task: threads tied at 585 and
 // won from 774 (0.67x) to 13325 (0.34x).

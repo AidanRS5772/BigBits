@@ -5,12 +5,9 @@ use std::{
 };
 
 use crate::utils::{
-    bin_split::{
-        bin_split, join2, ratio_to_fraction_dyn, ratio_to_fraction_static, static_split_stack,
-        BBPSeries, DynNodeBBP, Node, Shift, StaticNodeBBP,
-    },
-    utils::add_buf,
-    ScratchGuard, LN2_PAR_CUTOFF,
+    LN2_PAR_CUTOFF, ScratchGuard, bin_split::{
+        BBPSeries, DynHyperCtx, DynNodeBBP, DynNodeHyper, HyperSeries, Node, Shift, StaticNodeBBP, WideHyperSeries, bin_split, join2, ratio_to_fraction_dyn, ratio_to_fraction_static, static_split_stack
+    }, utils::add_buf
 };
 
 //$ ln(2) = \frac{2}{3} + 1/2  \sum^{\infty}_{n=1} \left(\frac{1}{2n} + \frac{1}{4n+1}+\frac{1}{8n+4}+\frac{1}{16n+12}\right)16^{-n}$
@@ -198,7 +195,8 @@ impl<const N: usize> StaticLn2<N> {
             acc: &mut [u64],
             t: &mut [u64],
         ) {
-            ratio_to_fraction_static::<N>(&s.p[..s.p_len], &s.q[..s.q_len], shift as i64, t);
+            let (p, q, k) = s.ratio(&LN2_CTX);
+            ratio_to_fraction_static::<N>(p, q, k + shift as i64, t);
             let carry = add_buf(acc, t);
             debug_assert!(!carry, "ln(2) < 1");
         }
@@ -233,8 +231,8 @@ impl<const N: usize> StaticLn2<N> {
         }
         let len = out.len() + 1;
         assert!(
-            len + 3 <= N,
-            "ln(2) past the table needs out.len() + 4 <= N"
+            len + 2 <= N,
+            "ln(2) past the table needs out.len() + 3 <= N"
         );
 
         // Each term adds 4 bits.
@@ -247,7 +245,12 @@ impl<const N: usize> StaticLn2<N> {
                     spawn_split::<N, Ln2S3>(sc, n),
                     spawn_split::<N, Ln2S4>(sc, n),
                 );
-                (join_split(h1, n), join_split(h2, n), join_split(h3, n), join_split(h4, n))
+                (
+                    join_split(h1, n),
+                    join_split(h2, n),
+                    join_split(h3, n),
+                    join_split(h4, n),
+                )
             })
         } else {
             let (s1, s2) = (split::<N, Ln2S1>(n), split::<N, Ln2S2>(n));
@@ -269,4 +272,51 @@ impl<const N: usize> StaticLn2<N> {
 
 pub fn ln2_static<const N: usize>(out: &mut [u64]) {
     StaticLn2::<N>::request(out);
+}
+
+//$1/\pi = \frac{\sqrt{10005}}{4270934400} \; \sum^{\infty}_{n=0} (-1)^{n} \frac{(6n)!}{(3n)!(n!)^3 640320^{3n}} (545140134 \cdot n + 13591409)$
+//$P_1 / Q_1 = \sum^{\infty}_{n=0} (-1)^{n} \; n \prod^{n}_{r=1} \frac{(6r-5)(6r-1)(2r-1)}{r^3 \cdot 333833583375 \cdot 2^15}$
+//$P_2 / Q_2 = \sum^{\infty}_{n=0} (-1)^{n} \prod^{n}_{r=1} \frac{(6r-5)(6r-1)(2r-1)}{r^3 \cdot 333833583375 \cdot 2^15}$
+//$\pi = \frac{4270934400 \cdot Q_1 Q_2}{\sqrt{10005}(545140134 \cdot P_1 Q_2 + 13591409 \cdot P_2 Q_1)}$
+
+const PI_POW: u128 = 333_833_583_375;
+struct PI1;
+impl WideHyperSeries for PI1 {
+    const SIGNED: bool = true;
+    fn p(n: u128) -> u128 {
+        n * (6 * n - 5) * (6 * n - 1) * (2 * n - 1)
+    }
+    fn q(n: u128) -> u128{
+        n * n * n * PI_POW
+    }
+    fn r(n: u128) -> u128{
+        (6 * n - 5) * (6 * n - 1) * (2 * n - 1)
+    }
+    fn neg(n: u128) -> bool {
+        (n & 1) == 1
+    }
+}
+
+struct PI2;
+impl WideHyperSeries for PI2 {
+    const SIGNED: bool = true;
+    fn p(n: u128) -> u128 {
+        (6 * n - 5) * (6 * n - 1) * (2 * n - 1)
+    }
+    fn q(n: u128) -> u128{
+        let n = n as u128;
+        n * n * n * PI_POW
+    }
+    fn r(n: u128) -> u128{
+        n * (6 * n - 5) * (6 * n - 1) * (2 * n - 1)
+    }
+    fn neg(n: u128) -> bool {
+        (n & 1) == 1
+    }
+}
+
+struct DynPI{
+    s1: Option<DynNodeHyper<PI1>>,
+    s2: Option<DynNodeHyper<PI2>>,
+    buf: Vec<u64>,
 }

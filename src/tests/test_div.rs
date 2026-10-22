@@ -1613,7 +1613,7 @@ fn test_newton_raphson_div_dyn_skewed_shapes() {
 
 // ─── reciprocal stack ────────────────────────────────────────────────────────
 
-fn exact_rcp_reference(d: &[u64], r_len: usize) -> Vec<u64> {
+pub(crate) fn exact_rcp_reference(d: &[u64], r_len: usize) -> Vec<u64> {
     if r_len == 0 {
         return Vec::new();
     }
@@ -1633,7 +1633,7 @@ fn exact_rcp_reference(d: &[u64], r_len: usize) -> Vec<u64> {
     }
 }
 
-fn assert_rcp_precision(name: &str, actual: &[u64], exact: &[u64]) {
+pub(crate) fn assert_rcp_precision(name: &str, actual: &[u64], exact: &[u64]) {
     assert_eq!(actual.len(), exact.len(), "{name}: output length changed");
     let mut error = match cmp_buf(actual, exact) {
         std::cmp::Ordering::Less => {
@@ -1794,6 +1794,13 @@ fn test_explicit_reciprocal_entry_contract_errors() {
             algorithm(&[3], &mut oversized);
         }));
         assert!(result.is_err(), "static reciprocal exceeded its capacity");
+        // Static entries take divisors of at most N limbs, even when only
+        // their top window would be read.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut out = [0u64; 1];
+            algorithm(&[3, 3], &mut out);
+        }));
+        assert!(result.is_err(), "static reciprocal accepted a divisor past N");
     }
 }
 
@@ -1822,8 +1829,8 @@ fn test_nr_rcp_two_guard_limb_regression() {
 
 #[test]
 fn test_nr_rcp_static_tight_fit() {
-    // With r == N there is no spare guard capacity. NR may use its Knuth
-    // capacity fallback when a refinement band needs one extra limb.
+    // With r == N the guard limbs and the last divisor window pass N; NR still
+    // completes, with the window's zero limbs past N dropped by mid_mul_static.
     fn run<const N: usize>(seed: u64) {
         let d = rand_nonzero_vec(N, seed);
         let mut rcp = vec![0u64; N];
@@ -1863,29 +1870,8 @@ fn test_static_reciprocal_entry_matrix_precision() {
     run::<256>("skewed", 12, 129, 12_600);
     // d + r exceeds N, but reciprocal wrappers only need the precision window.
     run::<128>("precision window capacity", 96, 120, 12_700);
-    // The original divisor exceeds N, but its precision window fits the
-    // static reciprocal wrappers.
-    run::<16>("long divisor precision window", 80, 8, 12_800);
-}
-
-#[test]
-fn test_static_reciprocal_capacity_tight_precision_window() {
-    const N: usize = 8;
-    let mut d = vec![u64::MAX; 3 * N];
-    d[2 * N..].fill(0);
-    d[3 * N - 1] = 1;
-    let exact = exact_rcp_reference(&d, N);
-    let algorithms: [(&str, fn(&[u64], &mut [u64])); 3] = [
-        ("Knuth", knuth_rcp_static::<N>),
-        ("Newton-Raphson", nr_rcp_static::<N>),
-        ("dispatcher", rcp_static::<N>),
-    ];
-
-    for (name, algorithm) in algorithms {
-        let mut actual = [0u64; N];
-        algorithm(&d, &mut actual);
-        assert_rcp_precision(name, &actual, &exact);
-    }
+    // Only the divisor's top R + 1 limbs reach the result.
+    run::<16>("divisor past the precision window", 16, 8, 12_800);
 }
 
 #[test]
@@ -1900,9 +1886,9 @@ fn test_reciprocal_entries_ignore_discarded_low_divisor_limbs() {
         ("dynamic Knuth", knuth_rcp_dyn),
         ("dynamic Newton-Raphson", nr_rcp_dyn),
         ("dynamic dispatcher", rcp_dyn),
-        ("static Knuth", knuth_rcp_static::<16>),
-        ("static Newton-Raphson", nr_rcp_static::<16>),
-        ("static dispatcher", rcp_static::<16>),
+        ("static Knuth", knuth_rcp_static::<64>),
+        ("static Newton-Raphson", nr_rcp_static::<64>),
+        ("static dispatcher", rcp_static::<64>),
     ];
 
     for (name, algorithm) in algorithms {
