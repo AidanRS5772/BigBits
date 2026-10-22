@@ -3,6 +3,7 @@ use crate::utils::consts::consts::{ln2_dyn, ln2_static, LN2_LIMBS};
 use crate::utils::div::div_dyn;
 use crate::utils::mul::mul_dyn;
 use crate::utils::utils::{add_buf, add_prim, cmp_buf, sub_buf, trim_lz};
+use crate::utils::CapacityError;
 use std::marker::PhantomData;
 
 // Small leaves give deep trees, so most work runs through merges, and the
@@ -186,7 +187,7 @@ fn test_ln2_static_table() {
     assert_eq!(&full[LN2_LIMBS - 32..], &LN2_32[..]);
     for l in [0, 1, 31, 32, 33, 500, LN2_LIMBS - 1, LN2_LIMBS] {
         let mut out = vec![0; l];
-        ln2_static::<8>(&mut out);
+        ln2_static::<8>(&mut out).unwrap();
         assert_eq!(&out[..], &full[LN2_LIMBS - l..], "ln2 at {l} limbs");
     }
 }
@@ -198,7 +199,7 @@ fn test_ln2_static_past_table() {
     fn check<const N: usize>(l: usize) {
         let (mut want, mut out) = (vec![0; l], vec![0; l]);
         ln2_dyn(&mut want);
-        ln2_static::<N>(&mut out);
+        ln2_static::<N>(&mut out).unwrap();
         assert_eq!(out, want, "ln2 at {l} limbs, N = {N}");
     }
     check::<{ LN2_LIMBS + 4 }>(LN2_LIMBS + 1);
@@ -207,9 +208,9 @@ fn test_ln2_static_past_table() {
 }
 
 #[test]
-#[should_panic(expected = "out.len() + 3 <= N")]
 fn test_ln2_static_past_table_small_n() {
-    ln2_static::<{ LN2_LIMBS + 3 }>(&mut [0; LN2_LIMBS + 1]);
+    let err = ln2_static::<{ LN2_LIMBS + 3 }>(&mut [0; LN2_LIMBS + 1]);
+    assert_eq!(err, Err(CapacityError { min_n: LN2_LIMBS + 4 }));
 }
 
 // floor(p 2^(64 len - shift) / q) by one exact division of the full operands.

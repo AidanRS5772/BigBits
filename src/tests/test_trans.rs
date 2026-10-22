@@ -2,7 +2,8 @@ use super::rand_vec;
 use crate::utils::consts::consts::ln2_dyn;
 use crate::utils::div::div_prim;
 use crate::utils::mul::{mul_buf, mul_prim};
-use crate::utils::trans::{exp_dyn, exp_dyn_entry, exp_static, exp_static_entry};
+use crate::utils::trans::{exp_dyn, exp_dyn_entry, exp_static, exp_static_entry, ExpError};
+use crate::utils::CapacityError;
 use crate::utils::utils::{buf_len, cmp_buf, shl_buf, shr_buf, split_sh, sub_buf, trim_lz};
 use std::cmp::Ordering;
 
@@ -108,7 +109,7 @@ fn exp_full_oracle(x: &[u64], m: i64, l: usize) -> (Vec<u64>, u64) {
     (o, k as u64)
 }
 
-type ExpFn = fn(&[u64], i64, &mut [u64]) -> Option<u64>;
+type ExpFn = fn(&[u64], i64, &mut [u64]) -> Result<u64, ExpError>;
 
 // exp against exp_full_oracle within 1 ulp. Within an ulp of a power of 2^64 the
 // two can pick neighboring exponents; the finer result then drops its low limb and
@@ -116,7 +117,7 @@ type ExpFn = fn(&[u64], i64, &mut [u64]) -> Option<u64>;
 fn check_full(x: &[u64], m: i64, l: usize, exp: ExpFn) {
     let what = format!("x.len()={} m={m} l={l}", x.len());
     let mut got = vec![0; l];
-    let k = exp(x, m, &mut got).unwrap_or_else(|| panic!("{what}: overflow"));
+    let k = exp(x, m, &mut got).unwrap_or_else(|e| panic!("{what}: {e}"));
     assert_ne!(got[l - 1], 0, "{what}: out's top limb must be nonzero");
     let (want, kw) = exp_full_oracle(x, m, l);
     let what = format!("{what} k={k} kw={kw}");
@@ -185,7 +186,7 @@ fn exp_zero_limbs_and_tiny(exp: ExpFn, ls: &[usize]) {
             (&[u64::MAX], -(l as i64) - 3),
         ] {
             let mut out = vec![u64::MAX; l];
-            assert_eq!(exp(x, m, &mut out), Some(0), "x={x:?} m={m}");
+            assert_eq!(exp(x, m, &mut out), Ok(0), "x={x:?} m={m}");
             assert_eq!(out, one(l), "x={x:?} m={m}");
         }
     }
@@ -202,13 +203,13 @@ fn exp_overflow(exp: ExpFn, ls: &[usize]) {
             (&[u64::MAX, u64::MAX, 22], 1),
             (&[5, 1], 2),
         ] {
-            assert_eq!(exp(x, m, &mut out), None, "x={x:?} m={m}");
+            assert_eq!(exp(x, m, &mut out), Err(ExpError::Overflow), "x={x:?} m={m}");
         }
         // 2^69 times ln(2) truncated to two limbs, just under the bound: n = 2^69 - 1.
         let mut ln2 = [0; 2];
         ln2_dyn(&mut ln2);
         let x = [ln2[0] << 5, ln2[1] << 5 | ln2[0] >> 59, ln2[1] >> 59];
-        assert_eq!(exp(&x, 1, &mut out), Some(i64::MAX as u64));
+        assert_eq!(exp(&x, 1, &mut out), Ok(i64::MAX as u64));
         assert!(out[l - 1] >= 1 << 63);
         check_full(&x, 1, l, exp);
         check_full(&[0, 22], 1, l, exp);
@@ -366,7 +367,7 @@ fn test_exp_dyn_entry_parallel_matches_serial() {
 // exp_static_entry against the oracle at N, from one limb to the most N allows,
 // over the shapes the dynamic tests use.
 fn static_entry_at<const N: usize>() {
-    let exp = exp_static_entry::<N>;
+    let exp = |x: &[u64], m, out: &mut [u64]| exp_static_entry::<N>(x, m, out).unwrap();
     let mut seed = 5000;
     let mut ls = vec![1, N / 2, N - 3];
     ls.retain(|&l| l + 3 <= N);
@@ -421,20 +422,23 @@ fn test_exp_static_entry_threaded() {
         if m == 0 {
             *x.last_mut().unwrap() >>= 1;
         }
-        check(&x, m, 297, exp_static_entry::<300>);
+        check(&x, m, 297, |x, m, out| exp_static_entry::<300>(x, m, out).unwrap());
     }
 }
 
+// Too small an N is the caller's to handle, so it's an error, not a panic.
 #[test]
-#[should_panic(expected = "out.len() + 3 <= N")]
 fn test_exp_static_entry_small_n() {
-    exp_static_entry::<8>(&[1 << 62], 0, &mut [0; 6]);
+    let mut out = [u64::MAX; 6];
+    let err = exp_static_entry::<8>(&[1 << 62], 0, &mut out);
+    assert_eq!(err, Err(CapacityError { min_n: 9 }));
+    assert_eq!(out, [u64::MAX; 6], "a capacity error leaves out alone");
 }
 
 // exp_static through the exp_dyn cases at N, from one limb to the most N allows.
 fn exp_static_at<const N: usize>() {
-    let mut ls = vec![1, 3, N / 2, N - 4];
-    ls.retain(|&l| l + 4 <= N);
+    let mut ls = vec![1, 3, N / 2, N - 3];
+    ls.retain(|&l| l + 3 <= N);
     ls.sort();
     ls.dedup();
     exp_random(exp_static::<N>, &ls, 8000 + N as u64);
@@ -445,6 +449,7 @@ fn exp_static_at<const N: usize>() {
 
 #[test]
 fn test_exp_static() {
+    exp_static_at::<4>();
     exp_static_at::<5>();
     exp_static_at::<6>();
     exp_static_at::<7>();
@@ -461,19 +466,35 @@ fn test_exp_static_threaded() {
         if m == 1 {
             x[299] = x[299] % 21 + 1;
         }
-        check_full(&x, m, 296, exp_static::<300>);
+        check_full(&x, m, 297, exp_static::<300>);
     }
 }
 
 #[test]
-#[should_panic(expected = "out.len() + 4 <= N")]
 fn test_exp_static_small_n() {
-    exp_static::<8>(&[1], 0, &mut [0; 5]);
+    let small = Err(ExpError::Capacity(CapacityError { min_n: 9 }));
+    let mut out = [u64::MAX; 6];
+    assert_eq!(exp_static::<8>(&[1], 0, &mut out), small);
+    // N is checked before any input, even one that needs no work.
+    assert_eq!(exp_static::<8>(&[], 0, &mut out), small);
+    assert_eq!(exp_static::<8>(&[1], 5, &mut out), small);
+    assert_eq!(out, [u64::MAX; 6], "a capacity error leaves out alone");
 }
 
-// ln(2) past its 1024-limb table is summed at out.len() + 2 limbs.
+// From 1023 output limbs, ln(2)'s 1025 limbs pass its table and are summed, which
+// needs one more limb of N. At exactly the bound, exp_static matches exp_dyn.
 #[test]
-#[should_panic(expected = "out.len() + 5 <= N")]
-fn test_exp_static_past_ln2_table_small_n() {
-    exp_static::<1028>(&[1], 0, &mut [0; 1024]);
+fn test_exp_static_past_ln2_table() {
+    fn check<const N: usize>(o: usize) {
+        let mut x = rand_vec(o, o as u64);
+        x[o - 1] >>= 1;
+        let (mut got, mut want) = (vec![0; o], vec![0; o]);
+        let k = exp_static::<N>(&x, 0, &mut got).unwrap();
+        assert_eq!(exp_dyn(&x, 0, &mut want), Ok(k));
+        assert_within_ulp(&got, &want, &format!("o={o} N={N}"));
+    }
+    check::<1025>(1022);
+    check::<1027>(1023);
+    let small = Err(ExpError::Capacity(CapacityError { min_n: 1027 }));
+    assert_eq!(exp_static::<1026>(&[1], 0, &mut [0; 1023]), small);
 }

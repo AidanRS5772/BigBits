@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::utils::{
-    LN2_PAR_CUTOFF, ScratchGuard, bin_split::{
+    CapacityError, LN2_PAR_CUTOFF, ScratchGuard, bin_split::{
         BBPSeries, DynHyperCtx, DynNodeBBP, DynNodeHyper, HyperSeries, Node, Shift, StaticNodeBBP, WideHyperSeries, bin_split, join2, ratio_to_fraction_dyn, ratio_to_fraction_static, static_split_stack
     }, utils::add_buf
 };
@@ -63,7 +63,7 @@ struct DynLn2 {
     buf: Vec<u64>,
 }
 
-static LN2: RwLock<DynLn2> = RwLock::new(DynLn2::new());
+static LN2_DYN: RwLock<DynLn2> = RwLock::new(DynLn2::new());
 
 const TERM_GAURD: u64 = 4;
 
@@ -137,15 +137,15 @@ impl DynLn2 {
 
 pub fn ln2_dyn(out: &mut [u64]) {
     fn ln2_write() -> RwLockWriteGuard<'static, DynLn2> {
-        LN2.write().unwrap_or_else(|e| {
+        LN2_DYN.write().unwrap_or_else(|e| {
             let mut cache = e.into_inner();
             *cache = DynLn2::new();
-            LN2.clear_poison();
+            LN2_DYN.clear_poison();
             cache
         })
     }
 
-    if let Ok(cache) = LN2.read() {
+    if let Ok(cache) = LN2_DYN.read() {
         if cache.get(out) {
             return;
         }
@@ -188,7 +188,8 @@ impl<const N: usize> StaticLn2<N> {
         true
     }
 
-    fn request(out: &mut [u64]) {
+    // Past the table, sums the series at out.len() + guard limbs.
+    fn request(out: &mut [u64], guard: usize) -> Result<(), CapacityError> {
         fn add_series_static<const N: usize, S: BBPSeries>(
             s: &StaticNodeBBP<N, S>,
             shift: u64,
@@ -227,13 +228,13 @@ impl<const N: usize> StaticLn2<N> {
         }
 
         if Self::get(out) {
-            return;
+            return Ok(());
         }
-        let len = out.len() + 1;
-        assert!(
-            len + 2 <= N,
-            "ln(2) past the table needs out.len() + 3 <= N"
-        );
+        let len = out.len() + guard;
+        // Static finalize needs 2 limbs past its output.
+        if len + 2 > N {
+            return Err(CapacityError { min_n: len + 2 });
+        }
 
         // Each term adds 4 bits.
         let n = 1 + 16 * len as u64 + TERM_GAURD;
@@ -266,12 +267,22 @@ impl<const N: usize> StaticLn2<N> {
         add_series_static(&s3, 1, buf, t);
         add_series_static(&s4, 3, buf, t);
 
-        out.copy_from_slice(&buf[1..]);
+        out.copy_from_slice(&buf[guard..]);
+        Ok(())
     }
 }
 
-pub fn ln2_static<const N: usize>(out: &mut [u64]) {
-    StaticLn2::<N>::request(out);
+// Past ln2.bin's LN2_LIMBS it needs N >= out.len() + 3, and returns a CapacityError
+// below that.
+pub fn ln2_static<const N: usize>(out: &mut [u64]) -> Result<(), CapacityError> {
+    StaticLn2::<N>::request(out, 1)
+}
+
+// ln2_static without its guard limb, so past the table it needs only
+// N >= out.len() + 2, but its four series' rounding can leave out a few ulps low.
+// For callers that keep their own guard bits.
+pub(crate) fn ln2_static_unguarded<const N: usize>(out: &mut [u64]) -> Result<(), CapacityError> {
+    StaticLn2::<N>::request(out, 0)
 }
 
 //$1/\pi = \frac{\sqrt{10005}}{4270934400} \; \sum^{\infty}_{n=0} (-1)^{n} \frac{(6n)!}{(3n)!(n!)^3 640320^{3n}} (545140134 \cdot n + 13591409)$
@@ -280,6 +291,7 @@ pub fn ln2_static<const N: usize>(out: &mut [u64]) {
 //$\pi = \frac{4270934400 \cdot Q_1 Q_2}{\sqrt{10005}(545140134 \cdot P_1 Q_2 + 13591409 \cdot P_2 Q_1)}$
 
 const PI_POW: u128 = 333_833_583_375;
+const PI_CTX: DynHyperCtx = DynHyperCtx::new_shift(15);
 struct PI1;
 impl WideHyperSeries for PI1 {
     const SIGNED: bool = true;
@@ -304,7 +316,6 @@ impl WideHyperSeries for PI2 {
         (6 * n - 5) * (6 * n - 1) * (2 * n - 1)
     }
     fn q(n: u128) -> u128{
-        let n = n as u128;
         n * n * n * PI_POW
     }
     fn r(n: u128) -> u128{
@@ -320,3 +331,13 @@ struct DynPI{
     s2: Option<DynNodeHyper<PI2>>,
     buf: Vec<u64>,
 }
+
+impl DynPI{
+    const fn new() -> DynPI{
+        DynPI{
+            s1: None, s2: None, buf: Vec::new(),
+        }
+    }
+}
+
+static PI_DYN: RwLock<DynPI> = RwLock::new(DynPI::new());

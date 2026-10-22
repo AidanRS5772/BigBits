@@ -8,6 +8,21 @@ pub mod sqrt;
 pub mod utils;
 pub mod trans;
 
+// A static entry's request needs more limbs than its N provides. This is a limit of
+// the stack buffers, not an arithmetic failure: the same call succeeds once N >= min_n.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapacityError {
+    pub min_n: usize,
+}
+
+impl std::fmt::Display for CapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "request needs a static capacity of N >= {}", self.min_n)
+    }
+}
+
+impl std::error::Error for CapacityError {}
+
 pub const CHUNKING_KARATSUBA_CUTOFF: usize = 22;
 pub const KARATSUBA_CUTOFF: f64 = 17.0;
 

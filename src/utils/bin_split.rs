@@ -188,7 +188,11 @@ fn add_term_split(
     let low = mulhi(x0, lo) as u128 + mulhi(g, hi) as u128;
     pass(0, x, hi);
     pass(0, x.get(1..).unwrap_or(&[]), lo);
-    pass(0, &[low as u64, (low >> 64) as u64][..1 + (low >> 64 != 0) as usize], 1);
+    pass(
+        0,
+        &[low as u64, (low >> 64) as u64][..1 + (low >> 64 != 0) as usize],
+        1,
+    );
 }
 
 // Drops P's low bits until P plus a term below 2^top has room in p, as add_term needs.
@@ -288,7 +292,12 @@ fn shift_up(buf: &mut [u64], len: &mut usize, e: &mut u64, bits: u64) {
         bits
     } else {
         let top = buf[*len - 1];
-        let room = free + if top == 0 { 0 } else { top.leading_zeros() as u64 };
+        let room = free
+            + if top == 0 {
+                0
+            } else {
+                top.leading_zeros() as u64
+            };
         if bits <= room {
             bits
         } else {
@@ -544,7 +553,12 @@ fn hyper_x_leaf_terms<'t, S: HyperSeries>(
         mul_shl(p, &mut p_len, &mut e, S::q(n), shift, 0);
         let w = S::p(n);
         if t_len != 0 {
-            make_room(p, &mut p_len, &mut e, et + bits(&t[..t_len]) + bits(x) + bit_len(w));
+            make_room(
+                p,
+                &mut p_len,
+                &mut e,
+                et + bits(&t[..t_len]) + bits(x) + bit_len(w),
+            );
         }
         (t_len, et) = t_mul(&t[..t_len], x, et, e, tmp);
         std::mem::swap(&mut t, &mut tmp);
@@ -849,7 +863,13 @@ fn hi_mul_norm<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> (usize,
 
 // floor(a b 2^(ea - e)) into out[off..off + len] above off zero limbs, returning
 // (off, len). It must fit N limbs.
-fn product_at<const N: usize>(a: &[u64], b: &[u64], ea: u64, e: u64, out: &mut [u64]) -> (usize, usize) {
+fn product_at<const N: usize>(
+    a: &[u64],
+    b: &[u64],
+    ea: u64,
+    e: u64,
+    out: &mut [u64],
+) -> (usize, usize) {
     if a.is_empty() || b.is_empty() {
         return (0, 0);
     }
@@ -1558,7 +1578,11 @@ impl<const N: usize, S: WideEngelSeries> Node for StaticNodeEngel<N, S> {
         let lp = &l.p[..l.p_len];
         let ea = l.ep + r.eq + sh;
         let ta = term_top(lp, rq, ea);
-        let tu = if r.p_len == 0 { 0 } else { r.ep + bits(&r.p[..r.p_len]) };
+        let tu = if r.p_len == 0 {
+            0
+        } else {
+            r.ep + bits(&r.p[..r.p_len])
+        };
         let ep = p_exponent::<N>(ta, ea, tu, r.ep, !S::SIGNED || l.neg == r.neg);
 
         let mut p = [0; N];
@@ -1663,7 +1687,7 @@ pub struct DynHyperCtx {
 }
 
 impl DynHyperCtx {
-    pub fn new(x: &[u64], shift: u64) -> Self {
+    pub fn new_buf(x: &[u64], shift: u64) -> Self {
         debug_assert!(
             x.last().is_some_and(|&l| l != 0),
             "x must be trimmed and nonzero"
@@ -1672,6 +1696,14 @@ impl DynHyperCtx {
             shift,
             x: (x != [1]).then(|| x.to_vec()),
             x_bits: x_bits(x),
+        }
+    }
+
+    pub const fn new_shift(shift: u64) -> Self {
+        DynHyperCtx {
+            shift,
+            x: None,
+            x_bits: 0,
         }
     }
 }
@@ -1748,7 +1780,8 @@ impl<S: WideHyperSeries> Node for DynNodeHyper<S> {
                 let mut p = vec![0; cap + words + 1];
                 let mut scratch = ScratchGuard::acquire();
                 let [t, tmp] = scratch.get_splits([cap + x.len(); 2]);
-                let exact = |a: &[u64], b: &[u64], ea, _, out: &mut [u64]| (mul_exact(a, b, out), ea);
+                let exact =
+                    |a: &[u64], b: &[u64], ea, _, out: &mut [u64]| (mul_exact(a, b, out), ea);
                 let (p_len, e, t, et, neg) = if narrow {
                     hyper_x_leaf_terms::<Narrow<S>>(a, b, ctx.shift, x, &mut p, t, tmp, exact)
                 } else {

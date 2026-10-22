@@ -2,23 +2,50 @@ use crate::utils::bin_split::{
     bin_split, static_split_stack, DynHyperCtx, DynNodeEngel, DynNodeHyper, EngelSeries,
     HyperSeries, Node, Shift, StaticHyperCtx, StaticNodeEngel, StaticNodeHyper,
 };
-use crate::utils::consts::consts::{ln2_dyn, ln2_static, LN2_LIMBS};
+use crate::utils::consts::consts::{ln2_dyn, ln2_static_unguarded, LN2_LIMBS};
 use crate::utils::div::{div_rem_dyn, div_rem_static};
 use crate::utils::mul::{hi_mul_dyn, hi_mul_static};
 use crate::utils::utils::{add_buf, buf_len, shl_buf, shr_buf, split_sh};
 use crate::utils::{
-    ScratchGuard, DYN_EXP_CHUNK_MIN_BITS, DYN_EXP_CHUNK_PAR_WORK, STATIC_EXP_CHUNK_MIN_BITS,
+    CapacityError, ScratchGuard, DYN_EXP_CHUNK_MIN_BITS, DYN_EXP_CHUNK_PAR_WORK, STATIC_EXP_CHUNK_MIN_BITS,
     STATIC_EXP_CHUNK_PAR_WORK,
 };
 use rayon::prelude::*;
 use std::f64::consts::{LOG2_E, PI};
-use std::{panic, thread};
+use std::{fmt, panic, thread};
 
 const EXP_GUARD_LIMBS: usize = 1;
-// r = X - n ln(2) scales ln(2)'s truncation error by n < 2^69, so two limbs
-// below out keep r's error far under out's last bit.
-const EXP_RED_GUARD_LIMBS: usize = 2;
+// r = X - n ln(2) scales ln(2)'s truncation error by n < 2^69, so the reduction
+// divides by ln(2) at o + 1 limbs and this many bits more, which keeps r's error far
+// under out's last bit. X < 23 * 2^64 has at most 69 integer bits, so X at that
+// scale still fits o + 3 limbs.
+const EXP_RED_GUARD_BITS: u8 = 58;
 const EXP_MAX_PAR_CHUNKS: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpError {
+    // e^X = 2^(64k) o with k past i64::MAX, i.e. X >= 2^69 ln(2).
+    Overflow,
+    // exp_static's N is too small for out.len().
+    Capacity(CapacityError),
+}
+
+impl From<CapacityError> for ExpError {
+    fn from(e: CapacityError) -> Self {
+        ExpError::Capacity(e)
+    }
+}
+
+impl fmt::Display for ExpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExpError::Overflow => write!(f, "e^X's exponent doesn't fit i64"),
+            ExpError::Capacity(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ExpError {}
 
 pub struct Exp;
 impl EngelSeries for Exp {
@@ -193,6 +220,7 @@ pub fn exp_dyn_entry(x: &[u64], m: u64, out: &mut [u64]) -> u64 {
     (z + d) as u64
 }
 
+// xr, l2 and t hold o + 3, o + 2 and o + 1 limbs.
 fn exp_reduced(
     x: &[u64],
     m: i64,
@@ -201,63 +229,71 @@ fn exp_reduced(
     ln2: fn(&mut [u64]),
     div_rem: fn(&mut [u64], &[u64], &mut [u64]) -> u64,
     exp_entry: fn(&[u64], u64, &mut [u64]) -> u64,
-) -> Option<u64> {
+) -> Result<u64, ExpError> {
     let (len, o) = (buf_len(x), out.len());
     if len == 0 {
         out.fill(0);
         if let Some(top) = out.last_mut() {
             *top = 1;
         }
-        return Some(0);
+        return Ok(0);
     }
     let me = m as i128 - (x.len() - len) as i128;
-    if me > 1 {
-        // X >= 2^128 > 2^69 ln(2)
-        return None;
+    if me > 1 || (me == 1 && x[len - 1] > 22) {
+        // X >= 23 * 2^64 > 2^69 ln(2)
+        return Err(ExpError::Overflow);
     }
-    let f = o + EXP_RED_GUARD_LIMBS;
-    // xr = floor(X 2^(64f)), at most f + 2 limbs as me <= 1: x[i] lands at lo + i.
+    let (f, g) = (o + 1, EXP_RED_GUARD_BITS);
+    // xr = floor(X 2^(64f)) 2^g: x[i] lands at lo + i, and X < 23 * 2^64 keeps the
+    // shift inside xr's top limb.
     xr.fill(0);
     let lo = f as i128 + me + 1 - len as i128;
     let skip = (-lo).clamp(0, len as i128) as usize;
     let start = lo.max(0) as usize;
     xr[start..start + len - skip].copy_from_slice(&x[skip..len]);
+    let carry = shl_buf(xr, g);
+    debug_assert_eq!(carry, 0, "X < 2^69");
+    // l2 = floor(ln(2) 2^(64f + g))
     ln2(l2);
+    shr_buf(l2, 64 - g);
     let mut q = [0; 3];
     let xl = buf_len(xr);
-    // q = n, xr = r 2^(64f) with 0 <= r < ln(2).
+    // q = n, xr = r 2^(64f + g) with 0 <= r < ln(2).
     div_rem(&mut xr[..xl], l2, &mut q);
     if q[2] != 0 || q[1] >= 32 {
         // n >= 2^69, so n / 64 > i64::MAX
-        return None;
+        return Err(ExpError::Overflow);
     }
     let (k, b) = ((q[1] << 58) | (q[0] >> 6), q[0] & 63);
+    // r at f limbs. The bits this drops are worth less than X's own truncation.
+    shr_buf(&mut xr[..=f], g);
 
-    // t = e^r 2^(64(o + 1)). e^r - 1's limbs past o + 1 never reach out.
+    // t = e^r 2^(64o). Shifting by b < 64 moves only part of t's low limb into out,
+    // so e^r - 1's own guard limb keeps that limb close enough.
     let r = &xr[..f];
     let rl = buf_len(r);
     t.fill(0);
     if rl != 0 {
         let rz = f - rl;
         let z = exp_zero_limbs(64 * rz as u64 + r[rl - 1].leading_zeros() as u64);
-        if let Some(p) = (o + 1).checked_sub(z).filter(|&p| p != 0) {
+        if let Some(p) = o.checked_sub(z).filter(|&p| p != 0) {
             let off = exp_entry(&r[..rl], rz as u64, &mut t[..p]) as usize - z;
             debug_assert!(off <= 1);
             t.copy_within(off..p, 0);
             t[p - off..p].fill(0);
         }
     }
-    t[o + 1] = 1;
+    t[o] = 1;
     let carry = shl_buf(t, b as u8);
     debug_assert_eq!(carry, 0, "2^b e^r < 2^64");
-    out.copy_from_slice(&t[2..]);
-    Some(k)
+    out.copy_from_slice(&t[1..]);
+    Ok(k)
 }
 
-pub fn exp_dyn(x: &[u64], m: i64, out: &mut [u64]) -> Option<u64> {
+pub fn exp_dyn(x: &[u64], m: i64, out: &mut [u64]) -> Result<u64, ExpError> {
     let o = out.len();
     let mut scratch = ScratchGuard::acquire();
-    let bufs = scratch.get_splits([o + 4, o + 2, o + 2]);
+    let bufs = scratch.get_splits([o + 3, o + 2, o + 1]);
     exp_reduced(x, m, out, bufs, ln2_dyn, div_rem_dyn, exp_dyn_entry)
 }
 
@@ -287,9 +323,21 @@ fn exp_chunk_static<const N: usize>(
     Some((b, bl))
 }
 
-pub fn exp_static_entry<const N: usize>(x: &[u64], m: u64, out: &mut [u64]) -> u64 {
+// Each series needs one guard limb past out, and static finalize 2 more.
+pub fn exp_static_entry<const N: usize>(
+    x: &[u64],
+    m: u64,
+    out: &mut [u64],
+) -> Result<u64, CapacityError> {
+    let min_n = out.len() + 3;
+    if N < min_n {
+        return Err(CapacityError { min_n });
+    }
+    Ok(exp_static_core::<N>(x, m, out))
+}
+
+fn exp_static_core<const N: usize>(x: &[u64], m: u64, out: &mut [u64]) -> u64 {
     assert!(x.last().is_some_and(|&l| l != 0));
-    assert!(out.len() + 3 <= N, "exp_static_entry needs out.len() + 3 <= N");
 
     let e = 64 * (m + x.len() as u64);
     let s = 64 * m + x[x.len() - 1].leading_zeros() as u64;
@@ -339,23 +387,23 @@ pub fn exp_static_entry<const N: usize>(x: &[u64], m: u64, out: &mut [u64]) -> u
     (z + d) as u64
 }
 
-pub fn exp_static<const N: usize>(x: &[u64], m: i64, out: &mut [u64]) -> Option<u64> {
+// The reduction's numerator and exp_static_entry at o limbs each need o + 3 limbs.
+// ln(2) past its table is summed at o + 2 limbs, which static finalize extends to
+// o + 4.
+pub fn exp_static<const N: usize>(x: &[u64], m: i64, out: &mut [u64]) -> Result<u64, ExpError> {
     let o = out.len();
-    // exp_static_entry writes up to o + 1 limbs, and ln(2) past its table is summed
-    // at o + 2 limbs, each needing 3 spare limbs.
-    assert!(o + 4 <= N, "exp_static needs out.len() + 4 <= N");
-    assert!(
-        o + EXP_RED_GUARD_LIMBS <= LN2_LIMBS || o + 5 <= N,
-        "exp_static past ln(2)'s table needs out.len() + 5 <= N"
-    );
+    let min_n = if o + 2 <= LN2_LIMBS { o + 3 } else { o + 4 };
+    if N < min_n {
+        return Err(CapacityError { min_n }.into());
+    }
     let (mut xr, mut l2, mut t) = ([0; N], [0; N], [0; N]);
     exp_reduced(
         x,
         m,
         out,
-        [&mut xr[..o + 4], &mut l2[..o + 2], &mut t[..o + 2]],
-        ln2_static::<N>,
+        [&mut xr[..o + 3], &mut l2[..o + 2], &mut t[..o + 1]],
+        |l2| ln2_static_unguarded::<N>(l2).expect("exp_static checks N"),
         div_rem_static::<N>,
-        exp_static_entry::<N>,
+        exp_static_core::<N>,
     )
 }
