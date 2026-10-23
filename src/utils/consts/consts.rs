@@ -1,307 +1,291 @@
 use std::{
-    panic,
-    sync::{RwLock, RwLockWriteGuard},
-    thread::{self, Scope, ScopedJoinHandle},
+    mem, panic,
+    sync::{PoisonError, RwLock},
+    thread,
 };
 
 use crate::utils::{
-    CapacityError, LN2_PAR_CUTOFF, ScratchGuard, bin_split::{
-        BBPSeries, DynHyperCtx, DynNodeBBP, DynNodeHyper, HyperSeries, Node, Shift, StaticNodeBBP, WideHyperSeries, bin_split, join2, ratio_to_fraction_dyn, ratio_to_fraction_static, static_split_stack
-    }, utils::add_buf
+    bin_split::{
+        bin_split, bin_split_tree, join2, ratio_to_fraction_dyn, ratio_to_fraction_static,
+        static_split_stack, BBPSeries, DynHyperCtx, DynNodeBBP, DynNodeHyper, Node, Shift,
+        StaticHyperCtx, StaticNodeBBP, StaticNodeHyper, WideHyperSeries,
+    },
+    div::div_dyn,
+    mul::{hi_mul_static, mul_dyn, mul_prim},
+    sqrt::{sqrt_approx_dyn, sqrt_approx_static},
+    utils::{add_buf, add_mul, buf_len, shl_buf, shr_buf, sub_buf},
+    CapacityError, ScratchGuard, DYN_LN2_PAR_CUTOFF, DYN_LN2_PAR_HALF, DYN_PI_PAR_CUTOFF,
+    DYN_PI_PAR_HALF, STATIC_LN2_PAR_CUTOFF, STATIC_PI_PAR_CUTOFF,
 };
 
-//$ ln(2) = \frac{2}{3} + 1/2  \sum^{\infty}_{n=1} \left(\frac{1}{2n} + \frac{1}{4n+1}+\frac{1}{8n+4}+\frac{1}{16n+12}\right)16^{-n}$
-//$ ln(2) = \frac{2}{3} + 1/4  \sum^{\infty}_{n=1} \frac{1}{n 16^n} + 1/2 \sum^{\infty}_{n=1} \frac{1}{(4n+1)16^n} + 1/8 \sum^{\infty}_{n=1} \frac{1}{(2n+1)16^n} + 1/8 \sum^{\infty}_{n=1} \frac{1}{(4n+3)16^n}$
-
-const LN2_CTX: Shift = Shift(4);
-
-struct Ln2S1;
-impl BBPSeries for Ln2S1 {
-    fn p(_: u64) -> u64 {
-        1
-    }
-    fn q(n: u64) -> u64 {
-        n
-    }
+fn cache_par(new: u64, cached: u64, cutoff: u64, half: u64) -> bool {
+    new.saturating_mul(cached.saturating_mul(cached) + half * half) >= cutoff * half * half
 }
 
-struct Ln2S2;
-impl BBPSeries for Ln2S2 {
-    fn p(_: u64) -> u64 {
-        1
-    }
-    fn q(n: u64) -> u64 {
-        2 * n + 1
-    }
+pub fn bin_split_extend<'a, N>(ctx: &N::Ctx, node: &'a mut Option<N>, start: u64, end: u64) -> &'a N
+where
+    N: Node + Send,
+    N::Ctx: Sync,
+{
+    let s = match node.take() {
+        Some(old) => {
+            let new = bin_split_tree::<N>(ctx, old.range().1, end, false);
+            N::merge(ctx, old, new)
+        }
+        None => bin_split_tree::<N>(ctx, start, end, false),
+    };
+    node.insert(s)
 }
 
-struct Ln2S3;
-impl BBPSeries for Ln2S3 {
-    fn p(_: u64) -> u64 {
-        1
+const fn limbs<const L: usize>(bytes: &[u8]) -> [u64; L] {
+    let mut t = [0; L];
+    let mut i = 0;
+    while i < 8 * L {
+        t[i / 8] |= (bytes[i] as u64) << (8 * (i % 8));
+        i += 1;
     }
-    fn q(n: u64) -> u64 {
-        4 * n + 1
-    }
+    t
 }
 
-struct Ln2S4;
-impl BBPSeries for Ln2S4 {
-    fn p(_: u64) -> u64 {
-        1
+fn from_table(table: &[u64], out: &mut [u64]) -> bool {
+    let hit = out.len() <= table.len();
+    if hit {
+        out.copy_from_slice(&table[table.len() - out.len()..]);
     }
-    fn q(n: u64) -> u64 {
-        4 * n + 3
-    }
+    hit
 }
 
-struct DynLn2 {
-    s1: Option<DynNodeBBP<Ln2S1>>,
-    s2: Option<DynNodeBBP<Ln2S2>>,
-    s3: Option<DynNodeBBP<Ln2S3>>,
-    s4: Option<DynNodeBBP<Ln2S4>>,
+struct DynCache<T> {
+    nodes: T,
     buf: Vec<u64>,
 }
 
-static LN2_DYN: RwLock<DynLn2> = RwLock::new(DynLn2::new());
-
-const TERM_GAURD: u64 = 4;
-
-impl DynLn2 {
-    const fn new() -> Self {
-        DynLn2 {
-            s1: None,
-            s2: None,
-            s3: None,
-            s4: None,
-            buf: Vec::new(),
+fn cached<T: Default>(
+    table: &[u64],
+    cache: &RwLock<DynCache<T>>,
+    out: &mut [u64],
+    build: fn(&mut T, &mut Vec<u64>, usize),
+) {
+    let get = |c: &DynCache<T>, out: &mut [u64]| {
+        let hit = out.len() < c.buf.len();
+        if hit {
+            out.copy_from_slice(&c.buf[c.buf.len() - out.len()..]);
         }
-    }
-
-    fn get(&self, out: &mut [u64]) -> bool {
-        if out.len() >= self.buf.len() {
-            return false;
-        }
-        out.copy_from_slice(&self.buf[self.buf.len() - out.len()..]);
-        true
-    }
-
-    fn request(&mut self, out: &mut [u64]) {
-        fn add_series<S: BBPSeries>(s: &DynNodeBBP<S>, shift: u64, acc: &mut [u64], t: &mut [u64]) {
-            ratio_to_fraction_dyn(&s.p, &s.q, shift as i64, t);
-            let carry = add_buf(acc, t);
-            debug_assert!(!carry, "ln(2) < 1");
-        }
-
-        fn extend<S: BBPSeries>(node: &mut Option<DynNodeBBP<S>>, n: u64) -> &DynNodeBBP<S> {
-            let s = match node.take() {
-                Some(old) => {
-                    let new = bin_split::<DynNodeBBP<S>>(&LN2_CTX, old.b, n);
-                    DynNodeBBP::merge(&LN2_CTX, old, new)
-                }
-                None => bin_split::<DynNodeBBP<S>>(&LN2_CTX, 1, n),
-            };
-            node.insert(s)
-        }
-
-        if self.get(out) {
-            return;
-        }
-        let len = out.len() + 1;
-
-        // Each term adds 4 bits.
-        let n = 1 + 16 * len as u64 + TERM_GAURD;
-        let par = len >= LN2_PAR_CUTOFF;
-        let ((s1, s2), (s3, s4)) = join2(
-            par,
-            || join2(par, || extend(&mut self.s1, n), || extend(&mut self.s2, n)),
-            || join2(par, || extend(&mut self.s3, n), || extend(&mut self.s4, n)),
-        );
-
-        let k = LN2_CTX.0 * (s1.b - s1.a);
-
-        let mut scratch = ScratchGuard::acquire();
-        let t = scratch.get(len);
-
-        self.buf.clear();
-        self.buf.resize(len, 0xAAAA_AAAA_AAAA_AAAA);
-
-        add_series(s1, k + 2, &mut self.buf, t);
-        add_series(s2, k + 3, &mut self.buf, t);
-        add_series(s3, k + 1, &mut self.buf, t);
-        add_series(s4, k + 3, &mut self.buf, t);
-
-        out.copy_from_slice(&self.buf[1..]);
-    }
-}
-
-pub fn ln2_dyn(out: &mut [u64]) {
-    fn ln2_write() -> RwLockWriteGuard<'static, DynLn2> {
-        LN2_DYN.write().unwrap_or_else(|e| {
-            let mut cache = e.into_inner();
-            *cache = DynLn2::new();
-            LN2_DYN.clear_poison();
-            cache
-        })
-    }
-
-    if let Ok(cache) = LN2_DYN.read() {
-        if cache.get(out) {
-            return;
-        }
+        hit
+    };
+    if from_table(table, out) || get(&cache.read().unwrap_or_else(PoisonError::into_inner), out) {
+        return;
     }
     let mut work = {
-        let mut cache = ln2_write();
-        if cache.get(out) {
+        let mut c = cache.write().unwrap_or_else(PoisonError::into_inner);
+        if get(&c, out) {
             return;
         }
-        DynLn2 {
-            s1: cache.s1.take(),
-            s2: cache.s2.take(),
-            s3: cache.s3.take(),
-            s4: cache.s4.take(),
+        DynCache {
+            nodes: mem::take(&mut c.nodes),
             buf: Vec::new(),
         }
     };
-    work.request(out);
-    let mut cache = ln2_write();
-    if work.buf.len() > cache.buf.len() {
-        *cache = work;
+    build(&mut work.nodes, &mut work.buf, out.len() + 1);
+    out.copy_from_slice(&work.buf[1..]);
+    let mut c = cache.write().unwrap_or_else(PoisonError::into_inner);
+    if work.buf.len() > c.buf.len() {
+        *c = work;
+    }
+}
+
+fn static_jobs<const N: usize, const K: usize>(
+    par: bool,
+    jobs: [&(dyn Fn() -> [u64; N] + Sync); K],
+) -> [[u64; N]; K] {
+    if !par {
+        return jobs.map(|j| j());
+    }
+    thread::scope(|sc| {
+        jobs.map(|j| {
+            (
+                j,
+                thread::Builder::new()
+                    .stack_size(static_split_stack(N))
+                    .spawn_scoped(sc, j)
+                    .ok(),
+            )
+        })
+        .map(|(j, h)| h.map_or_else(j, |h| h.join().unwrap_or_else(|e| panic::resume_unwind(e))))
+    })
+}
+
+// $ln(2) = \frac{1}{192} \sum^{\infty}_{n=0}\left(\frac{128}{6n+1} + \frac{8}{6n+3} + \frac{8}{6n+5} + \frac{1}{2n+2}\right) 64^{-n}$
+// $ln(2) = 2/3 \sum^{\infty}_{n=0} \frac{1}{6n+1} \; 64^{-n} + 1/24 \sum^{\infty}_{n=0} \frac{1}{6n+5} \; 64^{-n} + 1/72 \sum^{\infty}_{n=0} \frac{1}{2n+1} \; 64^{-n} + 1/384 \sum^{\infty}_{n=0} \frac{1}{n+1} \; 64^{-n} $
+const LN2_CTX: Shift = Shift(6);
+const TERM_GAURD: u64 = 4;
+
+// 1 / ((A n + B) 64^n), summed from n = 0.
+struct Ln2S<const A: u64, const B: u64>;
+impl<const A: u64, const B: u64> BBPSeries for Ln2S<A, B> {
+    fn p(_: u64) -> u64 {
+        1
+    }
+    fn q(n: u64) -> u64 {
+        A * n + B
+    }
+}
+
+// Each series' weight 2^-k / d, as (d, k).
+const LN2_W: [(u64, i64); 4] = [(3, -1), (3, 3), (9, 3), (3, 7)];
+
+// Terms [0, n) for len limbs. Each adds 6 bits.
+fn ln2_terms(len: usize) -> u64 {
+    32 * len as u64 / 3 + 1 + TERM_GAURD
+}
+
+// t <- w S for a series' S = P / (Q 2^sh) and weight w = 2^-k / d: d scales Q's top
+// dq.len() - 1 limbs into dq (finalize reads Q's top t.len() + 2), and 2^-k joins the
+// shift. A tree from 0 sums its terms 64^-(n + 1), which the shift's -6 undoes.
+fn ln2_share(
+    (p, q, sh): (&[u64], &[u64], i64),
+    (d, k): (u64, i64),
+    dq: &mut [u64],
+    t: &mut [u64],
+    finalize: fn(&[u64], &[u64], i64, &mut [u64]),
+) {
+    let q = &q[..buf_len(q)];
+    let cut = q.len().saturating_sub(dq.len() - 1);
+    let top = q.len() - cut;
+    dq[..top].copy_from_slice(&q[cut..]);
+    dq[top] = mul_prim(&mut dq[..top], d);
+    let dq = &dq[..=top];
+    finalize(p, &dq[..buf_len(dq)], sh + k - 6 + 64 * cut as i64, t);
+}
+
+type Ln2Nodes = (
+    Option<DynNodeBBP<Ln2S<6, 1>>>,
+    Option<DynNodeBBP<Ln2S<6, 5>>>,
+    Option<DynNodeBBP<Ln2S<2, 1>>>,
+    Option<DynNodeBBP<Ln2S<1, 1>>>,
+);
+
+// ln 2 at len limbs into buf: the sum of the series' shares, each extending its cached
+// node and finalizing in its own task.
+fn ln2_build(nodes: &mut Ln2Nodes, buf: &mut Vec<u64>, len: usize) {
+    fn share<S: BBPSeries>(node: &mut Option<DynNodeBBP<S>>, n: u64, w: (u64, i64), t: &mut [u64]) {
+        let s = bin_split_extend(&LN2_CTX, node, 0, n);
+        let sh = (LN2_CTX.0 * (s.b - s.a)) as i64;
+        let mut scratch = ScratchGuard::acquire();
+        let dq = scratch.get(t.len() + 3);
+        ln2_share((&s.p, &s.q, sh), w, dq, t, ratio_to_fraction_dyn);
+    }
+
+    let n = ln2_terms(len);
+    let have = nodes.0.as_ref().map_or(0, |s| s.range().1);
+    // Rounded up, so a one-limb extension counts.
+    let limbs = |terms: u64| (3 * terms).div_ceil(32);
+    let par = cache_par(
+        limbs(n - have),
+        limbs(have),
+        DYN_LN2_PAR_CUTOFF,
+        DYN_LN2_PAR_HALF,
+    );
+    let mut scratch = ScratchGuard::acquire();
+    let [t1, t2, t3, t4] = scratch.get_splits([len; 4]);
+    let (s1, s2, s3, s4) = nodes;
+    let [w1, w2, w3, w4] = LN2_W;
+    join2(
+        par,
+        || join2(par, || share(s1, n, w1, t1), || share(s2, n, w2, t2)),
+        || join2(par, || share(s3, n, w3, t3), || share(s4, n, w4, t4)),
+    );
+    buf.resize(len, 0);
+    for t in [t1, t2, t3, t4] {
+        let carry = add_buf(buf, t);
+        debug_assert!(!carry, "ln(2) < 1");
     }
 }
 
 const LN2_BIN: &[u8] = include_bytes!("ln2.bin");
 pub(crate) const LN2_LIMBS: usize = LN2_BIN.len() / 8;
 const _: () = assert!(LN2_BIN.len() % 8 == 0, "ln2.bin must hold whole u64 limbs");
+static LN2_TABLE: [u64; LN2_LIMBS] = limbs(LN2_BIN);
 
-struct StaticLn2<const N: usize>;
-
-impl<const N: usize> StaticLn2<N> {
-    fn get(out: &mut [u64]) -> bool {
-        if out.len() > LN2_LIMBS {
-            return false;
-        }
-        let bytes = &LN2_BIN[8 * (LN2_LIMBS - out.len())..];
-        for (l, c) in out.iter_mut().zip(bytes.chunks_exact(8)) {
-            *l = u64::from_le_bytes(c.try_into().unwrap());
-        }
-        true
-    }
-
-    // Past the table, sums the series at out.len() + guard limbs.
-    fn request(out: &mut [u64], guard: usize) -> Result<(), CapacityError> {
-        fn add_series_static<const N: usize, S: BBPSeries>(
-            s: &StaticNodeBBP<N, S>,
-            shift: u64,
-            acc: &mut [u64],
-            t: &mut [u64],
-        ) {
-            let (p, q, k) = s.ratio(&LN2_CTX);
-            ratio_to_fraction_static::<N>(p, q, k + shift as i64, t);
-            let carry = add_buf(acc, t);
-            debug_assert!(!carry, "ln(2) < 1");
-        }
-
-        #[inline(never)]
-        fn split<const N: usize, S: BBPSeries>(n: u64) -> StaticNodeBBP<N, S> {
-            bin_split::<StaticNodeBBP<N, S>>(&LN2_CTX, 1, n)
-        }
-
-        fn spawn_split<'s, const N: usize, S: BBPSeries + 's>(
-            sc: &'s Scope<'s, '_>,
-            n: u64,
-        ) -> Option<ScopedJoinHandle<'s, StaticNodeBBP<N, S>>> {
-            thread::Builder::new()
-                .stack_size(static_split_stack(N))
-                .spawn_scoped(sc, move || split::<N, S>(n))
-                .ok()
-        }
-
-        fn join_split<const N: usize, S: BBPSeries>(
-            h: Option<ScopedJoinHandle<'_, StaticNodeBBP<N, S>>>,
-            n: u64,
-        ) -> StaticNodeBBP<N, S> {
-            match h {
-                Some(h) => h.join().unwrap_or_else(|e| panic::resume_unwind(e)),
-                None => split::<N, S>(n),
-            }
-        }
-
-        if Self::get(out) {
-            return Ok(());
-        }
-        let len = out.len() + guard;
-        // Static finalize needs 2 limbs past its output.
-        if len + 2 > N {
-            return Err(CapacityError { min_n: len + 2 });
-        }
-
-        // Each term adds 4 bits.
-        let n = 1 + 16 * len as u64 + TERM_GAURD;
-        let (s1, s2, s3, s4) = if len >= LN2_PAR_CUTOFF {
-            thread::scope(|sc| {
-                let (h1, h2, h3, h4) = (
-                    spawn_split::<N, Ln2S1>(sc, n),
-                    spawn_split::<N, Ln2S2>(sc, n),
-                    spawn_split::<N, Ln2S3>(sc, n),
-                    spawn_split::<N, Ln2S4>(sc, n),
-                );
-                (
-                    join_split(h1, n),
-                    join_split(h2, n),
-                    join_split(h3, n),
-                    join_split(h4, n),
-                )
-            })
-        } else {
-            let (s1, s2) = (split::<N, Ln2S1>(n), split::<N, Ln2S2>(n));
-            let (s3, s4) = (split::<N, Ln2S3>(n), split::<N, Ln2S4>(n));
-            (s1, s2, s3, s4)
-        };
-
-        let (mut buf, mut t) = ([0xAAAA_AAAA_AAAA_AAAA; N], [0; N]);
-        let (buf, t) = (&mut buf[..len], &mut t[..len]);
-
-        add_series_static(&s1, 2, buf, t);
-        add_series_static(&s2, 3, buf, t);
-        add_series_static(&s3, 1, buf, t);
-        add_series_static(&s4, 3, buf, t);
-
-        out.copy_from_slice(&buf[guard..]);
-        Ok(())
-    }
+pub fn ln2_dyn(out: &mut [u64]) {
+    static LN2: RwLock<DynCache<Ln2Nodes>> = RwLock::new(DynCache {
+        nodes: (None, None, None, None),
+        buf: Vec::new(),
+    });
+    cached(&LN2_TABLE, &LN2, out, ln2_build);
 }
 
-// Past ln2.bin's LN2_LIMBS it needs N >= out.len() + 3, and returns a CapacityError
-// below that.
+#[inline(never)]
+fn ln2_share_static<const N: usize, S: BBPSeries>(n: u64, w: (u64, i64), len: usize) -> [u64; N] {
+    let s = bin_split::<StaticNodeBBP<N, S>>(&LN2_CTX, 0, n);
+    let (mut dq, mut t) = ([0; N], [0; N]);
+    let dq = &mut dq[..(len + 3).min(N)];
+    ln2_share(
+        s.ratio(&LN2_CTX),
+        w,
+        dq,
+        &mut t[..len],
+        ratio_to_fraction_static::<N>,
+    );
+    t
+}
+
+// Past the table, sums the series at out.len() + guard limbs.
+fn ln2_sum<const N: usize>(out: &mut [u64], guard: usize) -> Result<(), CapacityError> {
+    if from_table(&LN2_TABLE, out) {
+        return Ok(());
+    }
+    let len = out.len() + guard;
+    // Static finalize needs 2 limbs past its output.
+    if len + 2 > N {
+        return Err(CapacityError { min_n: len + 2 });
+    }
+
+    let n = ln2_terms(len);
+    let [w1, w2, w3, w4] = LN2_W;
+    let shares = static_jobs::<N, 4>(
+        len >= STATIC_LN2_PAR_CUTOFF,
+        [
+            &|| ln2_share_static::<N, Ln2S<6, 1>>(n, w1, len),
+            &|| ln2_share_static::<N, Ln2S<6, 5>>(n, w2, len),
+            &|| ln2_share_static::<N, Ln2S<2, 1>>(n, w3, len),
+            &|| ln2_share_static::<N, Ln2S<1, 1>>(n, w4, len),
+        ],
+    );
+    let mut buf = [0; N];
+    for t in &shares {
+        let carry = add_buf(&mut buf[..len], &t[..len]);
+        debug_assert!(!carry, "ln(2) < 1");
+    }
+    out.copy_from_slice(&buf[guard..len]);
+    Ok(())
+}
+
 pub fn ln2_static<const N: usize>(out: &mut [u64]) -> Result<(), CapacityError> {
-    StaticLn2::<N>::request(out, 1)
+    ln2_sum::<N>(out, 1)
 }
 
-// ln2_static without its guard limb, so past the table it needs only
-// N >= out.len() + 2, but its four series' rounding can leave out a few ulps low.
-// For callers that keep their own guard bits.
 pub(crate) fn ln2_static_unguarded<const N: usize>(out: &mut [u64]) -> Result<(), CapacityError> {
-    StaticLn2::<N>::request(out, 0)
+    ln2_sum::<N>(out, 0)
 }
 
 //$1/\pi = \frac{\sqrt{10005}}{4270934400} \; \sum^{\infty}_{n=0} (-1)^{n} \frac{(6n)!}{(3n)!(n!)^3 640320^{3n}} (545140134 \cdot n + 13591409)$
-//$P_1 / Q_1 = \sum^{\infty}_{n=0} (-1)^{n} \; n \prod^{n}_{r=1} \frac{(6r-5)(6r-1)(2r-1)}{r^3 \cdot 333833583375 \cdot 2^15}$
-//$P_2 / Q_2 = \sum^{\infty}_{n=0} (-1)^{n} \prod^{n}_{r=1} \frac{(6r-5)(6r-1)(2r-1)}{r^3 \cdot 333833583375 \cdot 2^15}$
-//$\pi = \frac{4270934400 \cdot Q_1 Q_2}{\sqrt{10005}(545140134 \cdot P_1 Q_2 + 13591409 \cdot P_2 Q_1)}$
+//$P / Q = \sum^{\infty}_{n=1} (-1)^{n} (545140134 \cdot n + 13591409) \prod^{n}_{r=1} \frac{(6r-5)(6r-1)(2r-1)}{r^3 \cdot 333833583375 \cdot 2^{15}}$
+//$\pi = \frac{426880 \sqrt{10005} \cdot Q}{13591409 \cdot Q + P}$
 
 const PI_POW: u128 = 333_833_583_375;
 const PI_CTX: DynHyperCtx = DynHyperCtx::new_shift(15);
-struct PI1;
-impl WideHyperSeries for PI1 {
+
+struct Pi;
+impl WideHyperSeries for Pi {
     const SIGNED: bool = true;
     fn p(n: u128) -> u128 {
-        n * (6 * n - 5) * (6 * n - 1) * (2 * n - 1)
+        (13591409 + 545140134 * n) * Self::r(n)
     }
-    fn q(n: u128) -> u128{
+    fn q(n: u128) -> u128 {
         n * n * n * PI_POW
     }
-    fn r(n: u128) -> u128{
+    fn r(n: u128) -> u128 {
         (6 * n - 5) * (6 * n - 1) * (2 * n - 1)
     }
     fn neg(n: u128) -> bool {
@@ -309,35 +293,160 @@ impl WideHyperSeries for PI1 {
     }
 }
 
-struct PI2;
-impl WideHyperSeries for PI2 {
-    const SIGNED: bool = true;
-    fn p(n: u128) -> u128 {
-        (6 * n - 5) * (6 * n - 1) * (2 * n - 1)
-    }
-    fn q(n: u128) -> u128{
-        n * n * n * PI_POW
-    }
-    fn r(n: u128) -> u128{
-        n * (6 * n - 5) * (6 * n - 1) * (2 * n - 1)
-    }
-    fn neg(n: u128) -> bool {
-        (n & 1) == 1
-    }
-}
-
-struct DynPI{
-    s1: Option<DynNodeHyper<PI1>>,
-    s2: Option<DynNodeHyper<PI2>>,
-    buf: Vec<u64>,
-}
-
-impl DynPI{
-    const fn new() -> DynPI{
-        DynPI{
-            s1: None, s2: None, buf: Vec::new(),
+// out <- floor(x * 2^sh), which must fit out.
+fn shifted(x: &[u64], sh: i64, out: &mut [u64]) {
+    let x = &x[..buf_len(x)];
+    let (w, v) = (
+        (sh.unsigned_abs() / 64) as usize,
+        (sh.unsigned_abs() % 64) as u8,
+    );
+    out.fill(0);
+    if sh >= 0 {
+        out[w..w + x.len()].copy_from_slice(x);
+        let c = shl_buf(&mut out[w..], v);
+        debug_assert_eq!(c, 0);
+    } else if w < x.len() {
+        let x = &x[w..];
+        let n = x.len().min(out.len());
+        debug_assert!(x.len() <= n + 1);
+        out[..n].copy_from_slice(&x[..n]);
+        shr_buf(&mut out[..n], v);
+        if let Some(&hi) = x.get(n) {
+            debug_assert!(v > 0 && hi >> v == 0);
+            out[n - 1] |= hi << (64 - v);
         }
     }
 }
 
-static PI_DYN: RwLock<DynPI> = RwLock::new(DynPI::new());
+fn pi_terms(f: usize) -> u64 {
+    2 + TERM_GAURD + (6400 * f as u64) / 4711
+}
+
+fn pi_denominator<'a>(
+    (p, q, sh): (&[u64], &[u64], i64),
+    qt: &'a mut [u64],
+    pt: &mut [u64],
+    t: &'a mut [u64],
+) -> (&'a [u64], &'a [u64]) {
+    let q = &q[..buf_len(q)];
+    let a = 64 * (qt.len() as i64 - q.len() as i64) + q[q.len() - 1].leading_zeros() as i64;
+    shifted(q, a, qt);
+    shifted(p, a - sh, pt);
+    t.fill(0);
+    let c = add_mul(t, qt, 13591409);
+    let borrow = sub_buf(t, pt);
+    debug_assert!(c == 0 && !borrow, "T is positive and fits its limbs");
+    (&qt[..buf_len(qt)], &t[..buf_len(t)])
+}
+
+fn pi_root(x: &mut [u64], root: &mut [u64], sqrt: fn(&mut [u64], &mut [u64])) {
+    x.fill(0);
+    x[root.len()] = 10005;
+    sqrt(x, root);
+    shr_buf(root, 32);
+    let c = mul_prim(root, 426880);
+    debug_assert_eq!(c, 0);
+}
+
+fn pi_build(node: &mut Option<DynNodeHyper<Pi>>, buf: &mut Vec<u64>, len: usize) {
+    let f = len - 1;
+    let n = pi_terms(f);
+    let have = node.as_ref().map_or(1, |s| s.range().1);
+    let limbs = |terms: u64| terms * 4711 / 6400;
+    let par = cache_par(
+        limbs(n - have),
+        limbs(have - 1),
+        DYN_PI_PAR_CUTOFF,
+        DYN_PI_PAR_HALF,
+    );
+    let mut scratch = ScratchGuard::acquire();
+    let [qt, pt, t, x, root, num] = scratch.get_splits([len, len, len + 1, len + 1, len, 2 * len]);
+    let mut den = None;
+    rayon::in_place_scope(|sc| {
+        let den = &mut den;
+        let series = move || {
+            let (node, qt, pt, t) = (node, qt, pt, t);
+            let s = bin_split_extend(&PI_CTX, node, 1, n);
+            debug_assert!(s.neg && !s.p.is_empty(), "S < 0");
+            *den = Some(pi_denominator(
+                (&s.p, &s.q, (PI_CTX.shift * (s.b - s.a)) as i64),
+                qt,
+                pt,
+                t,
+            ));
+        };
+        if par {
+            sc.spawn(|_| series());
+        } else {
+            series();
+        }
+        pi_root(x, root, sqrt_approx_dyn);
+    });
+    let (qt, t) = den.unwrap();
+    let num = &mut num[..root.len() + qt.len()];
+    let c = mul_dyn(root, qt, num);
+    debug_assert_eq!(c, 0);
+    buf.resize(len + 1, 0);
+    let c = div_dyn(&num[..buf_len(num)], t, buf);
+    debug_assert!(c == 0 && buf[f] == 3 && buf[len] == 0);
+    buf.truncate(len);
+}
+
+const PI_BIN: &[u8] = include_bytes!("pi.bin");
+pub(crate) const PI_LIMBS: usize = PI_BIN.len() / 8;
+const _: () = assert!(PI_BIN.len() % 8 == 0, "pi.bin must hold whole u64 limbs");
+static PI_TABLE: [u64; PI_LIMBS] = limbs(PI_BIN);
+
+pub fn pi_dyn(out: &mut [u64]) {
+    static PI: RwLock<DynCache<Option<DynNodeHyper<Pi>>>> = RwLock::new(DynCache {
+        nodes: None,
+        buf: Vec::new(),
+    });
+    cached(&PI_TABLE, &PI, out, pi_build);
+}
+
+#[inline(never)]
+fn pi_ratio_static<const N: usize>(f: usize) -> [u64; N] {
+    let ctx = StaticHyperCtx::<N>::new(&[1], PI_CTX.shift);
+    let s = bin_split::<StaticNodeHyper<N, Pi>>(&ctx, 1, pi_terms(f));
+    debug_assert!(s.is_neg(), "S < 0");
+    let (mut qt, mut t, mut v) = ([0; N], [0; N], [0; N]);
+    let (qt, t) = pi_denominator(
+        s.ratio(&ctx),
+        &mut qt[..f + 1],
+        &mut v[..f + 1],
+        &mut t[..f + 2],
+    );
+    ratio_to_fraction_static::<N>(qt, t, 0, &mut v[..f + 1]);
+    v
+}
+
+pub(crate) fn pi_static_sum<const N: usize>(out: &mut [u64]) -> Result<(), CapacityError> {
+    let f = out.len();
+    if f + 3 > N {
+        return Err(CapacityError { min_n: f + 3 });
+    }
+    let sqrt = || {
+        let (mut x, mut root) = ([0; N], [0; N]);
+        pi_root(&mut x[..f + 2], &mut root[..f + 1], sqrt_approx_static::<N>);
+        root
+    };
+    let [v, root] = static_jobs::<N, 2>(
+        f >= STATIC_PI_PAR_CUTOFF,
+        [&|| pi_ratio_static::<N>(f), &sqrt],
+    );
+
+    let mut buf = [0; N];
+    let top = hi_mul_static::<N>(&root[..f + 1], &v[..f + 1], &mut buf[..f]);
+    debug_assert_eq!(top, 3);
+    buf[f] = top;
+    out.copy_from_slice(&buf[1..f + 1]);
+    Ok(())
+}
+
+pub fn pi_static<const N: usize>(out: &mut [u64]) -> Result<(), CapacityError> {
+    if from_table(&PI_TABLE, out) {
+        return Ok(());
+    }
+    pi_static_sum::<N>(out)
+}

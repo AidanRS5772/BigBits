@@ -343,3 +343,116 @@ What kept the cost down:
   limbs.
 - The last x-leaf of a sum keeps its running term t only from P's exponent up, since t
   never becomes R. That took `exp_static_entry` at N = 16 from +12% to +4%.
+
+## Constant caches: when to build the series in parallel
+
+`ln2_dyn` and `pi_dyn` copy requests of up to their tables' length (1024 limbs) from
+`ln2.bin` and `pi.bin`, as the static caches do, and build only past them. So the rule
+below only runs past 1024 limbs, where it makes every ln2 build parallel, and π's from
+about 7 new limbs on a 1024-limb cache. The tables below were measured before the dynamic
+caches used the tables, building from small sizes, and still describe a shrunken table.
+The first request past a table builds from scratch: 1024 → 1025 took 6.2 ms for ln2 and
+1.56 ms for π, where extending a 1024-limb cache took 0.61 and 0.70 ms. In exchange, a
+request of up to 1024 limbs on a cold cache costs about 2 µs instead of up to 6.4 ms
+(ln2) and 1.5 ms (π), and `exp_dyn` at 64 and 512 limbs, whose ln2 now comes from the
+table, took 0.56x and 0.48x as long. Cold builds, hits and extensions past the table were
+unchanged (within an old-vs-old repeat's ±3%).
+
+ln2 now sums four base-64 series (`Shift(6)`) from n = 0, ln 2 = 2/3·S(6,1) + 1/24·S(6,5)
++ 1/72·S(2,1) + 1/384·S(1,1) with S(A,B) = Σ 1/((An + B) 64^n), in place of the base-16
+series from n = 1 with 2/3 as a constant. Each term adds 6 bits instead of 4, so a tree
+has 2/3 the terms, and its Q about 2/3 the bits. Each weight is 2^-k/d with d = 3 or 9,
+so a share scales a copy of the top limbs of its Q (all that finalize reads) by d and
+moves 2^-k into the finalize shift. Against the base-16 series (11–41 rounds, median, an
+old-vs-old repeat within ±3% except a few warm rows at ±5–11%):
+
+| | 1025 | 2048 | 4096 | 8192 | 16384 |
+|---|---|---|---|---|---|
+| `ln2_dyn` cold | 0.68 | 0.65–0.68 | 0.65 | 0.67 | 0.66 |
+| `ln2_static`, N = len + 3 | 0.75 (1100) | 0.67 | 0.65 | | |
+
+Warm extensions: 1100 → 1200 0.71–0.72, 2048 → 4096 0.66–0.68, and one limb (1100,
+2048, 4096) 0.95–0.97, since the full-length finalize dominates those. Growing 1100 →
+1150 a limb at a time: 0.94. `exp_static` at 1100 limbs, which sums ln2 past the table:
+0.87, and `exp_dyn` at 2048: 0.84. With the table cut to one limb, so that the series run
+below 1024 limbs: cold `ln2_dyn` 0.84 at 16 limbs, 0.75 at 32, 0.52–0.67 from 64 to 1024;
+`ln2_static` 0.69–0.89 from 32 to 512; `exp_dyn` 0.77 at 64 and 0.83 at 512. From 2 to
+8 limbs a fresh process paid about 1.5 µs once for touching `mul_prim` and a second
+scratch buffer (1.08–1.25x); with those touched first it was 0.97–0.99. `ln2_build`
+counts a cache's limbs as 3·terms/32 rounded up: rounded down, a one-limb extension (10
+or 11 terms) counted as 0 new limbs and ran its four shares serially, at 2.6x. The ln2
+parallel cutoffs above were measured on the base-16 series. Past the table they decide
+nothing, since every ln2 build there is parallel.
+
+`ln2_dyn` and `pi_dyn` keep their series nodes and extend them, so a request only sums
+the terms past the cache. But extending also merges the new node into the cached one and
+finalizes at the full length, and both cost more the larger the cache is. So the new
+limbs alone mispredict, and the threshold falls quickly with the cache size. The rule, in
+output limbs, is
+
+    par = new * (cached^2 + HALF^2) >= CUTOFF * HALF^2
+
+which is `new >= CUTOFF` on a cold cache, with the threshold halving at HALF cached
+limbs and falling with its square past that. A linear `new * (cached + HALF)` fit the
+earlier two-tree π and finalize-on-the-caller ln2, but not the current ones: their ties
+fall about as fast as 1 / cached² from a few dozen cached limbs.
+
+Measured on 8 threads (M-series, 11–15 rounds alternating, median), as parallel / serial,
+with the mode forced for every call of the process (so the priming build of a warm row
+ran in the same mode). "Serial" switches off only the cache-level parallelism; the
+trees' own splits stay parallel.
+
+ln2 runs its four series' shares, each extended and finalized, with nested `join2`:
+
+| cold | 24 | 28 | 32 | 36 | 40 | 48 |
+|---|---|---|---|---|---|---|
+| ln2 | 1.18 | 1.14 | 0.88–1.03 | 0.88 | 0.78 | 0.67 |
+
+| ln2 warm | Δ=1 | 2 | 4 | 6–8 | 10–12 | 16 | 24 |
+|---|---|---|---|---|---|---|---|
+| C=16 | | | | | 1.16 | 1.10 | 0.91 |
+| C=32 | 2.08 | 1.96 | 1.35 | 1.32 | 1.18–1.27 | 0.83 | |
+| C=64 | 1.11 | 1.11 | 0.93–1.00 | 0.79–1.03 | 0.57 | | |
+| C=128 | 1.02 | 0.85 | 0.69 (Δ=3) | | | | |
+| C=256 | 0.78 | 0.62–0.67 | 0.52 | | | | |
+| C=1024 | 0.44 | | | | | | |
+
+π spawns its one series into the pool with `rayon::in_place_scope`, where its top
+merges can run in parallel, while the calling thread builds the root:
+
+| cold | 64 | 96 | 128 | 160 |
+|---|---|---|---|---|
+| pi | 1.14 | 1.02 | 0.93 | 0.95 |
+
+| pi warm | Δ=1 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|
+| C=256 | | | | 1.11 | 1.10 | 0.85 |
+| C=1024 | | | 0.97 | 0.89 | 0.84 | 0.67 |
+| C=4096 | 1.00 | 0.97 | 0.94 | 0.87 | | |
+
+That gives CUTOFF = 32, HALF = 30 for ln2 and CUTOFF = 104, HALF = 256 for π. The
+misfits are within a few percent: ln2 at C = 64, Δ = 6 (1.03) and C = 128, Δ = 1 (1.02).
+
+Where a build runs matters beyond its own time, because each thread keeps its own FFT
+plans (`mul.rs`'s thread-local `FFT_CACHE`) and scratch pool. Building π's root on a
+worker made the next small serial extension on the caller 4–20% slower, which is why the
+caller builds it. The first request after a switch between the serial and parallel paths
+pays a few µs once: ln2 32 → 42 and 128 → 129 right after a parallel cold build cost
+about 1.05x the old code, whose cold builds finalized on the caller. Raising ln2's CUTOFF
+to 34 to keep cold 32 serial only moves that cost: the parallel 32 → 48 after it then
+starts on cold workers (1.23x). Growing either cache a limb at a time in one process
+shows no such cost (1.00x below 120 limbs).
+
+`ln2_static` builds from scratch, so it compares its working limbs with
+`STATIC_LN2_PAR_CUTOFF`. Each of its four scoped threads sums and finalizes one series,
+and they cost about 60 µs to start. With the table bypassed (41 rounds): 1.54 at 24
+limbs, 1.34 at 32, 0.95 at 40, 0.73 at 48, 0.56 at 64, 0.38 at 128 and 0.31 at 256.
+That gives 40, down from 56 when the four finalizes ran serially on the caller. It only
+matters if `ln2.bin` shrinks, since requests up to 1024 limbs copy the table.
+
+`pi_static` runs its series (through V = Q′/T′) and its root on two threads from
+`STATIC_PI_PAR_CUTOFF`, counted in limbs below π's integer limb, which only overlaps the
+root's cost with the series: 4.94 at 24, 2.20 at 64, 1.36 at 128, 1.06–1.16 at 256, 1.05
+at 384, 0.98 at 512 and 0.93 at 1000. That gives 480. Below `pi.bin`'s 1024 limbs it
+copies the table, so past it the series always gets its own thread, with a stack sized
+for N.

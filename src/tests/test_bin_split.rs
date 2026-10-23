@@ -1,5 +1,7 @@
 use crate::utils::bin_split::*;
-use crate::utils::consts::consts::{ln2_dyn, ln2_static, LN2_LIMBS};
+use crate::utils::consts::consts::{
+    ln2_dyn, ln2_static, pi_dyn, pi_static, pi_static_sum, LN2_LIMBS, PI_LIMBS,
+};
 use crate::utils::div::div_dyn;
 use crate::utils::mul::mul_dyn;
 use crate::utils::utils::{add_buf, add_prim, cmp_buf, sub_buf, trim_lz};
@@ -163,32 +165,37 @@ const LN2_32: [u64; 32] = [
 fn test_ln2_dyn_concurrent_requests() {
     use rayon::prelude::*;
     // floor(ln(2) * B^m) is the top m limbs of floor(ln(2) * B^M) for m <= M.
-    let mut full = vec![0; 600];
+    // Requests up to LN2_LIMBS come from the table and longer ones from the series
+    // built past it, which some of these extend concurrently.
+    let mut full = vec![0; LN2_LIMBS + 100];
     ln2_dyn(&mut full);
     assert_eq!(&full[full.len() - 32..], &LN2_32[..]);
-    let lens: Vec<usize> = (0..64).map(|i| 1 + (i * 37) % 700).collect();
+    let lens: Vec<usize> = (0..64).map(|i| 1 + (i * 37) % (LN2_LIMBS + 200)).collect();
     lens.par_iter().for_each(|&l| {
         let mut out = vec![0; l];
         ln2_dyn(&mut out);
         let m = l.min(full.len());
         assert_eq!(&out[l - m..], &full[full.len() - m..], "ln2 at {l} limbs");
     });
-    let mut big = vec![0; 700];
+    let mut big = vec![0; LN2_LIMBS + 200];
     ln2_dyn(&mut big);
-    assert_eq!(&big[big.len() - 600..], &full[..]);
+    assert_eq!(&big[big.len() - full.len()..], &full[..]);
 }
 
-// ln2.bin is ln2_dyn's output at LN2_LIMBS, and the static cache serves any
-// request up to that length from it whatever N is.
+// ln2.bin is the series built one limb past it, less that limb (examples/gen_ln2.rs),
+// and both caches serve any request up to its length from it, whatever N is.
 #[test]
 fn test_ln2_static_table() {
-    let mut full = vec![0; LN2_LIMBS];
+    let mut full = vec![0; LN2_LIMBS + 1];
     ln2_dyn(&mut full);
+    let full = &full[1..];
     assert_eq!(&full[LN2_LIMBS - 32..], &LN2_32[..]);
     for l in [0, 1, 31, 32, 33, 500, LN2_LIMBS - 1, LN2_LIMBS] {
-        let mut out = vec![0; l];
+        let (mut out, mut dyn_out) = (vec![0; l], vec![0; l]);
         ln2_static::<8>(&mut out).unwrap();
+        ln2_dyn(&mut dyn_out);
         assert_eq!(&out[..], &full[LN2_LIMBS - l..], "ln2 at {l} limbs");
+        assert_eq!(dyn_out, out, "ln2_dyn at {l} limbs");
     }
 }
 
@@ -211,6 +218,126 @@ fn test_ln2_static_past_table() {
 fn test_ln2_static_past_table_small_n() {
     let err = ln2_static::<{ LN2_LIMBS + 3 }>(&mut [0; LN2_LIMBS + 1]);
     assert_eq!(err, Err(CapacityError { min_n: LN2_LIMBS + 4 }));
+}
+
+// The top 32 limbs of floor(pi * B^1023), from Machin's formula.
+const PI_32: [u64; 32] = [
+    0xb4cc5c341141e8ce,
+    0x55ca396a2aab10b6,
+    0x5748986263e81440,
+    0xe65525f3aa55ab94,
+    0x78af2fda55605c60,
+    0xd71577c1bd314b27,
+    0x6c9e0e8bb01e8a3e,
+    0x8e79dcb0603a180e,
+    0xca417918b8db38ef,
+    0xc5d1b023286085f0,
+    0x9c30d5392af26013,
+    0x7b54a41dc25a59b5,
+    0x718bcd5882154aee,
+    0x0d95748f728eb658,
+    0xa458fea3f4933d7e,
+    0x636920d871574e69,
+    0x0801f2e2858efc16,
+    0x24a19947b3916cf7,
+    0xba7c9045f12c7f99,
+    0xb8e1afed6a267e96,
+    0x2ffd72dbd01adfb7,
+    0xd1310ba698dfb5ac,
+    0x9216d5d98979fb1b,
+    0x3f84d5b5b5470917,
+    0xc0ac29b7c97c50dd,
+    0xbe5466cf34e90c6c,
+    0x452821e638d01377,
+    0x082efa98ec4e6c89,
+    0xa4093822299f31d0,
+    0x13198a2e03707344,
+    0x243f6a8885a308d3,
+    0x0000000000000003,
+];
+
+#[test]
+fn test_pi_dyn_concurrent_requests() {
+    use rayon::prelude::*;
+    // floor(pi * B^(m - 1)) is the top m limbs of floor(pi * B^(M - 1)) for m <= M.
+    // Requests up to PI_LIMBS come from the table and longer ones from the series
+    // built past it, which some of these extend concurrently.
+    let mut full = vec![0; PI_LIMBS + 100];
+    pi_dyn(&mut full);
+    assert_eq!(&full[full.len() - 32..], &PI_32[..]);
+    let lens: Vec<usize> = (0..64).map(|i| 1 + (i * 37) % (PI_LIMBS + 200)).collect();
+    lens.par_iter().for_each(|&l| {
+        let mut out = vec![0; l];
+        pi_dyn(&mut out);
+        let m = l.min(full.len());
+        assert_eq!(&out[l - m..], &full[full.len() - m..], "pi at {l} limbs");
+    });
+    let mut big = vec![0; PI_LIMBS + 200];
+    pi_dyn(&mut big);
+    assert_eq!(&big[big.len() - full.len()..], &full[..]);
+}
+
+// pi.bin is the series built one limb past it, less that limb (examples/gen_pi.rs), and
+// both caches serve any request up to its length from it, whatever N is.
+#[test]
+fn test_pi_static_table() {
+    let mut full = vec![0; PI_LIMBS + 1];
+    pi_dyn(&mut full);
+    let full = &full[1..];
+    assert_eq!(&full[PI_LIMBS - 32..], &PI_32[..]);
+    for l in [0, 1, 31, 32, 33, 500, PI_LIMBS - 1, PI_LIMBS] {
+        let (mut out, mut dyn_out) = (vec![0; l], vec![0; l]);
+        pi_static::<8>(&mut out).unwrap();
+        pi_dyn(&mut dyn_out);
+        assert_eq!(&out[..], &full[PI_LIMBS - l..], "pi at {l} limbs");
+        assert_eq!(dyn_out, out, "pi_dyn at {l} limbs");
+    }
+}
+
+// The static series at every length up to the N - 3 bound match pi_dyn (here pi.bin)
+// exactly: the guard limb absorbs the static nodes' truncation and the finish's rounding.
+// These all run serially (below STATIC_PI_PAR_CUTOFF); test_pi_static_past_table runs the
+// threads against the dynamic series.
+#[test]
+fn test_pi_static_sum_matches_dyn() {
+    fn check<const N: usize>() {
+        for l in 1..=N - 3 {
+            let (mut want, mut out) = (vec![0; l], vec![0; l]);
+            pi_dyn(&mut want);
+            pi_static_sum::<N>(&mut out).unwrap();
+            assert_eq!(out, want, "pi at {l} limbs, N = {N}");
+        }
+    }
+    check::<4>();
+    check::<5>();
+    check::<8>();
+    check::<16>();
+    check::<33>();
+    check::<64>();
+    check::<300>();
+}
+
+#[test]
+fn test_pi_static_past_table() {
+    fn check<const N: usize>(l: usize) {
+        let (mut want, mut out) = (vec![0; l], vec![0; l]);
+        pi_dyn(&mut want);
+        pi_static::<N>(&mut out).unwrap();
+        assert_eq!(out, want, "pi at {l} limbs, N = {N}");
+    }
+    check::<{ PI_LIMBS + 4 }>(PI_LIMBS + 1);
+    check::<{ PI_LIMBS + 16 }>(PI_LIMBS + 1);
+    check::<{ PI_LIMBS + 16 }>(PI_LIMBS + 13);
+}
+
+// Too small an N is a CapacityError, returned before out is touched.
+#[test]
+fn test_pi_static_small_n() {
+    let mut out = [7; PI_LIMBS + 1];
+    let err = pi_static::<{ PI_LIMBS + 3 }>(&mut out);
+    assert_eq!(err, Err(CapacityError { min_n: PI_LIMBS + 4 }));
+    assert!(out.iter().all(|&l| l == 7));
+    assert_eq!(pi_static_sum::<4>(&mut [0; 2]), Err(CapacityError { min_n: 5 }));
 }
 
 // floor(p 2^(64 len - shift) / q) by one exact division of the full operands.

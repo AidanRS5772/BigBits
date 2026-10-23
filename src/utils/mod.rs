@@ -80,8 +80,41 @@ pub const STATIC_SQRT_REM_ZIMMERMAN_CUTOFF: usize = 20;
 pub const STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF: usize = 15;
 pub const STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF: usize = 14;
 
-// ln(2) computes its four series in parallel from this many output limbs.
-pub const LN2_PAR_CUTOFF: usize = 40;
+// The dynamic constant caches (ln2_dyn, pi_dyn) copy requests of up to their tables' 1024
+// limbs from them, and past that build in parallel (rayon) when
+// new * (cached^2 + HALF^2) >= CUTOFF * HALF^2, in output limbs: from CUTOFF new limbs on
+// a cold cache, with the threshold halving at HALF cached limbs and falling with its
+// square past that. Extending a cache also merges into the cached nodes and finalizes at
+// the full length, which both cost more the larger the cache is, so a few new limbs on a
+// large cache are worth parallelizing. Waking rayon's workers from outside the pool
+// costs about 15-20 us. ln2 runs its four series' shares in parallel (measured on the
+// earlier base-16 series): ties cold at ~31 limbs, warm at new ~ 20, 14, 6 and 1 for 16,
+// 32, 64 and 128 cached. pi spawns its one series into the pool, where its own top
+// merges can run in parallel, while the caller builds the root: ties cold at 96-128
+// limbs, warm at new ~ 45, 8 and 1 for 256, 1024 and 4096 cached. Each thread keeps its
+// own FFT plans and scratch, so the first request after a switch between the serial and
+// parallel paths pays a few us once (ln2 32 -> 42 and 128 -> 129 after a parallel cold
+// build, about 1.05x). Past the tables every ln2 build is parallel, and pi's from about 7
+// new limbs; the smaller ties matter only if a table shrinks. See
+// docs/bin_split_cutoff_tuning.md.
+pub const DYN_LN2_PAR_CUTOFF: u64 = 32;
+pub const DYN_LN2_PAR_HALF: u64 = 30;
+pub const DYN_PI_PAR_CUTOFF: u64 = 104;
+pub const DYN_PI_PAR_HALF: u64 = 256;
+
+// ln2_static sums and finalizes each of its four series on its own scoped thread from
+// this many limbs (out.len() plus its guard; measured on the earlier base-16 series).
+// Four threads cost about 60 us to start: they lost at 32 limbs (1.34x) and won from 40
+// (0.95x, 0.56x at 64). Below ln2.bin's 1024 limbs it copies the table instead, so this
+// only matters if the table shrinks.
+pub const STATIC_LN2_PAR_CUTOFF: usize = 40;
+
+// pi_static builds its series and its root on two scoped threads from this many limbs
+// below pi's integer limb (out.len() - 1 plus its guard), which only overlaps the root's
+// cost with the series: they lost at 384 (1.05x) and won from 512 (0.98x, 0.93x at
+// 1000). Below pi.bin's 1024 limbs it copies the table instead, so past it the series
+// always gets a thread, and its stack sized for N.
+pub const STATIC_PI_PAR_CUTOFF: usize = 480;
 
 // Binary splitting builds a range as one leaf once its node's estimated size
 // (Node::limbs) drops below LEAF_LIMBS, or it has at most LEAF_TERMS terms.

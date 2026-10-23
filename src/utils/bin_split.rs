@@ -1043,6 +1043,8 @@ pub trait Node: Sized {
     // Estimated limbs of the largest part of the node [a, b) builds. It only
     // shapes the tree, so it never changes the result.
     fn limbs(ctx: &Self::Ctx, a: u64, b: u64) -> u64;
+    // The terms [a, b) this node sums.
+    fn range(&self) -> (u64, u64);
     fn merge(ctx: &Self::Ctx, l: Self, r: Self) -> Self;
     fn leaf(ctx: &Self::Ctx, a: u64, b: u64, last: bool) -> Self;
     // out <- the sum's limbs below its top zeros limbs, which the caller knows are
@@ -1107,6 +1109,16 @@ where
     N::Ctx: Sync,
 {
     bin_split_tree::<N>(ctx, a, b, true)
+}
+
+pub trait CTX {}
+impl CTX for Shift {}
+impl CTX for DynHyperCtx {}
+impl<const N: usize> CTX for StaticHyperCtx<N> {}
+
+pub trait Series:
+    BBPSeries + WideBBPSeries + EngelSeries + WideEngelSeries + HyperSeries + WideHyperSeries
+{
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1181,6 +1193,10 @@ impl<S: WideBBPSeries> Node for DynNodeBBP<S> {
     const PARALLEL: bool = true;
 
     // P, about Q * 2^(shift t).
+    fn range(&self) -> (u64, u64) {
+        (self.a, self.b)
+    }
+
     fn limbs(ctx: &Shift, a: u64, b: u64) -> u64 {
         est_limbs(a, b, S::q, ctx.0)
     }
@@ -1314,6 +1330,10 @@ impl<const N: usize, S: WideBBPSeries> Node for StaticNodeBBP<N, S> {
     type Ctx = Shift;
     const LEAF_LIMBS: u64 = STATIC_BBP_LEAF_LIMBS;
 
+    fn range(&self) -> (u64, u64) {
+        (self.a, self.b)
+    }
+
     fn limbs(ctx: &Shift, a: u64, b: u64) -> u64 {
         est_limbs(a, b, S::q, ctx.0).min(N as u64)
     }
@@ -1436,6 +1456,10 @@ impl<S: WideEngelSeries> Node for DynNodeEngel<S> {
     const PARALLEL: bool = true;
 
     // P, about Q * 2^(shift t).
+    fn range(&self) -> (u64, u64) {
+        (self.a, self.b)
+    }
+
     fn limbs(ctx: &Shift, a: u64, b: u64) -> u64 {
         est_limbs(a, b, S::q, ctx.0)
     }
@@ -1550,6 +1574,10 @@ impl<const N: usize, S: WideEngelSeries> StaticNodeEngel<N, S> {
 impl<const N: usize, S: WideEngelSeries> Node for StaticNodeEngel<N, S> {
     type Ctx = Shift;
     const LEAF_LIMBS: u64 = STATIC_ENGEL_LEAF_LIMBS;
+
+    fn range(&self) -> (u64, u64) {
+        (self.a, self.b)
+    }
 
     fn limbs(ctx: &Shift, a: u64, b: u64) -> u64 {
         est_limbs(a, b, S::q, ctx.0).min(N as u64)
@@ -1680,14 +1708,14 @@ fn x_bits(x: &[u64]) -> u64 {
 
 #[derive(Debug, Clone)]
 pub struct DynHyperCtx {
-    shift: u64,
+    pub shift: u64,
     // None when x = 1.
     x: Option<Vec<u64>>,
     x_bits: u64,
 }
 
 impl DynHyperCtx {
-    pub fn new_buf(x: &[u64], shift: u64) -> Self {
+    pub fn new(x: &[u64], shift: u64) -> Self {
         debug_assert!(
             x.last().is_some_and(|&l| l != 0),
             "x must be trimmed and nonzero"
@@ -1750,6 +1778,10 @@ impl<S: WideHyperSeries> Node for DynNodeHyper<S> {
     const PARALLEL: bool = true;
 
     // P, about the larger of Q * 2^(shift t) and R x^t.
+    fn range(&self) -> (u64, u64) {
+        (self.a, self.b)
+    }
+
     fn limbs(ctx: &DynHyperCtx, a: u64, b: u64) -> u64 {
         est_limbs(a, b, S::q, ctx.shift).max(est_limbs(a, b, S::r, ctx.x_bits))
     }
@@ -1969,12 +2001,21 @@ impl<const N: usize, S: WideHyperSeries> StaticNodeHyper<N, S> {
         let shift = (ctx.shift * (self.b - self.a)) as i64 + self.eq as i64 - self.ep as i64;
         (&self.p[..self.p_len], &self.q[..self.q_len], shift)
     }
+
+    // Whether S is negative.
+    pub(crate) fn is_neg(&self) -> bool {
+        S::SIGNED && self.neg && self.p_len != 0
+    }
 }
 
 impl<const N: usize, S: WideHyperSeries> Node for StaticNodeHyper<N, S> {
     type Ctx = StaticHyperCtx<N>;
     const LEAF_LIMBS: u64 = STATIC_HYPER_LEAF_LIMBS;
     const LEAF_TERMS: u64 = STATIC_HYPER_LEAF_TERMS;
+
+    fn range(&self) -> (u64, u64) {
+        (self.a, self.b)
+    }
 
     fn limbs(ctx: &StaticHyperCtx<N>, a: u64, b: u64) -> u64 {
         let est = est_limbs(a, b, S::q, ctx.shift).max(est_limbs(a, b, S::r, ctx.x_bits));

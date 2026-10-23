@@ -18,10 +18,12 @@ fn main() {
         .unwrap_or(DEFAULT_LIMBS);
     assert!(limbs > 0, "limb count must be a positive integer");
 
-    let mut ln2 = vec![0u64; limbs];
+    // ln2_dyn copies requests up to the current table's length from it, so ask for one limb
+    // more than the table gets: from the current length on, that builds the series.
+    let mut ln2 = vec![0u64; limbs + 1];
     ln2_dyn(&mut ln2);
 
-    let bytes: Vec<u8> = ln2.iter().flat_map(|l| l.to_le_bytes()).collect();
+    let bytes: Vec<u8> = ln2[1..].iter().flat_map(|l| l.to_le_bytes()).collect();
     fs::write(PATH, &bytes).expect("failed to write ln2.bin");
     println!("wrote {limbs} limbs ({} bytes) to {PATH}", bytes.len());
 }
