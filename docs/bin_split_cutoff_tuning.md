@@ -286,6 +286,82 @@ the parent commit (`1ffd2ee`), with a browser using about one core:
 On one thread the gain is the min width alone. The combine is still serial, at about
 30% of the remaining wall time in parallel mode.
 
+### Argument scale: squares
+
+`exp_reduced` runs the core on r·2^-j instead of r, then squares back j times
+(u ← 2u + u², with u = e^x − 1). Near r's top the factorial sets each series' term
+count, so moving r down by j bits trims the most expensive series, and each square
+costs one `hi_sqr`. j is `DYN_EXP_SQR_BITS` (24) less r's own leading zero bits, and
+it is 0 whenever the core would sum r's chunks in parallel.
+
+The first rule tried was ln's: j = floor(A·log2(64·o)), the twin of `DYN_LN_SQRT_A`.
+`cargo bench-bin-split exp` (two random X per size, from 1 to 16384 limbs, 9 rounds)
+gives these geometric means relative to each row's best A:
+
+| A | 0 | 0.5 | 1 | 1.5 | 2 | 2.5 | 3 | 4 | 6 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 thread | 1.219 | 1.186 | 1.099 | 1.070 | 1.068 | 1.073 | 1.073 | 1.121 | 1.262 |
+| 12 threads | 1.167 | 1.194 | 1.183 | 1.207 | 1.253 | 1.301 | 1.317 | 1.435 | 1.699 |
+
+Neither fits. On one thread the best A falls from 4 at 1–2 limbs to 1–1.5 past 128,
+because the best j hardly moves at all: about 24 bits at every size. On 12 threads the
+best A is 0 from 256 limbs up. A fixed j per size, on one thread, relative to each
+size's best:
+
+| limbs | j=0 | 12 | 16 | 20 | **24** | 28 | 32 | 40 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1.200 | 1.220 | 1.176 | 1.055 | **1.002** | 1.006 | 1.042 | 1.070 |
+| 4 | 1.364 | 1.174 | 1.120 | 1.115 | **1.000** | 1.018 | 1.021 | 1.060 |
+| 16 | 1.471 | 1.132 | 1.089 | 1.041 | **1.001** | 1.013 | 1.001 | 1.017 |
+| 64 | 1.188 | 1.025 | 1.057 | 1.012 | **1.000** | 1.036 | 1.062 | 1.088 |
+| 128 | 1.220 | 1.001 | 1.022 | 1.027 | **1.029** | | 1.157 | |
+| 256 | 1.096 | 1.000 | 1.006 | 1.019 | **1.046** | | 1.108 | |
+| 1024 | 1.032 | 1.009 | 1.006 | 1.010 | **1.010** | | 1.031 | |
+| 4096 | 1.069 | 1.024 | 1.014 | 1.006 | **1.001** | | 1.005 | |
+
+(128 to 4096 also ran j = 8: 1.014, 1.010, 1.011 and 1.045.) 24 is within 1.05× of the
+best everywhere. At 128 limbs, ten more random X gave j = 0 1.159, j = 12 1.003 and
+j = 24 1.047. Below 24 the small sizes lose 5–12%, so 24 is the smallest constant in the
+noise band.
+
+On 12 threads `exp_dyn_entry` sums its chunks on rayon from about 64 limbs on. The
+squares stay serial, and the series they shorten were already overlapping, so they only
+add time:
+
+| limbs | j=0 | 4 | 8 | 12 | 16 | 24 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 64 | 1.111 | 1.066 | 1.022 | 1.009 | 1.004 | 1.102 |
+| 128 | 1.015 | 1.014 | 1.038 | 1.120 | 1.218 | |
+| 256 | 1.000 | 1.025 | 1.044 | 1.093 | | |
+
+So `exp_reduced` asks the core's own parallel gate first (`exp_par`, on r's frame at j =
+0) and takes no squares when it would go parallel. That gives up about 10% at 64 limbs
+and keeps every larger size at its j = 0 time.
+
+End to end, ms per call against j = 0 and against `ln_dyn` on the same X (means of the
+two rows per size, 9 rounds):
+
+| limbs | 1 thread j=0 | j=24 | gain | ln | 12 threads j=0 | j=24 | gain | ln |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.0050 | 0.0040 | 1.24× | 0.0085 | 0.0050 | 0.0040 | 1.24× | 0.0085 |
+| 4 | 0.0109 | 0.0080 | 1.36× | 0.0145 | 0.0111 | 0.0080 | 1.39× | 0.0145 |
+| 16 | 0.0401 | 0.0295 | 1.36× | 0.0520 | 0.0388 | 0.0285 | 1.36× | 0.0530 |
+| 32 | 0.103 | 0.076 | 1.35× | 0.130 | 0.105 | 0.078 | 1.36× | 0.134 |
+| 64 | 0.269 | 0.236 | 1.14× | 0.339 | 0.249 | 0.250 | 1.00× | 0.270 |
+| 128 | 1.043 | 1.053 | 0.99× | 1.276 | 0.611 | 0.608 | 1.01× | 0.552 |
+| 256 | 3.041 | 2.930 | 1.04× | 3.740 | 1.402 | 1.384 | 1.01× | 1.272 |
+| 512 | 7.144 | 6.989 | 1.02× | 8.622 | 2.914 | 2.829 | 1.03× | 2.657 |
+| 1024 | 17.16 | 16.30 | 1.05× | 21.34 | 6.243 | 6.159 | 1.01× | 6.901 |
+| 4096 | 95.15 | 91.71 | 1.04× | 126.8 | 32.11 | 31.06 | 1.03× | 36.95 |
+| 16384 | 582.3 | 539.2 | 1.08× | 694.9 | 184.5 | 183.0 | 1.01× | 224.3 |
+
+On 12 threads both columns from 64 limbs on run the same code, so their gap there is
+noise. The one-thread 128-limb row drew two unlucky X; the ten-X repeat above has j = 24
+1.11× ahead of j = 0. With the squares, exp is faster than ln at every size on one thread
+(ln takes 1.2–2.1× as long). On 12 threads ln takes 1.1–2.1× as long, except at 128–512
+limbs, where it takes about 0.92× as long: there exp's chunks run in parallel without
+squares.
+
 ## Static nodes: bit-level normalization
 
 Static parts used to keep limb exponents, so a truncated part kept its top N limbs

@@ -34,9 +34,8 @@ fn push(buf: &mut [u64], len: &mut usize, c: u64) {
     }
 }
 
-// Pushes the carry limb c, or once buf is full keeps its top 64 buf.len() - 1 bits, c's
-// on top (the spare bit leaves room for a term), and raises the bit exponent e by what
-// it drops.
+// Pushes carry c, or once buf is full keeps its top 64 buf.len() - 1 bits (the spare bit
+// leaves room for a term) and raises the bit exponent e by what it drops.
 fn push_or_drop(buf: &mut [u64], len: &mut usize, e: &mut u64, c: u64) {
     if c == 0 {
         return;
@@ -57,8 +56,6 @@ fn drop_under(buf: &mut [u64], len: &mut usize, e: &mut u64, c: u64) {
     *e += k;
 }
 
-// (ov : buf[..len]) >> k in place, with ov the limb above len, zeroing the limbs it
-// vacates. What remains must fit buf. Returns its trimmed length.
 fn shr_bits(buf: &mut [u64], len: usize, ov: u64, k: u64) -> usize {
     if k == 0 {
         if ov == 0 {
@@ -90,22 +87,12 @@ fn shr_bits(buf: &mut [u64], len: usize, ov: u64, k: u64) -> usize {
     buf_len(&buf[..len])
 }
 
-// buf[..len] << k in place, for a trimmed buf[..len] whose result fits buf. Returns its
-// length.
-fn shl_bits(buf: &mut [u64], len: usize, k: u64) -> usize {
-    if len == 0 || k == 0 {
-        return len;
-    }
-    let (kl, kb) = split_sh(k);
-    buf.copy_within(..len, kl);
-    buf[..kl].fill(0);
-    let mut n = kl + len;
-    let c = shl_buf(&mut buf[kl..n], kb);
-    push(buf, &mut n, c);
-    n
+fn shl_bits(buf: &mut [u64], mut len: usize, k: u8) -> usize {
+    let c = shl_buf(&mut buf[..len], k);
+    push(buf, &mut len, c);
+    len
 }
 
-// P += x m at limb offset off with the term's sign, returning whether P dropped bits.
 #[inline(always)]
 fn add_pass(
     p: &mut [u64],
@@ -130,7 +117,6 @@ fn add_pass(
     *e != e0
 }
 
-// P += x w 2^d with the term's sign, dropping x w's bits below P's last limb.
 #[inline(always)]
 fn add_term(
     p: &mut [u64],
@@ -149,9 +135,6 @@ fn add_term(
     }
 }
 
-// add_term once d isn't a whole number of limbs up. Then w 2^(d mod 64) spans two limbs
-// (one when w is small) and x goes in once per limb, so the caller first leaves P room
-// for P plus the term: no pass can then drop bits from P and misalign the next.
 #[inline(never)]
 fn add_term_split(
     p: &mut [u64],
@@ -172,7 +155,7 @@ fn add_term_split(
         pass(l + 1, x, (m >> 64) as u64);
         return;
     }
-    // g, the limb below x's part, keeps the bits it drops from costing up to w ulps.
+    // g, the limb below x's part, rounds the bits it drops.
     let g = x.get(l.wrapping_sub(1)).copied().unwrap_or(0);
     let x = &x[l.min(x.len())..];
     if s == 0 {
@@ -181,7 +164,6 @@ fn add_term_split(
         }
         return;
     }
-    // x w / 2^s = x hi + x lo / B, with w 2^(64 - s) = hi B + lo, and g adds g hi / B.
     let m = (w as u128) << (64 - s);
     let (hi, lo) = ((m >> 64) as u64, m as u64);
     let x0 = x.first().copied().unwrap_or(0);
@@ -195,8 +177,7 @@ fn add_term_split(
     );
 }
 
-// Drops P's low bits until P plus a term below 2^top has room in p, as add_term needs.
-// Only a tight fit waits on P's top limb.
+// Drops P's low bits until P plus a term below 2^top fits p, as add_term needs.
 fn make_room(p: &mut [u64], len: &mut usize, e: &mut u64, top: u64) {
     let cap = *e + 64 * p.len() as u64;
     if top.max(*e + 64 * *len as u64) < cap {
@@ -206,14 +187,6 @@ fn make_room(p: &mut [u64], len: &mut usize, e: &mut u64, top: u64) {
     if need > cap {
         *len = shr_bits(p, *len, 0, need - cap);
         *e += need - cap;
-    }
-}
-
-fn shr64(v: u64, e: u64) -> u64 {
-    if e < 64 {
-        v >> e
-    } else {
-        0
     }
 }
 
@@ -243,23 +216,6 @@ fn sub_mul_flip(
 }
 
 #[inline(always)]
-fn add_signed(
-    p: &mut [u64],
-    len: &mut usize,
-    off: usize,
-    t: &[u64],
-    neg: &mut bool,
-    t_neg: bool,
-    signed: bool,
-) -> u64 {
-    if signed && *neg != t_neg {
-        sub_mul_flip(p, len, off, t, 1, neg)
-    } else {
-        add_buf(&mut p[off..*len], t) as u64
-    }
-}
-
-#[inline(always)]
 fn add_or_sub(acc: u128, t: u128, sub: bool) -> (u128, bool) {
     if sub {
         (acc.abs_diff(t), t > acc)
@@ -268,8 +224,7 @@ fn add_or_sub(acc: u128, t: u128, sub: bool) -> (u128, bool) {
     }
 }
 
-// buf = (buf u + add) 2^sh. A shift past buf's end keeps its top 64 buf.len() - 1 bits,
-// like push_or_drop, and e takes the rest.
+// buf = (buf u + add) 2^sh, dropping low bits like push_or_drop.
 fn mul_shl(buf: &mut [u64], len: &mut usize, e: &mut u64, u: u64, sh: u64, add: u64) {
     let sb = (sh % 64) as u32;
     let f = if u.leading_zeros() >= sb { sb } else { 0 };
@@ -282,11 +237,9 @@ fn mul_shl(buf: &mut [u64], len: &mut usize, e: &mut u64, u: u64, sh: u64, add: 
     }
 }
 
-// buf = buf 2^bits for a nonzero buf. A shift past buf's end keeps its top 64 buf.len() - 1
-// bits, like push_or_drop, and e takes the rest.
+// buf = buf 2^bits for a nonzero buf, dropping low bits like push_or_drop.
 #[inline(always)]
 fn shift_up(buf: &mut [u64], len: &mut usize, e: &mut u64, bits: u64) {
-    // Only a shift past the free limbs waits on the top limb's leading zeros.
     let free = 64 * (buf.len() - *len) as u64;
     let s = if bits <= free {
         bits
@@ -315,7 +268,6 @@ fn shift_up(buf: &mut [u64], len: &mut usize, e: &mut u64, bits: u64) {
     push(buf, len, c);
 }
 
-// Pushes a two-limb carry onto a part that must fit.
 fn push2(buf: &mut [u64], len: &mut usize, c: u128) {
     if c != 0 {
         buf[*len] = c as u64;
@@ -324,7 +276,6 @@ fn push2(buf: &mut [u64], len: &mut usize, c: u128) {
     }
 }
 
-// push_or_drop for a two-limb carry c.
 fn push_or_drop2(buf: &mut [u64], len: &mut usize, e: &mut u64, c: u128) {
     let (lo, hi) = (c as u64, (c >> 64) as u64);
     if hi == 0 {
@@ -341,7 +292,6 @@ fn push_or_drop2(buf: &mut [u64], len: &mut usize, e: &mut u64, c: u128) {
     push_or_drop(buf, len, e, hi);
 }
 
-// buf = buf u 2^sh for a wide u, as mul_shl does for a narrow one.
 fn mul_shl_wide(buf: &mut [u64], len: &mut usize, e: &mut u64, u: u128, sh: u64) {
     let shift = *len != 0 && sh != 0;
     let c = mul_prim2(&mut buf[..*len], u);
@@ -351,9 +301,7 @@ fn mul_shl_wide(buf: &mut [u64], len: &mut usize, e: &mut u64, u: u128, sh: u64)
     }
 }
 
-// add_term for a wide w and x 2^ex: w's low limb at x's exponent, then its high limb 64
-// bits up, each placed from P's exponent at the time. Callers make room first, as
-// add_term asks.
+// add_term for a wide w and x 2^ex, one limb of w at a time. Callers make room first.
 fn add_term_wide(
     p: &mut [u64],
     len: &mut usize,
@@ -407,13 +355,8 @@ fn bbp_leaf_terms<S: BBPSeries>(
             n += 1;
         }
         mul_shl(p, &mut p_len, &mut e, u, shift * j, 0);
-        p_len = p_len.max(q_len);
-        let c = if S::SIGNED && vn != pn {
-            sub_mul_flip(p, &mut p_len, 0, &q[..q_len], v, &mut pn)
-        } else {
-            add_mul(&mut p[..p_len], &q[..q_len], v)
-        };
-        push_or_drop(p, &mut p_len, &mut e, c);
+        let qv = (0, &q[..q_len], v);
+        add_pass(p, &mut p_len, &mut e, &mut pn, qv, vn, S::SIGNED);
         let c = mul_prim(&mut q[..q_len], u);
         push(q, &mut q_len, c);
     }
@@ -427,6 +370,7 @@ fn engel_leaf_terms<S: EngelSeries>(
     p: &mut [u64],
     q: &mut [u64],
 ) -> (usize, usize, u64, bool) {
+    let shr = |v: u64, e: u64| if e < 64 { v >> e } else { 0 };
     q[0] = 1;
     let (mut p_len, mut q_len, mut e, mut pn) = (0, 1, 0, false);
     let mut n = a;
@@ -462,9 +406,9 @@ fn engel_leaf_terms<S: EngelSeries>(
         let opposite = S::SIGNED && vn != pn;
         let fused = !opposite && (p_len == 0 || (sh < 64 && u.leading_zeros() as u64 >= sh));
         // v lands at P's exponent, before the shift when fused and after it otherwise.
-        let add = if fused { shr64(v, e) } else { 0 };
+        let add = if fused { shr(v, e) } else { 0 };
         mul_shl(p, &mut p_len, &mut e, u, sh, add);
-        let v = shr64(v, e);
+        let v = shr(v, e);
         if !fused && v != 0 {
             let c = if opposite {
                 sub_mul_flip(p, &mut p_len, 0, &[v], 1, &mut pn)
@@ -531,50 +475,63 @@ fn hyper_leaf_terms<S: HyperSeries>(
     (buf_len(&p[..p_len]), q_len, r_len, e, pn)
 }
 
-// t_mul(t, x, et, e, out) puts t x 2^et in out as (len, exponent), keeping at least its
-// bits from P's exponent e up.
-fn hyper_x_leaf_terms<'t, S: HyperSeries>(
+// The x != 1 leaf, one term per step, with Q into q. t_mul(t, x, et, e, out) puts
+// t x 2^et in out as (len, exponent), keeping at least its bits from P's exponent e up.
+// A WIDE leaf takes u128 values, and otherwise every value fits u64.
+fn hyper_x_leaf_terms<'t, S: WideHyperSeries, const WIDE: bool>(
     a: u64,
     b: u64,
-    shift: u64,
-    x: &[u64],
+    (shift, x): (u64, &[u64]),
     p: &mut [u64],
+    q: &mut [u64],
     mut t: &'t mut [u64],
     mut tmp: &'t mut [u64],
     t_mul: impl Fn(&[u64], &[u64], u64, u64, &mut [u64]) -> (usize, u64),
-) -> (usize, u64, &'t [u64], u64, bool) {
+) -> (usize, usize, u64, &'t [u64], u64, bool) {
     t[0] = 1;
     let (mut p_len, mut e, mut t_len, mut et, mut pn) = (0, 0, 1, 0, false);
-    for n in a..b {
+    for n in (a..b).map(u128::from) {
         debug_assert!(S::SIGNED || !S::neg(n), "negative terms need SIGNED");
         if p_len == 0 {
             e = 0;
         }
-        mul_shl(p, &mut p_len, &mut e, S::q(n), shift, 0);
+        if WIDE {
+            mul_shl_wide(p, &mut p_len, &mut e, S::q(n), shift);
+        } else {
+            mul_shl(p, &mut p_len, &mut e, S::q(n) as u64, shift, 0);
+        }
         let w = S::p(n);
         if t_len != 0 {
-            make_room(
-                p,
-                &mut p_len,
-                &mut e,
-                et + bits(&t[..t_len]) + bits(x) + bit_len(w),
-            );
+            let top = et + bits(&t[..t_len]) + bits(x) + bit_len128(w);
+            make_room(p, &mut p_len, &mut e, top);
         }
         (t_len, et) = t_mul(&t[..t_len], x, et, e, tmp);
         std::mem::swap(&mut t, &mut tmp);
-        if t_len != 0 {
-            let ts = (&t[..t_len], et as i64 - e as i64);
+        if t_len != 0 && WIDE {
+            let ts = (&t[..t_len], et);
+            add_term_wide(p, &mut p_len, &mut e, &mut pn, ts, w, S::neg(n), S::SIGNED);
+        } else if t_len != 0 {
+            let (ts, w) = ((&t[..t_len], et as i64 - e as i64), w as u64);
             add_term(p, &mut p_len, &mut e, &mut pn, ts, w, S::neg(n), S::SIGNED);
         }
-        let c = mul_prim(&mut t[..t_len], S::r(n));
-        push_or_drop(t, &mut t_len, &mut et, c);
+        if WIDE {
+            let c = mul_prim2(&mut t[..t_len], S::r(n));
+            push_or_drop2(t, &mut t_len, &mut et, c);
+        } else {
+            let c = mul_prim(&mut t[..t_len], S::r(n) as u64);
+            push_or_drop(t, &mut t_len, &mut et, c);
+        }
     }
+    let q_len = if WIDE {
+        prod_terms_wide(a, b, S::q, q)
+    } else {
+        prod_terms(a, b, |n| S::q(n as u128) as u64, q)
+    };
     let t: &'t [u64] = t;
-    (buf_len(&p[..p_len]), e, &t[..t_len], et, pn)
+    (buf_len(&p[..p_len]), q_len, e, &t[..t_len], et, pn)
 }
 
-// The wide kernels take one term per step: their values seldom leave room to pack two
-// into 128 bits.
+// The wide kernels take one term per step: wide values seldom leave room to pack two.
 fn bbp_leaf_terms_wide<S: WideBBPSeries>(
     a: u64,
     b: u64,
@@ -648,43 +605,6 @@ fn hyper_leaf_terms_wide<S: WideHyperSeries>(
     (buf_len(&p[..p_len]), q_len, r_len, e, pn)
 }
 
-// hyper_x_leaf_terms for wide terms.
-fn hyper_x_leaf_terms_wide<'t, S: WideHyperSeries>(
-    a: u64,
-    b: u64,
-    shift: u64,
-    x: &[u64],
-    p: &mut [u64],
-    mut t: &'t mut [u64],
-    mut tmp: &'t mut [u64],
-    t_mul: impl Fn(&[u64], &[u64], u64, u64, &mut [u64]) -> (usize, u64),
-) -> (usize, u64, &'t [u64], u64, bool) {
-    t[0] = 1;
-    let (mut p_len, mut e, mut t_len, mut et, mut pn) = (0, 0, 1, 0, false);
-    for n in a as u128..b as u128 {
-        debug_assert!(S::SIGNED || !S::neg(n), "negative terms need SIGNED");
-        if p_len == 0 {
-            e = 0;
-        }
-        mul_shl_wide(p, &mut p_len, &mut e, S::q(n), shift);
-        let w = S::p(n);
-        if t_len != 0 {
-            let top = et + bits(&t[..t_len]) + bits(x) + bit_len128(w);
-            make_room(p, &mut p_len, &mut e, top);
-        }
-        (t_len, et) = t_mul(&t[..t_len], x, et, e, tmp);
-        std::mem::swap(&mut t, &mut tmp);
-        if t_len != 0 {
-            let ts = (&t[..t_len], et);
-            add_term_wide(p, &mut p_len, &mut e, &mut pn, ts, w, S::neg(n), S::SIGNED);
-        }
-        let c = mul_prim2(&mut t[..t_len], S::r(n));
-        push_or_drop2(t, &mut t_len, &mut et, c);
-    }
-    let t: &'t [u64] = t;
-    (buf_len(&p[..p_len]), e, &t[..t_len], et, pn)
-}
-
 fn prod_terms_wide(a: u64, b: u64, f: impl Fn(u128) -> u128, buf: &mut [u64]) -> usize {
     buf[0] = 1;
     let mut len = 1;
@@ -695,15 +615,10 @@ fn prod_terms_wide(a: u64, b: u64, f: impl Fn(u128) -> u128, buf: &mut [u64]) ->
     len
 }
 
-// Whether every value f takes over [a, b) fits u64, so a leaf can run the narrow
-// kernels. For a narrow series widened by its blanket impl this is a constant, and the
-// loop folds away as long as it counts in u64 (over a u128 range it doesn't).
 fn fits_u64(a: u64, b: u64, f: impl Fn(u128) -> u128) -> bool {
     (a..b).all(|n| f(n as u128) >> 64 == 0)
 }
 
-// Dyn leaf buffer lengths for P, and for Q and R. A wide term can add two limbs to
-// each, and the spare limbs cover carries and keep make_room from firing.
 fn leaf_lens(narrow: bool, terms: usize, words: usize) -> (usize, usize) {
     if narrow {
         (terms + words, terms)
@@ -756,14 +671,11 @@ fn bit_len128(x: u128) -> u64 {
     (128 - x.leading_zeros()) as u64
 }
 
-// Bits of x, whose top limb is nonzero.
 fn bits(x: &[u64]) -> u64 {
     x.last()
         .map_or(0, |&top| 64 * x.len() as u64 - top.leading_zeros() as u64)
 }
 
-// Whether prod f(n) over [a, b) fits in cap bits, bounding each product's
-// length by the sum of its factors' lengths.
 fn prod_fits(a: u64, b: u64, f: impl Fn(u128) -> u128, cap: u64) -> bool {
     let mut bits = 0;
     for n in a..b {
@@ -775,7 +687,6 @@ fn prod_fits(a: u64, b: u64, f: impl Fn(u128) -> u128, cap: u64) -> bool {
     true
 }
 
-// Stack for a thread that builds a static tree: about 640 bytes per limb of N.
 pub(crate) const fn static_split_stack(n: usize) -> usize {
     1024 * n + (1 << 20)
 }
@@ -784,52 +695,24 @@ pub(crate) const fn static_split_stack(n: usize) -> usize {
 // while it fits N limbs, and from then on keeps its top 64 N bits (P a bit or two fewer,
 // for carries), so it loses no more than rounding.
 
-// (ov : buf[..len]) 2^e, with ov the limb above len.
-#[derive(Debug, Clone, Copy)]
-struct Raw {
-    len: usize,
-    ov: u64,
-    e: u64,
-}
-
-impl Raw {
-    // One past its top bit, or 0 when it's zero.
-    fn top(self, buf: &[u64]) -> u64 {
-        if self.ov != 0 {
-            self.e + 64 * self.len as u64 + bit_len(self.ov)
-        } else if self.len != 0 {
-            self.e + bits(&buf[..self.len])
-        } else {
-            0
-        }
-    }
-}
-
-// a b's limbs from its bit e up, as (ov : out[..len]) 2^r.e with r.e <= e, for trimmed
-// a and b. Its bits from e up must fit N + 1 limbs.
-fn hi_mul_from<const N: usize>(a: &[u64], b: &[u64], e: u64, out: &mut [u64]) -> Raw {
+// a b's limbs from its bit e up, for trimmed a and b, as (len, ov, e') for
+// (ov : out[..len]) 2^e' with e' <= e. Its bits from e up must fit N + 1 limbs.
+fn hi_mul_from<const N: usize>(a: &[u64], b: &[u64], e: u64, out: &mut [u64]) -> (usize, u64, u64) {
     let n = a.len() + b.len();
     let d = ((e / 64) as usize).min(n - 2);
     if n - d <= N + 1 {
         let ov = hi_mul_static::<N>(a, b, &mut out[..n - d - 1]);
-        return Raw {
-            len: n - d - 1,
-            ov,
-            e: 64 * d as u64,
-        };
+        return (n - d - 1, ov, 64 * d as u64);
     }
-    // Then a b's top limb is zero, and so would be the window's: normalizing the operand
-    // with more leading zeros moves the window down a limb.
+    // Then a b's top limb is zero, so normalizing the operand with more leading zeros
+    // moves the window down a limb.
     let lz = |x: &[u64]| x[x.len() - 1].leading_zeros() as u64;
     let (x, y) = if lz(a) >= lz(b) { (a, b) } else { (b, a) };
     let z = lz(x);
     let d = (((e + z) / 64) as usize).min(n - 2);
     debug_assert!(n - d <= N + 1 && 64 * d as u64 >= z);
-    Raw {
-        len: n - d - 1,
-        ov: hi_mul_shifted::<N>(x, y, &mut out[..n - d - 1]),
-        e: 64 * d as u64 - z,
-    }
+    let ov = hi_mul_shifted::<N>(x, y, &mut out[..n - d - 1]);
+    (n - d - 1, ov, 64 * d as u64 - z)
 }
 
 // hi_mul_static of x << lz(x) and y, with x's copy out of the caller's frame.
@@ -856,9 +739,13 @@ fn hi_mul_norm<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> (usize,
         return (buf_len(&out[..m]), 0);
     }
     // a b has top or top - 1 bits, so this window holds 64 N of them or more.
-    let r = hi_mul_from::<N>(a, b, top - 1 - cap, out);
-    let k = r.top(out) - r.e - cap;
-    (shr_bits(out, r.len, r.ov, k), r.e + k)
+    let (len, ov, e) = hi_mul_from::<N>(a, b, top - 1 - cap, out);
+    let win = if ov != 0 {
+        64 * len as u64 + bit_len(ov)
+    } else {
+        bits(&out[..len])
+    };
+    (shr_bits(out, len, ov, win - cap), e + win - cap)
 }
 
 // floor(a b 2^(ea - e)) into out[off..off + len] above off zero limbs, returning
@@ -880,20 +767,18 @@ fn product_at<const N: usize>(
         let m = (a.len() + b.len()).min(out.len());
         let c = mul_static::<N>(a, b, &mut out[..m]);
         debug_assert_eq!(c, 0);
-        (off, shl_bits(out, buf_len(&out[..m]), s as u64))
+        (off, shl_bits(out, buf_len(&out[..m]), s))
     } else {
-        let r = hi_mul_from::<N>(a, b, e - ea, out);
-        (0, shr_bits(out, r.len, r.ov, e - ea - r.e))
+        let (len, ov, er) = hi_mul_from::<N>(a, b, e - ea, out);
+        (0, shr_bits(out, len, ov, e - ea - er))
     }
 }
 
-// Moves u[..len] 2^eu to exponent e, dropping its bits below it, as (offset, length):
-// no copy when that's a whole number of limbs up.
+// Moves u[..len] 2^eu to exponent e, dropping its bits below it, as (limb offset, length).
 fn place(u: &mut [u64], len: usize, eu: u64, e: u64) -> (usize, usize) {
-    if eu >= e && (eu - e) % 64 == 0 {
-        (((eu - e) / 64) as usize, len)
-    } else if eu >= e {
-        (0, shl_bits(u, len, eu - e))
+    if eu >= e {
+        let (off, s) = split_sh(eu - e);
+        (off, shl_bits(u, len, s))
     } else {
         (0, shr_bits(u, len, 0, e - eu))
     }
@@ -908,11 +793,10 @@ fn term_top(a: &[u64], b: &[u64], e: u64) -> u64 {
     }
 }
 
-// A merge's P = T + U takes its exponent from its terms' exponents and top bits (0 for
-// a zero term), before either is computed, so each product is only computed down to it.
-// P keeps every bit while the sum fits N limbs, and otherwise its top 64 N bits less up
-// to two: one for a carry when the signs agree, and one as a product's top bit is only
-// known within one.
+// A merge's P = T + U exponent, from its terms' exponents and top bits (0 for a zero
+// term) before either product is computed. P keeps every bit while it fits N limbs, and
+// otherwise its top 64 N bits less up to two: a carry, and a product's top bit being
+// known only within one.
 fn p_exponent<const N: usize>(ta: u64, ea: u64, tu: u64, eu: u64, same: bool) -> u64 {
     let low = |top: u64, e: u64| if top == 0 { u64::MAX } else { e };
     let low = low(ta, ea).min(low(tu, eu));
@@ -940,14 +824,17 @@ fn p_sum(
 ) -> (usize, bool) {
     let mut neg = if t_zero { un } else { tn };
     let mut len = len.max(off + us.len());
-    let c = add_signed(p, &mut len, off, us, &mut neg, un, signed);
+    let c = if signed && neg != un {
+        sub_mul_flip(p, &mut len, off, us, 1, &mut neg)
+    } else {
+        add_buf(&mut p[off..len], us) as u64
+    };
     push(p, &mut len, c);
     (buf_len(&p[..len]), neg)
 }
 
-// out = floor(p * 2^(64 out.len() - shift) / q) up to truncation error. Only the
-// top out.len() + 2 limbs of p and q can reach out, which bounds the error below
-// 2^-64 of out's last limb, so the division is sized by out rather than by p and q.
+// out = floor(p * 2^(64 out.len() - shift) / q) up to truncation error. Only the top
+// out.len() + 2 limbs of p and q reach out, so the division is sized by out.
 pub fn ratio_to_fraction_dyn(p: &[u64], q: &[u64], shift: i64, out: &mut [u64]) {
     let len = out.len();
     out.fill(0);
@@ -964,9 +851,9 @@ pub fn ratio_to_fraction_dyn(p: &[u64], q: &[u64], shift: i64, out: &mut [u64]) 
     let n = if e >= 0 {
         let (w, v) = split_sh(e as u64);
         let n = scratch.get(w + p.len() + 1);
-        n.fill(0);
+        n[..w].fill(0);
         n[w..w + p.len()].copy_from_slice(p);
-        shl_buf(&mut n[w..], v);
+        n[w + p.len()] = shl_buf(&mut n[w..w + p.len()], v);
         n
     } else {
         let (w, v) = split_sh(e.unsigned_abs());
@@ -984,10 +871,8 @@ pub fn ratio_to_fraction_dyn(p: &[u64], q: &[u64], shift: i64, out: &mut [u64]) 
     debug_assert_eq!(top, 0, "finalize expects S < 1");
 }
 
-// Same result as ratio_to_fraction_dyn, but a division sized by out would need a
-// numerator of about 2 out.len() limbs, past N. Instead multiply p by a
-// (len + 2)-limb reciprocal of q, which only reads q's top window. Its error is
-// below one of its limbs, which costs out less than one ulp.
+// ratio_to_fraction_dyn without its 2 out.len()-limb numerator, which wouldn't fit N:
+// p times a (len + 2)-limb reciprocal of q, whose error costs out under one ulp.
 pub fn ratio_to_fraction_static<const N: usize>(p: &[u64], q: &[u64], shift: i64, out: &mut [u64]) {
     let len = out.len();
     assert!(len + 2 <= N, "finalize output needs out.len() + 2 <= N");
@@ -1007,8 +892,8 @@ pub fn ratio_to_fraction_static<const N: usize>(p: &[u64], q: &[u64], shift: i64
         return;
     }
 
-    // y = p x / 2^(64 (w - 1)), with hi_mul's overflow on top. S < 1 keeps that
-    // overflow zero once y has len + 2 limbs below it, so it needs no slot then.
+    // y = p x / 2^(64 (w - 1)), with hi_mul's overflow on top, zero once y has len + 2
+    // limbs below it.
     let core = full - w;
     debug_assert!(core <= len + 2, "finalize expects S < 1");
     let top = hi_mul_static::<N>(p, x, &mut y[..core]);
@@ -1026,8 +911,7 @@ pub fn ratio_to_fraction_static<const N: usize>(p: &[u64], q: &[u64], shift: i64
     debug_assert!(y[n..].iter().all(|&l| l == 0), "finalize expects S < 1");
 }
 
-// Estimated limbs of b - a terms that each add about bits(f(m)) + shift bits, with
-// m the midpoint.
+// Limbs of b - a terms that each add about bits(f(midpoint)) + shift bits.
 fn est_limbs(a: u64, b: u64, f: impl Fn(u128) -> u128, shift: u64) -> u64 {
     let bits = bit_len128(f((a + (b - a) / 2) as u128)) + shift;
     (b - a).saturating_mul(bits).div_ceil(64)
@@ -1035,25 +919,24 @@ fn est_limbs(a: u64, b: u64, f: impl Fn(u128) -> u128, shift: u64) -> u64 {
 
 pub trait Node: Sized {
     type Ctx;
-    // A tree splits [a, b) while it has more than LEAF_TERMS terms and its node
-    // has an estimated LEAF_LIMBS limbs or more.
+    // A tree splits [a, b) while it has more than LEAF_TERMS terms and an estimated
+    // LEAF_LIMBS limbs or more.
     const LEAF_LIMBS: u64;
     const LEAF_TERMS: u64 = 1;
     const PARALLEL: bool = false;
-    // Estimated limbs of the largest part of the node [a, b) builds. It only
-    // shapes the tree, so it never changes the result.
+    // Estimated limbs of the largest part of the node [a, b). It only shapes the tree.
     fn limbs(ctx: &Self::Ctx, a: u64, b: u64) -> u64;
     // The terms [a, b) this node sums.
     fn range(&self) -> (u64, u64);
     fn merge(ctx: &Self::Ctx, l: Self, r: Self) -> Self;
     fn leaf(ctx: &Self::Ctx, a: u64, b: u64, last: bool) -> Self;
-    // out <- the sum's limbs below its top zeros limbs, which the caller knows are
-    // zero: S * 2^(64 (out.len() + zeros)). Returns whether S is negative.
+    // out <- S 2^(64 (out.len() + zeros)), skipping S's top zeros limbs, which the
+    // caller knows are zero. Returns whether S is negative.
     fn finalize(&self, ctx: &Self::Ctx, zeros: usize, out: &mut [u64]) -> bool;
 }
 
-// Where a tree stops splitting, and from what size it builds a split's halves in
-// parallel (only for Node::PARALLEL).
+// Where a tree stops splitting, and from what size a Node::PARALLEL tree builds a
+// split's halves in parallel.
 #[derive(Debug, Clone, Copy)]
 pub struct SplitCutoffs {
     pub leaf_limbs: u64,
@@ -1111,15 +994,39 @@ where
     bin_split_tree::<N>(ctx, a, b, true)
 }
 
-pub trait CTX {}
-impl CTX for Shift {}
-impl CTX for DynHyperCtx {}
-impl<const N: usize> CTX for StaticHyperCtx<N> {}
-
-pub trait Series:
-    BBPSeries + WideBBPSeries + EngelSeries + WideEngelSeries + HyperSeries + WideHyperSeries
-{
+// Only merges drop bits, so a static leaf too big for N limbs splits itself.
+fn split_leaf<T: Node>(ctx: &T::Ctx, a: u64, b: u64, last: bool) -> T {
+    let m = a + (b - a) / 2;
+    T::merge(ctx, T::leaf(ctx, a, m, false), T::leaf(ctx, m, b, last))
 }
+
+// Every narrow series is a wide one, and Narrow<S> views a wide series whose values fit
+// u64 as a narrow one.
+macro_rules! narrow_wide {
+    ($narrow:ident, $wide:ident, $($f:ident),+) => {
+        impl<S: $narrow> $wide for S {
+            const SIGNED: bool = <S as $narrow>::SIGNED;
+            $(fn $f(n: u128) -> u128 {
+                <S as $narrow>::$f(n as u64) as u128
+            })+
+            fn neg(n: u128) -> bool {
+                <S as $narrow>::neg(n as u64)
+            }
+        }
+
+        impl<S: $wide> $narrow for Narrow<S> {
+            const SIGNED: bool = <S as $wide>::SIGNED;
+            $(fn $f(n: u64) -> u64 {
+                <S as $wide>::$f(n as u128) as u64
+            })+
+            fn neg(n: u64) -> bool {
+                <S as $wide>::neg(n as u128)
+            }
+        }
+    };
+}
+
+struct Narrow<S>(PhantomData<fn() -> S>);
 
 #[derive(Debug, Clone, Copy)]
 pub struct Shift(pub u64);
@@ -1134,10 +1041,9 @@ pub trait BBPSeries {
     }
 }
 
-// A BBPSeries whose p and q may need 128 bits; every BBPSeries is one. A leaf whose
-// values all fit u64 runs the narrow kernel, and only other leaves the wide one. A type
-// implements one of the two traits, and calling p or q on a concrete narrow series with
-// both in scope needs <T as BBPSeries>::q.
+// A BBPSeries whose p and q may need 128 bits; every BBPSeries is one. A leaf whose values
+// all fit u64 runs the narrow kernel. A type implements one of the two traits, and
+// calling p or q on a concrete narrow series with both in scope needs <T as BBPSeries>::q.
 pub trait WideBBPSeries {
     const SIGNED: bool = false;
     fn p(n: u128) -> u128;
@@ -1147,34 +1053,7 @@ pub trait WideBBPSeries {
     }
 }
 
-impl<S: BBPSeries> WideBBPSeries for S {
-    const SIGNED: bool = <S as BBPSeries>::SIGNED;
-    fn p(n: u128) -> u128 {
-        <S as BBPSeries>::p(n as u64) as u128
-    }
-    fn q(n: u128) -> u128 {
-        <S as BBPSeries>::q(n as u64) as u128
-    }
-    fn neg(n: u128) -> bool {
-        <S as BBPSeries>::neg(n as u64)
-    }
-}
-
-// A wide series seen as a narrow one, for a leaf whose values all fit u64.
-struct Narrow<S>(PhantomData<fn() -> S>);
-
-impl<S: WideBBPSeries> BBPSeries for Narrow<S> {
-    const SIGNED: bool = <S as WideBBPSeries>::SIGNED;
-    fn p(n: u64) -> u64 {
-        <S as WideBBPSeries>::p(n as u128) as u64
-    }
-    fn q(n: u64) -> u64 {
-        <S as WideBBPSeries>::q(n as u128) as u64
-    }
-    fn neg(n: u64) -> bool {
-        <S as WideBBPSeries>::neg(n as u128)
-    }
-}
+narrow_wide!(BBPSeries, WideBBPSeries, p, q);
 
 #[derive(Debug, Clone)]
 pub struct DynNodeBBP<S: WideBBPSeries> {
@@ -1192,11 +1071,11 @@ impl<S: WideBBPSeries> Node for DynNodeBBP<S> {
     const LEAF_LIMBS: u64 = DYN_BBP_LEAF_LIMBS;
     const PARALLEL: bool = true;
 
-    // P, about Q * 2^(shift t).
     fn range(&self) -> (u64, u64) {
         (self.a, self.b)
     }
 
+    // P, about Q 2^(shift t).
     fn limbs(ctx: &Shift, a: u64, b: u64) -> u64 {
         est_limbs(a, b, S::q, ctx.0)
     }
@@ -1240,10 +1119,9 @@ impl<S: WideBBPSeries> Node for DynNodeBBP<S> {
             || join2(par, || mul_exact(&l.q, &r.p, t), || product(&l.q, &r.q)),
         );
         p[sl + pl] = shl_buf(&mut p[sl..sl + pl], sb);
-        let (mut len, mut neg) = (p.len(), S::SIGNED && l.neg);
-        let c = add_signed(&mut p, &mut len, 0, &t[..t_len], &mut neg, r.neg, S::SIGNED);
-        debug_assert_eq!(c, 0);
-        trim_lz(&mut p);
+        let (n, signs) = (p.len(), (l.neg, r.neg));
+        let (len, neg) = p_sum(&mut p, n, (0, &t[..t_len]), signs, false, S::SIGNED);
+        p.truncate(len);
 
         DynNodeBBP {
             a: l.a,
@@ -1278,8 +1156,7 @@ pub struct StaticNodeBBP<const N: usize, S: WideBBPSeries> {
 }
 
 impl<const N: usize, S: WideBBPSeries> StaticNodeBBP<N, S> {
-    // Whether [a, b)'s exact P fits N limbs, where
-    // |P| <= prod q * 2^(shift (t - 1)) * t * max p. Q is smaller.
+    // Whether [a, b)'s exact P, at most prod q 2^(shift (t - 1)) t max p, fits N limbs.
     fn leaf_fits(shift: u64, a: u64, b: u64) -> bool {
         let t = b - a;
         let cap = 64 * N as u64;
@@ -1338,21 +1215,15 @@ impl<const N: usize, S: WideBBPSeries> Node for StaticNodeBBP<N, S> {
         est_limbs(a, b, S::q, ctx.0).min(N as u64)
     }
 
-    // Only merges drop bits, so a leaf too big for N limbs splits itself.
     fn leaf(ctx: &Shift, a: u64, b: u64, last: bool) -> Self {
         if b - a > 1 && !Self::leaf_fits(ctx.0, a, b) {
-            let m = a + (b - a) / 2;
-            return Self::merge(
-                ctx,
-                Self::leaf(ctx, a, m, false),
-                Self::leaf(ctx, m, b, last),
-            );
+            return split_leaf(ctx, a, b, last);
         }
         Self::exact_leaf(ctx.0, a, b)
     }
 
-    // P = lp rq 2^(shift (b - m)) + lq rp, built in p from lp rq and, in l.p, lq rp.
-    // Then Q = lq rq in r.p.
+    // P = lp rq 2^(shift (b - m)) + lq rp from lp rq in p and lq rp in l.p, then
+    // Q = lq rq in r.p.
     fn merge(ctx: &Shift, mut l: Self, mut r: Self) -> Self {
         const { assert!(N >= 2) };
         let sh = ctx.0 * (r.b - r.a);
@@ -1396,7 +1267,6 @@ pub trait EngelSeries {
     const SIGNED: bool = false;
     fn p(n: u64) -> u64;
     fn q(n: u64) -> u64;
-    // Whether term n is negative.
     fn neg(_: u64) -> bool {
         false
     }
@@ -1407,37 +1277,12 @@ pub trait WideEngelSeries {
     const SIGNED: bool = false;
     fn p(n: u128) -> u128;
     fn q(n: u128) -> u128;
-    // Whether term n is negative.
     fn neg(_: u128) -> bool {
         false
     }
 }
 
-impl<S: EngelSeries> WideEngelSeries for S {
-    const SIGNED: bool = <S as EngelSeries>::SIGNED;
-    fn p(n: u128) -> u128 {
-        <S as EngelSeries>::p(n as u64) as u128
-    }
-    fn q(n: u128) -> u128 {
-        <S as EngelSeries>::q(n as u64) as u128
-    }
-    fn neg(n: u128) -> bool {
-        <S as EngelSeries>::neg(n as u64)
-    }
-}
-
-impl<S: WideEngelSeries> EngelSeries for Narrow<S> {
-    const SIGNED: bool = <S as WideEngelSeries>::SIGNED;
-    fn p(n: u64) -> u64 {
-        <S as WideEngelSeries>::p(n as u128) as u64
-    }
-    fn q(n: u64) -> u64 {
-        <S as WideEngelSeries>::q(n as u128) as u64
-    }
-    fn neg(n: u64) -> bool {
-        <S as WideEngelSeries>::neg(n as u128)
-    }
-}
+narrow_wide!(EngelSeries, WideEngelSeries, p, q);
 
 #[derive(Debug, Clone)]
 pub struct DynNodeEngel<S: WideEngelSeries> {
@@ -1455,11 +1300,11 @@ impl<S: WideEngelSeries> Node for DynNodeEngel<S> {
     const LEAF_LIMBS: u64 = DYN_ENGEL_LEAF_LIMBS;
     const PARALLEL: bool = true;
 
-    // P, about Q * 2^(shift t).
     fn range(&self) -> (u64, u64) {
         (self.a, self.b)
     }
 
+    // P, about Q 2^(shift t).
     fn limbs(ctx: &Shift, a: u64, b: u64) -> u64 {
         est_limbs(a, b, S::q, ctx.0)
     }
@@ -1499,10 +1344,9 @@ impl<S: WideEngelSeries> Node for DynNodeEngel<S> {
             || product(&l.q, &r.q),
         );
         p[sl + pl] = shl_buf(&mut p[sl..sl + pl], sb);
-        let (mut len, mut neg) = (p.len(), S::SIGNED && l.neg);
-        let c = add_signed(&mut p, &mut len, 0, &r.p, &mut neg, r.neg, S::SIGNED);
-        debug_assert_eq!(c, 0);
-        trim_lz(&mut p);
+        let n = p.len();
+        let (len, neg) = p_sum(&mut p, n, (0, &r.p), (l.neg, r.neg), false, S::SIGNED);
+        p.truncate(len);
 
         DynNodeEngel {
             a: l.a,
@@ -1537,11 +1381,6 @@ pub struct StaticNodeEngel<const N: usize, S: WideEngelSeries> {
 }
 
 impl<const N: usize, S: WideEngelSeries> StaticNodeEngel<N, S> {
-    // P drops bits on its own, but [a, b)'s exact Q must fit N limbs.
-    fn leaf_fits(a: u64, b: u64) -> bool {
-        prod_fits(a, b, S::q, 64 * N as u64)
-    }
-
     #[inline(never)]
     fn exact_leaf(shift: u64, a: u64, b: u64) -> Self {
         let (mut p, mut q) = ([0; N], [0; N]);
@@ -1583,20 +1422,15 @@ impl<const N: usize, S: WideEngelSeries> Node for StaticNodeEngel<N, S> {
         est_limbs(a, b, S::q, ctx.0).min(N as u64)
     }
 
-    // Only merges drop Q's bits, so a leaf too big for N limbs splits itself.
+    // P drops bits on its own, but a leaf's exact Q must fit N limbs.
     fn leaf(ctx: &Shift, a: u64, b: u64, last: bool) -> Self {
-        if b - a > 1 && !Self::leaf_fits(a, b) {
-            let m = a + (b - a) / 2;
-            return Self::merge(
-                ctx,
-                Self::leaf(ctx, a, m, false),
-                Self::leaf(ctx, m, b, last),
-            );
+        if b - a > 1 && !prod_fits(a, b, S::q, 64 * N as u64) {
+            return split_leaf(ctx, a, b, last);
         }
         Self::exact_leaf(ctx.0, a, b)
     }
 
-    // P = lp rq 2^(shift (b - m)) + rp, built in p from lp rq and rp where it is. Then
+    // P = lp rq 2^(shift (b - m)) + rp from lp rq in p and rp in place, then
     // Q = lq rq in l.p.
     fn merge(ctx: &Shift, mut l: Self, mut r: Self) -> Self {
         const { assert!(N >= 2) };
@@ -1647,7 +1481,6 @@ pub trait HyperSeries {
     fn p(n: u64) -> u64;
     fn q(n: u64) -> u64;
     fn r(n: u64) -> u64;
-    // Whether term n is negative.
     fn neg(_: u64) -> bool {
         false
     }
@@ -1659,57 +1492,17 @@ pub trait WideHyperSeries {
     fn p(n: u128) -> u128;
     fn q(n: u128) -> u128;
     fn r(n: u128) -> u128;
-    // Whether term n is negative.
     fn neg(_: u128) -> bool {
         false
     }
 }
 
-impl<S: HyperSeries> WideHyperSeries for S {
-    const SIGNED: bool = <S as HyperSeries>::SIGNED;
-    fn p(n: u128) -> u128 {
-        <S as HyperSeries>::p(n as u64) as u128
-    }
-    fn q(n: u128) -> u128 {
-        <S as HyperSeries>::q(n as u64) as u128
-    }
-    fn r(n: u128) -> u128 {
-        <S as HyperSeries>::r(n as u64) as u128
-    }
-    fn neg(n: u128) -> bool {
-        <S as HyperSeries>::neg(n as u64)
-    }
-}
-
-impl<S: WideHyperSeries> HyperSeries for Narrow<S> {
-    const SIGNED: bool = <S as WideHyperSeries>::SIGNED;
-    fn p(n: u64) -> u64 {
-        <S as WideHyperSeries>::p(n as u128) as u64
-    }
-    fn q(n: u64) -> u64 {
-        <S as WideHyperSeries>::q(n as u128) as u64
-    }
-    fn r(n: u64) -> u64 {
-        <S as WideHyperSeries>::r(n as u128) as u64
-    }
-    fn neg(n: u64) -> bool {
-        <S as WideHyperSeries>::neg(n as u128)
-    }
-}
-
-// Bits x^n adds per term: none when x = 1.
-fn x_bits(x: &[u64]) -> u64 {
-    if x == [1] {
-        0
-    } else {
-        64 * (x.len() - 1) as u64 + bit_len(x[x.len() - 1])
-    }
-}
+narrow_wide!(HyperSeries, WideHyperSeries, p, q, r);
 
 #[derive(Debug, Clone)]
 pub struct DynHyperCtx {
     pub shift: u64,
-    // None when x = 1.
+    // None when x = 1, and x_bits are the bits x^n adds per term.
     x: Option<Vec<u64>>,
     x_bits: u64,
 }
@@ -1723,7 +1516,7 @@ impl DynHyperCtx {
         DynHyperCtx {
             shift,
             x: (x != [1]).then(|| x.to_vec()),
-            x_bits: x_bits(x),
+            x_bits: if x == [1] { 0 } else { bits(x) },
         }
     }
 
@@ -1755,7 +1548,7 @@ impl<const N: usize> StaticHyperCtx<N> {
         StaticHyperCtx {
             shift,
             x: (x != [1]).then_some((limbs, x.len())),
-            x_bits: x_bits(x),
+            x_bits: if x == [1] { 0 } else { bits(x) },
         }
     }
 }
@@ -1777,11 +1570,11 @@ impl<S: WideHyperSeries> Node for DynNodeHyper<S> {
     const LEAF_TERMS: u64 = DYN_HYPER_LEAF_TERMS;
     const PARALLEL: bool = true;
 
-    // P, about the larger of Q * 2^(shift t) and R x^t.
     fn range(&self) -> (u64, u64) {
         (self.a, self.b)
     }
 
+    // P, about the larger of Q 2^(shift t) and R x^t.
     fn limbs(ctx: &DynHyperCtx, a: u64, b: u64) -> u64 {
         est_limbs(a, b, S::q, ctx.shift).max(est_limbs(a, b, S::r, ctx.x_bits))
     }
@@ -1806,26 +1599,22 @@ impl<S: WideHyperSeries> Node for DynNodeHyper<S> {
                 (p, q_len, (!last).then_some(r), neg)
             }
             Some(x) => {
-                // A spare limb past P keeps make_room from ever dropping its bits. A wide
-                // term's q and r can add two limbs each.
+                // A spare limb past P keeps make_room from dropping bits. A wide term's q
+                // and r can add two limbs each.
                 let cap = (terms + 1) * (x.len() + if narrow { 1 } else { 4 }) + 1;
                 let mut p = vec![0; cap + words + 1];
                 let mut scratch = ScratchGuard::acquire();
                 let [t, tmp] = scratch.get_splits([cap + x.len(); 2]);
                 let exact =
                     |a: &[u64], b: &[u64], ea, _, out: &mut [u64]| (mul_exact(a, b, out), ea);
-                let (p_len, e, t, et, neg) = if narrow {
-                    hyper_x_leaf_terms::<Narrow<S>>(a, b, ctx.shift, x, &mut p, t, tmp, exact)
+                let k = (ctx.shift, x);
+                let (p_len, q_len, e, t, et, neg) = if narrow {
+                    hyper_x_leaf_terms::<S, false>(a, b, k, &mut p, &mut q, t, tmp, exact)
                 } else {
-                    hyper_x_leaf_terms_wide::<S>(a, b, ctx.shift, x, &mut p, t, tmp, exact)
+                    hyper_x_leaf_terms::<S, true>(a, b, k, &mut p, &mut q, t, tmp, exact)
                 };
                 debug_assert_eq!(e + et, 0);
                 p.truncate(p_len);
-                let q_len = if narrow {
-                    prod_terms(a, b, |n| S::q(n as u128) as u64, &mut q)
-                } else {
-                    prod_terms_wide(a, b, S::q, &mut q)
-                };
                 (p, q_len, (!last).then(|| t.to_vec()), neg)
             }
         };
@@ -1871,18 +1660,9 @@ impl<S: WideHyperSeries> Node for DynNodeHyper<S> {
             },
         );
         p[sl + pl] = shl_buf(&mut p[sl..sl + pl], sb);
-        let (mut len, mut neg) = (p.len(), S::SIGNED && left.neg);
-        let c = add_signed(
-            &mut p,
-            &mut len,
-            0,
-            &t[..t_len],
-            &mut neg,
-            right.neg,
-            S::SIGNED,
-        );
-        debug_assert_eq!(c, 0);
-        trim_lz(&mut p);
+        let (n, signs) = (p.len(), (left.neg, right.neg));
+        let (len, neg) = p_sum(&mut p, n, (0, &t[..t_len]), signs, false, S::SIGNED);
+        p.truncate(len);
 
         DynNodeHyper {
             a: left.a,
@@ -1919,8 +1699,8 @@ pub struct StaticNodeHyper<const N: usize, S: WideHyperSeries> {
 }
 
 impl<const N: usize, S: WideHyperSeries> StaticNodeHyper<N, S> {
-    // t keeps its top 64 N bits, as R for a later merge. A leaf that ends the sum keeps
-    // no R, so its t is only kept from P's exponent up, where its terms land.
+    // t keeps its top 64 N bits as R for a later merge, or, in a leaf that ends the sum,
+    // only its bits from P's exponent up.
     #[inline(never)]
     fn x_leaf(
         a: u64,
@@ -1940,26 +1720,16 @@ impl<const N: usize, S: WideHyperSeries> StaticNodeHyper<N, S> {
                 (len, et + d)
             }
         };
-        let narrow = fits_u64(a, b, |n| S::p(n) | S::q(n) | S::r(n));
-        let (p_len, ep, t, er, neg) = if narrow {
-            hyper_x_leaf_terms::<Narrow<S>>(a, b, shift, x, p, &mut t, &mut tmp, t_mul)
+        let k = (shift, x);
+        let (p_len, q_len, ep, t, er, neg) = if fits_u64(a, b, |n| S::p(n) | S::q(n) | S::r(n)) {
+            hyper_x_leaf_terms::<S, false>(a, b, k, p, q, &mut t, &mut tmp, t_mul)
         } else {
-            hyper_x_leaf_terms_wide::<S>(a, b, shift, x, p, &mut t, &mut tmp, t_mul)
+            hyper_x_leaf_terms::<S, true>(a, b, k, p, q, &mut t, &mut tmp, t_mul)
         };
-        let q_len = if narrow {
-            prod_terms(a, b, |n| S::q(n as u128) as u64, q)
-        } else {
-            prod_terms_wide(a, b, S::q, q)
-        };
-        r[..t.len()].copy_from_slice(t);
+        if !last {
+            r[..t.len()].copy_from_slice(t);
+        }
         (p_len, q_len, t.len(), ep, er, neg)
-    }
-
-    // P drops bits on its own, and so does R when x != 1, but [a, b)'s exact
-    // Q, and R when x = 1, must fit N limbs.
-    fn leaf_fits(ctx: &StaticHyperCtx<N>, a: u64, b: u64) -> bool {
-        let cap = 64 * N as u64;
-        prod_fits(a, b, S::q, cap) && (ctx.x.is_some() || prod_fits(a, b, S::r, cap))
     }
 
     #[inline(never)]
@@ -2022,21 +1792,19 @@ impl<const N: usize, S: WideHyperSeries> Node for StaticNodeHyper<N, S> {
         est.min(N as u64)
     }
 
-    // Only merges drop Q's bits, so a leaf too big for N limbs splits itself.
+    // P, and R when x != 1, drop bits on their own, but a leaf's exact Q, and R when
+    // x = 1, must fit N limbs.
     fn leaf(ctx: &StaticHyperCtx<N>, a: u64, b: u64, last: bool) -> Self {
-        if b - a > 1 && !Self::leaf_fits(ctx, a, b) {
-            let m = a + (b - a) / 2;
-            return Self::merge(
-                ctx,
-                Self::leaf(ctx, a, m, false),
-                Self::leaf(ctx, m, b, last),
-            );
+        let cap = 64 * N as u64;
+        let fits = || prod_fits(a, b, S::q, cap) && (ctx.x.is_some() || prod_fits(a, b, S::r, cap));
+        if b - a > 1 && !fits() {
+            return split_leaf(ctx, a, b, last);
         }
         Self::exact_leaf(ctx, a, b, last)
     }
 
-    // P = lp rq 2^(shift (b - m)) + rp lr, built in p from lp rq and, in left.p, rp lr.
-    // Then Q = lq rq in right.p and R = lr rr in left.p.
+    // P = lp rq 2^(shift (b - m)) + rp lr from lp rq in p and rp lr in left.p, then
+    // Q = lq rq in right.p and R = lr rr in left.p.
     fn merge(ctx: &StaticHyperCtx<N>, mut left: Self, mut right: Self) -> Self {
         const { assert!(N >= 2) };
         let sh = ctx.shift * (right.b - right.a);
@@ -2084,6 +1852,6 @@ impl<const N: usize, S: WideHyperSeries> Node for StaticNodeHyper<N, S> {
     fn finalize(&self, ctx: &StaticHyperCtx<N>, zeros: usize, out: &mut [u64]) -> bool {
         let (p, q, shift) = self.ratio(ctx);
         ratio_to_fraction_static::<N>(p, q, shift - 64 * zeros as i64, out);
-        S::SIGNED && self.neg && self.p_len != 0
+        self.is_neg()
     }
 }

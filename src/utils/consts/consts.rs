@@ -294,7 +294,7 @@ impl WideHyperSeries for Pi {
 }
 
 // out <- floor(x * 2^sh), which must fit out.
-fn shifted(x: &[u64], sh: i64, out: &mut [u64]) {
+pub(crate) fn shifted(x: &[u64], sh: i64, out: &mut [u64]) {
     let x = &x[..buf_len(x)];
     let (w, v) = (
         (sh.unsigned_abs() / 64) as usize,

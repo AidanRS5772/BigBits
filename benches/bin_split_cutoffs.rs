@@ -2,9 +2,12 @@
 //
 //   cargo bench --bench bin_split_cutoffs -- <family> [--limbs 8,16,max] [--terms 1,4]
 //       [--par 256,max] [--cands 0/31/max,64/1/max] [--rounds 9] [--sizes 256,1024]
+//       [--a 0,0.5,1] [--j 0,16,24]
 //
 // Families: bbp, engel, hyper, sbbp, sengel, shyper (leaf sweeps, serial), par (parallel
-// cutoff, all threads, default leaves) and e2e (old term cutoffs against the defaults).
+// cutoff, all threads, default leaves), e2e (old term cutoffs against the defaults), ln
+// (ln_dyn end to end against its square-root scale A, all threads) and exp (exp_dyn end to
+// end against its square count j, with ln_dyn on the same X for scale, all threads).
 // Each candidate times a tree build only: finalize doesn't depend on the tree's shape.
 // Candidates alternate within each round and each one reports its median over rounds,
 // relative to the workload's best; the summary is the geometric mean over workloads.
@@ -15,7 +18,7 @@ use big_bits::utils::{
         HyperSeries, Node, Shift, SplitCutoffs, StaticHyperCtx, StaticNodeBBP, StaticNodeEngel,
         StaticNodeHyper,
     },
-    trans::{exp_dyn_entry, exp_terms, Exp},
+    trans::{exp_dyn_at, exp_dyn_entry, exp_terms, ln_dyn, ln_dyn_at, Exp},
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{env, hint::black_box, time::Instant};
@@ -298,6 +301,10 @@ struct Args {
     cands: Option<Vec<SplitCutoffs>>,
     rounds: usize,
     sizes: Option<Vec<usize>>,
+    // ln's square-root scales.
+    a: Option<Vec<f64>>,
+    // exp's square counts.
+    j: Option<Vec<u64>>,
 }
 
 // "limbs/terms/par" candidates, comma separated.
@@ -333,6 +340,8 @@ fn args() -> Args {
         cands: None,
         rounds: 9,
         sizes: None,
+        a: None,
+        j: None,
     };
     while let Some(flag) = it.next() {
         let val = it.next().expect("flag value");
@@ -343,6 +352,8 @@ fn args() -> Args {
             "--cands" => a.cands = Some(parse_cands(&val)),
             "--rounds" => a.rounds = val.parse().unwrap(),
             "--sizes" => a.sizes = Some(parse_list(&val).iter().map(|&s| s as usize).collect()),
+            "--a" => a.a = Some(val.split(',').map(|t| t.parse().expect("numbers")).collect()),
+            "--j" => a.j = Some(parse_list(&val)),
             f => panic!("unknown flag {f}"),
         }
     }
@@ -367,12 +378,12 @@ fn median(v: &mut [f64]) -> f64 {
 }
 
 // Median seconds per call of each candidate, alternating candidates each round.
-fn measure(w: &Workload, cands: &[SplitCutoffs], rounds: usize) -> Vec<f64> {
+fn measure<C: Copy>(run: &dyn Fn(C), cands: &[C], rounds: usize) -> Vec<f64> {
     // Calibrate on the middle candidate so each sample takes about 20 ms.
     let mid = cands[cands.len() / 2];
-    (w.run)(mid);
+    run(mid);
     let s = Instant::now();
-    (w.run)(mid);
+    run(mid);
     let reps = ((0.02 / s.elapsed().as_secs_f64()).ceil() as usize).clamp(1, 10_000);
 
     let mut samples = vec![Vec::with_capacity(rounds); cands.len()];
@@ -385,7 +396,7 @@ fn measure(w: &Workload, cands: &[SplitCutoffs], rounds: usize) -> Vec<f64> {
             };
             let s = Instant::now();
             for _ in 0..reps {
-                (w.run)(cands[i]);
+                run(cands[i]);
             }
             samples[i].push(s.elapsed().as_secs_f64() / reps as f64);
         }
@@ -398,7 +409,7 @@ fn sweep(ws: &[Workload], cands: &[SplitCutoffs], rounds: usize) {
     let header: Vec<String> = cands.iter().map(label).collect();
     println!("{:<22} {:>10}  {}", "workload", "best ms", header.join(" "));
     for w in ws {
-        let t = measure(w, cands, rounds);
+        let t = measure(&*w.run, cands, rounds);
         let best = t.iter().cloned().fold(f64::MAX, f64::min);
         let cells: Vec<String> = t
             .iter()
@@ -451,7 +462,7 @@ fn e2e(args: &Args) {
     for l in sizes_or(args, &[64, 256, 1024, 4096, 16384]) {
         let n = ln2_terms(l);
         let w = workload(format!("ln2 {l}"), move |c| ln2_dyn_tree(n, c));
-        let t = measure(&w, &[old(640), serial::<DynNodeBBP<Ln2A>>()], args.rounds);
+        let t = measure(&*w.run, &[old(640), serial::<DynNodeBBP<Ln2A>>()], args.rounds);
         row(w.name, t[0], t[1]);
     }
     for l in sizes_or(args, &[256, 1024, 4096]) {
@@ -469,7 +480,7 @@ fn e2e(args: &Args) {
                 tree::<DynNodeHyper<Exp>>(ctx, 1, *n, ch);
             }
         });
-        let t = measure(&w, &[old(32), new.1], args.rounds);
+        let t = measure(&*w.run, &[old(32), new.1], args.rounds);
         row(w.name, t[0], t[1]);
 
         let x = rand_x(64 * l as u64, &mut rng);
@@ -491,7 +502,7 @@ fn e2e(args: &Args) {
     fn static_row<const N: usize>(rounds: usize) -> (String, f64, f64) {
         let n = ln2_terms(N - 4);
         let w = workload(format!("ln2 static N={N}"), move |c| ln2_static_tree::<N>(n, c));
-        let t = measure(&w, &[old(640), SplitCutoffs::of::<StaticNodeBBP<N, Ln2A>>()], rounds);
+        let t = measure(&*w.run, &[old(640), SplitCutoffs::of::<StaticNodeBBP<N, Ln2A>>()], rounds);
         (w.name, t[0], t[1])
     }
     let rounds = args.rounds;
@@ -511,6 +522,54 @@ fn e2e(args: &Args) {
     for (name, o, n) in rows {
         row(name, o, n);
     }
+}
+
+// f for each candidate (A for ln, j for exp) on X in [1, 2) and X in [2^63, 2^64), both with
+// m = 0, relative to each workload's best. other, when given, times its own function on the
+// same X.
+fn scale_e2e<C: Copy + std::fmt::Display>(
+    args: &Args,
+    name: &str,
+    (knob, a): (&str, &[C]),
+    f: &dyn Fn(&[u64], &mut [u64], C),
+    other: Option<(&str, &dyn Fn(&[u64], &mut [u64]))>,
+) {
+    let mut rng = StdRng::seed_from_u64(23);
+    let header: Vec<String> = a.iter().map(|a| format!("{knob}={a}")).collect();
+    let other_h = other.map_or(String::new(), |(n, _)| format!(" {:>10}", format!("{n} ms")));
+    println!("{:<22} {:>10}{other_h}  {}", "workload", "best ms", header.join(" "));
+    let mut log_sum = vec![0.0; a.len()];
+    let mut rows = 0;
+    for l in sizes_or(args, &[4, 16, 64, 256, 1024]) {
+        let near = rand_x(64 * l as u64 + 1, &mut rng);
+        let far = rand_x(64 * (l as u64 + 1), &mut rng);
+        for (row, x) in [("[1,2)", near), ("2^63x", far)] {
+            let t = measure(&|a: C| f(&x, &mut vec![0; l], a), a, args.rounds);
+            let best = t.iter().cloned().fold(f64::MAX, f64::min);
+            let cells: Vec<String> = t
+                .iter()
+                .zip(&header)
+                .map(|(&x, h)| format!("{:>w$.3}", x / best, w = h.len()))
+                .collect();
+            let other_c = other.map_or(String::new(), |(_, g)| {
+                let t = measure(&|_: ()| g(&x, &mut vec![0; l]), &[()], args.rounds);
+                format!(" {:>10.3}", t[0] * 1e3)
+            });
+            let row = format!("{name} {row} {l}");
+            println!("{row:<22} {:>10.3}{other_c}  {}", best * 1e3, cells.join(" "));
+            for (s, &x) in log_sum.iter_mut().zip(&t) {
+                *s += (x / best).ln();
+            }
+            rows += 1;
+        }
+    }
+    let cells: Vec<String> = log_sum
+        .iter()
+        .zip(&header)
+        .map(|(&s, h)| format!("{:>w$.3}", (s / rows as f64).exp(), w = h.len()))
+        .collect();
+    let pad = other.map_or(String::new(), |_| format!(" {:>10}", ""));
+    println!("{:<22} {:>10}{pad}  {}", "geomean", "", cells.join(" "));
 }
 
 // Asks macOS to keep this thread on a performance core.
@@ -554,6 +613,26 @@ fn main() {
         "hyper" => sweep(&hyper_workloads(&a), &cands, a.rounds),
         "par" => sweep(&par_workloads(&a), &cands, a.rounds),
         "e2e" => e2e(&a),
+        "ln" => scale_e2e(
+            &a,
+            "ln",
+            ("A", a.a.as_deref().unwrap_or(&[0.0, 0.5, 1.0, 1.5, 2.0, 3.0])),
+            &|x, out, s| {
+                black_box(ln_dyn_at(x, 0, out, s).unwrap());
+            },
+            None,
+        ),
+        "exp" => scale_e2e(
+            &a,
+            "exp",
+            ("j", a.j.as_deref().unwrap_or(&[0, 8, 16, 24, 32, 40])),
+            &|x, out, s| {
+                black_box(exp_dyn_at(x, 0, out, s).unwrap());
+            },
+            Some(("ln", &|x, out| {
+                black_box(ln_dyn(x, 0, out).unwrap());
+            })),
+        ),
         f @ ("sbbp" | "sengel" | "shyper") => {
             // Static trees need far more stack than the main thread has.
             let f = f.to_string();

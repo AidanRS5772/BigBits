@@ -154,6 +154,33 @@ pub const DYN_EXP_CHUNK_MIN_BITS: u64 = 16;
 pub const STATIC_EXP_CHUNK_PAR_WORK: usize = 768;
 pub const STATIC_EXP_CHUNK_MIN_BITS: u64 = 16;
 
+// exp_dyn runs its core on r 2^-j, j = this less the bits by which r already sits below 1,
+// and squares the result back j times, unless the core would sum its chunks in parallel.
+// 0 disables them. `cargo bench-bin-split exp` (1 to 4096 limbs, serial) put 24 within 1.05x
+// of each size's best fixed j, 1.01x on the geometric mean; a log2(precision) scale fit
+// worse (1.07x, 1.26x at 1 to 4 limbs), as the best j hardly moves with precision.
+pub const DYN_EXP_SQR_BITS: u64 = 24;
+// GUESS: the dynamic value. exp_static only takes the squares when N has room for them.
+pub const STATIC_EXP_SQR_BITS: u64 = 24;
+
+// ln_dyn takes floor(A log2(64 out.len())) square roots before its series, less the bits
+// by which its argument already sits near 1, so the series' argument starts that far down.
+// 0 disables them. `cargo bench-bin-split ln` (2 to 2048 limbs) tied 0.25 and 0.5 within
+// noise, 1.06x and 1.08x of each size's best; 0 was 1.29x and 1 was 1.27x.
+pub const DYN_LN_SQRT_A: f64 = 0.25;
+// GUESS: the dynamic value. ln_static only takes the square roots when N has room for them.
+pub const STATIC_LN_SQRT_A: f64 = 0.25;
+
+// ln_dyn_entry's first chunk after its top bit spans at least this many bits. Unlike exp's,
+// an atanh chunk's term count depends only on its offset, so this starts at plain
+// doubling. GUESS
+pub const DYN_LN_CHUNK_MIN_BITS: u64 = 2;
+pub const STATIC_LN_CHUNK_MIN_BITS: u64 = 2;
+
+// ln_dyn_entry and ln_static_entry go parallel as exp's entries do. GUESS
+pub const DYN_LN_CHUNK_PAR_WORK: usize = 512;
+pub const STATIC_LN_CHUNK_PAR_WORK: usize = 768;
+
 thread_local! {
     static SCRATCH_POOL: RefCell<Vec<Vec<u64>>> = RefCell::new(Vec::new());
 }
