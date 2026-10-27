@@ -23,42 +23,92 @@ impl std::fmt::Display for CapacityError {
 
 impl std::error::Error for CapacityError {}
 
-pub const CHUNKING_KARATSUBA_CUTOFF: usize = 22;
-pub const KARATSUBA_CUTOFF: f64 = 17.0;
+// The multiplication cutoffs below were measured on an i7-8750H with
+// `benches/mul_cutoffs.rs` over three code layouts, on one pinned core except where
+// the static NTT is the upper side, which ran with rayon's full pool. Where a call
+// takes a few hundred ns or a few us (the schoolbook crossovers), 24 processes and an
+// exact Wilcoxon test per shape (p < 0.05) set the cutoff where the faster side is
+// significant at every larger size; larger calls compare averages over processes. For
+// the cost models, which no single value fits shape by shape, the value is the
+// smallest within noise of the least mean time lost. See docs/mul_cutoff_tuning.md.
 
-pub const FFT_CHUNKING_KARATSUBA_CUTOFF: f64 = 1.74;
-pub const FFT_KARATSUBA_CUTOFF: f64 = 1.92;
+// is_school: schoolbook below, Karatsuba above (one level over schoolbook leaves
+// against mul_buf). Chunking Karatsuba (s <= half) is significantly faster from
+// s = 64 at l = 2s, 4s and 16s alike. For s > half the parabola fits only roughly:
+// squares are faster from 44, but shapes with s just above half need s >= about
+// 0.7 l or s >= 66, so no c satisfies every shape. c = 52 is the smallest within
+// noise of the least mean time lost over the measured shapes (0.25%); squares
+// switch from 55.
+pub const CHUNKING_KARATSUBA_CUTOFF: usize = 63;
+pub const KARATSUBA_CUTOFF: f64 = 52.0;
+
+// is_karatsuba's cost ratios, Karatsuba against fft_entry (mul_dyn, one core). FFT
+// time steps up with its transform size, so the boundary is a sawtooth: squares are
+// faster with the FFT from about 250 limbs except just past a step (307x307 is 11%
+// slower), and 1.96 switches them from about 230. Mean time lost over the measured
+// shapes: 0.19% (regular) and 0.33% (chunking).
+pub const FFT_CHUNKING_KARATSUBA_CUTOFF: f64 = 1.88;
+pub const FFT_KARATSUBA_CUTOFF: f64 = 1.96;
+// The 16-bit FFT's f64 precision bound, not a speed choice.
 pub const FFT_16BIT_CUTOFF: usize = 1 << 16;
 
-pub const NTT_CHUNKING_KARATSUBA_CUTOFF: f64 = 3.58;
-pub const NTT_KARATSUBA_CUTOFF: f64 = 3.78;
+// is_karatsuba's cost ratios, karatsuba_entry_static against ntt_entry_static with
+// the NTT's three convolutions on rayon: squares switch from about 2500 limbs. On one
+// core the NTT stays 1.4x slower to at least 3700 limbs.
+pub const NTT_CHUNKING_KARATSUBA_CUTOFF: f64 = 5.9;
+pub const NTT_KARATSUBA_CUTOFF: f64 = 5.7;
 
 pub const NTT_PAR_CUTOFF_NTT_CONV: usize = 512;
 pub const NTT_PAR_CUTOFF_NTT: usize = 3600;
 pub const NTT_PAR_CUTOFF_NTT_3: usize = 27648;
 pub const NTT_PAR_CUTOFF_NTT_5: usize = 25600;
 
-pub const KARATSUBA_SQR_CUTOFF: usize = 14;
-pub const FFT_SQR_CUTOFF: usize = 33;
-pub const STATIC_NTT_SQR_CUTOFF: usize = 1014;
+// sqr_buf up to this many limbs, a Karatsuba square level above: one level over
+// schoolbook leaves is significantly faster at every size from 72 to 192 (0.989 at
+// 72), schoolbook to 67, and the two tie at 69 (dyn) and 71 (static).
+pub const KARATSUBA_SQR_CUTOFF: usize = 71;
+// sqr_dyn squares by Karatsuba up to this many limbs and by FFT above:
+// karatsuba_sqr_entry_dyn is faster than fft_sqr_entry to 340 except at 288 and
+// 316-336, just past FFT steps, and the FFT is faster at every size from 344 to 1024.
+// (Schoolbook alone would last only to 208 against the FFT.)
+pub const FFT_SQR_CUTOFF: usize = 340;
+// sqr_static squares by Karatsuba up to this many limbs and by NTT above, with the
+// NTT's convolutions on rayon: the NTT wins from about 3070, but loses at 3320 and
+// 3884 just past its transform steps, and wins at every size from 4040 to 12113.
+pub const STATIC_NTT_SQR_CUTOFF: usize = 3884;
 
-pub const PARTIAL_MUL_CUTOFF: usize = 90;
-pub const PARTIAL_SQR_CUTOFF: usize = 128;
+// hi_mul_* and hi_sqr_* take hi_mul_buf / hi_sqr_buf for windows of up to this many
+// limbs, and above them the guarded product of the operands' top limbs. Dyn and
+// static differ because the guarded product is an FFT on the dyn path and Karatsuba
+// on the static one. With operands one and two windows wide, the guarded dyn product
+// is faster at every window from 320 (0.78) to 2048 (0.16) but loses at 304-312,
+// just past an FFT step (1.09). The static one is faster from 392 (0.998; 0.88 at
+// 512), and from 440 with operands that fill N (its split path). Guarded squares:
+// dyn from 472 (0.91-0.97; some windows from 384 already win), static from 672 (0.995;
+// 0.88 at 1024).
+pub const DYN_PARTIAL_MUL_CUTOFF: usize = 312;
+pub const STATIC_PARTIAL_MUL_CUTOFF: usize = 408;
+pub const DYN_PARTIAL_SQR_CUTOFF: usize = 464;
+pub const STATIC_PARTIAL_SQR_CUTOFF: usize = 640;
 
 // hi_mul_buf and hi_sqr_buf use columns for windows of up to this many limbs
-// and rows above: rows are significantly faster (one-sided Wilcoxon
-// signed-rank, p < 0.05) at every wider window up to 256 limbs. Measured on
-// x86 (i7-8750H) with operands as wide as the window, which gives rows their
-// shortest rows: 24 separate processes over three code layouts, each giving
-// the median of 60 paired, randomly ordered rounds. Columns are significantly
-// faster up to 27 and 99 limbs. In between (28-30 and 100-117) the two are
-// within about 1% and no test tells them apart, and code layout alone moves
-// each build's crossover by up to 20 limbs.
-pub const HI_MUL_ROW_CUTOFF: usize = 30;
-pub const HI_SQR_ROW_CUTOFF: usize = 117;
+// and rows above: rows are significantly faster at every wider window up to 256
+// limbs, with operands as wide as the window, which gives rows their shortest
+// rows. Columns are significantly faster up to 22 and 69 limbs; in between the
+// two are within about 1%, and code layout alone moves each build's crossover by
+// up to 20 limbs. (Re-measured after the row kernels lost their bounds checks;
+// the cutoffs were 30 and 117.)
+pub const HI_MUL_ROW_CUTOFF: usize = 24;
+pub const HI_SQR_ROW_CUTOFF: usize = 90;
 
-pub const FFT_MID_CUTOFF: usize = 90;
-pub const NTT_MID_CUTOFF: usize = 200;
+// mid_mul_dyn uses mid_mul_buf below this and fft_mid_mul from it: the FFT is
+// significantly faster at every size from 125 to 320, but at 122-124 its transform
+// size steps up and it loses by up to 7.5%.
+pub const FFT_MID_CUTOFF: usize = 125;
+// mid_mul_static uses mid_mul_buf below this and ntt_mid_mul_static from it, with the
+// NTT's convolutions on rayon: the NTT is faster at every size from 687 to 3024, and
+// loses at 654-671 just past a transform step (on one core it would be 997).
+pub const NTT_MID_CUTOFF: usize = 672;
 
 pub const DIV_KNUTH_CUTOFF: usize = 88;
 pub const BZ_CUTOFF: usize = 216;

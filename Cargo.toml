@@ -60,3 +60,7 @@ harness = false
 [[bench]]
 name = "bin_split_cutoffs"
 harness = false
+
+[[bench]]
+name = "mul_cutoffs"
+harness = false

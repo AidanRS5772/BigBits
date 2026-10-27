@@ -4,8 +4,9 @@ use crate::utils::utils::trim_lz;
 use crate::utils::{
     CHUNKING_KARATSUBA_CUTOFF, FFT_16BIT_CUTOFF, FFT_CHUNKING_KARATSUBA_CUTOFF,
     FFT_KARATSUBA_CUTOFF, FFT_MID_CUTOFF, FFT_SQR_CUTOFF, KARATSUBA_CUTOFF, KARATSUBA_SQR_CUTOFF,
-    NTT_CHUNKING_KARATSUBA_CUTOFF, NTT_KARATSUBA_CUTOFF, NTT_MID_CUTOFF, PARTIAL_MUL_CUTOFF,
-    PARTIAL_SQR_CUTOFF, STATIC_NTT_SQR_CUTOFF,
+    DYN_PARTIAL_MUL_CUTOFF, DYN_PARTIAL_SQR_CUTOFF, NTT_CHUNKING_KARATSUBA_CUTOFF,
+    NTT_KARATSUBA_CUTOFF, NTT_MID_CUTOFF, STATIC_NTT_SQR_CUTOFF, STATIC_PARTIAL_MUL_CUTOFF,
+    STATIC_PARTIAL_SQR_CUTOFF,
 };
 use rustfft::num_complex::Complex;
 use rustfft::num_traits::Zero;
@@ -31,6 +32,14 @@ fn curved_boundary() -> (usize, usize, usize) {
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
+
+const fn max_usize(a: usize, b: usize) -> usize {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
 
 fn norm(mut v: Vec<u64>, c: u64) -> Vec<u64> {
     if c > 0 {
@@ -1492,12 +1501,12 @@ fn test_karatsuba_sqr_entry_small() {
 fn test_karatsuba_sqr_entry_sweep() {
     for seed in 0u64..15 {
         let n = KARATSUBA_SQR_CUTOFF + 1 + (seed as usize % (3 * KARATSUBA_SQR_CUTOFF));
-        if 2 * n - 1 > 128 {
+        if 2 * n - 1 > 1024 {
             continue;
         } // skip sizes that exceed static N
         let a = rand_nonzero_vec(n, seed);
         let mut out = vec![0u64; 2 * n - 1];
-        let c = karatsuba_sqr_entry_static::<128>(&a, &mut out);
+        let c = karatsuba_sqr_entry_static::<1024>(&a, &mut out);
         let (exp_buf, exp_carry) = sqr_ref_parts(&a);
         assert_eq_result(
             &out,
@@ -1633,12 +1642,38 @@ fn test_ntt_sqr_dyn_twiddle_cache_order() {
 
 // ─── Section 8: sqr_dyn / sqr_vec Dispatch Sanity ───────────────────────────
 // Dyn sqr dispatch: School → FFT → NTT (no karatsuba in dyn path).
+// karatsuba_sqr_entry_dyn takes one Karatsuba level at any length from 6, with
+// leaves dispatched at KARATSUBA_SQR_CUTOFF, so it is exact on both sides of it.
+#[test]
+fn test_karatsuba_sqr_entry_dyn() {
+    let k = KARATSUBA_SQR_CUTOFF;
+    for (i, &n) in [6, 7, 8, 9, 15, 16, k - 1, k, k + 1, 2 * k + 1, 2 * k + 2, 4 * k + 3]
+        .iter()
+        .enumerate()
+    {
+        for seed in 0u64..3 {
+            let a = rand_nonzero_vec(n, 100 * i as u64 + seed);
+            let mut out = vec![0u64; 2 * n - 1];
+            let c = karatsuba_sqr_entry_dyn(&a, &mut out);
+            let (exp_buf, exp_carry) = sqr_ref_parts(&a);
+            assert_eq_result(
+                &out,
+                c,
+                &exp_buf,
+                exp_carry,
+                &format!("karatsuba_sqr_entry_dyn n={n} seed={seed}"),
+            );
+        }
+    }
+}
+
+// Dyn sqr dispatch: School → Karatsuba → FFT → NTT.
 // Static sqr dispatch: School → Karatsuba → NTT.
 
 #[test]
 fn test_sqr_dyn_school_boundary() {
     for seed in 0u64..5 {
-        let n = FFT_SQR_CUTOFF;
+        let n = KARATSUBA_SQR_CUTOFF + (seed as usize % 2);
         let a = rand_nonzero_vec(n, seed);
         let (got_buf, got_carry) = sqr_vec(&a);
         let (exp_buf, exp_carry) = sqr_ref_parts(&a);
@@ -1654,9 +1689,9 @@ fn test_sqr_dyn_school_boundary() {
 
 #[test]
 fn test_sqr_dyn_above_school_boundary() {
-    // dyn sqr dispatch: School → FFT → NTT (no karatsuba in dyn path)
-    let n = FFT_SQR_CUTOFF + 1;
+    // Inside the dyn Karatsuba tier, below FFT_SQR_CUTOFF.
     for seed in 0u64..5 {
+        let n = KARATSUBA_SQR_CUTOFF + 1 + (seed as usize * 37) % (FFT_SQR_CUTOFF - KARATSUBA_SQR_CUTOFF);
         let a = rand_nonzero_vec(n, seed);
         let (got_buf, got_carry) = sqr_vec(&a);
         let (exp_buf, exp_carry) = sqr_ref_parts(&a);
@@ -1816,7 +1851,7 @@ fn test_sqr_static_karatsuba_dispatch() {
     let n = KARATSUBA_SQR_CUTOFF + 1;
     let a = rand_nonzero_vec(n, 5900);
     let mut out = vec![0u64; 2 * n - 1];
-    let c = sqr_static::<64>(&a, &mut out);
+    let c = sqr_static::<256>(&a, &mut out);
     let (exp_buf, exp_carry) = sqr_ref_parts(&a);
     assert_eq_result(
         &out,
@@ -1882,7 +1917,7 @@ fn test_hi_mul_buf_accuracy_small() {
 
 #[test]
 fn test_hi_mul_buf_accuracy_at_cutoff() {
-    let out_len = PARTIAL_MUL_CUTOFF;
+    let out_len = DYN_PARTIAL_MUL_CUTOFF;
     for seed in 0u64..10 {
         let a_len = out_len + 3;
         let b_len = out_len + 2;
@@ -1930,8 +1965,8 @@ fn test_hi_mul_dyn_exact_fit() {
 
 #[test]
 fn test_hi_mul_dyn_below_cutoff() {
-    // out.len() <= PARTIAL_MUL_CUTOFF → hi_mul_buf path
-    let out_len = PARTIAL_MUL_CUTOFF;
+    // out.len() <= DYN_PARTIAL_MUL_CUTOFF → hi_mul_buf path
+    let out_len = DYN_PARTIAL_MUL_CUTOFF;
     for seed in 0u64..10 {
         let a_len = out_len + 5;
         let b_len = out_len + 3;
@@ -1956,10 +1991,10 @@ fn test_hi_mul_dyn_below_cutoff() {
 
 #[test]
 fn test_hi_mul_dyn_above_cutoff() {
-    // out.len() > PARTIAL_MUL_CUTOFF → truncation path
+    // out.len() > DYN_PARTIAL_MUL_CUTOFF → truncation path
     // hi_mul_dyn truncates inputs to out_len before multiplying. The only
     // omitted effect should be carry into the lowest returned limbs.
-    let out_len = PARTIAL_MUL_CUTOFF + 10;
+    let out_len = DYN_PARTIAL_MUL_CUTOFF + 10;
     for seed in 0u64..10 {
         let a_len = out_len + 20;
         let b_len = out_len + 15;
@@ -2052,7 +2087,7 @@ fn test_hi_sqr_buf_accuracy_small() {
 
 #[test]
 fn test_hi_sqr_buf_accuracy_at_cutoff() {
-    let out_len = PARTIAL_SQR_CUTOFF;
+    let out_len = DYN_PARTIAL_SQR_CUTOFF;
     for seed in 0u64..10 {
         let n = out_len + 3;
         let a = rand_nonzero_vec(n, seed + 6900);
@@ -2091,12 +2126,12 @@ fn test_hi_sqr_dyn_exact_when_out_is_larger_than_full_product() {
 #[test]
 fn test_hi_sqr_dyn_below_and_above_cutoff() {
     for seed in 0u64..10 {
-        let n = PARTIAL_SQR_CUTOFF + 20 + seed as usize;
+        let n = DYN_PARTIAL_SQR_CUTOFF + 20 + seed as usize;
         let a = rand_nonzero_vec(n, seed + 7100);
 
-        let mut below_dyn = vec![0u64; PARTIAL_SQR_CUTOFF];
+        let mut below_dyn = vec![0u64; DYN_PARTIAL_SQR_CUTOFF];
         let c_below_dyn = hi_sqr_dyn(&a, &mut below_dyn);
-        let mut below_buf = vec![0u64; PARTIAL_SQR_CUTOFF];
+        let mut below_buf = vec![0u64; DYN_PARTIAL_SQR_CUTOFF];
         let c_below_buf = hi_sqr_buf(&a, &mut below_buf);
         assert_eq_result(
             &below_dyn,
@@ -2106,7 +2141,7 @@ fn test_hi_sqr_dyn_below_and_above_cutoff() {
             &format!("hi_sqr_dyn below cutoff seed={seed}"),
         );
 
-        let out_len = PARTIAL_SQR_CUTOFF + 10;
+        let out_len = DYN_PARTIAL_SQR_CUTOFF + 10;
         let mut above = vec![0u64; out_len];
         let _c = hi_sqr_dyn(&a, &mut above);
         let ref_top = hi_sqr_ref(&a, out_len);
@@ -2453,10 +2488,15 @@ fn test_ntt_mid_mul_static_zero_padded_long_matches_dyn() {
         let mut out_school = vec![0u64; n];
         let c_school = mid_mul_buf(&long, &short, &mut out_school);
         assert_approx_mid_result(&out_st, c_st, &out_school, c_school, &what);
-        // mid_mul_static routes it the same way.
+        // mid_mul_static routes it the same way: schoolbook below NTT_MID_CUTOFF.
+        let (want, want_c) = if n < NTT_MID_CUTOFF {
+            (&out_school, c_school)
+        } else {
+            (&out_st, c_st)
+        };
         let mut out_entry = vec![0u64; n];
-        assert_eq!(mid_mul_static::<N>(&long, &short, &mut out_entry), c_st);
-        assert_eq!(out_entry, out_st, "{what}: mid_mul_static entry");
+        assert_eq!(mid_mul_static::<N>(&long, &short, &mut out_entry), want_c);
+        assert_eq!(&out_entry, want, "{what}: mid_mul_static entry");
     }
     for seed in [8500, 8510] {
         run::<408>(1, seed);
@@ -2466,6 +2506,51 @@ fn test_ntt_mid_mul_static_zero_padded_long_matches_dyn() {
         run::<2043>(2, seed);
         run::<2044>(3, seed);
     }
+}
+
+// The NTT middle products read the two convolution coefficients below the band.
+// A transform 2n - 1 long wraps the product's top columns onto them, and when only
+// some of the three primes picked that length, the CRT combined residues that
+// disagree: limb 1 came out about 2^60 off. These n make 2n - 1 = 81, 125, 243, 375,
+// 405, 625, 1125 and 1215, each an NTT size for some but not all primes.
+#[test]
+fn test_ntt_mid_mul_exact_size_transform() {
+    fn check(long: &[u64], short: &[u64], got: &[u64], c: (u64, u64), what: &str) {
+        let expected = mid_mul_ref(long, short);
+        let carry = mid_mul_school_carry(long, short);
+        assert_approx_mid_result(got, c, &expected, carry, what);
+    }
+    fn run<const N: usize>(n: usize) {
+        for seed in 0u64..3 {
+            let long = rand_nonzero_vec(2 * n - 1, 9100 + seed);
+            let short = rand_nonzero_vec(n, 9200 + seed);
+            let mut out = vec![0u64; n];
+            let c = ntt_mid_mul_dyn(&long, &short, &mut out);
+            check(&long, &short, &out, c, &format!("ntt_mid_mul_dyn n={n} seed={seed}"));
+            let c = ntt_mid_mul_static::<N>(&long, &short, &mut out);
+            check(&long, &short, &out, c, &format!("ntt_mid_mul_static N={N} n={n} seed={seed}"));
+        }
+    }
+    // long = T B^z past N, through the static path's chunked convolution.
+    fn run_padded<const N: usize>(z: usize) {
+        let n = (N + 1 + z) / 2;
+        for seed in 0u64..3 {
+            let mut long = vec![0u64; z];
+            long.extend(rand_nonzero_vec(N, 9300 + seed));
+            let short = rand_nonzero_vec(n, 9400 + seed);
+            let mut out = vec![0u64; n];
+            let c = ntt_mid_mul_static::<N>(&long, &short, &mut out);
+            check(&long, &short, &out, c, &format!("padded ntt_mid_mul_static N={N} z={z} seed={seed}"));
+        }
+    }
+    for n in [41, 63, 122, 188, 203, 313] {
+        run::<640>(n);
+    }
+    for n in [563, 608] {
+        run::<1280>(n);
+    }
+    run_padded::<373>(2);
+    run_padded::<1213>(2);
 }
 
 #[test]
@@ -2679,7 +2764,7 @@ fn test_sqr_static_ntt_dispatch() {
     let out_sz = 2 * n - 1;
 
     let mut out = vec![0u64; out_sz];
-    let c = sqr_static::<4096>(&a, &mut out);
+    let c = sqr_static::<8192>(&a, &mut out);
 
     let (exp_buf, exp_carry) = sqr_ref_parts(&a);
     assert_eq_result(&out, c, &exp_buf, exp_carry, "sqr_static NTT dispatch");
@@ -2717,17 +2802,17 @@ fn test_mul_static_ntt_split() {
 
 #[test]
 fn test_mul_static_ntt_dispatch() {
-    let n = 1100usize;
-    assert!(
-        !is_karatsuba(n, n, NTT_CHUNKING_KARATSUBA_CUTOFF, NTT_KARATSUBA_CUTOFF),
-        "chosen size should dispatch to static NTT"
-    );
+    // The smallest balanced size the static cost model sends to the NTT.
+    let n = (2..)
+        .find(|&n| !is_karatsuba(n, n, NTT_CHUNKING_KARATSUBA_CUTOFF, NTT_KARATSUBA_CUTOFF))
+        .unwrap();
+    assert!(2 * n - 1 <= 8192, "static NTT dispatch starts past this test's N");
 
     let a = rand_nonzero_vec(n, 8300);
     let b = rand_nonzero_vec(n, 8400);
     let out_sz = 2 * n - 1;
     let mut out = vec![0u64; out_sz];
-    let c = mul_static::<4096>(&a, &b, &mut out);
+    let c = mul_static::<8192>(&a, &b, &mut out);
 
     let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
     assert_eq_result(&out, c, &exp_buf, exp_carry, "mul_static NTT dispatch");
@@ -2898,11 +2983,15 @@ fn test_karatsuba_static_entries() {
 
 #[test]
 fn test_karatsuba_static_fallback_scratch() {
-    let n = KARA_CUTOFF + 12;
+    // Leaves (half + 1 limbs) past the Karatsuba cutoff recurse, so the scratch
+    // exceeds N while the top level's cross term (2 half + 1) still fits it.
+    let n = 2 * KARA_CUTOFF + 8;
+    let half = (n + 1) / 2;
+    assert!(2 * half + 1 <= 128 && 128 < find_karatsuba_scratch(n, n) && n <= 128);
     let a = rand_nonzero_vec(n, 8950);
     let b = rand_nonzero_vec(n, 8960);
     let mut out = vec![0u64; 2 * n - 1];
-    let c = karatsuba_entry_static::<64>(&a, &b, &mut out);
+    let c = karatsuba_entry_static::<128>(&a, &b, &mut out);
     let (exp_buf, exp_carry) = mul_ref_parts(&a, &b);
     assert_eq_result(
         &out,
@@ -2912,10 +3001,12 @@ fn test_karatsuba_static_fallback_scratch() {
         "karatsuba static fallback scratch",
     );
 
-    let n = KARATSUBA_SQR_CUTOFF + 18;
+    let n = 2 * KARATSUBA_SQR_CUTOFF + 8;
+    let half = (n + 1) / 2;
+    assert!(2 * half + 1 <= 192 && 192 < find_karatsuba_sqr_scratch_sz(n) && n <= 192);
     let a = rand_nonzero_vec(n, 8970);
     let mut out = vec![0u64; 2 * n - 1];
-    let c = karatsuba_sqr_entry_static::<64>(&a, &mut out);
+    let c = karatsuba_sqr_entry_static::<192>(&a, &mut out);
     let (exp_buf, exp_carry) = sqr_ref_parts(&a);
     assert_eq_result(
         &out,
@@ -2940,19 +3031,22 @@ fn test_karatsuba_static_chunking_scratch_fallback() {
         assert_eq_result(&out, carry, &expected, expected_carry, label);
     }
 
+    // The shapes sit just past CHUNKING_KARATSUBA_CUTOFF (s = 64); the
+    // scratch sizes below follow from the cutoffs and change with them.
+
     // Exact scratch capacity must use the ordinary chunking path, not the
     // separate-cross fallback intended for balanced recursion.
-    assert_eq!(find_karatsuba_scratch(52, 23), 82);
-    check::<82>(52, 23, 12_000, "static chunking exact scratch capacity");
+    assert_eq!(find_karatsuba_scratch(134, 64), 204);
+    check::<204>(134, 64, 12_000, "static chunking exact scratch capacity");
 
     // The old fallback called karatsuba_core directly with half > short.len(),
-    // panicking while splitting the short operand.
-    assert!(find_karatsuba_scratch(47, 23) > 69);
-    check::<69>(47, 23, 12_100, "static chunking fallback boundary");
+    // panicking while splitting the short operand. N is the output's length.
+    assert!(find_karatsuba_scratch(127, 64) > 190);
+    check::<190>(127, 64, 12_100, "static chunking fallback boundary");
 
     // Exercise more than one full short-sized chunk before the remainder.
-    assert_eq!(find_karatsuba_scratch(150, 50), 178);
-    check::<177>(150, 50, 12_200, "static chunking fallback multiple chunks");
+    assert_eq!(find_karatsuba_scratch(197, 64), 203);
+    check::<202>(197, 64, 12_200, "static chunking fallback multiple chunks");
 }
 
 // ─── Section 17b: Karatsuba Overflow Offset ─────────────────────────────────
@@ -3112,7 +3206,7 @@ fn test_karatsuba_structured_operands() {
 
 #[test]
 fn test_hi_mul_static_split_matches_dyn() {
-    const N: usize = PARTIAL_MUL_CUTOFF + 1;
+    const N: usize = 1 + max_usize(DYN_PARTIAL_MUL_CUTOFF, STATIC_PARTIAL_MUL_CUTOFF);
     for seed in 0u64..5 {
         let a = rand_nonzero_vec(N, seed + 9_700);
         let b = rand_nonzero_vec(N, seed + 9_800);
@@ -3142,7 +3236,7 @@ fn test_hi_mul_static_split_matches_dyn() {
 
 #[test]
 fn test_hi_sqr_static_split_matches_dyn() {
-    const N: usize = PARTIAL_SQR_CUTOFF + 1;
+    const N: usize = 1 + max_usize(DYN_PARTIAL_SQR_CUTOFF, STATIC_PARTIAL_SQR_CUTOFF);
     for seed in 0u64..5 {
         let a = rand_nonzero_vec(N, seed + 9_900);
 
@@ -3541,7 +3635,7 @@ fn test_hi_mul_static_near_capacity() {
 }
 
 // hi_mul_*/hi_sqr_* compute their unguarded core product and add the guard
-// limbs' terms separately (add_hi_guard_terms). The result must equal, bit for
+// limbs' terms separately (hi_guarded_window). The result must equal, bit for
 // bit, the top window of the exact product of the guarded operands, for dyn and
 // static alike, including operands narrower than the window and saturated or
 // zero-heavy limbs that stress the carry chains.
@@ -3556,7 +3650,13 @@ fn test_hi_mul_guard_terms_match_exact_window() {
         (full[l - 1 - k..l - 1].to_vec(), full[l - 1])
     }
     for seed in 0..200u64 {
-        let k = PARTIAL_MUL_CUTOFF + 1 + (seed as usize * 37) % 500;
+        // Past every partial cutoff, so all four entries take their guarded window.
+        let k = 1
+            + max_usize(
+                max_usize(DYN_PARTIAL_MUL_CUTOFF, STATIC_PARTIAL_MUL_CUTOFF),
+                max_usize(DYN_PARTIAL_SQR_CUTOFF, STATIC_PARTIAL_SQR_CUTOFF),
+            )
+            + (seed as usize * 37) % 500;
         let a_len = [k - 50, k, k + 1, k + 2, k + 3, k + 40][(seed % 6) as usize];
         let b_len = [k + 2, k + 1, k + 7, k, k + 300, 3][(seed / 6 % 6) as usize];
         if a_len + b_len - 1 <= k {

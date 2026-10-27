@@ -2,3 +2,4 @@
 bench-utils = "bench --features _bench_internals --bench utils_bench"
 bench-cutoffs = "bench --features _bench_internals --bench cutoffs_bench"
 bench-bin-split = "bench --bench bin_split_cutoffs --"
+bench-mul-cutoffs = "bench --profile release --bench mul_cutoffs --"
