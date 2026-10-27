@@ -45,6 +45,18 @@ pub const STATIC_NTT_SQR_CUTOFF: usize = 1014;
 pub const PARTIAL_MUL_CUTOFF: usize = 90;
 pub const PARTIAL_SQR_CUTOFF: usize = 128;
 
+// hi_mul_buf and hi_sqr_buf use columns for windows of up to this many limbs
+// and rows above: rows are significantly faster (one-sided Wilcoxon
+// signed-rank, p < 0.05) at every wider window up to 256 limbs. Measured on
+// x86 (i7-8750H) with operands as wide as the window, which gives rows their
+// shortest rows: 24 separate processes over three code layouts, each giving
+// the median of 60 paired, randomly ordered rounds. Columns are significantly
+// faster up to 27 and 99 limbs. In between (28-30 and 100-117) the two are
+// within about 1% and no test tells them apart, and code layout alone moves
+// each build's crossover by up to 20 limbs.
+pub const HI_MUL_ROW_CUTOFF: usize = 30;
+pub const HI_SQR_ROW_CUTOFF: usize = 117;
+
 pub const FFT_MID_CUTOFF: usize = 90;
 pub const NTT_MID_CUTOFF: usize = 200;
 
