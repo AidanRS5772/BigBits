@@ -128,7 +128,7 @@ unsafe fn mul_asm_aarch(a_val: u64, b_val: u64, acc0: &mut u64, acc1: &mut u64, 
         a_val = in(reg) a_val,
         b_val = in(reg) b_val,
         lo = out(reg) _,
-      hi = out(reg) _,
+        hi = out(reg) _,
         acc0 = inout(reg) *acc0,
         acc1 = inout(reg) *acc1,
         acc2 = inout(reg) *acc2,
@@ -218,16 +218,276 @@ pub fn mul_elem(
     return out;
 }
 
-pub fn mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+// out[0..len] += s * l[0..len], returning the limb that belongs at out[len].
+// Two carry chains run side by side: adcx (CF) adds each product's high limb
+// into the next product's low limb, and adox (OF) adds that sum into out.
+// Nothing between them may write CF or OF, so the loops count with lea and
+// jrcxz instead of dec/jnz (dec clobbers OF). Needs BMI2 and ADX, which the
+// schoolbook routers check at runtime.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn mul_row_asm_x86(s: u64, l: *const u64, out: *mut u64, len: usize) -> u64 {
+    let top: u64;
+    asm!(
+        "xor {h0:e}, {h0:e}",                   // h0 = 0 and CF = OF = 0
+
+        // Four limbs per pass. The carried high limb alternates between h0
+        // and h1, so after an even number of steps it is back in h0 without
+        // a mov.
+        "2:",
+        "jrcxz 3f",
+        "mulx {h1}, {lo}, [{l}]",     // h1:lo = s * l[0]
+        "adcx {lo}, {h0}",                      // lo += previous high + CF
+        "adox {lo}, [{o}]",           // lo += out[0] + OF
+        "mov [{o}], {lo}",
+        "mulx {h0}, {lo}, [{l} + 8]",
+        "adcx {lo}, {h1}",
+        "adox {lo}, [{o} + 8]",
+        "mov [{o} + 8], {lo}",
+        "mulx {h1}, {lo}, [{l} + 16]",
+        "adcx {lo}, {h0}",
+        "adox {lo}, [{o} + 16]",
+        "mov [{o} + 16], {lo}",
+        "mulx {h0}, {lo}, [{l} + 24]",
+        "adcx {lo}, {h1}",
+        "adox {lo}, [{o} + 24]",
+        "mov [{o} + 24], {lo}",
+        "lea {l}, [{l} + 32]",
+        "lea {o}, [{o} + 32]",
+        "lea rcx, [rcx - 1]",
+        "jmp 2b",
+        "3:",
+
+        // The last len % 4 limbs, straight through: each step leaves by
+        // jrcxz once the count in rcx runs out, so no step pays a loop
+        // branch. mov and lea leave the flags alone.
+        "mov rcx, {rem}",
+        "jrcxz 5f",
+        "mulx {h1}, {lo}, [{l}]",
+        "adcx {lo}, {h0}",
+        "adox {lo}, [{o}]",
+        "mov [{o}], {lo}",
+        "lea rcx, [rcx - 1]",
+        "jrcxz 4f",                             // one limb: high limb in h1
+        "mulx {h0}, {lo}, [{l} + 8]",
+        "adcx {lo}, {h1}",
+        "adox {lo}, [{o} + 8]",
+        "mov [{o} + 8], {lo}",
+        "lea rcx, [rcx - 1]",
+        "jrcxz 5f",                             // two limbs: high limb in h0
+        "mulx {h1}, {lo}, [{l} + 16]",
+        "adcx {lo}, {h0}",
+        "adox {lo}, [{o} + 16]",
+        "mov [{o} + 16], {lo}",
+        "lea rcx, [rcx - 1]",                   // three limbs: rcx = 0 again
+        "4:",
+        "mov {h0}, {h1}",
+        "5:",
+
+        // Fold both pending carries into the top limb. It can't overflow,
+        // since out + s * l < 2^(64(len + 1)). rcx is zero here on every
+        // path, so it serves as the zero register.
+        "adcx {h0}, rcx",
+        "adox {h0}, rcx",
+        inout("rdx") s => _,
+        inout("rcx") len / 4 => _,
+        rem = in(reg) len % 4,
+        l = inout(reg) l => _,
+        o = inout(reg) out => _,
+        h0 = out(reg) top,
+        h1 = out(reg) _,
+        lo = out(reg) _,
+        options(nostack),
+    );
+    top
+}
+
+// out[0..len] += s * l[0..len], returning the limb that belongs at out[len].
+// AArch64 has a single carry flag, so each pass of four limbs runs its two
+// carry chains one after the other and carries between passes in a register:
+// first out += the products' low limbs, then += their high limbs (one limb
+// up) and the carry in. Only the second chain waits on the previous pass.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn mul_row_asm_aarch(s: u64, l: *const u64, out: *mut u64, len: usize) -> u64 {
+    let top: u64;
+    asm!(
+        "mov {c}, xzr",
+
+        // Four limbs per pass.
+        "cbz {n}, 3f",
+        "2:",
+        "ldp {a0}, {a1}, [{l}]",
+        "ldp {a2}, {a3}, [{l}, #16]",
+        "ldp {w0}, {w1}, [{o}]",
+        "ldp {w2}, {w3}, [{o}, #16]",
+        "umulh {h0}, {a0}, {s}",                // h0:a0 = s * l[0]
+        "mul {a0}, {a0}, {s}",
+        "umulh {h1}, {a1}, {s}",
+        "mul {a1}, {a1}, {s}",
+        "umulh {h2}, {a2}, {s}",
+        "mul {a2}, {a2}, {s}",
+        "umulh {h3}, {a3}, {s}",
+        "mul {a3}, {a3}, {s}",
+        "adds {w0}, {w0}, {a0}",                // out += low limbs
+        "adcs {w1}, {w1}, {a1}",
+        "adcs {w2}, {w2}, {a2}",
+        "adcs {w3}, {w3}, {a3}",
+        "cset {t}, cs",
+        "adds {w0}, {w0}, {c}",                 // += carry in, high limbs one up
+        "adcs {w1}, {w1}, {h0}",
+        "adcs {w2}, {w2}, {h1}",
+        "adcs {w3}, {w3}, {h2}",
+        // No carry out: out + c + s * l[0..4] < 2^320.
+        "adc {c}, {h3}, {t}",
+        "stp {w0}, {w1}, [{o}]",
+        "stp {w2}, {w3}, [{o}, #16]",
+        "add {l}, {l}, #32",
+        "add {o}, {o}, #32",
+        "sub {n}, {n}, #1",
+        "cbnz {n}, 2b",
+        "3:",
+
+        // The last len % 4 limbs, one at a time.
+        "cbz {rem}, 5f",
+        "4:",
+        "ldr {a0}, [{l}], #8",
+        "ldr {w0}, [{o}]",
+        "umulh {h0}, {a0}, {s}",
+        "mul {a0}, {a0}, {s}",
+        "adds {w0}, {w0}, {a0}",
+        "adc {h0}, {h0}, xzr",                  // h0 <= 2^64 - 2, so no carry out
+        "adds {w0}, {w0}, {c}",
+        "adc {c}, {h0}, xzr",
+        "str {w0}, [{o}], #8",
+        "sub {rem}, {rem}, #1",
+        "cbnz {rem}, 4b",
+        "5:",
+        s = in(reg) s,
+        l = inout(reg) l => _,
+        o = inout(reg) out => _,
+        n = inout(reg) len / 4 => _,
+        rem = inout(reg) len % 4 => _,
+        c = out(reg) top,
+        t = out(reg) _,
+        a0 = out(reg) _,
+        a1 = out(reg) _,
+        a2 = out(reg) _,
+        a3 = out(reg) _,
+        w0 = out(reg) _,
+        w1 = out(reg) _,
+        w2 = out(reg) _,
+        w3 = out(reg) _,
+        h0 = out(reg) _,
+        h1 = out(reg) _,
+        h2 = out(reg) _,
+        h3 = out(reg) _,
+        options(nostack),
+    );
+    top
+}
+
+// The row in plain Rust, for x86 without BMI2/ADX and other architectures.
+#[cfg(not(target_arch = "aarch64"))]
+fn mul_row_standard(s: u64, l: &[u64], out: &mut [u64]) -> u64 {
+    let mut carry = 0;
+    for (o, &x) in out.iter_mut().zip(l) {
+        let t = *o as u128 + s as u128 * x as u128 + carry as u128;
+        *o = t as u64;
+        carry = (t >> 64) as u64;
+    }
+    carry
+}
+
+// The row kernels as the schoolbook bodies take them: out[..l.len()] += s * l,
+// returning the limb that belongs at out[l.len()].
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn row_x86(s: u64, l: &[u64], out: &mut [u64]) -> u64 {
+    let out = &mut out[..l.len()];
+    mul_row_asm_x86(s, l.as_ptr(), out.as_mut_ptr(), l.len())
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn row_aarch(s: u64, l: &[u64], out: &mut [u64]) -> u64 {
+    let out = &mut out[..l.len()];
+    unsafe { mul_row_asm_aarch(s, l.as_ptr(), out.as_mut_ptr(), l.len()) }
+}
+
+// The schoolbook entries check this once per call, and their _x86 wrappers
+// rely on it.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn adx_available() -> bool {
+    is_x86_feature_detected!("bmi2") && is_x86_feature_detected!("adx")
+}
+
+// The schoolbook bodies below take the row kernel as `row`, so each entry
+// checks the architecture once and its whole body runs on one kernel.
+#[inline(always)]
+fn mul_buf_rows<R>(a: &[u64], b: &[u64], out: &mut [u64], row: R) -> u64
+where
+    R: Fn(u64, &[u64], &mut [u64]) -> u64 + Copy,
+{
     if a.is_empty() || b.is_empty() {
         return 0;
     }
+    let (a, b) = if a.len() > b.len() { (a, b) } else { (b, a) };
+    let len = a.len() + b.len() - 1;
+    debug_assert!(out.len() >= len, "out is not large enough for multiplication");
 
-    let (mut acc0, mut acc1, mut acc2) = (0, 0, 0);
-    for n in 0..out.len() {
-        out[n] = mul_elem(a, b, n, &mut acc0, &mut acc1, &mut acc2);
+    out[..a.len()].fill(0);
+    let (&last, rows) = b.split_last().unwrap();
+    for (i, &s) in rows.iter().enumerate() {
+        out[i + a.len()] = row(s, a, &mut out[i..]);
     }
-    return acc0;
+    let top = row(last, a, &mut out[rows.len()..]);
+
+    if out.len() > len {
+        out[len] = top;
+        out[len + 1..].fill(0);
+        return 0;
+    }
+    top
+}
+
+// Needs BMI2 and ADX, which mul_buf checks.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2,adx")]
+unsafe fn mul_buf_x86(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+    mul_buf_rows(a, b, out, |s, l, o| unsafe { row_x86(s, l, o) })
+}
+
+#[cfg(target_arch = "aarch64")]
+fn mul_buf_aarch(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+    mul_buf_rows(a, b, out, row_aarch)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn mul_buf_standard(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+    mul_buf_rows(a, b, out, mul_row_standard)
+}
+
+pub fn mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if adx_available() {
+            unsafe { mul_buf_x86(a, b, out) }
+        } else {
+            mul_buf_standard(a, b, out)
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        mul_buf_aarch(a, b, out)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        mul_buf_standard(a, b, out)
+    }
 }
 
 //KARATSUBA MULTIPLICATION
@@ -292,11 +552,6 @@ pub fn karatsuba_core(
         return overflow;
     }
 
-    // At the exact Recurse/Chunking boundary the standard product buffer can
-    // be one or two limbs shorter than the shifted cross buffer. Add the part
-    // that fits, then fold its carry and the first omitted limb into the one
-    // legitimate product overflow limb. Any higher omitted limbs must be zero
-    // by the a.len()+b.len() product-size bound.
     let fit = out_cross.len();
     let carry = add_buf(out_cross, &cross[..fit]) as u64;
     let omitted = cross[fit];
@@ -3086,15 +3341,97 @@ fn sqr_elem(buf: &[u64], n: usize, acc0: &mut u64, acc1: &mut u64, acc2: &mut u6
     return out;
 }
 
-pub fn sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
+// out = 2 out + bit + Σ x[k]² B^(2k), where out.len() == 2 * x.len() - 1 and
+// bit (0 or 1) is shifted in at the bottom, returning the limb that belongs at
+// out[out.len()]. One pass doubles the off-diagonal half and adds the squares.
+fn double_add_sqr_diag(x: &[u64], out: &mut [u64], mut bit: u64) -> u64 {
+    debug_assert_eq!(out.len(), 2 * x.len() - 1);
+    let (&last, rest) = x.split_last().unwrap();
+    let mut carry = 0u64;
+    for (o, &v) in out.chunks_exact_mut(2).zip(rest) {
+        let t = (o[1] as u128) << 64 | o[0] as u128;
+        let doubled = t << 1 | bit as u128;
+        bit = o[1] >> 63;
+        // At most one of these carries: doubled + v² + 1 < 2^129.
+        let (sum, c1) = doubled.overflowing_add(v as u128 * v as u128);
+        let (sum, c2) = sum.overflowing_add(carry as u128);
+        o[0] = sum as u64;
+        o[1] = (sum >> 64) as u64;
+        carry = (c1 | c2) as u64;
+    }
+    let sq = last as u128 * last as u128;
+    let o = out.last_mut().unwrap();
+    let top_bit = *o >> 63;
+    let lo = ((*o << 1) | bit) as u128 + sq as u64 as u128 + carry as u128;
+    *o = lo as u64;
+    top_bit + (sq >> 64) as u64 + (lo >> 64) as u64
+}
+
+#[inline(always)]
+fn sqr_buf_rows<R>(buf: &[u64], out: &mut [u64], row: R) -> u64
+where
+    R: Fn(u64, &[u64], &mut [u64]) -> u64 + Copy,
+{
     if buf.is_empty() {
         return 0;
     }
-    let (mut acc0, mut acc1, mut acc2) = (0, 0, 0);
-    for n in 0..out.len() {
-        out[n] = sqr_elem(buf, n, &mut acc0, &mut acc1, &mut acc2);
+    let n = buf.len();
+    let len = 2 * n - 1;
+    debug_assert!(out.len() >= len, "out is not large enough for multiplication");
+
+    // The off-diagonal half, the sum of buf[i] * buf[j] over i < j, by rows as
+    // in mul_buf: row i adds into out[2i + 1..n + i] and stores its top limb
+    // at out[n + i]. The half fits out[..len], so doubling it is a shift.
+    out[..n].fill(0);
+    for i in 0..n - 1 {
+        out[n + i] = row(buf[i], &buf[i + 1..], &mut out[2 * i + 1..]);
     }
-    acc0
+    let top = double_add_sqr_diag(buf, &mut out[..len], 0);
+
+    if out.len() > len {
+        out[len] = top;
+        out[len + 1..].fill(0);
+        return 0;
+    }
+    top
+}
+
+// Needs BMI2 and ADX, which sqr_buf checks.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2,adx")]
+unsafe fn sqr_buf_x86(buf: &[u64], out: &mut [u64]) -> u64 {
+    sqr_buf_rows(buf, out, |s, l, o| unsafe { row_x86(s, l, o) })
+}
+
+#[cfg(target_arch = "aarch64")]
+fn sqr_buf_aarch(buf: &[u64], out: &mut [u64]) -> u64 {
+    sqr_buf_rows(buf, out, row_aarch)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn sqr_buf_standard(buf: &[u64], out: &mut [u64]) -> u64 {
+    sqr_buf_rows(buf, out, mul_row_standard)
+}
+
+pub fn sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if adx_available() {
+            unsafe { sqr_buf_x86(buf, out) }
+        } else {
+            sqr_buf_standard(buf, out)
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        sqr_buf_aarch(buf, out)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        sqr_buf_standard(buf, out)
+    }
 }
 
 //KARATSUBA SQUARE
@@ -3624,23 +3961,97 @@ const fn hi_mul_static_guard<const N: usize>(out_len: usize) -> usize {
     }
 }
 
-pub fn hi_mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+// Adds acc0 + acc1 * B, the carry the guard columns pass into a non-empty
+// window, to out and its next limb top, returning the new top.
+fn add_guard_carry(out: &mut [u64], mut top: u64, acc0: u64, acc1: u64) -> u64 {
+    top += add_prim(out, acc0) as u64;
+    if out.len() > 1 {
+        top += add_prim(&mut out[1..], acc1) as u64;
+    } else {
+        top += acc1;
+    }
+    top
+}
+
+#[inline(always)]
+fn hi_mul_buf_rows<R>(a: &[u64], b: &[u64], out: &mut [u64], row: R) -> u64
+where
+    R: Fn(u64, &[u64], &mut [u64]) -> u64 + Copy,
+{
     if a.is_empty() || b.is_empty() {
         return 0;
     }
     let d = (a.len() + b.len() - 1).saturating_sub(out.len());
+    if d == 0 {
+        return mul_buf_rows(a, b, out, row);
+    }
+    let (a, b) = if a.len() > b.len() { (a, b) } else { (b, a) };
 
+    // The two columns below the window, by product scanning, give the carry
+    // they pass into it.
     let (mut acc0, mut acc1, mut acc2) = (0, 0, 0);
     if d >= 2 {
         mul_elem(a, b, d - 2, &mut acc0, &mut acc1, &mut acc2);
     }
-    if d >= 1 {
-        mul_elem(a, b, d - 1, &mut acc0, &mut acc1, &mut acc2);
+    mul_elem(a, b, d - 1, &mut acc0, &mut acc1, &mut acc2);
+    if out.is_empty() {
+        return acc0;
     }
-    for n in d..d + out.len() {
-        out[n - d] = mul_elem(a, b, n, &mut acc0, &mut acc1, &mut acc2);
+
+    // Row i adds b[i] * a[j] for every column i + j >= d and stores its top
+    // limb at out[i + a.len() - d], as in mul_buf. The last row's top limb is
+    // the window's.
+    let first = (d + 1).saturating_sub(a.len());
+    out[..first + a.len() - d].fill(0);
+    let mut top = 0;
+    for i in first..b.len() {
+        let j0 = d.saturating_sub(i);
+        let carry = row(b[i], &a[j0..], &mut out[i + j0 - d..]);
+        if i + 1 < b.len() {
+            out[i + a.len() - d] = carry;
+        } else {
+            top = carry;
+        }
     }
-    return acc0;
+    add_guard_carry(out, top, acc0, acc1)
+}
+
+// Needs BMI2 and ADX, which hi_mul_buf checks.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2,adx")]
+unsafe fn hi_mul_buf_x86(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+    hi_mul_buf_rows(a, b, out, |s, l, o| unsafe { row_x86(s, l, o) })
+}
+
+#[cfg(target_arch = "aarch64")]
+fn hi_mul_buf_aarch(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+    hi_mul_buf_rows(a, b, out, row_aarch)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn hi_mul_buf_standard(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+    hi_mul_buf_rows(a, b, out, mul_row_standard)
+}
+
+pub fn hi_mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if adx_available() {
+            unsafe { hi_mul_buf_x86(a, b, out) }
+        } else {
+            hi_mul_buf_standard(a, b, out)
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        hi_mul_buf_aarch(a, b, out)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        hi_mul_buf_standard(a, b, out)
+    }
 }
 
 pub fn hi_mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
@@ -3759,22 +4170,90 @@ pub fn hi_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u
 
 // HIGH SQUARING
 
-pub fn hi_sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
+#[inline(always)]
+fn hi_sqr_buf_rows<R>(buf: &[u64], out: &mut [u64], row: R) -> u64
+where
+    R: Fn(u64, &[u64], &mut [u64]) -> u64 + Copy,
+{
     if buf.is_empty() {
         return 0;
     }
-    let d = (2 * buf.len() - 1).saturating_sub(out.len());
+    let n = buf.len();
+    let d = (2 * n - 1).saturating_sub(out.len());
+    if d == 0 {
+        return sqr_buf_rows(buf, out, row);
+    }
+
+    // The two columns below the window, by product scanning, give the carry
+    // they pass into it.
     let (mut acc0, mut acc1, mut acc2) = (0, 0, 0);
     if d >= 2 {
         sqr_elem(buf, d - 2, &mut acc0, &mut acc1, &mut acc2);
     }
-    if d >= 1 {
-        sqr_elem(buf, d - 1, &mut acc0, &mut acc1, &mut acc2);
+    sqr_elem(buf, d - 1, &mut acc0, &mut acc1, &mut acc2);
+    if out.is_empty() {
+        return acc0;
     }
-    for n in d..d + out.len() {
-        out[n - d] = sqr_elem(buf, n, &mut acc0, &mut acc1, &mut acc2);
+
+    // The window of the off-diagonal half: row i adds buf[i] * buf[j] for
+    // j > i and i + j >= d, and stores its top limb at out[i + n - d]. The
+    // last row stores at out[out.len() - 1], so the half fits the window.
+    let first = (d + 1).saturating_sub(n);
+    out[..first + n - d].fill(0);
+    for i in first..n - 1 {
+        let j0 = (i + 1).max(d.saturating_sub(i));
+        out[i + n - d] = row(buf[i], &buf[j0..], &mut out[i + j0 - d..]);
     }
-    return acc0;
+
+    // Double it and add the squares from column d up. For odd d, the square
+    // in column d - 1 is already in the guard, so out[0] is only doubled.
+    let i0 = (d + 1) / 2;
+    let q0 = 2 * i0 - d;
+    let mut bit = 0;
+    if q0 == 1 {
+        bit = out[0] >> 63;
+        out[0] <<= 1;
+    }
+    let top = double_add_sqr_diag(&buf[i0..], &mut out[q0..], bit);
+    add_guard_carry(out, top, acc0, acc1)
+}
+
+// Needs BMI2 and ADX, which hi_sqr_buf checks.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2,adx")]
+unsafe fn hi_sqr_buf_x86(buf: &[u64], out: &mut [u64]) -> u64 {
+    hi_sqr_buf_rows(buf, out, |s, l, o| unsafe { row_x86(s, l, o) })
+}
+
+#[cfg(target_arch = "aarch64")]
+fn hi_sqr_buf_aarch(buf: &[u64], out: &mut [u64]) -> u64 {
+    hi_sqr_buf_rows(buf, out, row_aarch)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn hi_sqr_buf_standard(buf: &[u64], out: &mut [u64]) -> u64 {
+    hi_sqr_buf_rows(buf, out, mul_row_standard)
+}
+
+pub fn hi_sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if adx_available() {
+            unsafe { hi_sqr_buf_x86(buf, out) }
+        } else {
+            hi_sqr_buf_standard(buf, out)
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        hi_sqr_buf_aarch(buf, out)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        hi_sqr_buf_standard(buf, out)
+    }
 }
 
 pub fn hi_sqr_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
