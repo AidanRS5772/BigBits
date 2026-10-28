@@ -936,7 +936,8 @@ pub trait Node: Sized {
 }
 
 // Where a tree stops splitting, and from what size a Node::PARALLEL tree builds a
-// split's halves in parallel.
+// split's halves in parallel (on a pool of two or more threads: on one, rayon::join
+// would only move the work to the pool's thread).
 #[derive(Debug, Clone, Copy)]
 pub struct SplitCutoffs {
     pub leaf_limbs: u64,
@@ -971,7 +972,7 @@ where
     }
     let m = (a + b) / 2;
     let (l, r) = join2(
-        N::PARALLEL && limbs >= cut.par_limbs,
+        N::PARALLEL && limbs >= cut.par_limbs && rayon::current_num_threads() > 1,
         || bin_split_tree_at::<N>(ctx, a, m, false, cut),
         || bin_split_tree_at::<N>(ctx, m, b, last, cut),
     );

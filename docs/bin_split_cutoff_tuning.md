@@ -324,6 +324,18 @@ best everywhere. At 128 limbs, ten more random X gave j = 0 1.159, j = 12 1.003 
 j = 24 1.047. Below 24 the small sizes lose 5–12%, so 24 is the smallest constant in the
 noise band.
 
+That sweep ran with `RAYON_NUM_THREADS=1`, where every tree's top split still entered
+rayon from the caller's thread. Once the split was gated on a pool of two or more
+threads, the same sweep (two X per size, 9 rounds, 2026-10-28) gave these geometric
+means:
+
+| j | 0 | 8 | 12 | 16 | 20 | **24** | 32 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 to 4096 limbs | 1.207 | 1.118 | 1.094 | 1.076 | 1.034 | **1.013** | 1.047 |
+
+24 stays. Its worst rows are 512 limbs (1.061, 1.066, where j = 0–8 wins) and 1024
+(1.017, 1.032). Rows below 128 limbs still lose 5–30% under 24.
+
 On 12 threads `exp_dyn_entry` sums its chunks on rayon from about 64 limbs on. The
 squares stay serial, and the series they shorten were already overlapping, so they only
 add time:

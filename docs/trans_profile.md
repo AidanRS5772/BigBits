@@ -285,6 +285,12 @@ Gate the tree split on `rayon::current_num_threads() > 1` as well. Caveat: the
 one-thread exp-squares tuning in `bin_split_cutoff_tuning.md` was measured with
 this overhead included.
 
+**Done (2026-10-28).** `bin_split_tree_at` now gates its split on
+`rayon::current_num_threads() > 1`. With `RAYON_NUM_THREADS=1` and
+`cargo bench-bin-split exp` (two X per size, 9 rounds), exp got 2.5–6% faster at
+128–512 limbs and ln 2–11% faster, short of the table above because the merges
+already ran inline. Outputs are unchanged.
+
 ## 7. Squaring dispatch and the squares themselves
 
 Squares are 18–38% of exp. Through `hi_sqr_dyn` they use the column-wise
@@ -313,6 +319,13 @@ FFT square above. ns per call at n limbs:
   favored j ≈ 12 at 128–256 limbs (3–5% better than 24). A size-dependent count
   would take that. It matters less once squares get cheaper, and item 2b would
   remove them.
+
+**Done (2026-10-28).** The mul.rs retune covered the dispatch bullets. `sqr_dyn` now has
+a Karatsuba tier up to `FFT_SQR_CUTOFF = 340`, and the high-square crossover is a
+measured `DYN_PARTIAL_SQR_CUTOFF = 464`. After item 6, the one-thread j sweep was run
+again. j = 24 is still best (1.013× on the geometric mean from 1 to 4096 limbs). j ≈ 12
+no longer wins at 128–256, and 512 favors j ≤ 8 by about 6%. So `DYN_EXP_SQR_BITS`
+stays a constant 24. See `bin_split_cutoff_tuning.md`.
 
 ## 8. Smaller items
 

@@ -221,6 +221,8 @@ pub const STATIC_EXP_CHUNK_MIN_BITS: u64 = 16;
 // 0 disables them. `cargo bench-bin-split exp` (1 to 4096 limbs, serial) put 24 within 1.05x
 // of each size's best fixed j, 1.01x on the geometric mean; a log2(precision) scale fit
 // worse (1.07x, 1.26x at 1 to 4 limbs), as the best j hardly moves with precision.
+// Re-swept with the trees' rayon split gated on two or more threads: 24 was still best,
+// 1.013x on the geometric mean and within 1.07x of each size's best (worst at 512).
 pub const DYN_EXP_SQR_BITS: u64 = 24;
 // GUESS: the dynamic value. exp_static only takes the squares when N has room for them.
 pub const STATIC_EXP_SQR_BITS: u64 = 24;
