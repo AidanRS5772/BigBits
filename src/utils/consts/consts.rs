@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::utils::{
-    bin_split::{
+    series::{
         bin_split, bin_split_tree, join2, ratio_to_fraction_dyn, ratio_to_fraction_static,
         static_split_stack, BBPSeries, DynHyperCtx, DynNodeBBP, DynNodeHyper, Node, Shift,
         StaticHyperCtx, StaticNodeBBP, StaticNodeHyper, WideHyperSeries,

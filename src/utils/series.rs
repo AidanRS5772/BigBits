@@ -1,14 +1,20 @@
 use std::marker::PhantomData;
 
 use crate::utils::{
-    div::{div_dyn, rcp_static},
-    mul::{hi_mul_static, mul_add_prim, mul_dyn, mul_prim, mul_prim2, mul_static},
+    div::{div_dyn, div_prim, rcp_static},
+    mul::{hi_mul_dyn, hi_mul_static, mul_add_prim, mul_dyn, mul_prim, mul_prim2, mul_static},
     utils::{
-        add_buf, add_mul, add_prim, buf_len, inc_buf, shl_buf, shr_buf, split_sh, sub_mul, trim_lz,
+        add_buf, add_mul, add_prim, buf_len, inc_buf, shl_buf, shr_buf, split_sh, sub_mul,
     },
     ScratchGuard, DYN_BBP_LEAF_LIMBS, DYN_BIN_SPLIT_MERGE_PAR_CUTOFF, DYN_BIN_SPLIT_PAR_CUTOFF,
-    DYN_ENGEL_LEAF_LIMBS, DYN_HYPER_LEAF_LIMBS, DYN_HYPER_LEAF_TERMS, STATIC_BBP_LEAF_LIMBS,
-    STATIC_ENGEL_LEAF_LIMBS, STATIC_HYPER_LEAF_LIMBS, STATIC_HYPER_LEAF_TERMS,
+    DYN_ENGEL_LEAF_LIMBS, DYN_HYPER_LEAF_LIMBS, DYN_HYPER_LEAF_TERMS, DYN_SERIES_BIN_SPLIT_BBP,
+    DYN_SERIES_BIN_SPLIT_ENGEL, DYN_SERIES_BIN_SPLIT_FIXED, DYN_SERIES_BIN_SPLIT_HYPER,
+    DYN_SERIES_HORNER_BBP, DYN_SERIES_HORNER_ENGEL, DYN_SERIES_HORNER_HYPER,
+    DYN_SERIES_RECT_HYPER, SERIES_RECT_M_SCALE, STATIC_BBP_LEAF_LIMBS, STATIC_ENGEL_LEAF_LIMBS,
+    STATIC_HYPER_LEAF_LIMBS, STATIC_HYPER_LEAF_TERMS, STATIC_SERIES_BIN_SPLIT_BBP,
+    STATIC_SERIES_BIN_SPLIT_ENGEL, STATIC_SERIES_BIN_SPLIT_FIXED, STATIC_SERIES_BIN_SPLIT_HYPER,
+    STATIC_SERIES_HORNER_BBP, STATIC_SERIES_HORNER_ENGEL, STATIC_SERIES_HORNER_HYPER,
+    STATIC_SERIES_RECT_HYPER,
 };
 
 fn merge_par(q_len: usize) -> bool {
@@ -44,16 +50,10 @@ fn push_or_drop(buf: &mut [u64], len: &mut usize, e: &mut u64, c: u64) {
         buf[*len] = c;
         *len += 1;
     } else {
-        drop_under(buf, len, e, c);
+        let k = bit_len(c) + 1;
+        *len = shr_bits(buf, *len, c, k);
+        *e += k;
     }
-}
-
-#[cold]
-#[inline(never)]
-fn drop_under(buf: &mut [u64], len: &mut usize, e: &mut u64, c: u64) {
-    let k = bit_len(c) + 1;
-    *len = shr_bits(buf, *len, c, k);
-    *e += k;
 }
 
 fn shr_bits(buf: &mut [u64], len: usize, ov: u64, k: u64) -> usize {
@@ -117,26 +117,8 @@ fn add_pass(
     *e != e0
 }
 
-#[inline(always)]
+// p += w x 2^d, rounding the bits below p's bit 0.
 fn add_term(
-    p: &mut [u64],
-    len: &mut usize,
-    e: &mut u64,
-    pn: &mut bool,
-    (x, d): (&[u64], i64),
-    w: u64,
-    neg: bool,
-    signed: bool,
-) {
-    if d >= 0 && d % 64 == 0 {
-        add_pass(p, len, e, pn, ((d / 64) as usize, x, w), neg, signed);
-    } else {
-        add_term_split(p, len, e, pn, (x, d), w, neg, signed);
-    }
-}
-
-#[inline(never)]
-fn add_term_split(
     p: &mut [u64],
     len: &mut usize,
     e: &mut u64,
@@ -477,7 +459,7 @@ fn hyper_leaf_terms<S: HyperSeries>(
 
 // The x != 1 leaf, one term per step, with Q into q. t_mul(t, x, et, e, out) puts
 // t x 2^et in out as (len, exponent), keeping at least its bits from P's exponent e up.
-// A WIDE leaf takes u128 values, and otherwise every value fits u64.
+// A WIDE leaf's q may need 128 bits.
 fn hyper_x_leaf_terms<'t, S: WideHyperSeries, const WIDE: bool>(
     a: u64,
     b: u64,
@@ -507,26 +489,14 @@ fn hyper_x_leaf_terms<'t, S: WideHyperSeries, const WIDE: bool>(
         }
         (t_len, et) = t_mul(&t[..t_len], x, et, e, tmp);
         std::mem::swap(&mut t, &mut tmp);
-        if t_len != 0 && WIDE {
+        if t_len != 0 {
             let ts = (&t[..t_len], et);
             add_term_wide(p, &mut p_len, &mut e, &mut pn, ts, w, S::neg(n), S::SIGNED);
-        } else if t_len != 0 {
-            let (ts, w) = ((&t[..t_len], et as i64 - e as i64), w as u64);
-            add_term(p, &mut p_len, &mut e, &mut pn, ts, w, S::neg(n), S::SIGNED);
         }
-        if WIDE {
-            let c = mul_prim2(&mut t[..t_len], S::r(n));
-            push_or_drop2(t, &mut t_len, &mut et, c);
-        } else {
-            let c = mul_prim(&mut t[..t_len], S::r(n) as u64);
-            push_or_drop(t, &mut t_len, &mut et, c);
-        }
+        let c = mul_prim2(&mut t[..t_len], S::r(n));
+        push_or_drop2(t, &mut t_len, &mut et, c);
     }
-    let q_len = if WIDE {
-        prod_terms_wide(a, b, S::q, q)
-    } else {
-        prod_terms(a, b, |n| S::q(n as u128) as u64, q)
-    };
+    let q_len = prod_terms(a, b, S::q, q);
     let t: &'t [u64] = t;
     (buf_len(&p[..p_len]), q_len, e, &t[..t_len], et, pn)
 }
@@ -605,7 +575,7 @@ fn hyper_leaf_terms_wide<S: WideHyperSeries>(
     (buf_len(&p[..p_len]), q_len, r_len, e, pn)
 }
 
-fn prod_terms_wide(a: u64, b: u64, f: impl Fn(u128) -> u128, buf: &mut [u64]) -> usize {
+fn prod_terms(a: u64, b: u64, f: impl Fn(u128) -> u128, buf: &mut [u64]) -> usize {
     buf[0] = 1;
     let mut len = 1;
     for n in a as u128..b as u128 {
@@ -638,29 +608,9 @@ fn mul_exact(a: &[u64], b: &[u64], out: &mut [u64]) -> usize {
 
 fn product(a: &[u64], b: &[u64]) -> Vec<u64> {
     let mut v = vec![0; a.len() + b.len()];
-    mul_dyn(a, b, &mut v);
-    trim_lz(&mut v);
+    let n = mul_exact(a, b, &mut v);
+    v.truncate(n);
     v
-}
-
-fn prod_terms(a: u64, b: u64, f: impl Fn(u64) -> u64, buf: &mut [u64]) -> usize {
-    buf[0] = 1;
-    let (mut len, mut n) = (1, a);
-    while n < b {
-        let mut u = f(n);
-        n += 1;
-        while n < b {
-            let w = u as u128 * f(n) as u128;
-            if w >> 64 != 0 {
-                break;
-            }
-            u = w as u64;
-            n += 1;
-        }
-        let c = mul_prim(&mut buf[..len], u);
-        push(buf, &mut len, c);
-    }
-    len
 }
 
 fn bit_len(x: u64) -> u64 {
@@ -771,16 +721,6 @@ fn product_at<const N: usize>(
     } else {
         let (len, ov, er) = hi_mul_from::<N>(a, b, e - ea, out);
         (0, shr_bits(out, len, ov, e - ea - er))
-    }
-}
-
-// Moves u[..len] 2^eu to exponent e, dropping its bits below it, as (limb offset, length).
-fn place(u: &mut [u64], len: usize, eu: u64, e: u64) -> (usize, usize) {
-    if eu >= e {
-        let (off, s) = split_sh(eu - e);
-        (off, shl_bits(u, len, s))
-    } else {
-        (0, shr_bits(u, len, 0, e - eu))
     }
 }
 
@@ -915,6 +855,46 @@ pub fn ratio_to_fraction_static<const N: usize>(p: &[u64], q: &[u64], shift: i64
 fn est_limbs(a: u64, b: u64, f: impl Fn(u128) -> u128, shift: u64) -> u64 {
     let bits = bit_len128(f((a + (b - a) / 2) as u128)) + shift;
     (b - a).saturating_mul(bits).div_ceil(64)
+}
+
+// A BBP or Engel leaf kernel: (a, b, shift, p, q) -> (P's length, Q's, P's exponent, sign).
+type LeafKernel = fn(u64, u64, u64, &mut [u64], &mut [u64]) -> (usize, usize, u64, bool);
+
+// A dynamic BBP or Engel leaf's exact P and Q, and P's sign.
+fn dyn_leaf(a: u64, b: u64, shift: u64, narrow: bool, k: LeafKernel) -> (Vec<u64>, Vec<u64>, bool) {
+    let words = split_sh(shift * (b - a)).0 + 1;
+    let (pl, ql) = leaf_lens(narrow, (b - a) as usize, words);
+    let (mut p, mut q) = (vec![0; pl], vec![0; ql]);
+    let (p_len, q_len, e, neg) = k(a, b, shift, &mut p, &mut q);
+    debug_assert_eq!(e, 0);
+    p.truncate(p_len);
+    q.truncate(q_len);
+    (p, q, neg)
+}
+
+// A dynamic merge's exact P = lp rq 2^sh + u and Q = lq rq, and P's sign.
+fn dyn_merge(
+    (lp, lq, ln): (&[u64], &[u64], bool),
+    (u, rq, un): (&[u64], &[u64], bool),
+    sh: u64,
+    signed: bool,
+) -> (Vec<u64>, Vec<u64>, bool) {
+    let (sl, sb) = split_sh(sh);
+    let pl = lp.len() + rq.len();
+    let mut p = vec![0; (sl + pl + 1).max(u.len()) + 1];
+    let par = merge_par(lq.len() + rq.len());
+    let (_, q) = join2(par, || mul_dyn(lp, rq, &mut p[sl..sl + pl]), || product(lq, rq));
+    p[sl + pl] = shl_buf(&mut p[sl..sl + pl], sb);
+    let n = p.len();
+    let (len, neg) = p_sum(&mut p, n, (0, u), (ln, un), false, signed);
+    p.truncate(len);
+    (p, q, neg)
+}
+
+// A dynamic node's S = P / (Q 2^bits) into out, and whether it's negative.
+fn dyn_finalize(p: &[u64], q: &[u64], neg: bool, bits: u64, zeros: usize, out: &mut [u64]) -> bool {
+    ratio_to_fraction_dyn(p, q, bits as i64 - 64 * zeros as i64, out);
+    neg && !p.is_empty()
 }
 
 pub trait Node: Sized {
@@ -1082,19 +1062,13 @@ impl<S: WideBBPSeries> Node for DynNodeBBP<S> {
     }
 
     fn leaf(ctx: &Shift, a: u64, b: u64, _: bool) -> Self {
-        let terms = (b - a) as usize;
-        let words = split_sh(ctx.0 * (b - a)).0 + 1;
         let narrow = fits_u64(a, b, |n| S::p(n) | S::q(n));
-        let (pl, ql) = leaf_lens(narrow, terms, words);
-        let (mut p, mut q) = (vec![0; pl], vec![0; ql]);
-        let (p_len, q_len, e, neg) = if narrow {
-            bbp_leaf_terms::<Narrow<S>>(a, b, ctx.0, &mut p, &mut q)
+        let k: LeafKernel = if narrow {
+            bbp_leaf_terms::<Narrow<S>>
         } else {
-            bbp_leaf_terms_wide::<S>(a, b, ctx.0, &mut p, &mut q)
+            bbp_leaf_terms_wide::<S>
         };
-        debug_assert_eq!(e, 0);
-        p.truncate(p_len);
-        q.truncate(q_len);
+        let (p, q, neg) = dyn_leaf(a, b, ctx.0, narrow, k);
         DynNodeBBP {
             a,
             b,
@@ -1105,25 +1079,11 @@ impl<S: WideBBPSeries> Node for DynNodeBBP<S> {
         }
     }
 
+    // P = lp rq 2^(shift (b - m)) + lq rp, Q = lq rq.
     fn merge(ctx: &Shift, l: Self, r: Self) -> Self {
-        let (sl, sb) = split_sh(ctx.0 * (r.b - r.a)); // r(b - m)
-        let pl = l.p.len() + r.q.len();
-        let tl = l.q.len() + r.p.len();
-
-        let mut p = vec![0; (sl + pl + 1).max(tl) + 1];
-        let mut scratch = ScratchGuard::acquire();
-        let t = scratch.get(tl);
-        let par = merge_par(l.q.len() + r.q.len());
-        let (_, (t_len, q)) = join2(
-            par,
-            || mul_dyn(&l.p, &r.q, &mut p[sl..sl + pl]),
-            || join2(par, || mul_exact(&l.q, &r.p, t), || product(&l.q, &r.q)),
-        );
-        p[sl + pl] = shl_buf(&mut p[sl..sl + pl], sb);
-        let (n, signs) = (p.len(), (l.neg, r.neg));
-        let (len, neg) = p_sum(&mut p, n, (0, &t[..t_len]), signs, false, S::SIGNED);
-        p.truncate(len);
-
+        let u = product(&l.q, &r.p);
+        let sh = ctx.0 * (r.b - r.a);
+        let (p, q, neg) = dyn_merge((&l.p, &l.q, l.neg), (&u, &r.q, r.neg), sh, S::SIGNED);
         DynNodeBBP {
             a: l.a,
             b: r.b,
@@ -1135,9 +1095,8 @@ impl<S: WideBBPSeries> Node for DynNodeBBP<S> {
     }
 
     fn finalize(&self, ctx: &Shift, zeros: usize, out: &mut [u64]) -> bool {
-        let shift = (ctx.0 * (self.b - self.a)) as i64 - 64 * zeros as i64;
-        ratio_to_fraction_dyn(&self.p, &self.q, shift, out);
-        S::SIGNED && self.neg && !self.p.is_empty()
+        let bits = ctx.0 * (self.b - self.a);
+        dyn_finalize(&self.p, &self.q, S::SIGNED && self.neg, bits, zeros, out)
     }
 }
 
@@ -1157,31 +1116,16 @@ pub struct StaticNodeBBP<const N: usize, S: WideBBPSeries> {
 }
 
 impl<const N: usize, S: WideBBPSeries> StaticNodeBBP<N, S> {
-    // Whether [a, b)'s exact P, at most prod q 2^(shift (t - 1)) t max p, fits N limbs.
-    fn leaf_fits(shift: u64, a: u64, b: u64) -> bool {
-        let t = b - a;
-        let cap = 64 * N as u64;
-        let (mut bits, mut p_bits) = (shift * (t - 1) + bit_len(t), 0);
-        for n in a..b {
-            let n = n as u128;
-            bits += bit_len128(S::q(n));
-            p_bits = p_bits.max(bit_len128(S::p(n)));
-            if bits + p_bits > cap {
-                return false;
-            }
-        }
-        true
-    }
-
     #[inline(never)]
     fn exact_leaf(shift: u64, a: u64, b: u64) -> Self {
         let (mut p, mut q) = ([0; N], [0; N]);
-        let (p_len, q_len, e, neg) = if fits_u64(a, b, |n| S::p(n) | S::q(n)) {
-            bbp_leaf_terms::<Narrow<S>>(a, b, shift, &mut p, &mut q)
+        let k: LeafKernel = if fits_u64(a, b, |n| S::p(n) | S::q(n)) {
+            bbp_leaf_terms::<Narrow<S>>
         } else {
-            bbp_leaf_terms_wide::<S>(a, b, shift, &mut p, &mut q)
+            bbp_leaf_terms_wide::<S>
         };
-        debug_assert_eq!(e, 0, "leaf_fits keeps a leaf's P exact");
+        let (p_len, q_len, e, neg) = k(a, b, shift, &mut p, &mut q);
+        debug_assert_eq!(e, 0, "leaf checks that P stays exact");
 
         StaticNodeBBP {
             a,
@@ -1216,8 +1160,16 @@ impl<const N: usize, S: WideBBPSeries> Node for StaticNodeBBP<N, S> {
         est_limbs(a, b, S::q, ctx.0).min(N as u64)
     }
 
+    // A leaf's exact P, at most prod q 2^(shift (t - 1)) t max p, must fit N limbs.
     fn leaf(ctx: &Shift, a: u64, b: u64, last: bool) -> Self {
-        if b - a > 1 && !Self::leaf_fits(ctx.0, a, b) {
+        let (t, cap) = (b - a, 64 * N as u64);
+        let (mut bits, mut p_bits) = (ctx.0 * (t - 1) + bit_len(t), 0);
+        let fits = (a..b).all(|n| {
+            bits += bit_len128(S::q(n as u128));
+            p_bits = p_bits.max(bit_len128(S::p(n as u128)));
+            bits + p_bits <= cap
+        });
+        if t > 1 && !fits {
             return split_leaf(ctx, a, b, last);
         }
         Self::exact_leaf(ctx.0, a, b)
@@ -1311,19 +1263,13 @@ impl<S: WideEngelSeries> Node for DynNodeEngel<S> {
     }
 
     fn leaf(ctx: &Shift, a: u64, b: u64, _: bool) -> Self {
-        let terms = (b - a) as usize;
-        let words = split_sh(ctx.0 * (b - a)).0 + 1;
         let narrow = fits_u64(a, b, |n| S::p(n) | S::q(n));
-        let (pl, ql) = leaf_lens(narrow, terms, words);
-        let (mut p, mut q) = (vec![0; pl], vec![0; ql]);
-        let (p_len, q_len, e, neg) = if narrow {
-            engel_leaf_terms::<Narrow<S>>(a, b, ctx.0, &mut p, &mut q)
+        let k: LeafKernel = if narrow {
+            engel_leaf_terms::<Narrow<S>>
         } else {
-            engel_leaf_terms_wide::<S>(a, b, ctx.0, &mut p, &mut q)
+            engel_leaf_terms_wide::<S>
         };
-        debug_assert_eq!(e, 0);
-        p.truncate(p_len);
-        q.truncate(q_len);
+        let (p, q, neg) = dyn_leaf(a, b, ctx.0, narrow, k);
         DynNodeEngel {
             a,
             b,
@@ -1334,21 +1280,10 @@ impl<S: WideEngelSeries> Node for DynNodeEngel<S> {
         }
     }
 
+    // P = lp rq 2^(shift (b - m)) + rp, Q = lq rq.
     fn merge(ctx: &Shift, l: Self, r: Self) -> Self {
-        let (sl, sb) = split_sh(ctx.0 * (r.b - r.a));
-        let pl = l.p.len() + r.q.len();
-
-        let mut p = vec![0; (sl + pl + 1).max(r.p.len()) + 1];
-        let (_, q) = join2(
-            merge_par(l.q.len() + r.q.len()),
-            || mul_dyn(&l.p, &r.q, &mut p[sl..sl + pl]),
-            || product(&l.q, &r.q),
-        );
-        p[sl + pl] = shl_buf(&mut p[sl..sl + pl], sb);
-        let n = p.len();
-        let (len, neg) = p_sum(&mut p, n, (0, &r.p), (l.neg, r.neg), false, S::SIGNED);
-        p.truncate(len);
-
+        let sh = ctx.0 * (r.b - r.a);
+        let (p, q, neg) = dyn_merge((&l.p, &l.q, l.neg), (&r.p, &r.q, r.neg), sh, S::SIGNED);
         DynNodeEngel {
             a: l.a,
             b: r.b,
@@ -1360,9 +1295,8 @@ impl<S: WideEngelSeries> Node for DynNodeEngel<S> {
     }
 
     fn finalize(&self, ctx: &Shift, zeros: usize, out: &mut [u64]) -> bool {
-        let shift = (ctx.0 * (self.b - self.a)) as i64 - 64 * zeros as i64;
-        ratio_to_fraction_dyn(&self.p, &self.q, shift, out);
-        S::SIGNED && self.neg && !self.p.is_empty()
+        let bits = ctx.0 * (self.b - self.a);
+        dyn_finalize(&self.p, &self.q, S::SIGNED && self.neg, bits, zeros, out)
     }
 }
 
@@ -1385,11 +1319,12 @@ impl<const N: usize, S: WideEngelSeries> StaticNodeEngel<N, S> {
     #[inline(never)]
     fn exact_leaf(shift: u64, a: u64, b: u64) -> Self {
         let (mut p, mut q) = ([0; N], [0; N]);
-        let (p_len, q_len, ep, neg) = if fits_u64(a, b, |n| S::p(n) | S::q(n)) {
-            engel_leaf_terms::<Narrow<S>>(a, b, shift, &mut p, &mut q)
+        let k: LeafKernel = if fits_u64(a, b, |n| S::p(n) | S::q(n)) {
+            engel_leaf_terms::<Narrow<S>>
         } else {
-            engel_leaf_terms_wide::<S>(a, b, shift, &mut p, &mut q)
+            engel_leaf_terms_wide::<S>
         };
+        let (p_len, q_len, ep, neg) = k(a, b, shift, &mut p, &mut q);
         StaticNodeEngel {
             a,
             b,
@@ -1450,7 +1385,13 @@ impl<const N: usize, S: WideEngelSeries> Node for StaticNodeEngel<N, S> {
 
         let mut p = [0; N];
         let (off, n) = product_at::<N>(lp, rq, ea, ep, &mut p);
-        let (uo, un) = place(&mut r.p, r.p_len, r.ep, ep);
+        // rp moves to P's exponent in place, dropping its bits below it.
+        let (uo, un) = if r.ep >= ep {
+            let (off, s) = split_sh(r.ep - ep);
+            (off, shl_bits(&mut r.p, r.p_len, s))
+        } else {
+            (0, shr_bits(&mut r.p, r.p_len, 0, ep - r.ep))
+        };
         let u = (uo, &r.p[..un]);
         let (p_len, neg) = p_sum(&mut p, off + n, u, (l.neg, r.neg), ta == 0, S::SIGNED);
         let (q_len, e) = hi_mul_norm::<N>(lq, rq, &mut l.p);
@@ -1631,40 +1572,14 @@ impl<S: WideHyperSeries> Node for DynNodeHyper<S> {
         }
     }
 
+    // P = lp rq 2^(shift (b - m)) + rp lr, Q = lq rq, R = lr rr.
     fn merge(ctx: &DynHyperCtx, left: Self, right: Self) -> Self {
         let lr = left
             .r
             .expect("a node that ends the sum can't merge as a left child");
-        let (sl, sb) = split_sh(ctx.shift * (right.b - right.a));
-        let pl = left.p.len() + right.q.len();
-        let tl = right.p.len() + lr.len();
-
-        let par = merge_par(left.q.len() + right.q.len());
-        let mut p = vec![0; (sl + pl + 1).max(tl) + 1];
-        let mut scratch = ScratchGuard::acquire();
-        let t = scratch.get(tl);
-        let ((_, t_len), (q, r)) = join2(
-            par,
-            || {
-                join2(
-                    par,
-                    || mul_dyn(&left.p, &right.q, &mut p[sl..sl + pl]),
-                    || mul_exact(&right.p, &lr, t),
-                )
-            },
-            || {
-                join2(
-                    par,
-                    || product(&left.q, &right.q),
-                    || right.r.as_deref().map(|rr| product(&lr, rr)),
-                )
-            },
-        );
-        p[sl + pl] = shl_buf(&mut p[sl..sl + pl], sb);
-        let (n, signs) = (p.len(), (left.neg, right.neg));
-        let (len, neg) = p_sum(&mut p, n, (0, &t[..t_len]), signs, false, S::SIGNED);
-        p.truncate(len);
-
+        let (u, r) = (product(&right.p, &lr), right.r.as_deref().map(|rr| product(&lr, rr)));
+        let (l, rt) = ((&left.p[..], &left.q[..], left.neg), (&u[..], &right.q[..], right.neg));
+        let (p, q, neg) = dyn_merge(l, rt, ctx.shift * (right.b - right.a), S::SIGNED);
         DynNodeHyper {
             a: left.a,
             b: right.b,
@@ -1677,9 +1592,8 @@ impl<S: WideHyperSeries> Node for DynNodeHyper<S> {
     }
 
     fn finalize(&self, ctx: &DynHyperCtx, zeros: usize, out: &mut [u64]) -> bool {
-        let shift = (ctx.shift * (self.b - self.a)) as i64 - 64 * zeros as i64;
-        ratio_to_fraction_dyn(&self.p, &self.q, shift, out);
-        S::SIGNED && self.neg && !self.p.is_empty()
+        let bits = ctx.shift * (self.b - self.a);
+        dyn_finalize(&self.p, &self.q, S::SIGNED && self.neg, bits, zeros, out)
     }
 }
 
@@ -1854,5 +1768,535 @@ impl<const N: usize, S: WideHyperSeries> Node for StaticNodeHyper<N, S> {
         let (p, q, shift) = self.ratio(ctx);
         ratio_to_fraction_static::<N>(p, q, shift - 64 * zeros as i64, out);
         self.is_neg()
+    }
+}
+
+// series_eval sums [a, b) by reverse Horner, rectangular splitting (Hyper with x of two or
+// more limbs) or binary splitting, whichever its cost model picks, and writes S as
+// Node::finalize does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeriesAlg {
+    Horner,
+    Rect,
+    BinSplit,
+}
+
+// Which algorithms can sum a range. Binary splitting always can.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Eligible {
+    pub horner: bool,
+    pub rect: bool,
+}
+
+impl Eligible {
+    pub fn allows(self, alg: SeriesAlg) -> bool {
+        match alg {
+            SeriesAlg::Horner => self.horner,
+            SeriesAlg::Rect => self.rect,
+            SeriesAlg::BinSplit => true,
+        }
+    }
+}
+
+// The node types series_eval sums with. Only series_eval, series_eval_at and the tests call
+// these.
+pub trait SeriesNode: Node + Send {
+    // Whether the kind has a rect kernel: only Hyper's, whose steps multiply by x.
+    #[doc(hidden)]
+    const RECT: bool = false;
+    // Horner and rect take ranges whose values fit u64 (wide ones are left to bin_split for
+    // now), Hyper's with r(n) <= q(n) and k >= bits(x), and static ones the room they need.
+    #[doc(hidden)]
+    fn eligible(ctx: &Self::Ctx, a: u64, b: u64, len: usize, zeros: usize) -> Eligible;
+    #[doc(hidden)]
+    fn dispatch(ctx: &Self::Ctx, a: u64, b: u64, len: usize, zeros: usize) -> SeriesAlg;
+    #[doc(hidden)]
+    fn horner(ctx: &Self::Ctx, a: u64, b: u64, zeros: usize, out: &mut [u64]) -> bool;
+    #[doc(hidden)]
+    fn rect(_: &Self::Ctx, _: u64, _: u64, _: usize, _: &mut [u64]) -> bool {
+        unreachable!("only a RECT kind has a rect kernel")
+    }
+}
+
+// out <- S 2^(64 (out.len() + zeros)), skipping S's top zeros limbs, which the caller knows
+// are zero, as Node::finalize does. Returns whether S is negative. Horner and rect agree
+// with the exact sum within one unit of out's last limb, not bit for bit with bin_split.
+pub fn series_eval<N>(ctx: &N::Ctx, a: u64, b: u64, zeros: usize, out: &mut [u64]) -> bool
+where
+    N: SeriesNode,
+    N::Ctx: Sync,
+{
+    let alg = N::dispatch(ctx, a, b, out.len(), zeros);
+    series_eval_at::<N>(ctx, a, b, zeros, out, alg)
+}
+
+// series_eval with the algorithm forced, for tests and tuning.
+#[doc(hidden)]
+pub fn series_eval_at<N>(
+    ctx: &N::Ctx,
+    a: u64,
+    b: u64,
+    zeros: usize,
+    out: &mut [u64],
+    alg: SeriesAlg,
+) -> bool
+where
+    N: SeriesNode,
+    N::Ctx: Sync,
+{
+    debug_assert!(a < b);
+    let ok = N::eligible(ctx, a, b, out.len(), zeros).allows(alg);
+    assert!(ok, "{alg:?} can't sum this range");
+    match alg {
+        SeriesAlg::Horner => N::horner(ctx, a, b, zeros, out),
+        SeriesAlg::Rect => {
+            assert!(N::RECT, "only a RECT kind has a rect kernel");
+            N::rect(ctx, a, b, zeros, out)
+        }
+        SeriesAlg::BinSplit => bin_split::<N>(ctx, a, b).finalize(ctx, zeros, out),
+    }
+}
+
+// hi_mul_dyn or hi_mul_static.
+type HiMul = fn(&[u64], &[u64], &mut [u64]) -> u64;
+// Term n's bit in Horner's frame.
+type Bit<'a> = &'a dyn Fn(u64) -> i64;
+
+// Horner's guard limb below out: each step truncates by a few units at most and scales the
+// error below it by at most 1.
+const HORNER_GUARD: usize = 1;
+// At most this many powers of x on a static rect's stack, 8 N bytes each.
+const RECT_MAX_M: usize = 16;
+
+// Horner's accumulator: out, its guard limb, and 2 limbs for a value before its division
+// by q(n).
+const fn acc_len(len: usize) -> usize {
+    len + HORNER_GUARD + 2
+}
+
+// Runs a Horner or rect kernel in the frame F = S 2^(64 w), w = len + zeros + HORNER_GUARD.
+// The per-term 2^-k is never applied: term n's numerator lands at bit 64 w - k (n - a + 1),
+// so acc is F throughout and needs no final shift. Writes acc above its guard limb to out;
+// returns S < 0.
+fn horner_run(
+    (k, a, zeros): (u64, u64, usize),
+    out: &mut [u64],
+    acc: &mut [u64],
+    signed: bool,
+    kernel: impl FnOnce(Bit, &mut [u64]) -> (usize, bool),
+) -> bool {
+    let w = 64 * (out.len() + zeros + HORNER_GUARD) as i128;
+    let bit = |n: u64| (w - k as i128 * (n - a + 1) as i128).max((i64::MIN / 2) as i128) as i64;
+    acc.fill(0);
+    let (len, neg) = kernel(&bit, acc);
+    let g = HORNER_GUARD;
+    out.copy_from_slice(&acc[g..g + out.len()]);
+    debug_assert!(
+        acc[g + out.len()..].iter().all(|&l| l == 0),
+        "series_eval expects S < 2^(-64 zeros)"
+    );
+    signed && neg && len != 0
+}
+
+// acc[..len] <- about acc[..len] x / 2^(64 x.len()): hi_mul's window one limb lower in tmp,
+// and its top limb. Returns the new length.
+fn mul_frac(acc: &mut [u64], len: usize, x: &[u64], tmp: &mut [u64], hi_mul: HiMul) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let top = hi_mul(&acc[..len], x, &mut tmp[..len]);
+    acc[..len - 1].copy_from_slice(&tmp[1..len]);
+    acc[len - 1] = top;
+    buf_len(&acc[..len])
+}
+
+// x shifted so its top bit is set, in out: x' = xn 2^(-64 x.len()) = x 2^(-bits(x)).
+fn normalize<'x>(x: &[u64], out: &'x mut [u64]) -> &'x [u64] {
+    let out = &mut out[..x.len()];
+    out.copy_from_slice(x);
+    shl_buf(out, x[x.len() - 1].leading_zeros() as u8);
+    out
+}
+
+// acc += floor(p(n) 2^d) / q(n), from n = b - 1 down, each term through t.
+fn horner_bbp<S: BBPSeries>(a: u64, b: u64, bit: Bit, acc: &mut [u64], t: &mut [u64]) -> (usize, bool) {
+    let (mut len, mut e, mut neg) = (0, 0, false);
+    for n in (a..b).rev() {
+        debug_assert!(S::SIGNED || !S::neg(n), "negative terms need SIGNED");
+        // floor(p(n) 2^d) reaches limb d / 64 + 1 at most.
+        let (d, mut tl, mut te) = (bit(n), 0, 0);
+        let top = ((d.max(0) / 64) as usize + 2).min(t.len());
+        t[..top].fill(0);
+        add_term(t, &mut tl, &mut te, &mut false, (&[1], d), S::p(n), false, false);
+        div_prim(&mut t[..tl], S::q(n));
+        let tl = buf_len(&t[..tl]);
+        let sub = S::SIGNED && S::neg(n);
+        add_pass(acc, &mut len, &mut e, &mut neg, (0, &t[..tl], 1), sub, S::SIGNED);
+    }
+    debug_assert_eq!(e, 0, "Horner's accumulator overflowed");
+    (len, neg)
+}
+
+// acc = (acc + p(n) 2^d) / q(n), from n = b - 1 down.
+fn horner_engel<S: EngelSeries>(a: u64, b: u64, bit: Bit, acc: &mut [u64]) -> (usize, bool) {
+    let (mut len, mut e, mut neg) = (0, 0, false);
+    for n in (a..b).rev() {
+        debug_assert!(S::SIGNED || !S::neg(n), "negative terms need SIGNED");
+        let (t, sub) = ((&[1][..], bit(n)), S::SIGNED && S::neg(n));
+        add_term(acc, &mut len, &mut e, &mut neg, t, S::p(n), sub, S::SIGNED);
+        div_prim(&mut acc[..len], S::q(n));
+        len = buf_len(&acc[..len]);
+    }
+    debug_assert_eq!(e, 0, "Horner's accumulator overflowed");
+    (len, neg)
+}
+
+// acc = x' (r(n) acc + p(n) 2^d) / q(n), from n = b - 1 down, x' = xn 2^(-64 xn.len()) through
+// tmp, or 1 without x. The frame's k is the series' less bits(x), which x' doesn't carry.
+fn horner_hyper<S: HyperSeries>(
+    a: u64,
+    b: u64,
+    bit: Bit,
+    mut x: Option<(&[u64], &mut [u64], HiMul)>,
+    acc: &mut [u64],
+) -> (usize, bool) {
+    let (mut len, mut e, mut neg) = (0, 0, false);
+    for n in (a..b).rev() {
+        debug_assert!(S::SIGNED || !S::neg(n), "negative terms need SIGNED");
+        let c = mul_prim(&mut acc[..len], S::r(n));
+        push(acc, &mut len, c);
+        let (t, sub) = ((&[1][..], bit(n)), S::SIGNED && S::neg(n));
+        add_term(acc, &mut len, &mut e, &mut neg, t, S::p(n), sub, S::SIGNED);
+        if let Some((xn, tmp, hi_mul)) = x.as_mut() {
+            len = mul_frac(acc, len, xn, tmp, *hi_mul);
+        }
+        div_prim(&mut acc[..len], S::q(n));
+        len = buf_len(&acc[..len]);
+    }
+    debug_assert_eq!(e, 0, "Horner's accumulator overflowed");
+    (len, neg)
+}
+
+// pw[j] <- x'^(j + 1) 2^(64 P), P = pw[0].len(), for x' = xn 2^(-64 xn.len()), through tmp.
+fn rect_powers(xn: &[u64], pw: &mut [&mut [u64]], tmp: &mut [u64], hi_mul: HiMul) {
+    let (first, rest) = pw.split_first_mut().expect("rect needs a power");
+    let (p, c) = (first.len(), xn.len().min(first.len()));
+    first[..p - c].fill(0);
+    first[p - c..].copy_from_slice(&xn[xn.len() - c..]);
+    let mut prev: &[u64] = first;
+    for x in rest.iter_mut() {
+        x.copy_from_slice(prev);
+        mul_frac(x, p, first, tmp, hi_mul);
+        prev = x;
+    }
+}
+
+// Rectangular splitting: blocks of m = pw.len() terms from n = b - 1 down, each one high
+// product by x'^s for its s terms and then Horner's scalar steps with p(n) x'^(i + 1) in
+// place of p(n), so x' never multiplies in a step.
+fn rect_hyper<S: HyperSeries>(
+    a: u64,
+    b: u64,
+    bit: Bit,
+    pw: &[&mut [u64]],
+    acc: &mut [u64],
+    tmp: &mut [u64],
+    hi_mul: HiMul,
+) -> (usize, bool) {
+    let (m, pb) = (pw.len() as u64, 64 * pw[0].len() as i64);
+    let (mut len, mut e, mut neg) = (0, 0, false);
+    let mut n = b;
+    while n > a {
+        let lo = n.saturating_sub(m).max(a);
+        len = mul_frac(acc, len, &pw[(n - lo - 1) as usize], tmp, hi_mul);
+        for k in (lo..n).rev() {
+            debug_assert!(S::SIGNED || !S::neg(k), "negative terms need SIGNED");
+            let c = mul_prim(&mut acc[..len], S::r(k));
+            push(acc, &mut len, c);
+            let x = (&pw[(k - lo) as usize][..], bit(k) - pb);
+            add_term(acc, &mut len, &mut e, &mut neg, x, S::p(k), S::SIGNED && S::neg(k), S::SIGNED);
+            div_prim(&mut acc[..len], S::q(k));
+            len = buf_len(&acc[..len]);
+        }
+        n = lo;
+    }
+    debug_assert_eq!(e, 0, "rect's accumulator overflowed");
+    (len, neg)
+}
+
+// Narrow values, r(n) <= q(n) so no step scales the error below it up, and k >= bits(x).
+fn hyper_narrow<S: WideHyperSeries>(a: u64, b: u64, k: u64, x_bits: u64) -> bool {
+    k >= x_bits
+        && (a..b).all(|n| {
+            let (n, q, r) = (n as u128, S::q(n as u128), S::r(n as u128));
+            (S::p(n) | q | r) >> 64 == 0 && r <= q
+        })
+}
+
+// acc and tmp hold acc_len(out.len()) limbs, and xs x.len().
+fn hyper_horner<S: WideHyperSeries>(
+    (k, x): (u64, Option<&[u64]>),
+    a: u64,
+    b: u64,
+    zeros: usize,
+    out: &mut [u64],
+    [acc, tmp, xs]: [&mut [u64]; 3],
+    hi_mul: HiMul,
+) -> bool {
+    let (k, x) = match x {
+        None => (k, None),
+        Some(x) => (k - bits(x), Some((normalize(x, xs), tmp, hi_mul))),
+    };
+    let kernel = |bit: Bit, acc: &mut [u64]| horner_hyper::<Narrow<S>>(a, b, bit, x, acc);
+    horner_run((k, a, zeros), out, acc, S::SIGNED, kernel)
+}
+
+// hyper_horner's buffers, plus m powers of acc_len(out.len()) limbs each in pw.
+fn hyper_rect<S: WideHyperSeries>(
+    (k, x): (u64, &[u64]),
+    a: u64,
+    b: u64,
+    zeros: usize,
+    out: &mut [u64],
+    [acc, tmp, xs]: [&mut [u64]; 3],
+    pw: &mut [&mut [u64]],
+    hi_mul: HiMul,
+) -> bool {
+    rect_powers(normalize(x, xs), pw, tmp, hi_mul);
+    let kernel = |bit: Bit, acc: &mut [u64]| rect_hyper::<Narrow<S>>(a, b, bit, pw, acc, tmp, hi_mul);
+    horner_run((k - bits(x), a, zeros), out, acc, S::SIGNED, kernel)
+}
+
+// The dynamic rect at an explicit block length m, for tests.
+pub(crate) fn rect_dyn_m<S: WideHyperSeries>(
+    ctx: &DynHyperCtx,
+    a: u64,
+    b: u64,
+    zeros: usize,
+    out: &mut [u64],
+    m: usize,
+) -> bool {
+    let x = ctx.x.as_deref().expect("rect needs x != 1");
+    let n = acc_len(out.len());
+    let mut scratch = ScratchGuard::acquire();
+    let bufs = scratch.get_splits([n, n, x.len()]);
+    let mut powers = ScratchGuard::acquire();
+    let mut pw = powers.get_split_vec(std::iter::repeat(n).take(m));
+    hyper_rect::<S>((ctx.shift, x), a, b, zeros, out, bufs, &mut pw, hi_mul_dyn)
+}
+
+// Reverse Horner's limb-steps: term i of t (from 1) spans about w + 1 - k i / 64 limbs of
+// the frame, capped at the accumulator's, and none once the terms fall below it.
+fn horner_work(len: usize, zeros: usize, k: u64, t: u64) -> f64 {
+    let cap = acc_len(len) as f64;
+    let top = (len + zeros + HORNER_GUARD + 1) as f64;
+    let (t, s) = (t as f64, k as f64 / 64.0);
+    if s == 0.0 {
+        return cap * t;
+    }
+    let full = ((top - cap) / s).clamp(0.0, t);
+    let end = (top / s).clamp(full, t);
+    let at = |i: f64| (top - s * i).min(cap);
+    cap * full + (end - full) * (at(full) + at(end)) / 2.0
+}
+
+// Rect's block length for t terms, at most max.
+fn rect_m(t: u64, max: usize) -> usize {
+    let m = (SERIES_RECT_M_SCALE * (t as f64).sqrt()).round() as usize;
+    m.clamp(1, max.min(usize::try_from(t).unwrap_or(usize::MAX)))
+}
+
+// The eligible algorithm with the least weighted work estimate, for k the frame's shift and
+// xl x's limbs (0 for x = 1). w: Horner, rect, bin_split and fixed weights.
+fn cheapest<N: Node>(
+    ctx: &N::Ctx,
+    a: u64,
+    b: u64,
+    (len, zeros): (usize, usize),
+    ok: Eligible,
+    (k, xl, max_m): (u64, usize, usize),
+    [wh, wr, wb, wf]: [f64; 4],
+) -> SeriesAlg {
+    let t = b - a;
+    let steps = horner_work(len, zeros, k, t);
+    let rect = || {
+        let (m, p) = (rect_m(t, max_m) as f64, acc_len(len) as f64);
+        wr * ((m - 1.0 + (t as f64 / m).ceil()) * p * p) + wh * steps
+    };
+    let e = N::limbs(ctx, a, b);
+    let build = if t <= N::LEAF_TERMS || e < N::LEAF_LIMBS {
+        t as f64 * e as f64 / 2.0
+    } else {
+        e as f64 * e as f64
+    };
+    let f = (len + 2) as f64;
+    let costs = [
+        ok.horner.then(|| wh * steps + wr * steps * xl as f64),
+        ok.rect.then(rect),
+        Some(wb * (build + f * f.min(e as f64)) + wf),
+    ];
+    let algs = [SeriesAlg::Horner, SeriesAlg::Rect, SeriesAlg::BinSplit];
+    let mut best = (SeriesAlg::BinSplit, f64::INFINITY);
+    for (alg, cost) in algs.into_iter().zip(costs) {
+        if let Some(c) = cost.filter(|&c| c < best.1) {
+            best = (alg, c);
+        }
+    }
+    best.0
+}
+
+impl<S: WideBBPSeries> SeriesNode for DynNodeBBP<S> {
+    fn eligible(_: &Shift, a: u64, b: u64, _: usize, _: usize) -> Eligible {
+        let horner = fits_u64(a, b, |n| S::p(n) | S::q(n));
+        Eligible { horner, rect: false }
+    }
+
+    fn dispatch(ctx: &Shift, a: u64, b: u64, len: usize, zeros: usize) -> SeriesAlg {
+        let ok = Self::eligible(ctx, a, b, len, zeros);
+        let w = [DYN_SERIES_HORNER_BBP, 0.0, DYN_SERIES_BIN_SPLIT_BBP, DYN_SERIES_BIN_SPLIT_FIXED];
+        cheapest::<Self>(ctx, a, b, (len, zeros), ok, (ctx.0, 0, 1), w)
+    }
+
+    fn horner(ctx: &Shift, a: u64, b: u64, zeros: usize, out: &mut [u64]) -> bool {
+        let n = acc_len(out.len());
+        let mut scratch = ScratchGuard::acquire();
+        let [acc, t] = scratch.get_splits([n, n]);
+        let kernel = |bit: Bit, acc: &mut [u64]| horner_bbp::<Narrow<S>>(a, b, bit, acc, t);
+        horner_run((ctx.0, a, zeros), out, acc, S::SIGNED, kernel)
+    }
+}
+
+impl<const N: usize, S: WideBBPSeries> SeriesNode for StaticNodeBBP<N, S> {
+    fn eligible(_: &Shift, a: u64, b: u64, len: usize, _: usize) -> Eligible {
+        let horner = acc_len(len) <= N && fits_u64(a, b, |n| S::p(n) | S::q(n));
+        Eligible { horner, rect: false }
+    }
+
+    fn dispatch(ctx: &Shift, a: u64, b: u64, len: usize, zeros: usize) -> SeriesAlg {
+        let ok = Self::eligible(ctx, a, b, len, zeros);
+        let w = [STATIC_SERIES_HORNER_BBP, 0.0, STATIC_SERIES_BIN_SPLIT_BBP, STATIC_SERIES_BIN_SPLIT_FIXED];
+        cheapest::<Self>(ctx, a, b, (len, zeros), ok, (ctx.0, 0, 1), w)
+    }
+
+    fn horner(ctx: &Shift, a: u64, b: u64, zeros: usize, out: &mut [u64]) -> bool {
+        let n = acc_len(out.len());
+        let (mut acc, mut t) = ([0; N], [0; N]);
+        let kernel = |bit: Bit, acc: &mut [u64]| horner_bbp::<Narrow<S>>(a, b, bit, acc, &mut t[..n]);
+        horner_run((ctx.0, a, zeros), out, &mut acc[..n], S::SIGNED, kernel)
+    }
+}
+
+impl<S: WideEngelSeries> SeriesNode for DynNodeEngel<S> {
+    fn eligible(_: &Shift, a: u64, b: u64, _: usize, _: usize) -> Eligible {
+        let horner = fits_u64(a, b, |n| S::p(n) | S::q(n));
+        Eligible { horner, rect: false }
+    }
+
+    fn dispatch(ctx: &Shift, a: u64, b: u64, len: usize, zeros: usize) -> SeriesAlg {
+        let ok = Self::eligible(ctx, a, b, len, zeros);
+        let w = [DYN_SERIES_HORNER_ENGEL, 0.0, DYN_SERIES_BIN_SPLIT_ENGEL, DYN_SERIES_BIN_SPLIT_FIXED];
+        cheapest::<Self>(ctx, a, b, (len, zeros), ok, (ctx.0, 0, 1), w)
+    }
+
+    fn horner(ctx: &Shift, a: u64, b: u64, zeros: usize, out: &mut [u64]) -> bool {
+        let mut scratch = ScratchGuard::acquire();
+        let acc = scratch.get(acc_len(out.len()));
+        let kernel = |bit: Bit, acc: &mut [u64]| horner_engel::<Narrow<S>>(a, b, bit, acc);
+        horner_run((ctx.0, a, zeros), out, acc, S::SIGNED, kernel)
+    }
+}
+
+impl<const N: usize, S: WideEngelSeries> SeriesNode for StaticNodeEngel<N, S> {
+    fn eligible(_: &Shift, a: u64, b: u64, len: usize, _: usize) -> Eligible {
+        let horner = acc_len(len) <= N && fits_u64(a, b, |n| S::p(n) | S::q(n));
+        Eligible { horner, rect: false }
+    }
+
+    fn dispatch(ctx: &Shift, a: u64, b: u64, len: usize, zeros: usize) -> SeriesAlg {
+        let ok = Self::eligible(ctx, a, b, len, zeros);
+        let w = [STATIC_SERIES_HORNER_ENGEL, 0.0, STATIC_SERIES_BIN_SPLIT_ENGEL, STATIC_SERIES_BIN_SPLIT_FIXED];
+        cheapest::<Self>(ctx, a, b, (len, zeros), ok, (ctx.0, 0, 1), w)
+    }
+
+    fn horner(ctx: &Shift, a: u64, b: u64, zeros: usize, out: &mut [u64]) -> bool {
+        let mut acc = [0; N];
+        let kernel = |bit: Bit, acc: &mut [u64]| horner_engel::<Narrow<S>>(a, b, bit, acc);
+        horner_run((ctx.0, a, zeros), out, &mut acc[..acc_len(out.len())], S::SIGNED, kernel)
+    }
+}
+
+impl<S: WideHyperSeries> SeriesNode for DynNodeHyper<S> {
+    const RECT: bool = true;
+
+    fn eligible(ctx: &DynHyperCtx, a: u64, b: u64, _: usize, _: usize) -> Eligible {
+        let horner = hyper_narrow::<S>(a, b, ctx.shift, ctx.x_bits);
+        let rect = horner && ctx.x.as_ref().is_some_and(|x| x.len() >= 2);
+        Eligible { horner, rect }
+    }
+
+    fn dispatch(ctx: &DynHyperCtx, a: u64, b: u64, len: usize, zeros: usize) -> SeriesAlg {
+        let ok = Self::eligible(ctx, a, b, len, zeros);
+        let (k, xl) = (ctx.shift.saturating_sub(ctx.x_bits), ctx.x.as_ref().map_or(0, Vec::len));
+        let w = [
+            DYN_SERIES_HORNER_HYPER,
+            DYN_SERIES_RECT_HYPER,
+            DYN_SERIES_BIN_SPLIT_HYPER,
+            DYN_SERIES_BIN_SPLIT_FIXED,
+        ];
+        cheapest::<Self>(ctx, a, b, (len, zeros), ok, (k, xl, usize::MAX), w)
+    }
+
+    fn horner(ctx: &DynHyperCtx, a: u64, b: u64, zeros: usize, out: &mut [u64]) -> bool {
+        let (n, x) = (acc_len(out.len()), ctx.x.as_deref());
+        let mut scratch = ScratchGuard::acquire();
+        let bufs = scratch.get_splits([n, n, x.map_or(0, <[u64]>::len)]);
+        hyper_horner::<S>((ctx.shift, x), a, b, zeros, out, bufs, hi_mul_dyn)
+    }
+
+    fn rect(ctx: &DynHyperCtx, a: u64, b: u64, zeros: usize, out: &mut [u64]) -> bool {
+        rect_dyn_m::<S>(ctx, a, b, zeros, out, rect_m(b - a, usize::MAX))
+    }
+}
+
+impl<const N: usize, S: WideHyperSeries> SeriesNode for StaticNodeHyper<N, S> {
+    const RECT: bool = true;
+
+    fn eligible(ctx: &StaticHyperCtx<N>, a: u64, b: u64, len: usize, _: usize) -> Eligible {
+        let horner = acc_len(len) <= N && hyper_narrow::<S>(a, b, ctx.shift, ctx.x_bits);
+        let rect = horner && ctx.x.as_ref().is_some_and(|&(_, l)| l >= 2);
+        Eligible { horner, rect }
+    }
+
+    fn dispatch(ctx: &StaticHyperCtx<N>, a: u64, b: u64, len: usize, zeros: usize) -> SeriesAlg {
+        let ok = Self::eligible(ctx, a, b, len, zeros);
+        let (k, xl) = (ctx.shift.saturating_sub(ctx.x_bits), ctx.x.as_ref().map_or(0, |x| x.1));
+        let w = [
+            STATIC_SERIES_HORNER_HYPER,
+            STATIC_SERIES_RECT_HYPER,
+            STATIC_SERIES_BIN_SPLIT_HYPER,
+            STATIC_SERIES_BIN_SPLIT_FIXED,
+        ];
+        cheapest::<Self>(ctx, a, b, (len, zeros), ok, (k, xl, RECT_MAX_M), w)
+    }
+
+    fn horner(ctx: &StaticHyperCtx<N>, a: u64, b: u64, zeros: usize, out: &mut [u64]) -> bool {
+        let n = acc_len(out.len());
+        let x = ctx.x.as_ref().map(|(x, l)| &x[..*l]);
+        let (mut acc, mut tmp, mut xs) = ([0; N], [0; N], [0; N]);
+        let bufs = [&mut acc[..n], &mut tmp[..n], &mut xs[..]];
+        hyper_horner::<S>((ctx.shift, x), a, b, zeros, out, bufs, hi_mul_static::<N>)
+    }
+
+    #[inline(never)]
+    fn rect(ctx: &StaticHyperCtx<N>, a: u64, b: u64, zeros: usize, out: &mut [u64]) -> bool {
+        let (x, l) = ctx.x.as_ref().expect("rect needs x != 1");
+        let (n, m) = (acc_len(out.len()), rect_m(b - a, RECT_MAX_M));
+        let (mut acc, mut tmp, mut xs) = ([0; N], [0; N], [0; N]);
+        let bufs = [&mut acc[..n], &mut tmp[..n], &mut xs[..]];
+        let mut store = [[0; N]; RECT_MAX_M];
+        let mut pw = store.each_mut().map(|p| &mut p[..n]);
+        let x = (ctx.shift, &x[..*l]);
+        hyper_rect::<S>(x, a, b, zeros, out, bufs, &mut pw[..m], hi_mul_static::<N>)
     }
 }

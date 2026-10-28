@@ -1,4 +1,4 @@
-use big_bits::utils::bin_split::{
+use big_bits::utils::series::{
     bin_split, BBPSeries, DynHyperCtx, DynNodeBBP, DynNodeEngel, DynNodeHyper, EngelSeries,
     HyperSeries, Node, Shift, SplitCutoffs,
 };

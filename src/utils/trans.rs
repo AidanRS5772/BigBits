@@ -1,4 +1,4 @@
-use crate::utils::bin_split::{
+use crate::utils::series::{
     bin_split, join2, ratio_to_fraction_dyn, ratio_to_fraction_static, static_split_stack,
     BBPSeries, DynHyperCtx, DynNodeBBP, DynNodeEngel, DynNodeHyper, EngelSeries, HyperSeries, Node,
     Shift, StaticHyperCtx, StaticNodeBBP, StaticNodeEngel, StaticNodeHyper,

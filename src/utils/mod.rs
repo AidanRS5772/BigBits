@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 
-pub mod bin_split;
+pub mod series;
 pub mod consts;
 pub mod div;
 pub mod mul;
@@ -197,6 +197,30 @@ pub const STATIC_HYPER_LEAF_TERMS: u64 = 8;
 // this many limbs.
 pub const DYN_BIN_SPLIT_PAR_CUTOFF: u64 = 256;
 pub const DYN_BIN_SPLIT_MERGE_PAR_CUTOFF: usize = 256;
+
+// series_eval weighs each eligible algorithm's work estimate (series.rs's horner_work,
+// rect_work and bin_split_work) and takes the cheapest. Horner's weights are per
+// limb-step, mostly div_prim's hardware division; rect's per high-product limb, and also
+// per limb of Horner's x products; bin_split's per limb product, plus a fixed cost for its
+// nodes and finalize. GUESS: every value is a placeholder, not measured.
+pub const DYN_SERIES_HORNER_BBP: f64 = 8.0;
+pub const DYN_SERIES_HORNER_ENGEL: f64 = 4.0;
+pub const DYN_SERIES_HORNER_HYPER: f64 = 5.0;
+pub const DYN_SERIES_RECT_HYPER: f64 = 1.0;
+pub const DYN_SERIES_BIN_SPLIT_BBP: f64 = 1.0;
+pub const DYN_SERIES_BIN_SPLIT_ENGEL: f64 = 1.0;
+pub const DYN_SERIES_BIN_SPLIT_HYPER: f64 = 1.0;
+pub const DYN_SERIES_BIN_SPLIT_FIXED: f64 = 1000.0;
+pub const STATIC_SERIES_HORNER_BBP: f64 = 8.0;
+pub const STATIC_SERIES_HORNER_ENGEL: f64 = 4.0;
+pub const STATIC_SERIES_HORNER_HYPER: f64 = 5.0;
+pub const STATIC_SERIES_RECT_HYPER: f64 = 1.0;
+pub const STATIC_SERIES_BIN_SPLIT_BBP: f64 = 1.0;
+pub const STATIC_SERIES_BIN_SPLIT_ENGEL: f64 = 1.0;
+pub const STATIC_SERIES_BIN_SPLIT_HYPER: f64 = 1.0;
+pub const STATIC_SERIES_BIN_SPLIT_FIXED: f64 = 500.0;
+// Rectangular splitting's block length, about this times sqrt(terms). GUESS.
+pub const SERIES_RECT_M_SCALE: f64 = 1.0;
 
 // exp_dyn_entry evaluates its chunk series in parallel once it has at least two chunks
 // and chunks * working limbs reaches this, on a pool of two or more threads. Chunks

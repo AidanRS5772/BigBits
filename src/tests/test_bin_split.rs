@@ -1,4 +1,5 @@
-use crate::utils::bin_split::*;
+use super::exact_fraction;
+use crate::utils::series::*;
 use crate::utils::consts::consts::{
     ln2_dyn, ln2_static, pi_dyn, pi_static, pi_static_sum, LN2_LIMBS, PI_LIMBS,
 };
@@ -338,29 +339,6 @@ fn test_pi_static_small_n() {
     assert_eq!(err, Err(CapacityError { min_n: PI_LIMBS + 4 }));
     assert!(out.iter().all(|&l| l == 7));
     assert_eq!(pi_static_sum::<4>(&mut [0; 2]), Err(CapacityError { min_n: 5 }));
-}
-
-// floor(p 2^(64 len - shift) / q) by one exact division of the full operands.
-fn exact_fraction(p: &[u64], q: &[u64], shift: i64, len: usize) -> Vec<u64> {
-    let e = 64 * len as i64 - shift;
-    assert!(e >= 0);
-    let (w, v) = ((e / 64) as usize, (e % 64) as u32);
-    let mut n = vec![0; w + p.len() + 1];
-    n[w..w + p.len()].copy_from_slice(p);
-    if v != 0 {
-        for i in (w..n.len()).rev() {
-            n[i] = (n[i] << v) | if i > w { n[i - 1] >> (64 - v) } else { 0 };
-        }
-    }
-    trim_lz(&mut n);
-    let mut quo = vec![0; n.len().saturating_sub(q.len()) + 1];
-    div_dyn(&n, q, &mut quo);
-    assert!(
-        quo[len.min(quo.len())..].iter().all(|&l| l == 0),
-        "S must be below 1"
-    );
-    quo.resize(len, 0);
-    quo
 }
 
 // Static finalize up to its out.len() + 2 <= N bound, against the exact quotient

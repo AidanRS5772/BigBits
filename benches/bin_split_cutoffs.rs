@@ -13,7 +13,7 @@
 // relative to the workload's best; the summary is the geometric mean over workloads.
 
 use big_bits::utils::{
-    bin_split::{
+    series::{
         bin_split_tree_at, BBPSeries, DynHyperCtx, DynNodeBBP, DynNodeEngel, DynNodeHyper,
         HyperSeries, Node, Shift, SplitCutoffs, StaticHyperCtx, StaticNodeBBP, StaticNodeEngel,
         StaticNodeHyper,
