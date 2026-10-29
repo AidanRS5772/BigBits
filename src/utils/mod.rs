@@ -101,6 +101,12 @@ pub const STATIC_PARTIAL_SQR_CUTOFF: usize = 640;
 pub const HI_MUL_ROW_CUTOFF: usize = 24;
 pub const HI_SQR_ROW_CUTOFF: usize = 90;
 
+// mul_add_prim runs its plain mul loop below this many limbs and its mulx/adcx
+// loop from it, behind the ADX feature check, which costs about 2 ns a call. The
+// plain loop is ahead through 16 limbs (14% against 11% faster than the old
+// per-limb loop) and the mulx loop from 20 (17% against 15%), single runs.
+pub const MUL_PRIM_ADX_CUTOFF: usize = 20;
+
 // mid_mul_dyn uses mid_mul_buf below this and fft_mid_mul from it: the FFT is
 // significantly faster at every size from 125 to 320, but at 122-124 its transform
 // size steps up and it loses by up to 7.5%.

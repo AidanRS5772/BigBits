@@ -25,54 +25,141 @@ use std::arch::aarch64::*;
 // General: O(ls)
 // Primitive Optimizations: O(l)
 
+// buf = buf * s + c in place, returning the top limb. The whole loop is one asm
+// block, so the running carry stays in a register instead of passing through Rust
+// between limbs.
+
+// mul clobbers the flags, so each pass multiplies two limbs into registers and
+// then closes the pair with one add/adc/adc chain. The pair's top limb can't
+// overflow (c + s * buf[i..i + 2] < 2^192), and the block needs only caller-saved
+// registers, so short calls pay no spills.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn mul_prim_carry_x86(val: u64, prim: u64, carry: u64) -> (u64, u64) {
-    let lo: u64;
-    let hi: u64;
+unsafe fn mul_add_prim_base(buf: &mut [u64], s: u64, c: u64) -> u64 {
+    let (len, p) = (buf.len(), buf.as_mut_ptr());
+    let top: u64;
     asm!(
-        "mul {prim}",
-        "add rax, {carry}",
+        // An odd limb first, then pairs.
+        "shr {n}, 1",
+        "jnc 2f",
+        "mov rax, [{p}]",
+        "mul {s}",
+        "add rax, {c}",
         "adc rdx, 0",
-        prim = in(reg) prim,
-        carry = in(reg) carry,
-        inout("rax") val => lo,
-        out("rdx") hi,
-        options(nostack, nomem),
+        "mov [{p}], rax",
+        "mov {c}, rdx",
+        "add {p}, 8",
+        "2:",
+        "test {n}, {n}",
+        "jz 4f",
+        "3:",
+        "mov rax, [{p}]",
+        "mul {s}",
+        "mov {l0}, rax",
+        "mov {h0}, rdx",
+        "mov rax, [{p} + 8]",
+        "mul {s}",
+        "add {l0}, {c}",
+        "adc rax, {h0}",
+        "adc rdx, 0",
+        "mov [{p}], {l0}",
+        "mov [{p} + 8], rax",
+        "mov {c}, rdx",
+        "add {p}, 16",
+        "dec {n}",
+        "jnz 3b",
+        "4:",
+        s = in(reg) s,
+        p = inout(reg) p => _,
+        n = inout(reg) len => _,
+        c = inout(reg) c => top,
+        l0 = out(reg) _,
+        h0 = out(reg) _,
+        out("rax") _,
+        out("rdx") _,
+        options(nostack),
     );
-    (lo, hi)
+    top
 }
 
+// mulx leaves the flags alone, so one adcx chain (CF) runs through the whole row:
+// Adx's set row, with buf as both the row and its output.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2,adx")]
+unsafe fn mul_add_prim_adx(buf: &mut [u64], s: u64, c: u64) -> u64 {
+    adx_set_row(s, buf.as_ptr(), buf.as_mut_ptr(), buf.len(), c)
+}
+
+// One carry flag, as in Base::set: each pass of four limbs multiplies them all,
+// then adds the low limbs and the high limbs one up in a single adds/adcs chain.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn mul_prim_carry_aarch(val: u64, prim: u64, carry: u64) -> (u64, u64) {
-    let lo: u64;
-    let hi: u64;
+unsafe fn mul_add_prim_base(buf: &mut [u64], s: u64, c: u64) -> u64 {
+    let (len, p) = (buf.len(), buf.as_mut_ptr());
+    let top: u64;
     asm!(
-        "mul {lo}, {val}, {prim}",
-        "umulh {hi}, {val}, {prim}",
-        "adds {lo}, {lo}, {carry}",
-        "adc {hi}, {hi}, xzr",
-        val = in(reg) val,
-        prim = in(reg) prim,
-        carry = in(reg) carry,
-        lo = out(reg) lo,
-        hi = out(reg) hi,
-        options(nostack, nomem),
+        "cbz {n}, 3f",
+        "2:",
+        "ldp {a0}, {a1}, [{p}]",
+        "ldp {a2}, {a3}, [{p}, #16]",
+        "umulh {h0}, {a0}, {s}",
+        "mul {a0}, {a0}, {s}",
+        "umulh {h1}, {a1}, {s}",
+        "mul {a1}, {a1}, {s}",
+        "umulh {h2}, {a2}, {s}",
+        "mul {a2}, {a2}, {s}",
+        "umulh {h3}, {a3}, {s}",
+        "mul {a3}, {a3}, {s}",
+        "adds {a0}, {a0}, {c}",
+        "adcs {a1}, {a1}, {h0}",
+        "adcs {a2}, {a2}, {h1}",
+        "adcs {a3}, {a3}, {h2}",
+        // No carry out: c + s * buf[i..i + 4] < 2^320.
+        "adc {c}, {h3}, xzr",
+        "stp {a0}, {a1}, [{p}], #16",
+        "stp {a2}, {a3}, [{p}], #16",
+        "sub {n}, {n}, #1",
+        "cbnz {n}, 2b",
+        "3:",
+
+        "cbz {rem}, 5f",
+        "4:",
+        "ldr {a0}, [{p}]",
+        "umulh {h0}, {a0}, {s}",
+        "mul {a0}, {a0}, {s}",
+        "adds {a0}, {a0}, {c}",
+        "adc {c}, {h0}, xzr",                   // h0 <= 2^64 - 2, so no carry out
+        "str {a0}, [{p}], #8",
+        "sub {rem}, {rem}, #1",
+        "cbnz {rem}, 4b",
+        "5:",
+        s = in(reg) s,
+        p = inout(reg) p => _,
+        n = inout(reg) len / 4 => _,
+        rem = inout(reg) len % 4 => _,
+        c = inout(reg) c => top,
+        a0 = out(reg) _,
+        a1 = out(reg) _,
+        a2 = out(reg) _,
+        a3 = out(reg) _,
+        h0 = out(reg) _,
+        h1 = out(reg) _,
+        h2 = out(reg) _,
+        h3 = out(reg) _,
+        options(nostack),
     );
-    (lo, hi)
+    top
 }
 
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline(always)]
-unsafe fn mul_prim_carry_asm(val: u64, prim: u64, carry: u64) -> (u64, u64) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        mul_prim_carry_aarch(val, prim, carry)
+unsafe fn mul_add_prim_base(buf: &mut [u64], s: u64, mut c: u64) -> u64 {
+    for e in buf {
+        let t = *e as u128 * s as u128 + c as u128;
+        *e = t as u64;
+        c = (t >> 64) as u64;
     }
-    #[cfg(target_arch = "x86_64")]
-    {
-        mul_prim_carry_x86(val, prim, carry)
-    }
+    c
 }
 
 pub fn mul_prim(buf: &mut [u64], prim: u64) -> u64 {
@@ -89,13 +176,11 @@ pub fn mul_prim(buf: &mut [u64], prim: u64) -> u64 {
 // buf = buf * prim + add, returning the carry limb out of the top of buf.
 #[inline]
 pub fn mul_add_prim(buf: &mut [u64], prim: u64, add: u64) -> u64 {
-    let mut carry = add;
-    for e in buf {
-        let (lo, hi) = unsafe { mul_prim_carry_asm(*e, prim, carry) };
-        *e = lo;
-        carry = hi;
+    #[cfg(target_arch = "x86_64")]
+    if buf.len() >= MUL_PRIM_ADX_CUTOFF && adx_available() {
+        return unsafe { mul_add_prim_adx(buf, prim, add) };
     }
-    carry
+    unsafe { mul_add_prim_base(buf, prim, add) }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -153,8 +238,130 @@ pub fn mul_prim2(buf: &mut [u64], prim: u128) -> u128 {
         buf.fill(0);
         return 0;
     }
-    let p0 = prim as u64;
-    let p1 = (prim >> 64) as u64;
+    let (p0, p1) = (prim as u64, (prim >> 64) as u64);
+    if p1 == 0 {
+        return mul_add_prim(buf, p0, 0) as u128;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if adx_available() {
+        return unsafe { mul_prim2_adx(buf, p0, p1) };
+    }
+    unsafe { mul_prim2_base(buf, p0, p1) }
+}
+
+// One pass, four limbs of b at a time. Each output limb sums four partial products,
+// which takes three carry chains (b p0's, b p1's and their sum), and ADX has two
+// flags. So each block runs b p1's row first on CF into registers (ra..rd, one
+// limb up), then b p0's row on CF, adding the b p1 limbs on OF and storing. CF
+// folds into the pending high limb after each row, which can't overflow (a mulx
+// high limb is at most 2^64 - 2), while OF, the sum's carry, stays live to the
+// end: mulx, adcx, mov, lea and jrcxz leave it alone. re carries b p1's limb that
+// lands on the next block's first limb. A clc after each fold writes CF without
+// reading it, so one row's CF chain doesn't wait on the other's (38% faster than
+// the mul loop from 64 limbs, against 31% without). All 13 free registers are in
+// use (one holds zero for the folds), so p0, p1 and len % 4 wait in xmm registers
+// (movq costs port 0, but a stack copy costs store-forwarding at entry). It runs
+// at every length: the mul loop is ahead below 8 limbs, by 6.5 ns at one limb and
+// 2-3 ns from four, too little to dispatch on.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2,adx")]
+unsafe fn mul_prim2_adx(buf: &mut [u64], p0: u64, p1: u64) -> u128 {
+    let (len, p) = (buf.len(), buf.as_mut_ptr());
+    let (hp0, hp1, re, of): (u64, u64, u64, u64);
+    asm!(
+        "xor {z:e}, {z:e}",
+        "xor {hp0:e}, {hp0:e}",
+        "xor {hp1:e}, {hp1:e}",
+        "xor {re:e}, {re:e}",
+        "test rcx, rcx",                        // CF = OF = 0
+        "jz 3f",
+        "2:",
+        // b p1 at limbs 1..4 of the block, into ra..rd.
+        "movq rdx, {p1}",
+        "mulx {x}, {ra}, [{p}]",
+        "adcx {ra}, {hp1}",
+        "mulx {hp1}, {rb}, [{p} + 8]",
+        "adcx {rb}, {x}",
+        "mulx {x}, {rc}, [{p} + 16]",
+        "adcx {rc}, {hp1}",
+        "mulx {hp1}, {rd}, [{p} + 24]",
+        "adcx {rd}, {x}",
+        "adcx {hp1}, {z}",                      // CF = 0
+        "clc",                                  // so b p0's row needn't wait for it
+        // b p0 at limbs 0..3, plus b p1's re, ra, rb, rc on OF.
+        "movq rdx, {p0}",
+        "mulx {x}, {lo}, [{p}]",
+        "adcx {lo}, {hp0}",
+        "adox {lo}, {re}",
+        "mov [{p}], {lo}",
+        "mulx {hp0}, {lo}, [{p} + 8]",
+        "adcx {lo}, {x}",
+        "adox {lo}, {ra}",
+        "mov [{p} + 8], {lo}",
+        "mulx {x}, {lo}, [{p} + 16]",
+        "adcx {lo}, {hp0}",
+        "adox {lo}, {rb}",
+        "mov [{p} + 16], {lo}",
+        "mulx {hp0}, {lo}, [{p} + 24]",
+        "adcx {lo}, {x}",
+        "adox {lo}, {rc}",
+        "mov [{p} + 24], {lo}",
+        "adcx {hp0}, {z}",                      // CF = 0
+        "clc",
+        "mov {re}, {rd}",
+        "lea {p}, [{p} + 32]",
+        "lea rcx, [rcx - 1]",
+        "jrcxz 3f",                             // jrcxz only reaches 128 bytes
+        "jmp 2b",
+        "3:",
+        // The last len % 4 limbs one at a time, the same two rows.
+        "movq rcx, {rm}",
+        "4:",
+        "jrcxz 5f",
+        "movq rdx, {p1}",
+        "mulx {x}, {ra}, [{p}]",
+        "adcx {ra}, {hp1}",
+        "mov {hp1}, {x}",
+        "adcx {hp1}, {z}",
+        "movq rdx, {p0}",
+        "mulx {x}, {lo}, [{p}]",
+        "adcx {lo}, {hp0}",
+        "adox {lo}, {re}",
+        "mov [{p}], {lo}",
+        "mov {hp0}, {x}",
+        "adcx {hp0}, {z}",
+        "mov {re}, {ra}",
+        "lea {p}, [{p} + 8]",
+        "lea rcx, [rcx - 1]",
+        "jmp 4b",
+        "5:",
+        "adox {z}, {z}",                        // z = OF
+        inout("rcx") len / 4 => _,
+        out("rdx") _,
+        p0 = in(xmm_reg) p0,
+        p1 = in(xmm_reg) p1,
+        rm = in(xmm_reg) (len % 4) as u64,
+        p = inout(reg) p => _,
+        hp0 = out(reg) hp0,
+        hp1 = out(reg) hp1,
+        re = out(reg) re,
+        z = out(reg) of,
+        lo = out(reg) _,
+        x = out(reg) _,
+        ra = out(reg) _,
+        rb = out(reg) _,
+        rc = out(reg) _,
+        rd = out(reg) _,
+        options(nostack),
+    );
+    // b p0's high limb, b p1's last low limb and OF land on limb len, b p1's high
+    // limb on len + 1. The product's top two limbs can't overflow u128.
+    hp0 as u128 + re as u128 + of as u128 + ((hp1 as u128) << 64)
+}
+
+// buf = buf * (p1 B + p0) in place for nonempty buf, returning the top two limbs.
+#[inline(always)]
+unsafe fn mul_prim2_base(buf: &mut [u64], p0: u64, p1: u64) -> u128 {
     let len = buf.len();
 
     let mut acc0: u64 = 0;
@@ -408,135 +615,148 @@ impl Rows for Adx {
     #[inline(always)]
     unsafe fn add(s: u64, l: &[u64], out: &mut [u64]) -> u64 {
         debug_assert!(out.len() >= l.len());
-        let (len, l, out) = (l.len(), l.as_ptr(), out.as_mut_ptr());
-        let top: u64;
-        asm!(
-            "xor {h0:e}, {h0:e}",                   // h0 = 0 and CF = OF = 0
-            // Four limbs per pass; the high limb alternates between h0 and h1.
-            "2:",
-            "jrcxz 3f",
-            "mulx {h1}, {lo}, [{l}]",
-            "adcx {lo}, {h0}",
-            "adox {lo}, [{o}]",
-            "mov [{o}], {lo}",
-            "mulx {h0}, {lo}, [{l} + 8]",
-            "adcx {lo}, {h1}",
-            "adox {lo}, [{o} + 8]",
-            "mov [{o} + 8], {lo}",
-            "mulx {h1}, {lo}, [{l} + 16]",
-            "adcx {lo}, {h0}",
-            "adox {lo}, [{o} + 16]",
-            "mov [{o} + 16], {lo}",
-            "mulx {h0}, {lo}, [{l} + 24]",
-            "adcx {lo}, {h1}",
-            "adox {lo}, [{o} + 24]",
-            "mov [{o} + 24], {lo}",
-            "lea {l}, [{l} + 32]",
-            "lea {o}, [{o} + 32]",
-            "lea rcx, [rcx - 1]",
-            "jmp 2b",
-            "3:",
-            // The last len % 4 limbs, leaving by jrcxz as rcx runs out.
-            "mov rcx, {rem}",
-            "jrcxz 5f",
-            "mulx {h1}, {lo}, [{l}]",
-            "adcx {lo}, {h0}",
-            "adox {lo}, [{o}]",
-            "mov [{o}], {lo}",
-            "lea rcx, [rcx - 1]",
-            "jrcxz 4f",
-            "mulx {h0}, {lo}, [{l} + 8]",
-            "adcx {lo}, {h1}",
-            "adox {lo}, [{o} + 8]",
-            "mov [{o} + 8], {lo}",
-            "lea rcx, [rcx - 1]",
-            "jrcxz 5f",
-            "mulx {h1}, {lo}, [{l} + 16]",
-            "adcx {lo}, {h0}",
-            "adox {lo}, [{o} + 16]",
-            "mov [{o} + 16], {lo}",
-            "lea rcx, [rcx - 1]",
-            "4:",
-            "mov {h0}, {h1}",
-            "5:",
-            // Fold both carries into the top limb, which can't overflow
-            // (out + s l < 2^(64(len + 1))). rcx is zero here.
-            "adcx {h0}, rcx",
-            "adox {h0}, rcx",
-            inout("rdx") s => _,
-            inout("rcx") len / 4 => _,
-            rem = in(reg) len % 4,
-            l = inout(reg) l => _,
-            o = inout(reg) out => _,
-            h0 = out(reg) top,
-            h1 = out(reg) _,
-            lo = out(reg) _,
-            options(nostack),
-        );
-        top
+        adx_add_row(s, l.as_ptr(), out.as_mut_ptr(), l.len(), 0)
     }
 
     #[inline(always)]
     unsafe fn set(s: u64, l: &[u64], out: &mut [u64]) -> u64 {
         debug_assert!(out.len() >= l.len());
-        let (len, l, out) = (l.len(), l.as_ptr(), out.as_mut_ptr());
-        let top: u64;
-        asm!(
-            "xor {h0:e}, {h0:e}",                   // h0 = 0 and CF = 0
-            // Four limbs per pass, as in add.
-            "2:",
-            "jrcxz 3f",
-            "mulx {h1}, {lo}, [{l}]",
-            "adcx {lo}, {h0}",
-            "mov [{o}], {lo}",
-            "mulx {h0}, {lo}, [{l} + 8]",
-            "adcx {lo}, {h1}",
-            "mov [{o} + 8], {lo}",
-            "mulx {h1}, {lo}, [{l} + 16]",
-            "adcx {lo}, {h0}",
-            "mov [{o} + 16], {lo}",
-            "mulx {h0}, {lo}, [{l} + 24]",
-            "adcx {lo}, {h1}",
-            "mov [{o} + 24], {lo}",
-            "lea {l}, [{l} + 32]",
-            "lea {o}, [{o} + 32]",
-            "lea rcx, [rcx - 1]",
-            "jmp 2b",
-            "3:",
-            // The last len % 4 limbs, leaving by jrcxz as rcx runs out.
-            "mov rcx, {rem}",
-            "jrcxz 5f",
-            "mulx {h1}, {lo}, [{l}]",
-            "adcx {lo}, {h0}",
-            "mov [{o}], {lo}",
-            "lea rcx, [rcx - 1]",
-            "jrcxz 4f",
-            "mulx {h0}, {lo}, [{l} + 8]",
-            "adcx {lo}, {h1}",
-            "mov [{o} + 8], {lo}",
-            "lea rcx, [rcx - 1]",
-            "jrcxz 5f",
-            "mulx {h1}, {lo}, [{l} + 16]",
-            "adcx {lo}, {h0}",
-            "mov [{o} + 16], {lo}",
-            "lea rcx, [rcx - 1]",
-            "4:",
-            "mov {h0}, {h1}",
-            "5:",
-            // Fold the carry into the top limb, which can't overflow. rcx is zero here.
-            "adcx {h0}, rcx",
-            inout("rdx") s => _,
-            inout("rcx") len / 4 => _,
-            rem = in(reg) len % 4,
-            l = inout(reg) l => _,
-            o = inout(reg) out => _,
-            h0 = out(reg) top,
-            h1 = out(reg) _,
-            lo = out(reg) _,
-            options(nostack),
-        );
-        top
+        adx_set_row(s, l.as_ptr(), out.as_mut_ptr(), l.len(), 0)
     }
+}
+
+// out[..len] += s * l[..len] + c, returning the top limb.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn adx_add_row(s: u64, l: *const u64, out: *mut u64, len: usize, c: u64) -> u64 {
+    let top: u64;
+    asm!(
+        "test {h0}, 0",                         // CF = OF = 0
+        // Four limbs per pass; the high limb alternates between h0 and h1.
+        "2:",
+        "jrcxz 3f",
+        "mulx {h1}, {lo}, [{l}]",
+        "adcx {lo}, {h0}",
+        "adox {lo}, [{o}]",
+        "mov [{o}], {lo}",
+        "mulx {h0}, {lo}, [{l} + 8]",
+        "adcx {lo}, {h1}",
+        "adox {lo}, [{o} + 8]",
+        "mov [{o} + 8], {lo}",
+        "mulx {h1}, {lo}, [{l} + 16]",
+        "adcx {lo}, {h0}",
+        "adox {lo}, [{o} + 16]",
+        "mov [{o} + 16], {lo}",
+        "mulx {h0}, {lo}, [{l} + 24]",
+        "adcx {lo}, {h1}",
+        "adox {lo}, [{o} + 24]",
+        "mov [{o} + 24], {lo}",
+        "lea {l}, [{l} + 32]",
+        "lea {o}, [{o} + 32]",
+        "lea rcx, [rcx - 1]",
+        "jmp 2b",
+        "3:",
+        // The last len % 4 limbs, leaving by jrcxz as rcx runs out.
+        "mov rcx, {rem}",
+        "jrcxz 5f",
+        "mulx {h1}, {lo}, [{l}]",
+        "adcx {lo}, {h0}",
+        "adox {lo}, [{o}]",
+        "mov [{o}], {lo}",
+        "lea rcx, [rcx - 1]",
+        "jrcxz 4f",
+        "mulx {h0}, {lo}, [{l} + 8]",
+        "adcx {lo}, {h1}",
+        "adox {lo}, [{o} + 8]",
+        "mov [{o} + 8], {lo}",
+        "lea rcx, [rcx - 1]",
+        "jrcxz 5f",
+        "mulx {h1}, {lo}, [{l} + 16]",
+        "adcx {lo}, {h0}",
+        "adox {lo}, [{o} + 16]",
+        "mov [{o} + 16], {lo}",
+        "lea rcx, [rcx - 1]",
+        "4:",
+        "mov {h0}, {h1}",
+        "5:",
+        // Fold both carries into the top limb, which can't overflow
+        // (out + c + s l < 2^(64(len + 1))). rcx is zero here.
+        "adcx {h0}, rcx",
+        "adox {h0}, rcx",
+        inout("rdx") s => _,
+        inout("rcx") len / 4 => _,
+        rem = in(reg) len % 4,
+        l = inout(reg) l => _,
+        o = inout(reg) out => _,
+        h0 = inout(reg) c => top,
+        h1 = out(reg) _,
+        lo = out(reg) _,
+        options(nostack),
+    );
+    top
+}
+
+// out[..len] = s * l[..len] + c, returning the top limb. out may be l itself:
+// each limb is read before it is stored.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn adx_set_row(s: u64, l: *const u64, out: *mut u64, len: usize, c: u64) -> u64 {
+    let top: u64;
+    asm!(
+        "test {h0}, 0",                         // CF = 0
+        // Four limbs per pass, as in add.
+        "2:",
+        "jrcxz 3f",
+        "mulx {h1}, {lo}, [{l}]",
+        "adcx {lo}, {h0}",
+        "mov [{o}], {lo}",
+        "mulx {h0}, {lo}, [{l} + 8]",
+        "adcx {lo}, {h1}",
+        "mov [{o} + 8], {lo}",
+        "mulx {h1}, {lo}, [{l} + 16]",
+        "adcx {lo}, {h0}",
+        "mov [{o} + 16], {lo}",
+        "mulx {h0}, {lo}, [{l} + 24]",
+        "adcx {lo}, {h1}",
+        "mov [{o} + 24], {lo}",
+        "lea {l}, [{l} + 32]",
+        "lea {o}, [{o} + 32]",
+        "lea rcx, [rcx - 1]",
+        "jmp 2b",
+        "3:",
+        // The last len % 4 limbs, leaving by jrcxz as rcx runs out.
+        "mov rcx, {rem}",
+        "jrcxz 5f",
+        "mulx {h1}, {lo}, [{l}]",
+        "adcx {lo}, {h0}",
+        "mov [{o}], {lo}",
+        "lea rcx, [rcx - 1]",
+        "jrcxz 4f",
+        "mulx {h0}, {lo}, [{l} + 8]",
+        "adcx {lo}, {h1}",
+        "mov [{o} + 8], {lo}",
+        "lea rcx, [rcx - 1]",
+        "jrcxz 5f",
+        "mulx {h1}, {lo}, [{l} + 16]",
+        "adcx {lo}, {h0}",
+        "mov [{o} + 16], {lo}",
+        "lea rcx, [rcx - 1]",
+        "4:",
+        "mov {h0}, {h1}",
+        "5:",
+        // Fold the carry into the top limb, which can't overflow. rcx is zero here.
+        "adcx {h0}, rcx",
+        inout("rdx") s => _,
+        inout("rcx") len / 4 => _,
+        rem = in(reg) len % 4,
+        l = inout(reg) l => _,
+        o = inout(reg) out => _,
+        h0 = inout(reg) c => top,
+        h1 = out(reg) _,
+        lo = out(reg) _,
+        options(nostack),
+    );
+    top
 }
 
 // The rows every CPU of the architecture runs: AArch64 asm, plain Rust elsewhere.

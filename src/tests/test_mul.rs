@@ -559,7 +559,73 @@ fn test_mul_prim_correctness_single_limb() {
     }
 }
 
+// Every tail and unroll shape of both asm loops, on each side of
+// MUL_PRIM_ADX_CUTOFF, against a u128 loop. Limbs and multipliers lean toward
+// u64::MAX so every carry chain runs at its limit.
+#[test]
+fn test_mul_add_prim_asm_loops() {
+    use crate::utils::MUL_PRIM_ADX_CUTOFF;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(0x6d75_6c70);
+    let limb = |rng: &mut StdRng| match rng.gen_range(0..4) {
+        0 => u64::MAX,
+        1 => 0,
+        _ => rng.gen(),
+    };
+    for len in (0..MUL_PRIM_ADX_CUTOFF + 40).chain([100, 255, 256, 257, 1000]) {
+        for _ in 0..200 {
+            let v: Vec<u64> = (0..len).map(|_| limb(&mut rng)).collect();
+            let (s, add) = (limb(&mut rng), limb(&mut rng));
+            let mut want = v.clone();
+            let mut c = add;
+            for e in &mut want {
+                let t = *e as u128 * s as u128 + c as u128;
+                *e = t as u64;
+                c = (t >> 64) as u64;
+            }
+            let mut got = v.clone();
+            let top = mul_add_prim(&mut got, s, add);
+            assert_eq!((got, top), (want, c), "len {len}, s {s:#x}, add {add:#x}");
+        }
+    }
+}
+
 // ─── Section 2: mul_prim2 ───────────────────────────────────────────────────
+
+// mul_prim2's asm loop (its four-limb blocks and every len % 4 tail) against a
+// u128 loop. Limbs and multiplier halves lean toward u64::MAX and 0, which drive
+// both carry chains and the folds into the high limbs (p1 = 0 takes mul_prim's
+// path).
+#[test]
+fn test_mul_prim2_asm_loops() {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(0x6d75_6c32);
+    let limb = |rng: &mut StdRng| match rng.gen_range(0..4) {
+        0 => u64::MAX,
+        1 => 0,
+        _ => rng.gen(),
+    };
+    let lens = (0..64).chain([100, 255, 256, 257, 258, 1000, 1025]);
+    for len in lens {
+        for _ in 0..100 {
+            let v: Vec<u64> = (0..len).map(|_| limb(&mut rng)).collect();
+            let (p0, p1) = (limb(&mut rng), limb(&mut rng));
+            let mut want = v.clone();
+            let (mut c0, mut c1) = (0u64, 0u64);
+            for e in &mut want {
+                // c1:c0 + e * p0 + (e * p1) B, keeping the low limb.
+                let lo = *e as u128 * p0 as u128 + c0 as u128;
+                let hi = *e as u128 * p1 as u128 + c1 as u128 + (lo >> 64);
+                *e = lo as u64;
+                (c0, c1) = (hi as u64, (hi >> 64) as u64);
+            }
+            let mut got = v.clone();
+            let top = mul_prim2(&mut got, (p1 as u128) << 64 | p0 as u128);
+            let want_top = (c1 as u128) << 64 | c0 as u128;
+            assert_eq!((got, top), (want, want_top), "len {len}, p {p1:#x}:{p0:#x}");
+        }
+    }
+}
 
 #[test]
 fn test_mul_prim2_by_one() {
