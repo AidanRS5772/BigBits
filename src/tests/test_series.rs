@@ -106,7 +106,7 @@ impl HyperSeries for SgHyp {
     }
 }
 
-// Horner can't take these: a q past u64, and r(n) > q(n).
+// Wide denominators are supported by Horner; r(n) > q(n) still is not.
 struct WideQ;
 impl WideBBPSeries for WideQ {
     fn p(_: u128) -> u128 {
@@ -137,19 +137,31 @@ fn finalize_shift(k: u64, a: u64, b: u64, zeros: usize) -> i64 {
     (k * (b - a)) as i64 - 64 * zeros as i64
 }
 
-fn want_bbp<S: BBPSeries>(k: u64, a: u64, b: u64, zeros: usize, len: usize) -> Want {
+fn want_bbp<S: WideBBPSeries>(k: u64, a: u64, b: u64, zeros: usize, len: usize) -> Want {
     let n = bin_split::<DynNodeBBP<S>>(&Shift(k), a, b);
     let neg = S::SIGNED && n.neg && !n.p.is_empty();
-    (exact_fraction(&n.p, &n.q, finalize_shift(k, a, b, zeros), len), neg)
+    (
+        exact_fraction(&n.p, &n.q, finalize_shift(k, a, b, zeros), len),
+        neg,
+    )
 }
 
-fn want_engel<S: EngelSeries>(k: u64, a: u64, b: u64, zeros: usize, len: usize) -> Want {
+fn want_engel<S: WideEngelSeries>(k: u64, a: u64, b: u64, zeros: usize, len: usize) -> Want {
     let n = bin_split::<DynNodeEngel<S>>(&Shift(k), a, b);
     let neg = S::SIGNED && n.neg && !n.p.is_empty();
-    (exact_fraction(&n.p, &n.q, finalize_shift(k, a, b, zeros), len), neg)
+    (
+        exact_fraction(&n.p, &n.q, finalize_shift(k, a, b, zeros), len),
+        neg,
+    )
 }
 
-fn want_hyper<S: HyperSeries>(ctx: &DynHyperCtx, a: u64, b: u64, zeros: usize, len: usize) -> Want {
+fn want_hyper<S: WideHyperSeries>(
+    ctx: &DynHyperCtx,
+    a: u64,
+    b: u64,
+    zeros: usize,
+    len: usize,
+) -> Want {
     let n = bin_split::<DynNodeHyper<S>>(ctx, a, b);
     let neg = S::SIGNED && n.neg && !n.p.is_empty();
     let shift = finalize_shift(ctx.shift, a, b, zeros);
@@ -168,7 +180,10 @@ fn assert_close(got: &[u64], got_neg: bool, (want, want_neg): &Want, what: &str)
         _ => (got.to_vec(), &want[..]),
     };
     sub_buf(&mut hi, lo);
-    assert!(tiny(&hi), "{what}: off by more than one\n got {got:x?}\nwant {want:x?}");
+    assert!(
+        tiny(&hi),
+        "{what}: off by more than one\n got {got:x?}\nwant {want:x?}"
+    );
     assert!(tiny(want) || got_neg == *want_neg, "{what}: sign");
 }
 
@@ -178,7 +193,13 @@ fn elig(horner: bool, rect: bool) -> Eligible {
 
 // Every eligible algorithm, forced, and series_eval's own pick against want. Returns the
 // eligibility.
-fn check_algs<N>(ctx: &N::Ctx, (a, b): (u64, u64), zeros: usize, want: &Want, what: &str) -> Eligible
+fn check_algs<N>(
+    ctx: &N::Ctx,
+    (a, b): (u64, u64),
+    zeros: usize,
+    want: &Want,
+    what: &str,
+) -> Eligible
 where
     N: SeriesNode,
     N::Ctx: Sync,
@@ -292,7 +313,12 @@ fn test_horner_and_rect_hyper_x_match_exact() {
 #[test]
 fn test_rect_every_block_length() {
     let mut rng = StdRng::seed_from_u64(12);
-    for (bits, extra, len, t) in [(128, 1, 3, 20), (190, 5, 2, 13), (256, 64, 5, 9), (65, 3, 1, 25)] {
+    for (bits, extra, len, t) in [
+        (128, 1, 3, 20),
+        (190, 5, 2, 13),
+        (256, 64, 5, 9),
+        (65, 3, 1, 25),
+    ] {
         let x = rand_x(bits, &mut rng);
         let ctx = DynHyperCtx::new(&x, bits + extra);
         let want = want_hyper::<Exp>(&ctx, 1, 1 + t, 0, len);
@@ -376,16 +402,22 @@ fn test_series_eval_exp_ln_shapes() {
 
 #[test]
 fn test_series_eligibility_edges() {
-    // Wide values and r(n) > q(n) leave only bin_split, which series_eval then takes.
+    // Wide denominators now allow Horner; r(n) > q(n) still requires bin_split.
     let want = {
         let n = bin_split::<DynNodeBBP<WideQ>>(&Shift(3), 1, 20);
-        (exact_fraction(&n.p, &n.q, finalize_shift(3, 1, 20, 0), 3), false)
+        (
+            exact_fraction(&n.p, &n.q, finalize_shift(3, 1, 20, 0), 3),
+            false,
+        )
     };
     let ok = check_algs::<DynNodeBBP<WideQ>>(&Shift(3), (1, 20), 0, &want, "wide q");
-    assert_eq!(ok, elig(false, false));
+    assert_eq!(ok, elig(true, false));
     let ctx = DynHyperCtx::new_shift(4);
     let want = want_hyper::<RBig>(&ctx, 0, 20, 0, 3);
-    assert_eq!(check_algs::<DynNodeHyper<RBig>>(&ctx, (0, 20), 0, &want, "r > q"), elig(false, false));
+    assert_eq!(
+        check_algs::<DynNodeHyper<RBig>>(&ctx, (0, 20), 0, &want, "r > q"),
+        elig(false, false)
+    );
 
     // Only Hyper kinds have a rect kernel.
     assert!(!DynNodeBBP::<BbpLin>::RECT && !StaticNodeEngel::<8, Exp>::RECT);
@@ -399,38 +431,66 @@ fn test_series_eligibility_edges() {
     assert_eq!(ok, elig(true, true));
 
     // A static accumulator needs out.len() + 3 limbs.
-    assert_eq!(StaticNodeEngel::<8, Exp>::eligible(&Shift(5), 1, 10, 5, 0), elig(true, false));
-    assert_eq!(StaticNodeEngel::<8, Exp>::eligible(&Shift(5), 1, 10, 6, 0), elig(false, false));
+    assert_eq!(
+        StaticNodeEngel::<8, Exp>::eligible(&Shift(5), 1, 10, 5, 0),
+        elig(true, false)
+    );
+    assert_eq!(
+        StaticNodeEngel::<8, Exp>::eligible(&Shift(5), 1, 10, 6, 0),
+        elig(false, false)
+    );
     let ctx = StaticHyperCtx::<8>::new(&x, 70);
-    assert_eq!(StaticNodeHyper::<8, Exp>::eligible(&ctx, 1, 10, 6, 0), elig(false, false));
+    assert_eq!(
+        StaticNodeHyper::<8, Exp>::eligible(&ctx, 1, 10, 6, 0),
+        elig(false, false)
+    );
 }
 
 #[test]
 #[should_panic(expected = "can't sum this range")]
 fn test_series_eval_at_rejects_ineligible() {
     let mut out = [0; 2];
-    series_eval_at::<DynNodeBBP<WideQ>>(&Shift(3), 1, 20, 0, &mut out, SeriesAlg::Horner);
+    series_eval_at::<DynNodeHyper<RBig>>(
+        &DynHyperCtx::new_shift(3),
+        1,
+        20,
+        0,
+        &mut out,
+        SeriesAlg::Horner,
+    );
 }
 
 fn static_suite<const N: usize>() {
     let mut rng = StdRng::seed_from_u64(15 + N as u64);
-    let lens = [1, N / 2, N - 3].into_iter().filter(|&l| l >= 1 && l + 3 <= N);
+    let lens = [1, N / 2, N - 3]
+        .into_iter()
+        .filter(|&l| l >= 1 && l + 3 <= N);
     for len in lens {
         for (k, t) in [(1, 30), (8, 200), (65, 5), (130, 40)] {
             let what = format!("N {N} len {len} k {k} t {t}");
             let zeros = ((k - 1) / 64) as usize;
             let want = want_bbp::<BbpQuad>(k, 1, 1 + t, zeros, len);
-            let ok = check_algs::<StaticNodeBBP<N, BbpQuad>>(&Shift(k), (1, 1 + t), zeros, &want, &what);
+            let ok =
+                check_algs::<StaticNodeBBP<N, BbpQuad>>(&Shift(k), (1, 1 + t), zeros, &want, &what);
             assert_eq!(ok, elig(true, false), "{what}");
             let want = want_engel::<Exp>(k, 1, 1 + t, zeros, len);
             check_algs::<StaticNodeEngel<N, Exp>>(&Shift(k), (1, 1 + t), zeros, &want, &what);
             let want = want_engel::<SgEngel>(k.max(3), 1, 1 + t, 0, len);
-            check_algs::<StaticNodeEngel<N, SgEngel>>(&Shift(k.max(3)), (1, 1 + t), 0, &want, &what);
+            check_algs::<StaticNodeEngel<N, SgEngel>>(
+                &Shift(k.max(3)),
+                (1, 1 + t),
+                0,
+                &want,
+                &what,
+            );
             let (dctx, sctx) = (DynHyperCtx::new_shift(k), StaticHyperCtx::<N>::new(&[1], k));
             let want = want_hyper::<Hyp>(&dctx, 0, t, zeros, len);
             check_algs::<StaticNodeHyper<N, Hyp>>(&sctx, (0, t), zeros, &want, &what);
         }
-        for bits in [40, 64, 128, 190].into_iter().filter(|&b| b <= 64 * N as u64) {
+        for bits in [40, 64, 128, 190]
+            .into_iter()
+            .filter(|&b| b <= 64 * N as u64)
+        {
             for t in [1, 9, 40] {
                 let x = rand_x(bits, &mut rng);
                 let k = bits + 3;
@@ -452,4 +512,333 @@ fn test_static_series_match_exact() {
     static_suite::<8>();
     static_suite::<16>();
     static_suite::<64>();
+}
+
+// Includes u64/u128 boundaries, mixed widths, zero terms, and two-limb carries.
+struct WideTerms<const SIGNED: bool>;
+fn wide_coeffs(n: u128) -> (u128, u128, u128) {
+    let m = u64::MAX as u128;
+    match n % 8 {
+        0 => (0, u128::MAX, 1),
+        1 => (m, m, m),
+        2 => (m + 1, m + 1, m + 1),
+        3 => (m + 2, m + 20, m + 8),
+        4 => (u128::MAX - 1, u128::MAX, u128::MAX),
+        5 => ((1 << 127) + 3, u128::MAX, (1 << 127) + 5),
+        6 => (1, (1 << 70) + 1, 1),
+        _ => ((1 << 90) + 9, (1 << 90) + 17, 1),
+    }
+}
+
+macro_rules! wide_terms {
+    ($trait:ident $(, $r:ident)?) => {
+        impl<const SIGNED: bool> $trait for WideTerms<SIGNED> {
+            const SIGNED: bool = SIGNED;
+            fn p(n: u128) -> u128 { wide_coeffs(n).0 }
+            fn q(n: u128) -> u128 { wide_coeffs(n).1 }
+            $(fn $r(n: u128) -> u128 { wide_coeffs(n).2 })?
+            fn neg(n: u128) -> bool { SIGNED && negative(n as u64) }
+        }
+    };
+}
+wide_terms!(WideBBPSeries);
+wide_terms!(WideEngelSeries);
+wide_terms!(WideHyperSeries, r);
+
+fn wide_dynamic_suite<const SIGNED: bool>() {
+    let mut rng = StdRng::seed_from_u64(91);
+    for k in [3, 63, 64, 65, 130, 200] {
+        for len in [1, 2, 5] {
+            for (a, t) in [(1, 1), (2, 1), (4, 1), (0, 9), (3, 40)] {
+                for zeros in [0, ((k - 1) / 64) as usize] {
+                    let b = a + t;
+                    let what =
+                        format!("wide signed {SIGNED} k {k} len {len} [{a},{b}) zeros {zeros}");
+                    let want = want_bbp::<WideTerms<SIGNED>>(k, a, b, zeros, len);
+                    assert_eq!(
+                        check_algs::<DynNodeBBP<WideTerms<SIGNED>>>(
+                            &Shift(k),
+                            (a, b),
+                            zeros,
+                            &want,
+                            &what
+                        ),
+                        elig(true, false)
+                    );
+                    let want = want_engel::<WideTerms<SIGNED>>(k, a, b, zeros, len);
+                    assert_eq!(
+                        check_algs::<DynNodeEngel<WideTerms<SIGNED>>>(
+                            &Shift(k),
+                            (a, b),
+                            zeros,
+                            &want,
+                            &what
+                        ),
+                        elig(true, false)
+                    );
+                    for x in [vec![1], rand_x(64, &mut rng), rand_x(128, &mut rng)] {
+                        let bits = 64 * (x.len() as u64 - 1)
+                            + (64 - x.last().unwrap().leading_zeros()) as u64;
+                        let shift = if x == [1] { k } else { k + bits };
+                        let ctx = DynHyperCtx::new(&x, shift);
+                        let want = want_hyper::<WideTerms<SIGNED>>(&ctx, a, b, zeros, len);
+                        let narrow = a == 1 && t == 1;
+                        assert_eq!(
+                            check_algs::<DynNodeHyper<WideTerms<SIGNED>>>(
+                                &ctx,
+                                (a, b),
+                                zeros,
+                                &want,
+                                &what
+                            ),
+                            elig(true, narrow && x.len() >= 2)
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_wide_horner_matches_exact() {
+    wide_dynamic_suite::<false>();
+    wide_dynamic_suite::<true>();
+}
+
+fn wide_static_suite<const N: usize>() {
+    let mut rng = StdRng::seed_from_u64(92 + N as u64);
+    for len in [1, N - 4, N - 3] {
+        let ok = elig(len + 4 <= N, false);
+        for (k, a, b) in [(3, 0, 9), (65, 2, 19), (200, 4, 44)] {
+            let zeros = ((k - 1) / 64) as usize;
+            let what = format!("wide static N {N} len {len} k {k}");
+            let want = want_bbp::<WideTerms<true>>(k, a, b, zeros, len);
+            assert_eq!(
+                check_algs::<StaticNodeBBP<N, WideTerms<true>>>(
+                    &Shift(k),
+                    (a, b),
+                    zeros,
+                    &want,
+                    &what
+                ),
+                ok
+            );
+            let want = want_engel::<WideTerms<true>>(k, a, b, zeros, len);
+            assert_eq!(
+                check_algs::<StaticNodeEngel<N, WideTerms<true>>>(
+                    &Shift(k),
+                    (a, b),
+                    zeros,
+                    &want,
+                    &what
+                ),
+                ok
+            );
+            for x in [vec![1], rand_x(128, &mut rng)] {
+                let shift = k + if x.len() == 1 { 0 } else { 128 };
+                let ctx = StaticHyperCtx::<N>::new(&x, shift);
+                let want =
+                    want_hyper::<WideTerms<true>>(&DynHyperCtx::new(&x, shift), a, b, zeros, len);
+                assert_eq!(
+                    check_algs::<StaticNodeHyper<N, WideTerms<true>>>(
+                        &ctx,
+                        (a, b),
+                        zeros,
+                        &want,
+                        &what
+                    ),
+                    ok
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_wide_horner_static_capacity() {
+    wide_static_suite::<5>();
+    wide_static_suite::<8>();
+    wide_static_suite::<16>();
+    wide_static_suite::<64>();
+
+    // A range of a wide trait whose values fit u64 keeps narrow capacity and rect.
+    let ctx = StaticHyperCtx::<8>::new(&[7, 3], 70);
+    assert_eq!(
+        StaticNodeHyper::<8, WideTerms<false>>::eligible(&ctx, 1, 2, 5, 0),
+        elig(true, true)
+    );
+    assert_eq!(
+        StaticNodeHyper::<8, WideTerms<false>>::eligible(&ctx, 1, 3, 5, 0),
+        elig(false, false)
+    );
+    assert_eq!(
+        StaticNodeHyper::<8, WideTerms<false>>::eligible(&ctx, 1, 3, 4, 0),
+        elig(true, false)
+    );
+}
+
+// A full u128 numerator with a narrow denominator exercises div_prim2's fallback and
+// negative frame offsets that still leave significant bits of the numerator.
+struct WideNumerator;
+impl WideBBPSeries for WideNumerator {
+    fn p(_: u128) -> u128 {
+        u128::MAX
+    }
+    fn q(_: u128) -> u128 {
+        1
+    }
+}
+impl WideEngelSeries for WideNumerator {
+    fn p(_: u128) -> u128 {
+        u128::MAX
+    }
+    fn q(_: u128) -> u128 {
+        1
+    }
+}
+impl WideHyperSeries for WideNumerator {
+    fn p(_: u128) -> u128 {
+        u128::MAX
+    }
+    fn q(_: u128) -> u128 {
+        1
+    }
+    fn r(_: u128) -> u128 {
+        1
+    }
+}
+
+#[test]
+fn test_wide_horner_numerator_offsets() {
+    for k in [129, 130, 191, 192, 193, 255, 256, 257] {
+        for len in [1, 2, 4] {
+            let zeros = ((k - 129) / 64) as usize;
+            let what = format!("wide numerator k {k} len {len} zeros {zeros}");
+            let want = want_bbp::<WideNumerator>(k, 7, 12, zeros, len);
+            check_algs::<DynNodeBBP<WideNumerator>>(&Shift(k), (7, 12), zeros, &want, &what);
+            check_algs::<StaticNodeBBP<8, WideNumerator>>(&Shift(k), (7, 12), zeros, &want, &what);
+            let want = want_engel::<WideNumerator>(k, 7, 12, zeros, len);
+            check_algs::<DynNodeEngel<WideNumerator>>(&Shift(k), (7, 12), zeros, &want, &what);
+            check_algs::<StaticNodeEngel<8, WideNumerator>>(
+                &Shift(k),
+                (7, 12),
+                zeros,
+                &want,
+                &what,
+            );
+            let ctx = DynHyperCtx::new(&[7, 3], k + 66);
+            let want = want_hyper::<WideNumerator>(&ctx, 7, 12, zeros, len);
+            check_algs::<DynNodeHyper<WideNumerator>>(&ctx, (7, 12), zeros, &want, &what);
+            check_algs::<StaticNodeHyper<8, WideNumerator>>(
+                &StaticHyperCtx::new(&[7, 3], k + 66),
+                (7, 12),
+                zeros,
+                &want,
+                &what,
+            );
+        }
+    }
+}
+
+struct ZeroR;
+impl WideHyperSeries for ZeroR {
+    fn p(n: u128) -> u128 {
+        u128::MAX - n
+    }
+    fn q(_: u128) -> u128 {
+        u128::MAX
+    }
+    fn r(_: u128) -> u128 {
+        0
+    }
+}
+
+#[test]
+fn test_wide_horner_zero_multiplier() {
+    for x in [vec![1], vec![7, 3]] {
+        let k = if x.len() == 1 { 3 } else { 69 };
+        let dctx = DynHyperCtx::new(&x, k);
+        let sctx = StaticHyperCtx::<8>::new(&x, k);
+        let want = want_hyper::<ZeroR>(&dctx, 0, 20, 0, 4);
+        let mut out = [u64::MAX; 4];
+        let neg =
+            series_eval_at::<DynNodeHyper<ZeroR>>(&dctx, 0, 20, 0, &mut out, SeriesAlg::Horner);
+        assert_close(&out, neg, &want, "wide zero r dyn");
+        // Force Horner independently of static binary splitting's zero-product merges.
+        let neg = series_eval_at::<StaticNodeHyper<8, ZeroR>>(
+            &sctx,
+            0,
+            20,
+            0,
+            &mut out,
+            SeriesAlg::Horner,
+        );
+        assert_close(&out, neg, &want, "wide zero r static");
+    }
+}
+
+struct Cancel;
+impl WideBBPSeries for Cancel {
+    const SIGNED: bool = true;
+    fn p(_: u128) -> u128 {
+        u128::MAX
+    }
+    fn q(_: u128) -> u128 {
+        u128::MAX
+    }
+    fn neg(n: u128) -> bool {
+        n % 2 == 0
+    }
+}
+impl WideEngelSeries for Cancel {
+    const SIGNED: bool = true;
+    fn p(n: u128) -> u128 {
+        if n % 2 == 0 {
+            1
+        } else {
+            u128::MAX
+        }
+    }
+    fn q(_: u128) -> u128 {
+        u128::MAX
+    }
+    fn neg(n: u128) -> bool {
+        n % 2 == 0
+    }
+}
+impl WideHyperSeries for Cancel {
+    const SIGNED: bool = true;
+    fn p(_: u128) -> u128 {
+        u128::MAX
+    }
+    fn q(_: u128) -> u128 {
+        u128::MAX
+    }
+    fn r(_: u128) -> u128 {
+        u128::MAX
+    }
+    fn neg(n: u128) -> bool {
+        n % 2 == 0
+    }
+}
+
+#[test]
+fn test_wide_horner_exact_cancellation() {
+    // Each pair cancels exactly even though its individual terms are large.
+    // Use separate outputs so every kernel also has to overwrite a nonzero buffer.
+    macro_rules! check_zero {
+        ($node:ty, $ctx:expr) => {{
+            let mut got = [u64::MAX; 4];
+            let neg = series_eval_at::<$node>(&$ctx, 0, 2, 0, &mut got, SeriesAlg::Horner);
+            assert_eq!(got, [0; 4]);
+            assert!(!neg);
+        }};
+    }
+    check_zero!(DynNodeBBP<Cancel>, Shift(0));
+    check_zero!(StaticNodeBBP<8, Cancel>, Shift(0));
+    check_zero!(DynNodeEngel<Cancel>, Shift(0));
+    check_zero!(StaticNodeEngel<8, Cancel>, Shift(0));
+    check_zero!(DynNodeHyper<Cancel>, DynHyperCtx::new_shift(0));
+    check_zero!(StaticNodeHyper<8, Cancel>, StaticHyperCtx::new(&[1], 0));
 }
