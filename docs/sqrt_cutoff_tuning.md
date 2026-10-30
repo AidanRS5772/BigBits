@@ -6,6 +6,9 @@ from a constant-cutoff copy of `src/utils/sqrt.rs` under `target/`. Every timed
 candidate is first validated against `binom_sqrt`; variants alternate within each
 round and the median of 7-15 rounds of thread CPU time is used.
 
+The values below are superseded by the
+[retune after the Knuth rewrite](#retune-after-the-knuth-rewrite-2026-10-29); the method is unchanged.
+
 The former single `ZIMMERMAN_SQRT_CUTOFF = 17` is replaced by seven constants:
 
 | Constant | Old | New | 0.2% plateau |
@@ -98,4 +101,61 @@ taskset -c 3 ./sqrt_cutoffs --sizes 4:48 --leaves 0,4096 --families dyn,static \
 # Top level: binomial (0) vs Zimmermann with leaf 15.
 taskset -c 3 ./sqrt_cutoffs --sizes 4:48 --leaves 0,15 --modes rem,only,approx \
   --shapes full,near,mid,padded --pattern mixed --rounds 7 --ms 10 --families dyn,static
+```
+
+## Retune after the Knuth rewrite (2026-10-29)
+
+Binomial sqrt runs `knuth_est` once per root limb, and the Zimmermann descent divides with
+`div_rem_*`. Both got faster with the Knuth rewrite, by different amounts, so every constant above
+was remeasured. The probe and protocol are unchanged: `v5`, built against the retuned division
+constants, on CPU 2. Leaves 9 and 11 were added to the probe.
+
+| Constant | Before | After |
+|---|---:|---:|
+| `ZIMMERMAN_SQRT_LEAF_CUTOFF` | 15 | 11 |
+| `DYN_SQRT_REM_ZIMMERMAN_CUTOFF` | 20 | 16 |
+| `DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF` | 15 | 11 |
+| `DYN_SQRT_APPROX_ZIMMERMAN_CUTOFF` | 15 | 11 |
+| `STATIC_SQRT_REM_ZIMMERMAN_CUTOFF` | 20 | 16 |
+| `STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF` | 15 | 11 |
+| `STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF` | 14 | 11 |
+
+One descent / binomial (`core`, 9 × 25 ms):
+
+| Root limbs | 9 | 10 | 11 | 12 | 13 | 14 | 15 |
+|---|---|---|---|---|---|---|---|
+| dyn | 1.056 | 1.035 | **0.982** | 0.996 | 0.946 | 0.949 | 0.890 |
+| static, N = next_pow2(2n) | 1.047 | 1.031 | **0.984** | 0.991 | 0.949 | 0.939 | 0.887 |
+
+Zimmermann (leaf 11) / binomial at the top level, geometric mean over the four shapes and both
+runs (7 × 10 ms and 15 × 15 ms with another seed):
+
+| Root limbs | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 |
+|---|---|---|---|---|---|---|---|---|
+| dyn rem | 1.201 | 1.149 | 1.122 | 1.103 | 1.071 | 1.033 | **1.009** | 0.992 |
+| dyn only | 1.071 | **1.009** | 1.013 | 0.972 | 0.979 | 0.909 | 0.910 | 0.869 |
+| dyn approx | 1.048 | **1.005** | 0.989 | 0.966 | 0.947 | 0.907 | 0.886 | 0.871 |
+| static rem | 1.186 | 1.131 | 1.112 | 1.092 | 1.064 | 1.024 | **0.998** | 0.986 |
+| static only | 1.063 | **0.995** | 1.006 | 0.964 | 0.968 | 0.906 | 0.900 | 0.868 |
+| static approx | 1.028 | **0.980** | 0.966 | 0.955 | 0.935 | 0.895 | 0.875 | 0.865 |
+
+Each cutoff is the smallest width from which Zimmermann is never more than about 1.5% slower,
+the single-thread noise band. Each lies inside the 0.2% plateau of the geometric-mean slowdown
+that the earlier sections minimized. Those minimizers are 17, 13, 12, 16, 13 and 11 in table
+order, and the two runs agree within one or two limbs. Zimmermann's lead also grows faster than
+before: at 22 root limbs dyn rem takes 0.87 of binomial's time (0.96 before), and at 48 the six
+modes take 0.49–0.56.
+
+```bash
+cargo bench-cutoffs --no-run
+python3 scripts/python/tune_sqrt_cutoffs.py --rlib target/release/deps/libbig_bits-HASH.rlib \
+  --output target/sqrt_cutoff_tuning/v5
+cd target/sqrt_cutoff_tuning/v5
+taskset -c 2 ./sqrt_cutoffs --sizes 4:48 --leaves 0,4096 --families dyn,static \
+  --modes core --pattern random --rounds 9 --ms 25
+taskset -c 2 ./sqrt_cutoffs --sizes 4:48 --leaves 0,11 --modes rem,only,approx \
+  --shapes full,near,mid,padded --pattern mixed --rounds 7 --ms 10 --families dyn,static
+taskset -c 2 ./sqrt_cutoffs --sizes 4:48 --leaves 0,11 --modes rem,only,approx \
+  --shapes full,near,mid,padded --pattern mixed --rounds 15 --ms 15 --families dyn,static \
+  --seed 12345
 ```

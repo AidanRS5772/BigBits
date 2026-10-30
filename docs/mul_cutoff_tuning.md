@@ -342,6 +342,8 @@ Single sizes where the new constants are slower:
   `DIV_KNUTH_CUTOFF`, `BZ_CUTOFF`, the BZ/NR cost models (`bz_2_1_cost` reads
   `dyn_dispatch`, whose tiers moved), `DYN_RCP_KNUTH_NR_CUTOFF` /
   `STATIC_RCP_KNUTH_NR_CUTOFF`, the sqrt cutoffs and the bin_split leaves. Their
-  harnesses are `cargo bench-cutoffs` and `cargo bench-bin-split`.
+  harnesses are `cargo bench-cutoffs` and `cargo bench-bin-split`. Division, the
+  reciprocal and sqrt were retuned on 2026-10-29, after the Knuth rewrite (see
+  `division_dispatch_split.md` and `sqrt_cutoff_tuning.md`); the bin_split leaves remain.
 - **`NTT_PAR_*`** decide the NTT's internal threading; they don't depend on the
   schoolbook kernels and weren't retuned.

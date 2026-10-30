@@ -1,7 +1,7 @@
 use crate::utils::{
     div::{
         div_buf_of, div_dyn, div_rem_dyn, div_rem_static, div_static, knuth_est,
-        knuth_rcp_normalized, mul_u64_asm,
+        knuth_rcp_normalized, mul_u64_asm, reciprocal_3_2,
     },
     mul::{mul_elem, sqr_dyn, sqr_static},
     utils::{
@@ -51,10 +51,11 @@ fn sqrt_4x2(x: &mut [u64; 4]) -> (u64, u64) {
     (s_lo as u64, s_hi as u64)
 }
 
-fn binom_sqrt_est_reduced(x: &mut [u64], s: &[u64], s0: u64, s1: u64, c: u64) -> u64 {
+// v = reciprocal_3_2(s1, s0), the same for every root limb, as s's top two limbs don't change.
+fn binom_sqrt_est_reduced(x: &mut [u64], s: &[u64], s0: u64, s1: u64, v: u64, c: u64) -> u64 {
     let t = {
         let (win, of) = x.split_at_mut(s.len());
-        knuth_est(win, &mut of[0], s, s1, s0)
+        knuth_est(win, &mut of[0], s, s1, s0, v)
     };
     let (q, d) = match c {
         0 => (t >> 1, t & 1),
@@ -114,6 +115,7 @@ pub fn binom_sqrt_core(x: &mut [u64], s: &mut [u64]) {
 
     let mut x_end = x_start + 3;
     let mut j = s_len - 2;
+    let v = reciprocal_3_2(s_hi, s_lo);
     while j > 0 {
         let mut c = 0;
         while cmp_buf(&x[x_start..x_end], &s[j..]).is_ge() {
@@ -130,7 +132,7 @@ pub fn binom_sqrt_core(x: &mut [u64], s: &mut [u64]) {
         }
         j -= 1;
         x_start -= 2;
-        s[j] = binom_sqrt_est_reduced(&mut x[x_start + 1..x_end], &s[j + 1..], s_lo, s_hi, c);
+        s[j] = binom_sqrt_est_reduced(&mut x[x_start + 1..x_end], &s[j + 1..], s_lo, s_hi, v, c);
         let s_sqr = unsafe { mul_u64_asm(s[j], s[j]) };
         if correct_sqrt(&mut x[x_start..x_end], &s[j..], &[s_sqr.1, s_sqr.0]) {
             s[j] -= 1;

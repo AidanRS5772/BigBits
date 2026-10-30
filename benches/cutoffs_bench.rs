@@ -742,6 +742,35 @@ fn bench_nr_seed_start_precision_ratio(c: &mut Criterion) {
 // durations encode NR_runtime / Knuth_runtime.
 
 const DIV_TUNE_STATIC_CAPACITY: usize = 16_384;
+
+// Static runs use N = DIV_TUNE_STATIC_CAPACITY unless DIV_TUNE_STATIC_SIZED is set, which
+// sizes N to each operand (the next power of two from 64). Static drivers zero-fill their
+// [u64; N] buffers, so at a fixed large N small divisions mostly time those memsets.
+fn static_capacity(len: usize) -> usize {
+    static SIZED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *SIZED.get_or_init(|| env::var_os("DIV_TUNE_STATIC_SIZED").is_some()) {
+        len.next_power_of_two().clamp(64, DIV_TUNE_STATIC_CAPACITY)
+    } else {
+        DIV_TUNE_STATIC_CAPACITY
+    }
+}
+
+// Calls f::<N>(args) at static_capacity(len).
+macro_rules! at_capacity {
+    ($len:expr, $f:ident($($arg:expr),* $(,)?)) => {
+        match static_capacity($len) {
+            64 => $f::<64>($($arg),*),
+            128 => $f::<128>($($arg),*),
+            256 => $f::<256>($($arg),*),
+            512 => $f::<512>($($arg),*),
+            1024 => $f::<1024>($($arg),*),
+            2048 => $f::<2048>($($arg),*),
+            4096 => $f::<4096>($($arg),*),
+            8192 => $f::<8192>($($arg),*),
+            _ => $f::<DIV_TUNE_STATIC_CAPACITY>($($arg),*),
+        }
+    };
+}
 const DIV_TUNE_CASES_PER_SCALE: usize = 8;
 const DIV_TUNE_SEARCH_BUDGET: usize = 20_000;
 const DIV_TUNE_KARATSUBA_D_CENTERS: [usize; 7] = [96, 128, 192, 256, 384, 512, 768];
@@ -1131,17 +1160,23 @@ fn division_tuning_ratio_bench(
             DivisionTuneFamily::StaticDiv => time_pair_alternating(
                 nr_first,
                 || {
-                    nr_div_static::<DIV_TUNE_STATIC_CAPACITY>(
-                        black_box(input.n.as_slice()),
-                        black_box(input.d.as_slice()),
-                        black_box(q_nr.as_mut_slice()),
+                    at_capacity!(
+                        input.n.len(),
+                        nr_div_static(
+                            black_box(input.n.as_slice()),
+                            black_box(input.d.as_slice()),
+                            black_box(q_nr.as_mut_slice()),
+                        )
                     );
                 },
                 || {
-                    bz_div_static::<DIV_TUNE_STATIC_CAPACITY>(
-                        black_box(input.n.as_slice()),
-                        black_box(input.d.as_slice()),
-                        black_box(q_bz.as_mut_slice()),
+                    at_capacity!(
+                        input.n.len(),
+                        bz_div_static(
+                            black_box(input.n.as_slice()),
+                            black_box(input.d.as_slice()),
+                            black_box(q_bz.as_mut_slice()),
+                        )
                     );
                 },
             ),
@@ -1151,17 +1186,23 @@ fn division_tuning_ratio_bench(
                 time_pair_alternating(
                     nr_first,
                     || {
-                        nr_div_rem_static::<DIV_TUNE_STATIC_CAPACITY>(
-                            black_box(n_nr.as_mut_slice()),
-                            black_box(input.d.as_slice()),
-                            black_box(q_nr.as_mut_slice()),
+                        at_capacity!(
+                            input.n.len(),
+                            nr_div_rem_static(
+                                black_box(n_nr.as_mut_slice()),
+                                black_box(input.d.as_slice()),
+                                black_box(q_nr.as_mut_slice()),
+                            )
                         );
                     },
                     || {
-                        bz_div_rem_static::<DIV_TUNE_STATIC_CAPACITY>(
-                            black_box(n_bz.as_mut_slice()),
-                            black_box(input.d.as_slice()),
-                            black_box(q_bz.as_mut_slice()),
+                        at_capacity!(
+                            input.n.len(),
+                            bz_div_rem_static(
+                                black_box(n_bz.as_mut_slice()),
+                                black_box(input.d.as_slice()),
+                                black_box(q_bz.as_mut_slice()),
+                            )
                         );
                     },
                 )
@@ -1268,22 +1309,44 @@ fn register_division_grid(
     family: DivisionTuneFamily,
     regime: &str,
 ) {
-    assert!(matches!(
+    assert!(
+        matches!(
+            family,
+            DivisionTuneFamily::DynDiv | DivisionTuneFamily::DynRem
+        ) || (matches!(regime, "grid" | "runtime") && !family.is_reciprocal())
+    );
+    let static_family = matches!(
         family,
-        DivisionTuneFamily::DynDiv | DivisionTuneFamily::DynRem
-    ));
+        DivisionTuneFamily::StaticDiv | DivisionTuneFamily::StaticRem
+    );
     let ratios = env_f64_values(&[0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 8.0]);
     for d_len in env_usize_values("DIV_TUNE_SCALES", &[96, 128, 256, 512, 1024, 1536, 2048]) {
         let mut seen_q = HashSet::new();
         for &ratio in &ratios {
             let q_len = (d_len as f64 * ratio).round().max(8.0) as usize;
-            if !seen_q.insert(q_len) {
+            if !seen_q.insert(q_len)
+                || (static_family && q_len + d_len - 1 > DIV_TUNE_STATIC_CAPACITY)
+            {
                 continue;
             }
             let inputs = make_division_tuning_inputs(
                 &vec![(q_len, d_len); 4],
                 (q_len as u64).rotate_left(17) ^ d_len as u64,
             );
+            if static_family {
+                for input in &inputs {
+                    let (mut want_n, mut want_q) = (input.n.clone(), vec![0; q_len]);
+                    div_rem_dyn(&mut want_n, &input.d, &mut want_q);
+                    for use_bz in [false, true] {
+                        let (mut n, mut q) = (input.n.clone(), vec![0; q_len]);
+                        run_division_choice(family, use_bz, &mut n, &input.d, &mut q);
+                        assert_eq!(q, want_q, "static quotient d{d_len} q{q_len} bz={use_bz}");
+                        if matches!(family, DivisionTuneFamily::StaticRem) {
+                            assert_eq!(n, want_n, "static remainder d{d_len} q{q_len} bz={use_bz}");
+                        }
+                    }
+                }
+            }
             group.bench_with_input(
                 BenchmarkId::new(
                     format!("{}/{}", family.label(), regime),
@@ -1307,6 +1370,14 @@ fn register_division_grid(
                                     DivisionTuneFamily::DynRem => {
                                         div_rem_dyn(black_box(n), black_box(d), black_box(q))
                                     }
+                                    DivisionTuneFamily::StaticDiv => at_capacity!(
+                                        n.len(),
+                                        div_static(black_box(n), black_box(d), black_box(q))
+                                    ),
+                                    DivisionTuneFamily::StaticRem => at_capacity!(
+                                        n.len(),
+                                        div_rem_static(black_box(n), black_box(d), black_box(q))
+                                    ),
                                     _ => unreachable!(),
                                 });
                             },
@@ -1426,15 +1497,15 @@ fn run_division_choice(
         (DivisionTuneFamily::DynDiv, false) => nr_div_dyn(n, d, q),
         (DivisionTuneFamily::DynRem, true) => bz_div_rem_dyn(n, d, q),
         (DivisionTuneFamily::DynRem, false) => nr_div_rem_dyn(n, d, q),
-        (DivisionTuneFamily::StaticDiv, true) => bz_div_static::<DIV_TUNE_STATIC_CAPACITY>(n, d, q),
+        (DivisionTuneFamily::StaticDiv, true) => at_capacity!(n.len(), bz_div_static(n, d, q)),
         (DivisionTuneFamily::StaticDiv, false) => {
-            nr_div_static::<DIV_TUNE_STATIC_CAPACITY>(n, d, q)
+            at_capacity!(n.len(), nr_div_static(n, d, q))
         }
         (DivisionTuneFamily::StaticRem, true) => {
-            bz_div_rem_static::<DIV_TUNE_STATIC_CAPACITY>(n, d, q)
+            at_capacity!(n.len(), bz_div_rem_static(n, d, q))
         }
         (DivisionTuneFamily::StaticRem, false) => {
-            nr_div_rem_static::<DIV_TUNE_STATIC_CAPACITY>(n, d, q)
+            at_capacity!(n.len(), nr_div_rem_static(n, d, q))
         }
         (DivisionTuneFamily::DynRcp | DivisionTuneFamily::StaticRcp, _) => unreachable!(),
     }
@@ -1563,10 +1634,13 @@ fn reciprocal_tuning_ratio_bench(
                             rcp_prepared_dyn(black_box(&input.d), black_box(&mut nr), RcpAlg::NR)
                         }
                         DivisionTuneFamily::StaticRcp => {
-                            rcp_prepared_static::<DIV_TUNE_STATIC_CAPACITY>(
-                                black_box(&input.d),
-                                black_box(&mut nr),
-                                RcpAlg::NR,
+                            at_capacity!(
+                                input.d.len(),
+                                rcp_prepared_static(
+                                    black_box(&input.d),
+                                    black_box(&mut nr),
+                                    RcpAlg::NR,
+                                )
                             )
                         }
                         _ => unreachable!(),
@@ -1582,10 +1656,13 @@ fn reciprocal_tuning_ratio_bench(
                             RcpAlg::Knuth,
                         ),
                         DivisionTuneFamily::StaticRcp => {
-                            rcp_prepared_static::<DIV_TUNE_STATIC_CAPACITY>(
-                                black_box(&input.d),
-                                black_box(&mut knuth),
-                                RcpAlg::Knuth,
+                            at_capacity!(
+                                input.d.len(),
+                                rcp_prepared_static(
+                                    black_box(&input.d),
+                                    black_box(&mut knuth),
+                                    RcpAlg::Knuth,
+                                )
                             )
                         }
                         _ => unreachable!(),

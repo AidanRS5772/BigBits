@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use crate::utils::{rows_dispatch, Rows, MUL_LIMB_ADX_CUTOFF};
 use std::arch::asm;
 
 #[inline(always)]
@@ -464,176 +465,43 @@ pub fn sub_prim(buf: &mut [u64], prim: u64) -> bool {
     };
 }
 
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn add_mul_aarch(x: *mut u64, s: *const u64, d: u64, len: usize) -> u64 {
-    let carry: u64;
-    asm!(
-        "mov {mc}, xzr",
-        "2:",
-        "ldr {w}, [{dst}]",
-        "ldr {sv}, [{src}], #8",
-        "mul   {lo}, {sv}, {d}",
-        "umulh {hi}, {sv}, {d}",
-        "adds {lo}, {lo}, {mc}",
-        "adc  {mc}, {hi}, xzr",
-        "adds {w}, {w}, {lo}",
-        "cinc {mc}, {mc}, cs",
-        "str {w}, [{dst}], #8",
-        "sub {len}, {len}, #1",
-        "cbnz {len}, 2b",
-        dst = inout(reg) x => _,
-        src = inout(reg) s => _,
-        d = in(reg) d,
-        len = inout(reg) len => _,
-        mc = out(reg) carry,
-        w = out(reg) _,
-        sv = out(reg) _,
-        lo = out(reg) _,
-        hi = out(reg) _,
-        options(nostack),
-    );
-    carry
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn sub_mul_aarch(x: *mut u64, s: *const u64, d: u64, len: usize) -> u64 {
-    let borrow: u64;
-    asm!(
-        "mov {mc}, xzr",
-        "2:",
-        "ldr {w}, [{dst}]",
-        "ldr {sv}, [{src}], #8",
-        "mul   {lo}, {sv}, {d}",
-        "umulh {hi}, {sv}, {d}",
-        "adds {lo}, {lo}, {mc}",
-        "adc  {mc}, {hi}, xzr",
-        "subs {w}, {w}, {lo}",
-        "cinc {mc}, {mc}, cc",
-        "str {w}, [{dst}], #8",
-        "sub {len}, {len}, #1",
-        "cbnz {len}, 2b",
-        dst = inout(reg) x => _,
-        src = inout(reg) s => _,
-        d = in(reg) d,
-        len = inout(reg) len => _,
-        mc = out(reg) borrow,
-        w = out(reg) _,
-        sv = out(reg) _,
-        lo = out(reg) _,
-        hi = out(reg) _,
-        options(nostack),
-    );
-    borrow
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn add_mul_x86(x: *mut u64, s: *const u64, d: u64, len: usize) -> u64 {
-    let carry: u64;
-    asm!(
-        "mov {mc}, 0",
-        "2:",
-        "mov rax, [{src}]",
-        "mul {d}",
-        "add rax, {mc}",
-        "adc rdx, 0",
-        "add QWORD PTR [{dst}], rax",
-        "adc rdx, 0",
-        "mov {mc}, rdx",
-        "lea {dst}, [{dst} + 8]",
-        "lea {src}, [{src} + 8]",
-        "dec {len}",
-        "jnz 2b",
-        dst = inout(reg) x => _,
-        src = inout(reg) s => _,
-        len = inout(reg) len => _,
-        d = in(reg) d,
-        mc = out(reg) carry,
-        out("rax") _,
-        out("rdx") _,
-        options(nostack),
-    );
-    carry
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn sub_mul_x86(x: *mut u64, s: *const u64, d: u64, len: usize) -> u64 {
-    let borrow: u64;
-    asm!(
-        "mov {mc}, 0",
-        "2:",
-        "mov rax, [{src}]",
-        "mul {d}",
-        "add rax, {mc}",
-        "adc rdx, 0",
-        "sub QWORD PTR [{dst}], rax",
-        "adc rdx, 0",
-        "mov {mc}, rdx",
-        "lea {dst}, [{dst} + 8]",
-        "lea {src}, [{src} + 8]",
-        "dec {len}",
-        "jnz 2b",
-        dst = inout(reg) x => _,
-        src = inout(reg) s => _,
-        len = inout(reg) len => _,
-        d = in(reg) d,
-        mc = out(reg) borrow,
-        out("rax") _,
-        out("rdx") _,
-        options(nostack),
-    );
-    borrow
-}
-
-#[inline(always)]
-unsafe fn add_mul_asm(x: *mut u64, s: *const u64, d: u64, len: usize) -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        add_mul_aarch(x, s, d, len)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        add_mul_x86(x, s, d, len)
-    }
-}
-
-#[inline(always)]
-unsafe fn sub_mul_asm(x: *mut u64, s: *const u64, d: u64, len: usize) -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        sub_mul_aarch(x, s, d, len)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        sub_mul_x86(x, s, d, len)
-    }
-}
-
 // Adds s * d into x (equal lengths) and returns the carry limb owed to x's next limb.
 #[inline(always)]
 pub fn add_mul_limb(x: &mut [u64], s: &[u64], d: u64) -> u64 {
-    let len = s.len();
-    assert!(x.len() == len, "x and s must have equal length");
-    if len == 0 {
+    assert!(x.len() == s.len(), "x and s must have equal length");
+    if s.is_empty() {
         return 0;
     }
-    unsafe { add_mul_asm(x.as_mut_ptr(), s.as_ptr(), d, len) }
+    add_mul_row(x, s, d)
 }
 
 // Subtracts s * d from x (equal lengths) and returns the borrow limb owed by x's next limb.
 #[inline(always)]
 pub fn sub_mul_limb(x: &mut [u64], s: &[u64], d: u64) -> u64 {
-    let len = s.len();
-    assert!(x.len() == len, "x and s must have equal length");
-    if len == 0 {
+    assert!(x.len() == s.len(), "x and s must have equal length");
+    if s.is_empty() {
         return 0;
     }
-    unsafe { sub_mul_asm(x.as_mut_ptr(), s.as_ptr(), d, len) }
+    sub_mul_row(x, s, d)
+}
+
+// The rows behind add_mul_limb and sub_mul_limb, checked first: the ADX row runs from
+// MUL_LIMB_ADX_CUTOFF limbs, below which its bmi2/adx call costs more than it saves.
+rows_dispatch!(#[inline(always)]
+    fn add_mul_row(x: &mut [u64], s: &[u64], d: u64) -> u64 = add_mul_rows
+    if s.len() >= MUL_LIMB_ADX_CUTOFF);
+rows_dispatch!(#[inline(always)]
+    fn sub_mul_row(x: &mut [u64], s: &[u64], d: u64) -> u64 = sub_mul_rows
+    if s.len() >= MUL_LIMB_ADX_CUTOFF);
+
+#[inline(always)]
+fn add_mul_rows<K: Rows>(x: &mut [u64], s: &[u64], d: u64) -> u64 {
+    unsafe { K::add(d, s, x) }
+}
+
+#[inline(always)]
+fn sub_mul_rows<K: Rows>(x: &mut [u64], s: &[u64], d: u64) -> u64 {
+    unsafe { K::sub(d, s, x) }
 }
 
 // Adds s * d into x (x.len() >= s.len()), carrying through x's upper limbs, and
@@ -671,78 +539,40 @@ pub fn twos_comp(buf: &mut [u64]) {
     inc_buf(buf);
 }
 
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn shr_asm_x86(dst: &mut u64, src: u64, sh: u8) {
-    asm!(
-        "shrd {dst}, {src}, cl",
-        dst = inout(reg) *dst,
-        src = in(reg) src,
-        in("cl") sh,
-        options(nostack, nomem)
-    );
-}
-
-unsafe fn shr_asm(dst: &mut u64, src: u64, sh: u8) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        *dst = (*dst >> sh) | (src << (64 - sh))
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    shr_asm_x86(dst, src, sh);
-}
-
+// buf >> sh in place, returning the bits shifted out of the bottom (at the top of the
+// returned limb). Plain Rust, reading each limb's upper neighbour before it is overwritten,
+// which LLVM vectorizes: about 1.5 cycles a limb from 64 limbs, against 3 for one shrd asm
+// block per limb, and ahead from 8 limbs (a few cycles behind at 4).
 pub fn shr_buf(buf: &mut [u64], sh: u8) -> u64 {
     assert!(sh < 64, "shift right must be less then 64");
     if sh == 0 || buf.is_empty() {
         return 0;
     }
-    let carry = buf[0] << (64 - sh);
+    let (r, l) = (sh as u32, 64 - sh as u32);
+    let carry = buf[0] << l;
     for i in 0..buf.len() - 1 {
-        let src = buf[i + 1];
-        unsafe {
-            shr_asm(&mut buf[i], src, sh);
-        }
+        buf[i] = (buf[i] >> r) | (buf[i + 1] << l);
     }
-    *buf.last_mut().unwrap() >>= sh;
-    return carry;
+    *buf.last_mut().unwrap() >>= r;
+    carry
 }
 
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn shl_asm_x86(dst: &mut u64, src: u64, sh: u8) {
-    asm!(
-        "shld {dst}, {src}, cl",
-        dst = inout(reg) *dst,
-        src = in(reg) src,
-        in("cl") sh,
-        options(nostack, nomem)
-    );
-}
-
-unsafe fn shl_asm(dst: &mut u64, src: u64, sh: u8) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        *dst = (*dst << sh) | (src >> (64 - sh))
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    shl_asm_x86(dst, src, sh);
-}
-
+// buf << sh in place, returning the bits shifted out of the top. It runs upward, carrying each
+// limb's old value to the next, a first-order recurrence LLVM vectorizes (the in-place
+// downward loop doesn't vectorize): about 1.5 cycles a limb, as shr_buf.
 pub fn shl_buf(buf: &mut [u64], sh: u8) -> u64 {
     assert!(sh < 64, "shift left must be less then 64");
     if sh == 0 || buf.is_empty() {
         return 0;
     }
-    let carry = *buf.last().unwrap() >> (64 - sh);
-    for i in (1..buf.len()).rev() {
-        let src = buf[i - 1];
-        unsafe { shl_asm(&mut buf[i], src, sh) }
+    let (l, r) = (sh as u32, 64 - sh as u32);
+    let mut prev = 0u64;
+    for x in buf.iter_mut() {
+        let cur = *x;
+        *x = (cur << l) | (prev >> r);
+        prev = cur;
     }
-    buf[0] <<= sh;
-    return carry;
+    prev >> r
 }
 
 // Copies the top out.len() limbs of (src << sh) into out; reads one limb below

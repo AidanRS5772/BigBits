@@ -77,7 +77,7 @@ def main():
     parser.add_argument('csv')
     parser.add_argument('--knuth-cutoff', type=int, help='separate mandatory Knuth cutoff for model fitting')
     parser.add_argument('--runtime', action='store_true', help='summarize a runtime comparison CSV')
-    parser.add_argument('--family', choices=['dyn_div', 'dyn_rem'])
+    parser.add_argument('--family', choices=['dyn_div', 'dyn_rem', 'static_div', 'static_rem'])
     parser.add_argument('--model', nargs=4, type=float,
                         metavar=('BZ_CUTOFF', 'SWITCH', 'KARATSUBA', 'TRANSFORM'))
     args = parser.parse_args()

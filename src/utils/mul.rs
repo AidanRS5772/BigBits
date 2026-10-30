@@ -587,7 +587,14 @@ pub fn mul_elem(
     let mf = n.min(a.len() - 1);
     if mi <= mf {
         unsafe {
-            mul_col(a.as_ptr().add(mi), b.as_ptr().add(n - mi), mf - mi + 1, acc0, acc1, acc2);
+            mul_col(
+                a.as_ptr().add(mi),
+                b.as_ptr().add(n - mi),
+                mf - mi + 1,
+                acc0,
+                acc1,
+                acc2,
+            );
         }
     }
     let out = *acc0;
@@ -597,19 +604,10 @@ pub fn mul_elem(
     return out;
 }
 
-// Row kernels: out[..l.len()] += s * l (add) or = s * l (set), returning the limb
-// that belongs at out[l.len()]. Callers check out.len() >= l.len() once per product.
-trait Rows {
-    unsafe fn add(s: u64, l: &[u64], out: &mut [u64]) -> u64;
-    unsafe fn set(s: u64, l: &[u64], out: &mut [u64]) -> u64;
-}
-
-// mulx/adcx/adox rows, run inside bmi2/adx functions after adx_available(). Two
-// carry chains run side by side, adcx (CF) between products and adox (OF) into
-// out, so the loops count with lea and jrcxz, which leave both flags alone.
-#[cfg(target_arch = "x86_64")]
-struct Adx;
-
+// Rows (mod.rs) for mul_buf and its kin; callers check out.len() >= l.len() once per
+// product. mulx/adcx/adox rows, run inside rows_dispatch!'s bmi2/adx copies. Two carry
+// chains run side by side, adcx (CF) between products and adox (OF) into out, so the
+// loops count with lea and jrcxz, which leave both flags alone.
 #[cfg(target_arch = "x86_64")]
 impl Rows for Adx {
     #[inline(always)]
@@ -622,6 +620,12 @@ impl Rows for Adx {
     unsafe fn set(s: u64, l: &[u64], out: &mut [u64]) -> u64 {
         debug_assert!(out.len() >= l.len());
         adx_set_row(s, l.as_ptr(), out.as_mut_ptr(), l.len(), 0)
+    }
+
+    #[inline(always)]
+    unsafe fn sub(s: u64, l: &[u64], out: &mut [u64]) -> u64 {
+        debug_assert!(out.len() >= l.len());
+        adx_sub_row(s, l.as_ptr(), out.as_mut_ptr(), l.len())
     }
 }
 
@@ -696,6 +700,88 @@ unsafe fn adx_add_row(s: u64, l: *const u64, out: *mut u64, len: usize, c: u64) 
     top
 }
 
+// out[..len] -= s * l[..len], returning the borrow limb owed by out[len]. adcx (CF) still
+// carries between products, but OF can only add, so each product limb p is complemented
+// and added with OF starting at 1: out + !p + 1 = out - p + B^len over the row, and the
+// borrow is p's top limb plus one, less the OF that comes out.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn adx_sub_row(s: u64, l: *const u64, out: *mut u64, len: usize) -> u64 {
+    let borrow: u64;
+    asm!(
+        "xor {h0:e}, {h0:e}",
+        "mov {lo:e}, 0x7fffffff",
+        "add {lo:e}, 1",                        // CF = 0, OF = 1
+        "2:",
+        "jrcxz 3f",
+        "mulx {h1}, {lo}, [{l}]",
+        "adcx {lo}, {h0}",
+        "not {lo}",
+        "adox {lo}, [{o}]",
+        "mov [{o}], {lo}",
+        "mulx {h0}, {lo}, [{l} + 8]",
+        "adcx {lo}, {h1}",
+        "not {lo}",
+        "adox {lo}, [{o} + 8]",
+        "mov [{o} + 8], {lo}",
+        "mulx {h1}, {lo}, [{l} + 16]",
+        "adcx {lo}, {h0}",
+        "not {lo}",
+        "adox {lo}, [{o} + 16]",
+        "mov [{o} + 16], {lo}",
+        "mulx {h0}, {lo}, [{l} + 24]",
+        "adcx {lo}, {h1}",
+        "not {lo}",
+        "adox {lo}, [{o} + 24]",
+        "mov [{o} + 24], {lo}",
+        "lea {l}, [{l} + 32]",
+        "lea {o}, [{o} + 32]",
+        "lea rcx, [rcx - 1]",
+        "jmp 2b",
+        "3:",
+        // The last len % 4 limbs, as in adx_add_row.
+        "mov rcx, {rem}",
+        "jrcxz 5f",
+        "mulx {h1}, {lo}, [{l}]",
+        "adcx {lo}, {h0}",
+        "not {lo}",
+        "adox {lo}, [{o}]",
+        "mov [{o}], {lo}",
+        "lea rcx, [rcx - 1]",
+        "jrcxz 4f",
+        "mulx {h0}, {lo}, [{l} + 8]",
+        "adcx {lo}, {h1}",
+        "not {lo}",
+        "adox {lo}, [{o} + 8]",
+        "mov [{o} + 8], {lo}",
+        "lea rcx, [rcx - 1]",
+        "jrcxz 5f",
+        "mulx {h1}, {lo}, [{l} + 16]",
+        "adcx {lo}, {h0}",
+        "not {lo}",
+        "adox {lo}, [{o} + 16]",
+        "mov [{o} + 16], {lo}",
+        "lea rcx, [rcx - 1]",
+        "4:",
+        "mov {h0}, {h1}",
+        "5:",
+        // p's top limb (rcx is zero here), then the borrow.
+        "adcx {h0}, rcx",
+        "lea {lo}, [{h0} + 1]",
+        "cmovo {lo}, {h0}",
+        inout("rdx") s => _,
+        inout("rcx") len / 4 => _,
+        rem = in(reg) len % 4,
+        l = inout(reg) l => _,
+        o = inout(reg) out => _,
+        h0 = out(reg) _,
+        h1 = out(reg) _,
+        lo = out(reg) borrow,
+        options(nostack),
+    );
+    borrow
+}
+
 // out[..len] = s * l[..len] + c, returning the top limb. out may be l itself:
 // each limb is read before it is stored.
 #[cfg(target_arch = "x86_64")]
@@ -759,8 +845,7 @@ unsafe fn adx_set_row(s: u64, l: *const u64, out: *mut u64, len: usize, c: u64) 
     top
 }
 
-// The rows every CPU of the architecture runs: AArch64 asm, plain Rust elsewhere.
-struct Base;
+// Base: the rows every CPU of the architecture runs, AArch64 asm and plain Rust elsewhere.
 
 // AArch64 has one carry flag, so each pass of four limbs adds the low limbs, then
 // the high limbs one up with the carry in.
@@ -908,9 +993,124 @@ impl Rows for Base {
         );
         top
     }
+
+    // One limb a pass, as utils' sub_mul loop was: the product's carry limb and the
+    // subtraction's borrow share the one flag, so each limb adds the carry in, then
+    // subtracts and counts its borrow into the next carry.
+    #[inline(always)]
+    unsafe fn sub(s: u64, l: &[u64], out: &mut [u64]) -> u64 {
+        debug_assert!(out.len() >= l.len());
+        if l.is_empty() {
+            return 0;
+        }
+        let (len, l, out) = (l.len(), l.as_ptr(), out.as_mut_ptr());
+        let borrow: u64;
+        asm!(
+            "mov {mc}, xzr",
+            "2:",
+            "ldr {w}, [{dst}]",
+            "ldr {sv}, [{src}], #8",
+            "mul   {lo}, {sv}, {d}",
+            "umulh {hi}, {sv}, {d}",
+            "adds {lo}, {lo}, {mc}",
+            "adc  {mc}, {hi}, xzr",
+            "subs {w}, {w}, {lo}",
+            "cinc {mc}, {mc}, cc",
+            "str {w}, [{dst}], #8",
+            "sub {len}, {len}, #1",
+            "cbnz {len}, 2b",
+            dst = inout(reg) out => _,
+            src = inout(reg) l => _,
+            d = in(reg) s,
+            len = inout(reg) len => _,
+            mc = out(reg) borrow,
+            w = out(reg) _,
+            sv = out(reg) _,
+            lo = out(reg) _,
+            hi = out(reg) _,
+            options(nostack),
+        );
+        borrow
+    }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+// x86 without ADX: add and sub thread one carry limb through rdx a limb at a time (mul
+// clobbers the flags); set stays plain Rust. Against plain Rust rows, sub's loop is 4-14%
+// faster at every length and add's ahead to 16 limbs, even to 64 and 6% behind from 128.
+#[cfg(target_arch = "x86_64")]
+impl Rows for Base {
+    #[inline(always)]
+    unsafe fn add(s: u64, l: &[u64], out: &mut [u64]) -> u64 {
+        debug_assert!(out.len() >= l.len());
+        if l.is_empty() {
+            return 0;
+        }
+        let carry: u64;
+        asm!(
+            "mov {mc}, 0",
+            "2:",
+            "mov rax, [{src}]",
+            "mul {d}",
+            "add rax, {mc}",
+            "adc rdx, 0",
+            "add QWORD PTR [{dst}], rax",
+            "adc rdx, 0",
+            "mov {mc}, rdx",
+            "lea {dst}, [{dst} + 8]",
+            "lea {src}, [{src} + 8]",
+            "dec {len}",
+            "jnz 2b",
+            dst = inout(reg) out.as_mut_ptr() => _,
+            src = inout(reg) l.as_ptr() => _,
+            len = inout(reg) l.len() => _,
+            d = in(reg) s,
+            mc = out(reg) carry,
+            out("rax") _,
+            out("rdx") _,
+            options(nostack),
+        );
+        carry
+    }
+
+    unsafe fn set(s: u64, l: &[u64], out: &mut [u64]) -> u64 {
+        plain_set_row(s, l, out)
+    }
+
+    #[inline(always)]
+    unsafe fn sub(s: u64, l: &[u64], out: &mut [u64]) -> u64 {
+        debug_assert!(out.len() >= l.len());
+        if l.is_empty() {
+            return 0;
+        }
+        let borrow: u64;
+        asm!(
+            "mov {mc}, 0",
+            "2:",
+            "mov rax, [{src}]",
+            "mul {d}",
+            "add rax, {mc}",
+            "adc rdx, 0",
+            "sub QWORD PTR [{dst}], rax",
+            "adc rdx, 0",
+            "mov {mc}, rdx",
+            "lea {dst}, [{dst} + 8]",
+            "lea {src}, [{src} + 8]",
+            "dec {len}",
+            "jnz 2b",
+            dst = inout(reg) out.as_mut_ptr() => _,
+            src = inout(reg) l.as_ptr() => _,
+            len = inout(reg) l.len() => _,
+            d = in(reg) s,
+            mc = out(reg) borrow,
+            out("rax") _,
+            out("rdx") _,
+            options(nostack),
+        );
+        borrow
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 impl Rows for Base {
     unsafe fn add(s: u64, l: &[u64], out: &mut [u64]) -> u64 {
         let mut carry = 0;
@@ -923,20 +1123,32 @@ impl Rows for Base {
     }
 
     unsafe fn set(s: u64, l: &[u64], out: &mut [u64]) -> u64 {
-        let mut carry = 0;
+        plain_set_row(s, l, out)
+    }
+
+    // The borrow limb stays below B: s x + borrow < B^2 - B, so its high limb plus one fits.
+    unsafe fn sub(s: u64, l: &[u64], out: &mut [u64]) -> u64 {
+        let mut borrow = 0;
         for (o, &x) in out.iter_mut().zip(l) {
-            let t = s as u128 * x as u128 + carry as u128;
-            *o = t as u64;
-            carry = (t >> 64) as u64;
+            let t = s as u128 * x as u128 + borrow as u128;
+            let (r, b) = o.overflowing_sub(t as u64);
+            *o = r;
+            borrow = (t >> 64) as u64 + b as u64;
         }
-        carry
+        borrow
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
-fn adx_available() -> bool {
-    is_x86_feature_detected!("bmi2") && is_x86_feature_detected!("adx")
+fn plain_set_row(s: u64, l: &[u64], out: &mut [u64]) -> u64 {
+    let mut carry = 0;
+    for (o, &x) in out.iter_mut().zip(l) {
+        let t = s as u128 * x as u128 + carry as u128;
+        *o = t as u64;
+        carry = (t >> 64) as u64;
+    }
+    carry
 }
 
 #[inline(always)]
@@ -947,7 +1159,10 @@ fn mul_buf_rows<K: Rows>(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     let (a, b) = if a.len() > b.len() { (a, b) } else { (b, a) };
     let len = a.len() + b.len() - 1;
     // The rows rely on this, so it is checked in release builds too.
-    assert!(out.len() >= len, "out is not large enough for multiplication");
+    assert!(
+        out.len() >= len,
+        "out is not large enough for multiplication"
+    );
 
     // Row i spans out[i..i + a.len()]; it starts once row i - 1 stores its top limb.
     let (&first, rows) = b.split_first().unwrap();
@@ -964,24 +1179,7 @@ fn mul_buf_rows<K: Rows>(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     top
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "bmi2,adx")]
-unsafe fn mul_buf_adx(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
-    mul_buf_rows::<Adx>(a, b, out)
-}
-
-pub fn mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    if adx_available() {
-        return unsafe { mul_buf_adx(a, b, out) };
-    }
-    mul_buf_base(a, b, out)
-}
-
-// The rows every CPU runs, optimized on their own before being inlined.
-fn mul_buf_base(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
-    mul_buf_rows::<Base>(a, b, out)
-}
+rows_dispatch!(pub fn mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 = mul_buf_rows);
 
 //KARATSUBA MULTIPLICATION
 // Mid tier complexity overhead is still relatively small, Mid tier algorithm. It handles unbalanced inputs through a
@@ -1055,7 +1253,12 @@ pub fn karatsuba_core(
     overflow
 }
 
-pub fn chunking_karatsuba(long: &[u64], short: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
+pub fn chunking_karatsuba(
+    long: &[u64],
+    short: &[u64],
+    out: &mut [u64],
+    scratch: &mut [u64],
+) -> u64 {
     out.fill(0);
     let s = short.len();
     let l = long.len();
@@ -3353,7 +3556,12 @@ pub fn ntt_entry_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     let mut res_guard = ScratchGuard::acquire();
     let [res1, res2, res3] = res_guard.get_splits([n1, n2, n3]);
 
-    dyn_convolutions(a, Some(b), [&mut *res1, &mut *res2, &mut *res3], out_len > NTT_PAR_CUTOFF_NTT_CONV);
+    dyn_convolutions(
+        a,
+        Some(b),
+        [&mut *res1, &mut *res2, &mut *res3],
+        out_len > NTT_PAR_CUTOFF_NTT_CONV,
+    );
 
     let (out_core, out_tail) = out.split_at_mut(out_len);
     let overflow = ntt_accumulate(res1, res2, res3, out_core, out_len, n1, n2, n3);
@@ -3751,41 +3959,45 @@ pub fn mul_arr<const N: usize>(a: &[u64], b: &[u64]) -> ([u64; N], u64) {
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn add_twice(s: [u64; 3], acc0: &mut u64, acc1: &mut u64, acc2: &mut u64) {
-    unsafe { asm!(
-        "add {acc0}, {s0}",
-        "adc {acc1}, {s1}",
-        "adc {acc2}, {s2}",
-        "add {acc0}, {s0}",
-        "adc {acc1}, {s1}",
-        "adc {acc2}, {s2}",
-        s0 = in(reg) s[0],
-        s1 = in(reg) s[1],
-        s2 = in(reg) s[2],
-        acc0 = inout(reg) *acc0,
-        acc1 = inout(reg) *acc1,
-        acc2 = inout(reg) *acc2,
-        options(nostack, nomem),
-    ) };
+    unsafe {
+        asm!(
+            "add {acc0}, {s0}",
+            "adc {acc1}, {s1}",
+            "adc {acc2}, {s2}",
+            "add {acc0}, {s0}",
+            "adc {acc1}, {s1}",
+            "adc {acc2}, {s2}",
+            s0 = in(reg) s[0],
+            s1 = in(reg) s[1],
+            s2 = in(reg) s[2],
+            acc0 = inout(reg) *acc0,
+            acc1 = inout(reg) *acc1,
+            acc2 = inout(reg) *acc2,
+            options(nostack, nomem),
+        )
+    };
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn add_twice(s: [u64; 3], acc0: &mut u64, acc1: &mut u64, acc2: &mut u64) {
-    unsafe { asm!(
-        "adds {acc0}, {acc0}, {s0}",
-        "adcs {acc1}, {acc1}, {s1}",
-        "adc {acc2}, {acc2}, {s2}",
-        "adds {acc0}, {acc0}, {s0}",
-        "adcs {acc1}, {acc1}, {s1}",
-        "adc {acc2}, {acc2}, {s2}",
-        s0 = in(reg) s[0],
-        s1 = in(reg) s[1],
-        s2 = in(reg) s[2],
-        acc0 = inout(reg) *acc0,
-        acc1 = inout(reg) *acc1,
-        acc2 = inout(reg) *acc2,
-        options(nostack, nomem),
-    ) };
+    unsafe {
+        asm!(
+            "adds {acc0}, {acc0}, {s0}",
+            "adcs {acc1}, {acc1}, {s1}",
+            "adc {acc2}, {acc2}, {s2}",
+            "adds {acc0}, {acc0}, {s0}",
+            "adcs {acc1}, {acc1}, {s1}",
+            "adc {acc2}, {acc2}, {s2}",
+            s0 = in(reg) s[0],
+            s1 = in(reg) s[1],
+            s2 = in(reg) s[2],
+            acc0 = inout(reg) *acc0,
+            acc1 = inout(reg) *acc1,
+            acc2 = inout(reg) *acc2,
+            options(nostack, nomem),
+        )
+    };
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -3858,7 +4070,10 @@ fn sqr_buf_rows<K: Rows>(buf: &[u64], out: &mut [u64]) -> u64 {
     let n = buf.len();
     let len = 2 * n - 1;
     // The rows rely on this, so it is checked in release builds too.
-    assert!(out.len() >= len, "out is not large enough for multiplication");
+    assert!(
+        out.len() >= len,
+        "out is not large enough for multiplication"
+    );
 
     // The off-diagonal half by rows, as in mul_buf: row i adds buf[i] * buf[i + 1..]
     // into out[2i + 1..] and stores its top limb at out[n + i]. Then double it and
@@ -3879,24 +4094,7 @@ fn sqr_buf_rows<K: Rows>(buf: &[u64], out: &mut [u64]) -> u64 {
     top
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "bmi2,adx")]
-unsafe fn sqr_buf_adx(buf: &[u64], out: &mut [u64]) -> u64 {
-    sqr_buf_rows::<Adx>(buf, out)
-}
-
-pub fn sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    if adx_available() {
-        return unsafe { sqr_buf_adx(buf, out) };
-    }
-    sqr_buf_base(buf, out)
-}
-
-// The rows every CPU runs, optimized on their own before being inlined.
-fn sqr_buf_base(buf: &[u64], out: &mut [u64]) -> u64 {
-    sqr_buf_rows::<Base>(buf, out)
-}
+rows_dispatch!(pub fn sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 = sqr_buf_rows);
 
 //KARATSUBA SQUARE
 
@@ -4164,7 +4362,12 @@ pub fn ntt_sqr_entry_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
     let mut scratch_gaurd = ScratchGuard::acquire();
     let [res1, res2, res3] = scratch_gaurd.get_splits([n1, n2, n3]);
 
-    dyn_convolutions(buf, None, [&mut *res1, &mut *res2, &mut *res3], out_len > NTT_PAR_CUTOFF_NTT_CONV);
+    dyn_convolutions(
+        buf,
+        None,
+        [&mut *res1, &mut *res2, &mut *res3],
+        out_len > NTT_PAR_CUTOFF_NTT_CONV,
+    );
     let (out_core, out_tail) = out.split_at_mut(out_len);
     let overflow = ntt_accumulate(res1, res2, res3, out_core, out_len, n1, n2, n3);
     absorb_overflow(out_tail, overflow)
@@ -4453,12 +4656,6 @@ fn hi_mul_buf_rows<K: Rows>(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     add_guard_carry(out, top, acc0, acc1)
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "bmi2,adx")]
-unsafe fn hi_mul_buf_adx(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
-    hi_mul_buf_rows::<Adx>(a, b, out)
-}
-
 // The window by columns: the two guard columns, then one column per limb.
 pub fn hi_mul_buf_cols(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     if a.is_empty() || b.is_empty() {
@@ -4488,17 +4685,9 @@ pub fn hi_mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
 }
 
 // hi_mul_buf by rows at any width (benchmarks compare it with columns).
-pub fn hi_mul_buf_by_rows(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    if adx_available() {
-        return unsafe { hi_mul_buf_adx(a, b, out) };
-    }
-    hi_mul_buf_base(a, b, out)
-}
-
-fn hi_mul_buf_base(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
-    hi_mul_buf_rows::<Base>(a, b, out)
-}
+rows_dispatch!(
+    pub fn hi_mul_buf_by_rows(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 = hi_mul_buf_rows
+);
 
 pub fn hi_mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     if a.is_empty() || b.is_empty() {
@@ -4551,7 +4740,10 @@ pub fn hi_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u
 pub fn hi_mul_guarded_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     let out_len = out.len();
     let guard = hi_mul_static_guard::<N>(out_len);
-    let ((a_g, a_t), (b_g, b_t)) = (hi_guard_split(a, out_len, guard), hi_guard_split(b, out_len, guard));
+    let ((a_g, a_t), (b_g, b_t)) = (
+        hi_guard_split(a, out_len, guard),
+        hi_guard_split(b, out_len, guard),
+    );
     let full_len = a_g.len() + a_t.len() + b_g.len() + b_t.len();
     if full_len <= N {
         let mut full = [0; N];
@@ -4669,12 +4861,6 @@ fn hi_sqr_buf_rows<K: Rows>(buf: &[u64], out: &mut [u64]) -> u64 {
     add_guard_carry(out, top, acc0, acc1)
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "bmi2,adx")]
-unsafe fn hi_sqr_buf_adx(buf: &[u64], out: &mut [u64]) -> u64 {
-    hi_sqr_buf_rows::<Adx>(buf, out)
-}
-
 // The window by columns: the two guard columns, then one column per limb.
 pub fn hi_sqr_buf_cols(buf: &[u64], out: &mut [u64]) -> u64 {
     if buf.is_empty() {
@@ -4704,17 +4890,9 @@ pub fn hi_sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
 }
 
 // hi_sqr_buf by rows at any width (benchmarks compare it with columns).
-pub fn hi_sqr_buf_by_rows(buf: &[u64], out: &mut [u64]) -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    if adx_available() {
-        return unsafe { hi_sqr_buf_adx(buf, out) };
-    }
-    hi_sqr_buf_base(buf, out)
-}
-
-fn hi_sqr_buf_base(buf: &[u64], out: &mut [u64]) -> u64 {
-    hi_sqr_buf_rows::<Base>(buf, out)
-}
+rows_dispatch!(
+    pub fn hi_sqr_buf_by_rows(buf: &[u64], out: &mut [u64]) -> u64 = hi_sqr_buf_rows
+);
 
 pub fn hi_sqr_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
     if buf.is_empty() {

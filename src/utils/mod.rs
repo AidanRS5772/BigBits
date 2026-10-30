@@ -23,6 +23,65 @@ impl std::fmt::Display for CapacityError {
 
 impl std::error::Error for CapacityError {}
 
+// Row kernels on out[..l.len()]: += s l (add) and = s l (set) return the limb that belongs at
+// out[l.len()], -= s l (sub) the borrow owed by it. Base runs on every CPU of the architecture
+// (AArch64 asm, plain Rust elsewhere); Adx's mulx/adcx/adox rows (x86) assemble only inside
+// bmi2/adx functions, which can't inline into others. The impls live in mul.rs with the asm.
+pub(crate) trait Rows {
+    unsafe fn add(s: u64, l: &[u64], out: &mut [u64]) -> u64;
+    unsafe fn set(s: u64, l: &[u64], out: &mut [u64]) -> u64;
+    unsafe fn sub(s: u64, l: &[u64], out: &mut [u64]) -> u64;
+}
+
+pub(crate) struct Base;
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) struct Adx;
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) fn adx_available() -> bool {
+    is_x86_feature_detected!("bmi2") && is_x86_feature_detected!("adx")
+}
+
+// rows_dispatch!(fn name(args) -> ret = body) defines name, which runs body::<Adx> inside a
+// bmi2/adx copy when the CPU has both (and the optional `if cond` holds), else body::<Base>.
+// body is a safe function generic over K: Rows, written once; each copy fixes its rows at
+// compile time, so the asm inlines into the whole operation and only the CPU check runs per
+// call of name.
+macro_rules! rows_dispatch {
+    ($(#[$attr:meta])* $vis:vis fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> $ret:ty
+        = $body:ident $(if $cond:expr)?) => {
+        $(#[$attr])*
+        $vis fn $name($($arg: $ty),*) -> $ret {
+            #[cfg(target_arch = "x86_64")]
+            {
+                #[target_feature(enable = "bmi2,adx")]
+                fn adx($($arg: $ty),*) -> $ret {
+                    $body::<$crate::utils::Adx>($($arg),*)
+                }
+                if true $(&& $cond)? && $crate::utils::adx_available() {
+                    return unsafe { adx($($arg),*) };
+                }
+            }
+            // The rows every CPU runs, optimized on their own before being inlined, with name's
+            // attributes, so an #[inline(always)] name inlines this copy into its callers too.
+            $(#[$attr])*
+            fn base($($arg: $ty),*) -> $ret {
+                $body::<$crate::utils::Base>($($arg),*)
+            }
+            base($($arg),*)
+        }
+    };
+    ($(#[$attr:meta])* $vis:vis fn $name:ident($($arg:ident: $ty:ty),* $(,)?)
+        = $body:ident $(if $cond:expr)?) => {
+        $crate::utils::rows_dispatch!(
+            $(#[$attr])* $vis fn $name($($arg: $ty),*) -> () = $body $(if $cond)?
+        );
+    };
+}
+pub(crate) use rows_dispatch;
+
 // The multiplication cutoffs below were measured on an i7-8750H with
 // `benches/mul_cutoffs.rs` over three code layouts, on one pinned core except where
 // the static NTT is the upper side, which ran with rayon's full pool. Where a call
@@ -107,6 +166,12 @@ pub const HI_SQR_ROW_CUTOFF: usize = 90;
 // per-limb loop) and the mulx loop from 20 (17% against 15%), single runs.
 pub const MUL_PRIM_ADX_CUTOFF: usize = 20;
 
+// add_mul_limb and sub_mul_limb run their one-limb loops below this many limbs and the
+// ADX rows from it, behind the feature check and an out-of-line call. On an i7-8750H (24
+// paired processes, exact Wilcoxon) the ADX row is faster from 9 limbs for add and 12 for
+// sub; 10 favors add, which has most of the callers (sub loses 8% at 10 and 4% at 11).
+pub const MUL_LIMB_ADX_CUTOFF: usize = 10;
+
 // mid_mul_dyn uses mid_mul_buf below this and fft_mid_mul from it: the FFT is
 // significantly faster at every size from 125 to 320, but at 122-124 its transform
 // size steps up and it loses by up to 7.5%.
@@ -116,37 +181,37 @@ pub const FFT_MID_CUTOFF: usize = 125;
 // loses at 654-671 just past a transform step (on one core it would be 997).
 pub const NTT_MID_CUTOFF: usize = 672;
 
-pub const DIV_KNUTH_CUTOFF: usize = 88;
-pub const BZ_CUTOFF: usize = 216;
-pub const BZ_TOP_PADDED_COST_SCALE: f64 = 1.60;
+pub const DIV_KNUTH_CUTOFF: usize = 68;
+pub const BZ_CUTOFF: usize = 140;
+pub const BZ_TOP_PADDED_COST_SCALE: f64 = 1.80;
 
-pub const DYN_DIV_KARATSUBA_FFT_NR_BZ_CUTOFF: usize = 352;
-pub const DYN_DIV_KARATSUBA_NR_BZ_CUTOFF: f64 = 0.60;
-pub const DYN_DIV_FFT_NR_BZ_CUTOFF: f64 = 5.50;
+pub const DYN_DIV_KARATSUBA_FFT_NR_BZ_CUTOFF: usize = 112;
+pub const DYN_DIV_KARATSUBA_NR_BZ_CUTOFF: f64 = 1.5;
+pub const DYN_DIV_FFT_NR_BZ_CUTOFF: f64 = 6.98;
 
-pub const DYN_DIV_REM_KARATSUBA_FFT_NR_BZ_CUTOFF: usize = 192;
-pub const DYN_DIV_REM_KARATSUBA_NR_BZ_CUTOFF: f64 = 24.0;
-pub const DYN_DIV_REM_FFT_NR_BZ_CUTOFF: f64 = 6.17;
+pub const DYN_DIV_REM_KARATSUBA_FFT_NR_BZ_CUTOFF: usize = 778;
+pub const DYN_DIV_REM_KARATSUBA_NR_BZ_CUTOFF: f64 = 4.4;
+pub const DYN_DIV_REM_FFT_NR_BZ_CUTOFF: f64 = 7.15;
 
-pub const DYN_RCP_KNUTH_NR_CUTOFF: usize = 11;
+pub const DYN_RCP_KNUTH_NR_CUTOFF: usize = 36;
 
-pub const STATIC_DIV_KARATSUBA_NTT_NR_BZ_CUTOFF: usize = 1664;
-pub const STATIC_DIV_KARATSUBA_NR_BZ_CUTOFF: f64 = 0.65;
-pub const STATIC_DIV_NTT_NR_BZ_CUTOFF: f64 = 9.485;
+pub const STATIC_DIV_KARATSUBA_NTT_NR_BZ_CUTOFF: usize = 842;
+pub const STATIC_DIV_KARATSUBA_NR_BZ_CUTOFF: f64 = 0.75;
+pub const STATIC_DIV_NTT_NR_BZ_CUTOFF: f64 = 11.66;
 
-pub const STATIC_DIV_REM_KARATSUBA_NTT_NR_BZ_CUTOFF: usize = 3328;
-pub const STATIC_DIV_REM_KARATSUBA_NR_BZ_CUTOFF: f64 = 0.82;
-pub const STATIC_DIV_REM_NTT_NR_BZ_CUTOFF: f64 = 10.5;
+pub const STATIC_DIV_REM_KARATSUBA_NTT_NR_BZ_CUTOFF: usize = 112;
+pub const STATIC_DIV_REM_KARATSUBA_NR_BZ_CUTOFF: f64 = 4.4;
+pub const STATIC_DIV_REM_NTT_NR_BZ_CUTOFF: f64 = 11.66;
 
-pub const STATIC_RCP_KNUTH_NR_CUTOFF: usize = 100;
+pub const STATIC_RCP_KNUTH_NR_CUTOFF: usize = 36;
 
-pub const ZIMMERMAN_SQRT_LEAF_CUTOFF: usize = 15;
-pub const DYN_SQRT_REM_ZIMMERMAN_CUTOFF: usize = 20;
-pub const DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF: usize = 15;
-pub const DYN_SQRT_APPROX_ZIMMERMAN_CUTOFF: usize = 15;
-pub const STATIC_SQRT_REM_ZIMMERMAN_CUTOFF: usize = 20;
-pub const STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF: usize = 15;
-pub const STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF: usize = 14;
+pub const ZIMMERMAN_SQRT_LEAF_CUTOFF: usize = 11;
+pub const DYN_SQRT_REM_ZIMMERMAN_CUTOFF: usize = 16;
+pub const DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF: usize = 11;
+pub const DYN_SQRT_APPROX_ZIMMERMAN_CUTOFF: usize = 11;
+pub const STATIC_SQRT_REM_ZIMMERMAN_CUTOFF: usize = 16;
+pub const STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF: usize = 11;
+pub const STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF: usize = 11;
 
 // The dynamic constant caches (ln2_dyn, pi_dyn) copy requests of up to their tables' 1024
 // limbs from them, and past that build in parallel (rayon) when
