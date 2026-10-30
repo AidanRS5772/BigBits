@@ -1718,9 +1718,12 @@ unsafe fn div_prim_asm(buf: &mut [u64], d: u64, v: u64, s: u32, mut r: u64) -> u
         "adds {q0}, {q0}, {u0}",
         "csel {t}, {d}, xzr, cs",
         "adc {q1}, {q1}, {h}",
-        // rem = r - c d - h d = u0 - q1 d
+        // rem = r - c d - h d = u0 - q1 d, with h d its own mul: M1 forwards a late accumulator
+        // only from another multiply-add, so msub would multiply after r (11.6 cycles a limb
+        // against 9.9).
+        "mul {u0}, {h}, {d}",
         "sub {r}, {r}, {t}",
-        "msub {r}, {h}, {d}, {r}",
+        "sub {r}, {r}, {u0}",
         // rem > q0: q1 -= 1, rem += d (C is clear when q0 < rem)
         "add {t}, {r}, {d}",
         "cmp {q0}, {r}",
@@ -1779,7 +1782,9 @@ pub fn div_prim(buf: &mut [u64], prim: u64) -> u64 {
 // u0: q q0 = v r1 + (r1 r0), r1 r0 = (r0 - q d1) u0 - d - q d0 is the remainder for q + 1, d is
 // added back when r1 >= q0, and r1 r0 >= d (rare) branches out of line. x86 forms both remainder
 // candidates from copies taken before the products (adding d back afterwards puts copies on the
-// chain), which needs a fourteenth register: v and d0 wait in xmm registers.
+// chain), which needs a fourteenth register: v and d0 wait in xmm registers. aarch64 splits q into
+// h + r1 + c (h = hi(v r1), c the carry into it), so r1 d and c d come off the chain while v r1
+// multiplies and only h d waits on h: 12.2 cycles a limb on M1 against 13.2 for q d after q.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn div_prim2_asm(
@@ -1896,30 +1901,42 @@ unsafe fn div_prim2_asm(
         "lsr {t}, {t}, #1",
         "lsr {t}, {t}, {ns}",
         "orr {u0}, {u0}, {t}",
-        // q q0 = v r1 + (r1 r0)
+        // h q0 = v r1, and r1 d's low two limbs in a1 a0 beside it. madd would wait for a1 before
+        // multiplying, as M1 forwards a late accumulator only from another multiply-add.
         "mul {q0}, {v}, {r1}",
-        "umulh {q}, {v}, {r1}",
+        "umulh {h}, {v}, {r1}",
+        "mul {a0}, {r1}, {d0}",
+        "umulh {a1}, {r1}, {d0}",
+        "mul {a2}, {r1}, {d1}",
+        "add {a1}, {a1}, {a2}",
+        // q0 += r0 with carry c, q = h + r1 + c, and c d in c1 t.
         "adds {q0}, {q0}, {r0}",
-        "adc {q}, {q}, {r1}",
-        // r0 u0 = (r0 - q d1) u0 - d - q d0
-        "msub {r0}, {q}, {d1}, {r0}",
+        "adc {q}, {h}, {r1}",
+        "csel {t}, {d0}, xzr, cs",
+        "csel {c1}, {d1}, xzr, cs",
+        // r0 u0 = (r0 u0) - d - r1 d - c d
         "subs {u0}, {u0}, {d0}",
         "sbc {r0}, {r0}, {d1}",
-        "mul {t0}, {q}, {d0}",
-        "umulh {t1}, {q}, {d0}",
-        "subs {u0}, {u0}, {t0}",
-        "sbc {r0}, {r0}, {t1}",
-        // t1 t0 = r0 u0 + d, kept when r0 >= q0; otherwise r0 u0 is the remainder and q + 1
-        // the quotient.
-        "adds {t0}, {u0}, {d0}",
-        "adc {t1}, {r0}, {d1}",
+        "subs {u0}, {u0}, {a0}",
+        "sbc {r0}, {r0}, {a1}",
+        "subs {u0}, {u0}, {t}",
+        "sbc {r0}, {r0}, {c1}",
+        // r0 u0 -= h d, the remainder for q + 1, and c1 t = r0 u0 + d, the one for q.
+        "mul {a0}, {h}, {d0}",
+        "umulh {a1}, {h}, {d0}",
+        "mul {a2}, {h}, {d1}",
+        "add {a1}, {a1}, {a2}",
+        "subs {u0}, {u0}, {a0}",
+        "sbc {r0}, {r0}, {a1}",
+        "adds {t}, {u0}, {d0}",
+        "adc {c1}, {r0}, {d1}",
+        // r0 u0 and q + 1 when r0 < q0, else c1 t and q.
         "cmp {r0}, {q0}",
-        "csel {r1}, {r0}, {t1}, lo",
-        "csel {r0}, {u0}, {t0}, lo",
+        "csel {r1}, {r0}, {c1}, lo",
+        "csel {r0}, {u0}, {t}, lo",
         "cinc {q}, {q}, lo",
-        // r1 r0 >= d: q += 1, r1 r0 -= d
-        "cmp {r0}, {d0}",
-        "sbcs xzr, {r1}, {d1}",
+        // r1 r0 >= d, which needs r1 >= d1: q += 1, r1 r0 -= d
+        "cmp {r1}, {d1}",
         "b.hs 5f",
         "4:",
         "str {q}, [{p}], #-8",
@@ -1927,6 +1944,10 @@ unsafe fn div_prim2_asm(
         "b.hs 2b",
         "b 6f",
         "5:",
+        "b.hi 7f",
+        "cmp {r0}, {d0}",
+        "b.lo 4b",
+        "7:",
         "subs {r0}, {r0}, {d0}",
         "sbc {r1}, {r1}, {d1}",
         "add {q}, {q}, #1",
@@ -1945,8 +1966,11 @@ unsafe fn div_prim2_asm(
         t = out(reg) _,
         q = out(reg) _,
         q0 = out(reg) _,
-        t0 = out(reg) _,
-        t1 = out(reg) _,
+        h = out(reg) _,
+        a0 = out(reg) _,
+        a1 = out(reg) _,
+        a2 = out(reg) _,
+        c1 = out(reg) _,
         options(nostack),
     );
     ((r1 as u128) << 64) | r0 as u128

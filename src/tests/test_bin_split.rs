@@ -1,7 +1,8 @@
 use super::exact_fraction;
 use crate::utils::series::*;
 use crate::utils::consts::consts::{
-    ln2_dyn, ln2_static, pi_dyn, pi_static, pi_static_sum, LN2_LIMBS, PI_LIMBS,
+    ln2_build, ln2_dyn, ln2_end, ln2_static, ln2_static_sum, pi_build, pi_dyn, pi_end, pi_static,
+    pi_static_sum, LN2_LIMBS, PI_LIMBS,
 };
 use crate::utils::div::div_dyn;
 use crate::utils::mul::mul_dyn;
@@ -31,6 +32,7 @@ fn leaves(leaf_limbs: u64, leaf_terms: u64) -> SplitCutoffs {
 
 struct BbpLin;
 impl BBPSeries for BbpLin {
+    no_tail!(1);
     fn p(_: u64) -> u64 {
         1
     }
@@ -41,6 +43,7 @@ impl BBPSeries for BbpLin {
 
 struct BbpQuad;
 impl BBPSeries for BbpQuad {
+    no_tail!(1);
     fn p(n: u64) -> u64 {
         3 * n + 2
     }
@@ -51,6 +54,7 @@ impl BBPSeries for BbpQuad {
 
 struct EngelFact;
 impl EngelSeries for EngelFact {
+    no_tail!(2);
     fn p(n: u64) -> u64 {
         n % 3
     }
@@ -61,6 +65,7 @@ impl EngelSeries for EngelFact {
 
 struct Hyp;
 impl HyperSeries for Hyp {
+    no_tail!(0);
     fn p(n: u64) -> u64 {
         n + 1
     }
@@ -492,6 +497,7 @@ fn mag(n: u64) -> u64 {
 
 struct SBbp<const K: u8, const PART: u8>;
 impl<const K: u8, const PART: u8> BBPSeries for SBbp<K, PART> {
+    no_tail!(1);
     const SIGNED: bool = PART == 0;
     fn p(n: u64) -> u64 {
         part::<K, PART>(n, mag(n))
@@ -506,6 +512,7 @@ impl<const K: u8, const PART: u8> BBPSeries for SBbp<K, PART> {
 
 struct SEngel<const K: u8, const PART: u8>;
 impl<const K: u8, const PART: u8> EngelSeries for SEngel<K, PART> {
+    no_tail!(1);
     const SIGNED: bool = PART == 0;
     fn p(n: u64) -> u64 {
         part::<K, PART>(n, mag(n) - 1)
@@ -524,6 +531,7 @@ impl<const K: u8, const PART: u8> EngelSeries for SEngel<K, PART> {
 
 struct SHyp<const K: u8, const PART: u8>;
 impl<const K: u8, const PART: u8> HyperSeries for SHyp<K, PART> {
+    no_tail!(1);
     const SIGNED: bool = PART == 0;
     fn p(n: u64) -> u64 {
         part::<K, PART>(n, mag(n))
@@ -641,6 +649,7 @@ fn test_signed_hyper_matches_unsigned_parts() {
 // A series' terms with term n's sign by pattern K.
 struct Signed<S, const K: u8>(PhantomData<S>);
 impl<S: BBPSeries, const K: u8> BBPSeries for Signed<S, K> {
+    no_tail!(S::START);
     const SIGNED: bool = true;
     fn p(n: u64) -> u64 {
         S::p(n)
@@ -653,6 +662,7 @@ impl<S: BBPSeries, const K: u8> BBPSeries for Signed<S, K> {
     }
 }
 impl<S: EngelSeries, const K: u8> EngelSeries for Signed<S, K> {
+    no_tail!(S::START);
     const SIGNED: bool = true;
     fn p(n: u64) -> u64 {
         S::p(n)
@@ -665,6 +675,7 @@ impl<S: EngelSeries, const K: u8> EngelSeries for Signed<S, K> {
     }
 }
 impl<S: HyperSeries, const K: u8> HyperSeries for Signed<S, K> {
+    no_tail!(S::START);
     const SIGNED: bool = true;
     fn p(n: u64) -> u64 {
         S::p(n)
@@ -719,6 +730,7 @@ fn test_static_signed_nodes_match_dyn() {
 // The ln(2) series with the largest terms, sum 1 / ((4n + 1) 16^n).
 struct Ln2Like;
 impl BBPSeries for Ln2Like {
+    no_tail!(0);
     fn p(_: u64) -> u64 {
         1
     }
@@ -995,6 +1007,7 @@ fn test_static_nodes_keep_bits() {
 // ln(3/2) = sum_{n >= 1} (-1)^(n + 1) / (n 2^n).
 struct Ln3Over2;
 impl BBPSeries for Ln3Over2 {
+    no_tail!(1);
     const SIGNED: bool = true;
     fn p(_: u64) -> u64 {
         1
@@ -1010,6 +1023,7 @@ impl BBPSeries for Ln3Over2 {
 // -ln(3/2), the same terms with every sign flipped.
 struct NegLn3Over2;
 impl BBPSeries for NegLn3Over2 {
+    no_tail!(1);
     const SIGNED: bool = true;
     fn p(_: u64) -> u64 {
         1
@@ -1025,6 +1039,7 @@ impl BBPSeries for NegLn3Over2 {
 // e^(-1/2) / 2 = sum_{n >= 0} (-1)^n / (n! 2^(n + 1)).
 struct ExpHalf;
 impl HyperSeries for ExpHalf {
+    no_tail!(0);
     const SIGNED: bool = true;
     fn p(_: u64) -> u64 {
         1
@@ -1210,6 +1225,7 @@ fn k_at<const M: u64>(n: u128) -> u128 {
 
 struct Twin<S, const M: u64>(PhantomData<S>);
 impl<S: BBPSeries, const M: u64> WideBBPSeries for Twin<S, M> {
+    no_tail!(S::START);
     const SIGNED: bool = S::SIGNED;
     fn p(n: u128) -> u128 {
         S::p(n as u64) as u128 * k_at::<M>(n)
@@ -1222,6 +1238,7 @@ impl<S: BBPSeries, const M: u64> WideBBPSeries for Twin<S, M> {
     }
 }
 impl<S: HyperSeries, const M: u64> WideHyperSeries for Twin<S, M> {
+    no_tail!(S::START);
     const SIGNED: bool = S::SIGNED;
     fn p(n: u128) -> u128 {
         S::p(n as u64) as u128 * k_at::<M>(n)
@@ -1241,6 +1258,7 @@ impl<S: HyperSeries, const M: u64> WideHyperSeries for Twin<S, M> {
 // q(n) = n it goes wide from n = 64.
 struct Shifted58<S>(PhantomData<S>);
 impl<S: EngelSeries> WideEngelSeries for Shifted58<S> {
+    no_tail!(S::START);
     const SIGNED: bool = S::SIGNED;
     fn p(n: u128) -> u128 {
         S::p(n as u64) as u128
@@ -1379,6 +1397,7 @@ fn test_static_wide_twins() {
 // wide.
 struct Chud;
 impl WideHyperSeries for Chud {
+    no_tail!(1);
     const SIGNED: bool = true;
     fn p(n: u128) -> u128 {
         Self::r(n) * (13591409 + 545140134 * n)
@@ -1456,4 +1475,61 @@ fn test_chudnovsky_wide() {
     check_bits::<DynNodeHyper<Chud>, StaticNodeHyper<64, Chud>>(&d, &s64, 1, 500, 64);
     let s400 = StaticHyperCtx::<400>::new(&[1], 15);
     check_static_cutoffs::<DynNodeHyper<Chud>, StaticNodeHyper<400, Chud>>(&d, &s400, 1, 500, 398);
+}
+
+// The constants' term counts come from their series' tail bounds, a limb past the output,
+// within a few terms of the closed forms they replaced.
+#[test]
+fn test_const_term_counts() {
+    for len in 1..=4096 {
+        let old = 32 * len as u64 / 3 + 5;
+        let new = ln2_end(len);
+        assert!(
+            new.abs_diff(old) <= 8,
+            "ln2 at {len} limbs: {new} terms, was {old}"
+        );
+        let old = 6 + 6400 * len as u64 / 4711;
+        let new = pi_end(len);
+        assert!(
+            new.abs_diff(old) <= 8,
+            "pi at {len} limbs: end {new}, was {old}"
+        );
+    }
+}
+
+// Below the tables, the series paths (dynamic, extending one cache as it grows, and static)
+// give exactly the tables' limbs.
+#[test]
+fn test_const_series_match_tables() {
+    let (mut ln2_nodes, mut pi_node) = ((None, None, None, None), None);
+    for l in [
+        1,
+        2,
+        3,
+        5,
+        17,
+        64,
+        100,
+        257,
+        500,
+        1000,
+        LN2_LIMBS.min(PI_LIMBS) - 1,
+    ] {
+        let mut want = vec![0; l];
+        ln2_dyn(&mut want);
+        let mut buf = Vec::new();
+        ln2_build(&mut ln2_nodes, &mut buf, l + 1);
+        assert_eq!(&buf[1..], &want[..], "ln2 dyn series at {l} limbs");
+        let mut fresh = Vec::new();
+        ln2_build(&mut (None, None, None, None), &mut fresh, l + 1);
+        assert_eq!(&fresh[1..], &want[..], "ln2 fresh series at {l} limbs");
+        let mut out = vec![0; l];
+        ln2_static_sum::<1030>(&mut out, 1).unwrap();
+        assert_eq!(out, want, "ln2 static series at {l} limbs");
+
+        pi_dyn(&mut want);
+        let mut buf = Vec::new();
+        pi_build(&mut pi_node, &mut buf, l + 1);
+        assert_eq!(&buf[1..], &want[..], "pi dyn series at {l} limbs");
+    }
 }

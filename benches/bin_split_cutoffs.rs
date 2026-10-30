@@ -14,18 +14,34 @@
 
 use big_bits::utils::{
     series::{
-        bin_split_tree_at, BBPSeries, DynHyperCtx, DynNodeBBP, DynNodeEngel, DynNodeHyper,
-        HyperSeries, Node, Shift, SplitCutoffs, StaticHyperCtx, StaticNodeBBP, StaticNodeEngel,
-        StaticNodeHyper,
+        bin_split_tree_at, BBPSeries, DynHyperCtx, DynNodeBBP, DynNodeEngel, DynNodeHyper, Engel,
+        HyperSeries, Node, Series, Shift, SplitCutoffs, StaticHyperCtx, StaticNodeBBP,
+        StaticNodeEngel, StaticNodeHyper,
     },
-    trans::{exp_dyn_at, exp_dyn_entry, exp_terms, ln_dyn, ln_dyn_at, Exp},
+    trans::{exp_dyn_at, exp_dyn_entry, ln_dyn, ln_dyn_at, Exp},
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{env, hint::black_box, time::Instant};
 
+// e^y - 1's term count for y <= 2^-s at w limbs, at least one.
+fn exp_terms(s: u64, w: usize) -> u64 {
+    (Engel::<Exp>::new(s).range(64 * w as u64).1 - 1).max(1)
+}
+
+// START, and a tail bound of 0: these series are only summed over explicit ranges.
+macro_rules! no_tail {
+    ($start:expr) => {
+        const START: u64 = $start;
+        fn tail_bits(_: u64, _: i64) -> u64 {
+            0
+        }
+    };
+}
+
 // The four ln(2) series, sum 1 / (q(n) 16^n).
 struct Ln2A;
 impl BBPSeries for Ln2A {
+    no_tail!(1);
     fn p(_: u64) -> u64 {
         1
     }
@@ -35,6 +51,7 @@ impl BBPSeries for Ln2A {
 }
 struct Ln2B;
 impl BBPSeries for Ln2B {
+    no_tail!(0);
     fn p(_: u64) -> u64 {
         1
     }
@@ -44,6 +61,7 @@ impl BBPSeries for Ln2B {
 }
 struct Ln2C;
 impl BBPSeries for Ln2C {
+    no_tail!(0);
     fn p(_: u64) -> u64 {
         1
     }
@@ -53,6 +71,7 @@ impl BBPSeries for Ln2C {
 }
 struct Ln2D;
 impl BBPSeries for Ln2D {
+    no_tail!(0);
     fn p(_: u64) -> u64 {
         1
     }
@@ -64,6 +83,7 @@ impl BBPSeries for Ln2D {
 // Ratio (2n + 1) / (2n + 4) per term.
 struct Hyp;
 impl HyperSeries for Hyp {
+    no_tail!(0);
     fn p(n: u64) -> u64 {
         n + 1
     }

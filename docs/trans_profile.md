@@ -88,8 +88,8 @@ base cases that Karatsuba recursion bottoms out in.
 
 ### Why the shape looks like this
 
-The series per call, from the chunk schedule (`chunk_width`, `exp_terms`,
-`ln_terms`). These are approximate: exp assumes r with one leading zero bit, so
+The series per call, from the chunk schedule (`chunk_width` and the series' term counts,
+now from their tail bounds through the typed contexts' `range`). These are approximate: exp assumes r with one leading zero bit, so
 j = 23 squares. ln assumes δ ≈ 2^-(1 + roots).
 
 | Limbs | exp: top Engel terms | exp: Hyper chunk terms | ln: roots, top BBP terms | ln: Hyper chunk terms |
@@ -329,8 +329,8 @@ stays a constant 24. See `bin_split_cutoff_tuning.md`.
 
 ## 8. Smaller items
 
-- **`exp_terms`** binary-searches a Stirling bound in f64 (`log2` per step, in
-  libm) for every series. That's about 5% at 1–2 limbs. An integer bound (a
+- **`exp_terms`** (now `range` over `exp_tail_bits`, which doubles and then bisects)
+  evaluates a Stirling bound in f64 (`log2` per step, in libm) for every series. That's about 5% at 1–2 limbs. An integer bound (a
   `log2(n!)` table for small n, `ilog2` Stirling beyond) or memoizing per frame
   would remove it.
 - **ln's chain at 1–4 limbs** sends 2–4-limb chunk quotients through the general

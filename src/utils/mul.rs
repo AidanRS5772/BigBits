@@ -3815,6 +3815,41 @@ pub fn is_karatsuba(l: usize, s: usize, chunk: f64, reg: f64) -> bool {
     }
 }
 
+// The work of an l x s product in schoolbook limb products, following mul_dyn's tiers
+// (stat: mul_static's, with the NTT for the FFT), for cost models. Each tier's scale comes
+// from the crossover that selects it, where both sides cost the same: Karatsuba's cost is
+// scaled to l s at the school boundary (c^(2 - log2 3) for is_school's cutoff c), and the
+// transform's is is_karatsuba's ratio times fft_cost. A two-limb short side counts four
+// limb products a limb, as mul_prim2's 128-bit carries cost about four mul_prim passes.
+// Only Karatsuba and above call libm.
+pub fn mul_work(l: usize, s: usize, stat: bool) -> f64 {
+    let (l, s) = if l >= s { (l, s) } else { (s, l) };
+    if s <= 2 {
+        return (l * s * s) as f64;
+    }
+    if is_school(l, s) {
+        return l as f64 * s as f64;
+    }
+    const SCALE: f64 = 2.0 - 1.584962501;
+    let (kara, cut, ratio) = if s <= (l + 1) / 2 {
+        let ratio = if stat {
+            NTT_CHUNKING_KARATSUBA_CUTOFF
+        } else {
+            FFT_CHUNKING_KARATSUBA_CUTOFF
+        };
+        let cut = CHUNKING_KARATSUBA_CUTOFF as f64;
+        (chunking_karatsuba_cost(l, s), cut, ratio)
+    } else {
+        let ratio = if stat {
+            NTT_KARATSUBA_CUTOFF
+        } else {
+            FFT_KARATSUBA_CUTOFF
+        };
+        (karatsuba_cost(l, s), KARATSUBA_CUTOFF, ratio)
+    };
+    cut.powf(SCALE) * kara.min(ratio * fft_cost(l, s))
+}
+
 #[derive(Debug)]
 pub enum MulDynDispatch {
     Prim,

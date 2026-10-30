@@ -1,3 +1,13 @@
+// START, and a tail bound of 0, for series that tests only sum over explicit ranges.
+macro_rules! no_tail {
+    ($start:expr) => {
+        const START: u64 = $start;
+        fn tail_bits(_: u64, _: i64) -> u64 {
+            0
+        }
+    };
+}
+
 mod test_bin_split;
 mod test_series;
 pub(crate) mod test_div;

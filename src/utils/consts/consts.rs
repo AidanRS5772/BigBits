@@ -7,8 +7,8 @@ use std::{
 use crate::utils::{
     series::{
         bin_split, bin_split_tree, join2, ratio_to_fraction_dyn, ratio_to_fraction_static,
-        static_split_stack, BBPSeries, DynHyperCtx, DynNodeBBP, DynNodeHyper, Node, Shift,
-        StaticHyperCtx, StaticNodeBBP, StaticNodeHyper, WideHyperSeries,
+        static_split_stack, BBPSeries, Bbp, DynHyperCtx, DynNodeBBP, DynNodeHyper, Hyper, Node,
+        Series, Shift, StaticHyperCtx, StaticNodeBBP, StaticNodeHyper, WideHyperSeries,
     },
     div::div_dyn,
     mul::{hi_mul_static, mul_dyn, mul_prim},
@@ -118,11 +118,19 @@ fn static_jobs<const N: usize, const K: usize>(
 // $ln(2) = \frac{1}{192} \sum^{\infty}_{n=0}\left(\frac{128}{6n+1} + \frac{8}{6n+3} + \frac{8}{6n+5} + \frac{1}{2n+2}\right) 64^{-n}$
 // $ln(2) = 2/3 \sum^{\infty}_{n=0} \frac{1}{6n+1} \; 64^{-n} + 1/24 \sum^{\infty}_{n=0} \frac{1}{6n+5} \; 64^{-n} + 1/72 \sum^{\infty}_{n=0} \frac{1}{2n+1} \; 64^{-n} + 1/384 \sum^{\infty}_{n=0} \frac{1}{n+1} \; 64^{-n} $
 const LN2_CTX: Shift = Shift(6);
-const TERM_GAURD: u64 = 4;
 
 // 1 / ((A n + B) 64^n), summed from n = 0.
-struct Ln2S<const A: u64, const B: u64>;
+pub(crate) struct Ln2S<const A: u64, const B: u64>;
 impl<const A: u64, const B: u64> BBPSeries for Ln2S<A, B> {
+    const START: u64 = 0;
+    // Term n is 2^(-s (n + 1)) / (A n + B), so for s >= 1 the tail from n is at most twice it.
+    fn tail_bits(n: u64, s: i64) -> u64 {
+        let s = s.max(0) as u64;
+        (n + 1)
+            .saturating_mul(s)
+            .saturating_add(A.saturating_mul(n).saturating_add(B).ilog2() as u64)
+            .saturating_sub(1)
+    }
     fn p(_: u64) -> u64 {
         1
     }
@@ -134,9 +142,15 @@ impl<const A: u64, const B: u64> BBPSeries for Ln2S<A, B> {
 // Each series' weight 2^-k / d, as (d, k).
 const LN2_W: [(u64, i64); 4] = [(3, -1), (3, 3), (9, 3), (3, 7)];
 
-// Terms [0, n) for len limbs. Each adds 6 bits.
-fn ln2_terms(len: usize) -> u64 {
-    32 * len as u64 / 3 + 1 + TERM_GAURD
+// The four series' terms [0, n) for len limbs: the most any of their tail bounds needs to
+// reach a limb past len, which covers the shares' weights (at most 2^7 / 3 on a node's S).
+pub(crate) fn ln2_end(len: usize) -> u64 {
+    fn end<const A: u64, const B: u64>(bits: u64) -> u64 {
+        Bbp::<Ln2S<A, B>>::new(LN2_CTX.0).range(bits).1
+    }
+    let bits = 64 * (len as u64 + 1);
+    let ends = [end::<6, 1>, end::<6, 5>, end::<2, 1>, end::<1, 1>];
+    ends.into_iter().map(|end| end(bits)).max().unwrap()
 }
 
 // t <- w S for a series' S = P / (Q 2^sh) and weight w = 2^-k / d: d scales Q's top
@@ -158,7 +172,7 @@ fn ln2_share(
     finalize(p, &dq[..buf_len(dq)], sh + k - 6 + 64 * cut as i64, t);
 }
 
-type Ln2Nodes = (
+pub(crate) type Ln2Nodes = (
     Option<DynNodeBBP<Ln2S<6, 1>>>,
     Option<DynNodeBBP<Ln2S<6, 5>>>,
     Option<DynNodeBBP<Ln2S<2, 1>>>,
@@ -167,7 +181,7 @@ type Ln2Nodes = (
 
 // ln 2 at len limbs into buf: the sum of the series' shares, each extending its cached
 // node and finalizing in its own task.
-fn ln2_build(nodes: &mut Ln2Nodes, buf: &mut Vec<u64>, len: usize) {
+pub(crate) fn ln2_build(nodes: &mut Ln2Nodes, buf: &mut Vec<u64>, len: usize) {
     fn share<S: BBPSeries>(node: &mut Option<DynNodeBBP<S>>, n: u64, w: (u64, i64), t: &mut [u64]) {
         let s = bin_split_extend(&LN2_CTX, node, 0, n);
         let sh = (LN2_CTX.0 * (s.b - s.a)) as i64;
@@ -176,7 +190,7 @@ fn ln2_build(nodes: &mut Ln2Nodes, buf: &mut Vec<u64>, len: usize) {
         ln2_share((&s.p, &s.q, sh), w, dq, t, ratio_to_fraction_dyn);
     }
 
-    let n = ln2_terms(len);
+    let n = ln2_end(len);
     let have = nodes.0.as_ref().map_or(0, |s| s.range().1);
     // Rounded up, so a one-limb extension counts.
     let limbs = |terms: u64| (3 * terms).div_ceil(32);
@@ -235,13 +249,21 @@ fn ln2_sum<const N: usize>(out: &mut [u64], guard: usize) -> Result<(), Capacity
     if from_table(&LN2_TABLE, out) {
         return Ok(());
     }
+    ln2_static_sum::<N>(out, guard)
+}
+
+// The series at out.len() + guard limbs, which tests call directly to skip the table.
+pub(crate) fn ln2_static_sum<const N: usize>(
+    out: &mut [u64],
+    guard: usize,
+) -> Result<(), CapacityError> {
     let len = out.len() + guard;
     // Static finalize needs 2 limbs past its output.
     if len + 2 > N {
         return Err(CapacityError { min_n: len + 2 });
     }
 
-    let n = ln2_terms(len);
+    let n = ln2_end(len);
     let [w1, w2, w3, w4] = LN2_W;
     let shares = static_jobs::<N, 4>(
         len >= STATIC_LN2_PAR_CUTOFF,
@@ -274,11 +296,23 @@ pub(crate) fn ln2_static_unguarded<const N: usize>(out: &mut [u64]) -> Result<()
 //$\pi = \frac{426880 \sqrt{10005} \cdot Q}{13591409 \cdot Q + P}$
 
 const PI_POW: u128 = 333_833_583_375;
-const PI_CTX: DynHyperCtx = DynHyperCtx::new_shift(15);
+const PI_SHIFT: u64 = 15;
+const PI_CTX: DynHyperCtx = DynHyperCtx::new_shift(PI_SHIFT);
 
-struct Pi;
+pub(crate) struct Pi;
 impl WideHyperSeries for Pi {
     const SIGNED: bool = true;
+    const START: u64 = 1;
+    // |term n| = (13591409 + 545140134 n) prod r(i) / (q(i) 2^s), and each r(i) / q(i) <
+    // 72 / PI_POW < 2^-32.11, so the terms fall far faster than by half and the tail from n
+    // is under twice term n.
+    fn tail_bits(n: u64, s: i64) -> u64 {
+        let s = s.max(0) as u64;
+        let lead = 128 - (13591409 + 545140134 * n as u128).leading_zeros() as u64;
+        n.saturating_mul(s + 32)
+            .saturating_add(n / 10)
+            .saturating_sub(lead + 1)
+    }
     fn p(n: u128) -> u128 {
         (13591409 + 545140134 * n) * Self::r(n)
     }
@@ -318,8 +352,11 @@ pub(crate) fn shifted(x: &[u64], sh: i64, out: &mut [u64]) {
     }
 }
 
-fn pi_terms(f: usize) -> u64 {
-    2 + TERM_GAURD + (6400 * f as u64) / 4711
+// The terms [1, n) for f fraction limbs: an error e in S moves pi by about e pi / 13591409,
+// so a tail bound a limb past f leaves room to spare.
+pub(crate) fn pi_end(f: usize) -> u64 {
+    let ctx = Hyper::<Pi>::new(&[1], PI_SHIFT).expect("x = 1 is below 2^PI_SHIFT");
+    ctx.range(64 * (f as u64 + 1)).1
 }
 
 fn pi_denominator<'a>(
@@ -348,9 +385,9 @@ fn pi_root(x: &mut [u64], root: &mut [u64], sqrt: fn(&mut [u64], &mut [u64])) {
     debug_assert_eq!(c, 0);
 }
 
-fn pi_build(node: &mut Option<DynNodeHyper<Pi>>, buf: &mut Vec<u64>, len: usize) {
+pub(crate) fn pi_build(node: &mut Option<DynNodeHyper<Pi>>, buf: &mut Vec<u64>, len: usize) {
     let f = len - 1;
-    let n = pi_terms(f);
+    let n = pi_end(f);
     let have = node.as_ref().map_or(1, |s| s.range().1);
     let limbs = |terms: u64| terms * 4711 / 6400;
     let par = cache_par(
@@ -407,8 +444,8 @@ pub fn pi_dyn(out: &mut [u64]) {
 
 #[inline(never)]
 fn pi_ratio_static<const N: usize>(f: usize) -> [u64; N] {
-    let ctx = StaticHyperCtx::<N>::new(&[1], PI_CTX.shift);
-    let s = bin_split::<StaticNodeHyper<N, Pi>>(&ctx, 1, pi_terms(f));
+    let ctx = StaticHyperCtx::<N>::new(&[1], PI_SHIFT);
+    let s = bin_split::<StaticNodeHyper<N, Pi>>(&ctx, 1, pi_end(f));
     debug_assert!(s.is_neg(), "S < 0");
     let (mut qt, mut t, mut v) = ([0; N], [0; N], [0; N]);
     let (qt, t) = pi_denominator(

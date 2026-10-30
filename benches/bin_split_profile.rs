@@ -8,9 +8,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+// START, and a tail bound of 0: these series are only summed over explicit ranges.
+macro_rules! no_tail {
+    ($start:expr) => {
+        const START: u64 = $start;
+        fn tail_bits(_: u64, _: i64) -> u64 {
+            0
+        }
+    };
+}
+
 // The four ln(2) series, sum 1 / (q(n) 16^n).
 struct Ln2A;
 impl BBPSeries for Ln2A {
+    no_tail!(1);
     fn p(_: u64) -> u64 {
         1
     }
@@ -20,6 +31,7 @@ impl BBPSeries for Ln2A {
 }
 struct Ln2B;
 impl BBPSeries for Ln2B {
+    no_tail!(0);
     fn p(_: u64) -> u64 {
         1
     }
@@ -29,6 +41,7 @@ impl BBPSeries for Ln2B {
 }
 struct Ln2C;
 impl BBPSeries for Ln2C {
+    no_tail!(0);
     fn p(_: u64) -> u64 {
         1
     }
@@ -38,6 +51,7 @@ impl BBPSeries for Ln2C {
 }
 struct Ln2D;
 impl BBPSeries for Ln2D {
+    no_tail!(0);
     fn p(_: u64) -> u64 {
         1
     }
@@ -49,6 +63,7 @@ impl BBPSeries for Ln2D {
 // e - 2 = sum_{n >= 2} 1 / n!
 struct EMinus2;
 impl EngelSeries for EMinus2 {
+    no_tail!(2);
     fn p(_: u64) -> u64 {
         1
     }
@@ -60,6 +75,7 @@ impl EngelSeries for EMinus2 {
 // Ratio (2n + 1) / (2n + 4) * x / 2^shift per term.
 struct Hyp;
 impl HyperSeries for Hyp {
+    no_tail!(0);
     fn p(n: u64) -> u64 {
         n + 1
     }

@@ -1,12 +1,12 @@
 use std::cell::RefCell;
 
-pub mod series;
 pub mod consts;
 pub mod div;
 pub mod mul;
+pub mod series;
 pub mod sqrt;
-pub mod utils;
 pub mod trans;
+pub mod utils;
 
 // A static entry's request needs more limbs than its N provides. This is a limit of
 // the stack buffers, not an arithmetic failure: the same call succeeds once N >= min_n.
@@ -269,29 +269,27 @@ pub const STATIC_HYPER_LEAF_TERMS: u64 = 8;
 pub const DYN_BIN_SPLIT_PAR_CUTOFF: u64 = 256;
 pub const DYN_BIN_SPLIT_MERGE_PAR_CUTOFF: usize = 256;
 
-// series_eval weighs each eligible algorithm's work estimate (series.rs's horner_work,
-// rect_work and bin_split_work) and takes the cheapest. Horner's weights are per
-// limb-step, mostly div_prim's hardware division; rect's per high-product limb, and also
-// per limb of Horner's x products; bin_split's per limb product, plus a fixed cost for its
-// nodes and finalize. GUESS: every value is a placeholder, not measured.
-pub const DYN_SERIES_HORNER_BBP: f64 = 8.0;
-pub const DYN_SERIES_HORNER_ENGEL: f64 = 4.0;
-pub const DYN_SERIES_HORNER_HYPER: f64 = 5.0;
-pub const DYN_SERIES_RECT_HYPER: f64 = 1.0;
-pub const DYN_SERIES_BIN_SPLIT_BBP: f64 = 1.0;
-pub const DYN_SERIES_BIN_SPLIT_ENGEL: f64 = 1.0;
-pub const DYN_SERIES_BIN_SPLIT_HYPER: f64 = 1.0;
-pub const DYN_SERIES_BIN_SPLIT_FIXED: f64 = 1000.0;
-pub const STATIC_SERIES_HORNER_BBP: f64 = 8.0;
-pub const STATIC_SERIES_HORNER_ENGEL: f64 = 4.0;
-pub const STATIC_SERIES_HORNER_HYPER: f64 = 5.0;
-pub const STATIC_SERIES_RECT_HYPER: f64 = 1.0;
-pub const STATIC_SERIES_BIN_SPLIT_BBP: f64 = 1.0;
-pub const STATIC_SERIES_BIN_SPLIT_ENGEL: f64 = 1.0;
-pub const STATIC_SERIES_BIN_SPLIT_HYPER: f64 = 1.0;
-pub const STATIC_SERIES_BIN_SPLIT_FIXED: f64 = 500.0;
-// Rectangular splitting's block length, about this times sqrt(terms). GUESS.
-pub const SERIES_RECT_M_SCALE: f64 = 1.0;
+// series_eval predicts each eligible algorithm's time from its kernels' operation counts
+// (series.rs's Work: Big-O in the call's terms, precision, shifts, x and N, with structural
+// pass, product and array counts) and takes the fastest. These are the ns per unit of each
+// count, shared by every series kind and both allocation modes, fitted by non-negative
+// least squares on relative error over serial timings on an Apple M1 (aarch64). See
+// docs/series_cutoff_tuning.md.
+// A limb of a div_prim or div_prim2 pass, or a Knuth quotient limb.
+pub const SERIES_NS_DIV: f64 = 3.574;
+// A limb times scalar limb of a linear pass: a product or multiply-add by a scalar, an
+// addition, a negation, a clear or a copy.
+pub const SERIES_NS_SCALAR: f64 = 0.1574;
+// A schoolbook limb product of a multi-limb product (mul::mul_work).
+pub const SERIES_NS_PRODUCT: f64 = 0.3847;
+// A Horner or rect term's group and weight bookkeeping.
+pub const SERIES_NS_TERM: f64 = 9.334;
+// A kernel call: a pass, product or division.
+pub const SERIES_NS_CALL: f64 = 0.9307;
+// A heap allocation or scratch acquisition.
+pub const SERIES_NS_ALLOC: f64 = 9.377;
+// A limb of a static [u64; N] array zero-filled or moved.
+pub const SERIES_NS_FILL: f64 = 0.09114;
 
 // exp_dyn_entry evaluates its chunk series in parallel once it has at least two chunks
 // and chunks * working limbs reaches this, on a pool of two or more threads. Chunks

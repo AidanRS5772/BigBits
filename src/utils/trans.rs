@@ -1,7 +1,6 @@
 use crate::utils::series::{
-    bin_split, join2, ratio_to_fraction_dyn, ratio_to_fraction_static, static_split_stack,
-    BBPSeries, DynHyperCtx, DynNodeBBP, DynNodeEngel, DynNodeHyper, EngelSeries, HyperSeries, Node,
-    Shift, StaticHyperCtx, StaticNodeBBP, StaticNodeEngel, StaticNodeHyper,
+    join2, ratio_to_fraction_dyn, ratio_to_fraction_static, series_eval_dyn, series_eval_static,
+    static_split_stack, BBPSeries, Bbp, Engel, EngelSeries, Hyper, HyperSeries, Series,
 };
 use crate::utils::consts::consts::{ln2_dyn, ln2_static_unguarded, shifted, LN2_LIMBS};
 use crate::utils::div::{div_dyn, div_rem_dyn, div_rem_static, div_static};
@@ -71,8 +70,37 @@ fn capacity<const N: usize>(min_n: usize) -> Result<(), CapacityError> {
     (N >= min_n).then_some(()).ok_or(CapacityError { min_n })
 }
 
+// A lower bound on log2(n!), Stirling's less half a bit, or 0 for n < 2.
+fn log2_factorial(n: u64) -> u64 {
+    let c = (LOG2_E - PI.log2() - 1.0) * 0.5;
+    let nf = n as f64;
+    ((nf + 0.5) * nf.log2() - nf * LOG2_E - c) as u64
+}
+
+// e^y - 1 for y <= 2^-s <= 1/2 is below 2^(1 - s), and from term n >= 2 its tail is at most
+// 2 y^n / n! <= y^(n - 1) / (n - 1)!.
+fn exp_tail_bits(n: u64, s: i64) -> u64 {
+    let s = s.max(0) as u64;
+    match n.checked_sub(1) {
+        None | Some(0) => s.saturating_sub(1),
+        Some(m) => m.saturating_mul(s).saturating_add(log2_factorial(m)),
+    }
+}
+
+// ATanh(y) for y <= 2^-s <= 1/2 has tail y^n / ((2n + 1)(1 - y)) <= 2 y^n / (2n + 1) from n.
+fn atanh_tail_bits(n: u64, s: i64) -> u64 {
+    let s = s.max(0) as u64;
+    n.saturating_mul(s)
+        .saturating_add((2 * n.min(u64::MAX / 4) + 1).ilog2() as u64)
+        .saturating_sub(1)
+}
+
 pub struct Exp;
 impl EngelSeries for Exp {
+    const START: u64 = 1;
+    fn tail_bits(n: u64, s: i64) -> u64 {
+        exp_tail_bits(n, s)
+    }
     fn p(_: u64) -> u64 {
         1
     }
@@ -81,6 +109,10 @@ impl EngelSeries for Exp {
     }
 }
 impl HyperSeries for Exp {
+    const START: u64 = 1;
+    fn tail_bits(n: u64, s: i64) -> u64 {
+        exp_tail_bits(n, s)
+    }
     fn p(_: u64) -> u64 {
         1
     }
@@ -95,6 +127,10 @@ impl HyperSeries for Exp {
 // atanh(x) = x (1 + ATanh(x^2)), summed from n = 1.
 pub struct ATanh;
 impl BBPSeries for ATanh {
+    const START: u64 = 1;
+    fn tail_bits(n: u64, s: i64) -> u64 {
+        atanh_tail_bits(n, s)
+    }
     fn p(_: u64) -> u64 {
         1
     }
@@ -103,6 +139,10 @@ impl BBPSeries for ATanh {
     }
 }
 impl HyperSeries for ATanh {
+    const START: u64 = 1;
+    fn tail_bits(n: u64, s: i64) -> u64 {
+        atanh_tail_bits(n, s)
+    }
     fn p(_: u64) -> u64 {
         1
     }
@@ -112,44 +152,6 @@ impl HyperSeries for ATanh {
     fn r(n: u64) -> u64 {
         2 * n + 1
     }
-}
-
-// The fewest n with fits(n), for a monotone fits that holds from ceil(p / s).
-fn min_terms(p: u64, s: u64, fits: impl Fn(u64) -> bool) -> u64 {
-    if fits(0) {
-        return 0;
-    }
-    let (mut a, mut b) = (0, p.div_ceil(s));
-    while b - a > 1 {
-        let n = (a + b) / 2;
-        if fits(n) {
-            b = n;
-        } else {
-            a = n;
-        }
-    }
-    b
-}
-
-// Terms of e^x, x <= 2^-s, past which n s + log2(n!) (Stirling) reaches 64w bits.
-pub fn exp_terms(s: u64, w: usize) -> u64 {
-    let c = (LOG2_E - PI.log2() - 1.0) * 0.5;
-    let p = 64 * w as u64;
-    min_terms(p, s, |n| {
-        let nf = n as f64;
-        n * s + ((nf + 0.5) * nf.log2() - nf * LOG2_E - c) as u64 >= p
-    })
-}
-
-// Terms of ATanh(x), x < 2^-s, whose tail x^(n + 1) / ((2n + 3)(1 - x)) is below 2^-64w.
-pub fn ln_terms(s: u64, w: usize) -> u64 {
-    // 1 / (1 - x) <= 2
-    let p = 64 * w as u64 + 1;
-    min_terms(p, s, |n| (n + 1) * s + (2 * n + 3).ilog2() as u64 >= p)
-}
-
-fn exp_zero_limbs(t: u64) -> usize {
-    (t.saturating_sub(1) / 64) as usize
 }
 
 // Bits of x, whose top limb is nonzero.
@@ -237,7 +239,7 @@ fn chunk_bits<'r>(
     s: u64,
     width: u64,
     out: &'r mut [u64],
-) -> Option<(&'r [u64], u64, u64)> {
+) -> Option<(&'r [u64], u64)> {
     let (l, sh) = split_sh(e - s - width);
     let n = width.div_ceil(64) as usize;
     let c = (n + 1).min(x.len() - l);
@@ -249,30 +251,54 @@ fn chunk_bits<'r>(
     let r = &mut out[skip..n];
     shr_buf(r, tz as u8);
     let r = &r[..buf_len(r)];
-    let k = s + width - 64 * skip as u64 - tz as u64;
-    Some((r, k - bits(r), k))
+    Some((r, s + width - 64 * skip as u64 - tz as u64))
 }
 
-// n terms of the series in r 2^-k into out, the low limbs of a w-limb frame: an Engel or BBP
-// tree (E) when r = 1, otherwise a Hyper tree.
-fn series<E, H>(
-    r: &[u64],
-    k: u64,
-    n: u64,
-    w: usize,
-    out: &mut [u64],
-    ctx: fn(&[u64], u64) -> H::Ctx,
-) where
-    E: Node<Ctx = Shift> + Send,
-    H: Node + Send,
-    H::Ctx: Sync,
-{
-    let zeros = w - out.len();
+// series_eval_dyn or series_eval_static, for the code the dynamic and static entries share.
+trait Eval {
+    // ctx's series into out, below its zero limbs, which it returns.
+    fn eval<C: Series>(ctx: &C, out: &mut [u64]) -> usize;
+}
+
+struct DynEval;
+
+impl Eval for DynEval {
+    fn eval<C: Series>(ctx: &C, out: &mut [u64]) -> usize {
+        series_eval_dyn(ctx, out).1
+    }
+}
+
+struct StaticEval<const N: usize>;
+
+impl<const N: usize> Eval for StaticEval<N> {
+    fn eval<C: Series>(ctx: &C, out: &mut [u64]) -> usize {
+        let (_, zeros) = series_eval_static::<N, C>(ctx, out)
+            .expect("the static entries' bounds leave every series room");
+        zeros
+    }
+}
+
+// e^(r 2^-k) - 1's Hyper context, for an odd r with r 2^-k < 1/2.
+fn exp_hyper(r: &[u64], k: u64) -> Hyper<'_, Exp> {
+    Hyper::new(r, k).expect("a chunk's bits lie below 2^-1")
+}
+
+// The zero limbs above e^(r 2^-k) - 1.
+fn exp_zeros(r: &[u64], k: u64) -> usize {
     if r == [1] {
-        bin_split::<E>(&Shift(k), 1, n + 1).finalize(&Shift(k), zeros, out);
+        Engel::<Exp>::new(k).zeros()
     } else {
-        let ctx = ctx(r, k);
-        bin_split::<H>(&ctx, 1, n + 1).finalize(&ctx, zeros, out);
+        exp_hyper(r, k).zeros()
+    }
+}
+
+// e^(r 2^-k) - 1 into out, the limbs of its frame below exp_zeros(r, k): an Engel series when
+// r = 1, otherwise a Hyper one.
+fn exp_series<V: Eval>(r: &[u64], k: u64, out: &mut [u64]) {
+    if r == [1] {
+        V::eval(&Engel::<Exp>::new(k), out);
+    } else {
+        V::eval(&exp_hyper(r, k), out);
     }
 }
 
@@ -318,17 +344,15 @@ pub fn exp_dyn_entry(x: &[u64], m: u64, out: &mut [u64]) -> u64 {
         parts.extend(chunk_bits(x, e, s, width, r));
     }
 
-    let exp = |r: &[u64], t, k, out: &mut [u64]| {
-        let n = exp_terms(t, w);
-        series::<DynNodeEngel<Exp>, DynNodeHyper<Exp>>(r, k, n, w, out, DynHyperCtx::new)
-    };
-    let top = w - exp_zero_limbs(s + 1);
+    let top = w - exp_zeros(&[1], s + 1);
     a[top..].fill(0);
-    exp(&[1], s + 1, s + 1, &mut a[..top]);
+    exp_series::<DynEval>(&[1], s + 1, &mut a[..top]);
     let par = chunks_par(parts.len(), v, DYN_EXP_CHUNK_PAR_WORK, true);
     let mut results = ScratchGuard::acquire();
-    let mut bs = results.get_split_vec(parts.iter().map(|&(_, t, _)| w - exp_zero_limbs(t)));
-    for_each_slot(par, &parts, &mut bs, |&(r, t, k), b| exp(r, t, k, b));
+    let mut bs = results.get_split_vec(parts.iter().map(|&(r, k)| w - exp_zeros(r, k)));
+    for_each_slot(par, &parts, &mut bs, |&(r, k), b| {
+        exp_series::<DynEval>(r, k, b)
+    });
     for b in &bs {
         exp_combine(a, b, z, c, hi_mul_dyn);
     }
@@ -411,7 +435,7 @@ fn exp_reduced(
         let c = shl_buf(&mut xr[..top], (64 - jb) % 64);
         debug_assert_eq!(c, 0);
         let xl = buf_len(&xr[..top]);
-        let z = exp_zero_limbs(lead + j);
+        let z = ((lead + j).saturating_sub(1) / 64) as usize;
         if let Some(p) = fs.checked_sub(z).filter(|&p| p != 0) {
             let off = exp_entry(&xr[..xl], (top - xl + jl) as u64, &mut t[..p]) as usize - z;
             debug_assert!(off <= 1);
@@ -468,12 +492,6 @@ pub fn exp_dyn_at(x: &[u64], m: i64, out: &mut [u64], sqr_bits: u64) -> Result<u
     )
 }
 
-// e^(r 2^-k) - 1, r 2^-k <= 2^-t, into out, the low limbs of a w-limb frame.
-fn exp_series_static<const N: usize>(r: &[u64], t: u64, k: u64, w: usize, out: &mut [u64]) {
-    let n = exp_terms(t, w);
-    series::<StaticNodeEngel<N, Exp>, StaticNodeHyper<N, Exp>>(r, k, n, w, out, StaticHyperCtx::new)
-}
-
 #[inline(never)]
 fn exp_chunk_static<const N: usize>(
     x: &[u64],
@@ -483,9 +501,9 @@ fn exp_chunk_static<const N: usize>(
     w: usize,
 ) -> Option<([u64; N], usize)> {
     let mut r = [0; N];
-    let (r, t, k) = chunk_bits(x, e, s, width, &mut r)?;
-    let (mut b, bl) = ([0; N], w - exp_zero_limbs(t));
-    exp_series_static::<N>(r, t, k, w, &mut b[..bl]);
+    let (r, k) = chunk_bits(x, e, s, width, &mut r)?;
+    let (mut b, bl) = ([0; N], w - exp_zeros(r, k));
+    exp_series::<StaticEval<N>>(r, k, &mut b[..bl]);
     Some((b, bl))
 }
 
@@ -506,8 +524,8 @@ fn exp_static_core<const N: usize>(x: &[u64], m: u64, out: &mut [u64]) -> u64 {
     let (z, v, w) = (f.z, f.v, f.w);
     let (mut a, mut c) = ([0; N], [0; N]);
     let a = &mut a[..v];
-    let top = w - exp_zero_limbs(s + 1);
-    let top_series = |a: &mut [u64]| exp_series_static::<N>(&[1], s + 1, s + 1, w, &mut a[..top]);
+    let top = w - exp_zeros(&[1], s + 1);
+    let top_series = |a: &mut [u64]| exp_series::<StaticEval<N>>(&[1], s + 1, &mut a[..top]);
     let chunks = || exp_chunks(s + 1, end, STATIC_EXP_CHUNK_MIN_BITS);
     let chunk = |(s, width)| exp_chunk_static::<N>(x, e, s, width, w);
     if chunks_par(chunks().count(), v, STATIC_EXP_CHUNK_PAR_WORK, false) {
@@ -794,11 +812,11 @@ fn ln_chain(
 }
 
 // Where chunk a = A 2^-k's 2 a S, S = ATanh(a^2) < 2^-(2 lead + 1) for a < 2^-lead, lands in
-// the w-limb frame: S's n terms at wi limbs below its top `zeros`, then A S shifted down by
-// sh >= bits(A), so S's last-limb error costs under a unit. None when it's below the frame.
+// the w-limb frame: S at wi limbs, below at least `zeros` zero limbs (its context's tail bound
+// may find more), then A S shifted down by sh >= bits(A), so S's last-limb error costs under
+// a unit. None when it's below the frame.
 #[derive(Debug, Clone, Copy)]
 struct LnChunk {
-    n: u64,
     wi: usize,
     zeros: usize,
     sh: u64,
@@ -808,34 +826,38 @@ fn ln_chunk(a: &[u64], k: u64, w: usize) -> Option<LnChunk> {
     let lead = k - bits(a);
     let wi = w - ((lead - 1) / 64) as usize;
     let zeros = ((2 * lead + 1) / 64) as usize;
-    let n = ln_terms(2 * lead, wi);
-    (zeros < wi && n != 0).then(|| LnChunk {
-        n,
+    (zeros < wi).then(|| LnChunk {
         wi,
         zeros,
         sh: 64 * wi as u64 + k - 1 - 64 * w as u64,
     })
 }
 
-// 2 a S into t (v + 1 limbs), through sq and s. Returns its length.
-fn ln_chunk_sum<B, H>(
+// ctx's series at wi limbs into s, below its zero limbs. Returns those limbs of s.
+fn ln_series<'s, V: Eval, C: Series>(ctx: &C, wi: usize, s: &'s mut [u64]) -> &'s [u64] {
+    let s = &mut s[..wi - ctx.zeros()];
+    V::eval(ctx, s);
+    s
+}
+
+// 2 a S into t (v + 1 limbs), through sq and s: S is BBP when A = 1, otherwise Hyper in A^2.
+// Returns its length.
+fn ln_chunk_sum<V: Eval>(
     a: &[u64],
     k: u64,
     c: LnChunk,
     [sq, s, t]: [&mut [u64]; 3],
-    ctx: fn(&[u64], u64) -> H::Ctx,
     (mul, hi_mul): (BinOp, BinOp),
-) -> usize
-where
-    B: Node<Ctx = Shift> + Send,
-    H: Node + Send,
-    H::Ctx: Sync,
-{
+) -> usize {
     let la = a.len();
     sq[2 * la - 1] = mul(a, a, &mut sq[..2 * la - 1]);
     let a2 = &sq[..buf_len(&sq[..2 * la])];
-    let s = &mut s[..c.wi - c.zeros];
-    series::<B, H>(a2, 2 * k, c.n, c.wi, s, ctx);
+    let s = if a2 == [1] {
+        ln_series::<V, _>(&Bbp::<ATanh>::new(2 * k), c.wi, s)
+    } else {
+        let ctx = Hyper::<ATanh>::new(a2, 2 * k).expect("a chunk is below 1/2");
+        ln_series::<V, _>(&ctx, c.wi, s)
+    };
     mul_shr(a, &s[..buf_len(s)], c.sh, t, hi_mul)
 }
 
@@ -897,14 +919,7 @@ pub fn ln_dyn_entry(x: &[u64], m: u64, neg: bool, out: &mut [u64]) -> u64 {
             for_each_slot(par, &chunks, &mut bs, |&(i, l, k, c), b| {
                 let mut sc = ScratchGuard::acquire();
                 let [sq, s] = sc.get_splits([2 * l, c.wi - c.zeros]);
-                ln_chunk_sum::<DynNodeBBP<ATanh>, DynNodeHyper<ATanh>>(
-                    &pool[i..i + l],
-                    k,
-                    c,
-                    [sq, s, b],
-                    DynHyperCtx::new,
-                    (mul_dyn, hi_mul_dyn),
-                );
+                ln_chunk_sum::<DynEval>(&pool[i..i + l], k, c, [sq, s, b], (mul_dyn, hi_mul_dyn));
             })
         },
         || ln_tail(nb, db, sl, (w, v), &mut *t1, ratio_to_fraction_dyn),
@@ -919,12 +934,11 @@ pub fn ln_dyn_entry(x: &[u64], m: u64, neg: bool, out: &mut [u64]) -> u64 {
 #[inline(never)]
 fn ln_chunk_static<const N: usize>(a: &[u64], k: u64, c: LnChunk, v: usize) -> ([u64; N], usize) {
     let (mut sq, mut s, mut t) = ([0; N], [0; N], [0; N]);
-    let l = ln_chunk_sum::<StaticNodeBBP<N, ATanh>, StaticNodeHyper<N, ATanh>>(
+    let l = ln_chunk_sum::<StaticEval<N>>(
         a,
         k,
         c,
         [&mut sq, &mut s, &mut t[..v + 1]],
-        StaticHyperCtx::new,
         (mul_static::<N>, hi_mul_static::<N>),
     );
     (t, l)
