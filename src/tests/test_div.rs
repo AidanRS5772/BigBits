@@ -105,6 +105,212 @@ fn nr_rcp_static<const N: usize>(d: &[u64], rcp: &mut [u64]) {
 
 // ─── div_prim ───────────────────────────────────────────────────────────────
 
+// Bit-at-a-time division, independent of the reciprocal and assembly kernels.
+// Keep the 129th remainder bit separately so two-limb divisors near u128::MAX work.
+fn div_prim_bitwise_ref(n: &[u64], d: u128) -> (Vec<u64>, u128) {
+    assert_ne!(d, 0);
+    let mut q = vec![0; n.len()];
+    let mut r = 0u128;
+    for i in (0..n.len()).rev() {
+        for bit in (0..64).rev() {
+            let high = r >> 127 != 0;
+            r = (r << 1) | ((n[i] >> bit) & 1) as u128;
+            if high || r >= d {
+                r = r.wrapping_sub(d);
+                q[i] |= 1 << bit;
+            }
+        }
+    }
+    (q, r)
+}
+
+#[test]
+fn test_div_prim_asm_normalization_sweep() {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(0x6469_7670);
+    // Every normalization shift, odd/even loop counts, empty inputs and long loops.
+    for shift in 0..64 {
+        let leading = 1u64 << (63 - shift);
+        for d in [
+            leading,
+            leading | (leading - 1),
+            leading | (rng.gen::<u64>() & (leading - 1)),
+        ] {
+            for len in (0..10).chain([31, 32, 33, 255, 256, 257]) {
+                for pattern in 0..5 {
+                    let n: Vec<u64> = (0..len)
+                        .map(|i| match pattern {
+                            0 => 0,
+                            1 => u64::MAX,
+                            2 => {
+                                if i % 2 == 0 {
+                                    u64::MAX
+                                } else {
+                                    0
+                                }
+                            }
+                            3 => {
+                                if i + 1 == len {
+                                    1
+                                } else {
+                                    0
+                                }
+                            }
+                            _ => rng.gen(),
+                        })
+                        .collect();
+                    let (want, rem) = div_prim_bitwise_ref(&n, d as u128);
+                    let mut storage = vec![0xa55a_a55a_a55a_a55a; len + 2];
+                    storage[1..len + 1].copy_from_slice(&n);
+                    let got_rem = div_prim(&mut storage[1..len + 1], d);
+                    assert_eq!(
+                        (&storage[1..len + 1], got_rem as u128),
+                        (want.as_slice(), rem),
+                        "len={len} d={d:#x} pattern={pattern}"
+                    );
+                    assert_eq!(storage[0], 0xa55a_a55a_a55a_a55a);
+                    assert_eq!(storage[len + 1], storage[0]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_div_prim2_asm_normalization_sweep() {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(0x6469_7632);
+    // Include the one-limb dispatch and every shift of a genuine two-limb divisor.
+    let mut divisors = vec![1, 2, u64::MAX as u128];
+    for shift in 0..64 {
+        let leading = 1u128 << (127 - shift);
+        divisors.extend([
+            leading,
+            leading | (leading - 1),
+            leading | (rng.gen::<u128>() & (leading - 1)),
+        ]);
+    }
+    for d in divisors {
+        for len in (0..10).chain([31, 32, 33, 255, 256, 257]) {
+            for pattern in 0..5 {
+                let n: Vec<u64> = (0..len)
+                    .map(|i| match pattern {
+                        0 => 0,
+                        1 => u64::MAX,
+                        2 => {
+                            if i % 2 == 0 {
+                                u64::MAX
+                            } else {
+                                0
+                            }
+                        }
+                        3 => {
+                            if i + 1 == len {
+                                1
+                            } else {
+                                0
+                            }
+                        }
+                        _ => rng.gen(),
+                    })
+                    .collect();
+                let (want, rem) = div_prim_bitwise_ref(&n, d);
+                if len <= 2 {
+                    let value = to_u128(&n);
+                    assert_eq!((to_u128(&want), rem), (value / d, value % d));
+                }
+                let mut storage = vec![0xa55a_a55a_a55a_a55a; len + 2];
+                storage[1..len + 1].copy_from_slice(&n);
+                let got_rem = div_prim2(&mut storage[1..len + 1], d);
+                assert_eq!(
+                    (&storage[1..len + 1], got_rem),
+                    (want.as_slice(), rem),
+                    "len={len} d={d:#x} pattern={pattern}"
+                );
+                assert_eq!(storage[0], 0xa55a_a55a_a55a_a55a);
+                assert_eq!(storage[len + 1], storage[0]);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_knuth_est_asm_two_limb_boundaries() {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(0x332f_3264);
+    let edges = [0, 1, 2, (1 << 63) - 1, 1 << 63, u64::MAX - 1, u64::MAX];
+    for case in 0..20_000 {
+        let d1 = if case < edges.len() * edges.len() {
+            edges[case / edges.len()]
+        } else {
+            rng.gen()
+        } | (1 << 63);
+        let d0 = if case < edges.len() * edges.len() {
+            edges[case % edges.len()]
+        } else {
+            rng.gen()
+        };
+        let d = (d1 as u128) << 64 | d0 as u128;
+        let top = match case % 4 {
+            0 => 0,
+            1 => d - 1,
+            2 => d / 2,
+            _ => rng.gen::<u128>() % d,
+        };
+        let u0 = edges.get(case % 10).copied().unwrap_or_else(|| rng.gen());
+        let n = if case % 2 == 0 {
+            // Construct q*d+r to exercise exact division and remainders next to d,
+            // including q=MAX where the estimate's increment can wrap.
+            let q = edges[case % edges.len()];
+            let r = match case % 3 {
+                0 => 0,
+                1 => 1,
+                _ => d - 1,
+            };
+            let lo = q as u128 * d0 as u128;
+            let hi = q as u128 * d1 as u128 + (lo >> 64);
+            let (n0, carry) = (lo as u64).overflowing_add(r as u64);
+            let mid = (hi as u64) as u128 + (r >> 64) + carry as u128;
+            [n0, mid as u64, ((hi >> 64) + (mid >> 64)) as u64]
+        } else {
+            [u0, top as u64, (top >> 64) as u64]
+        };
+        let (want, rem) = div_prim_bitwise_ref(&n, d);
+        let mut win = [n[0], n[1]];
+        let mut of = n[2];
+        let q = knuth_est(&mut win, &mut of, &[d0, d1], d1, d0, reciprocal_3_2(d1, d0));
+        assert_eq!(
+            (q, to_u128(&win), of),
+            (want[0], rem, 0),
+            "n={n:x?} d={d:#x}"
+        );
+    }
+}
+
+#[test]
+fn test_div_reciprocal_seeds_against_bitwise_division() {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(0x7263_7032);
+    let edges = [0, 1, 2, (1 << 63) - 1, 1 << 63, u64::MAX - 1, u64::MAX];
+    for case in 0..10_000 {
+        let d1 = if case < 49 {
+            edges[case / 7]
+        } else {
+            rng.gen()
+        } | (1 << 63);
+        let d0 = if case < 49 {
+            edges[case % 7]
+        } else {
+            rng.gen()
+        };
+        let want = u128::MAX / d1 as u128 - (1u128 << 64);
+        assert_eq!(reciprocal_2_1(d1), want as u64, "d1={d1:#x}");
+        let d = (d1 as u128) << 64 | d0 as u128;
+        let (want, _) = div_prim_bitwise_ref(&[u64::MAX; 3], d);
+        assert_eq!(reciprocal_3_2(d1, d0), want[0], "d={d:#x}");
+    }
+}
+
 #[test]
 fn test_div_prim_basic() {
     let mut v = vec![6u64];

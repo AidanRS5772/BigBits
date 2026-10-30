@@ -495,6 +495,75 @@ fn test_static_entry_signatures_match_dynamic_entries() {
 // ─── Section 1: mul_prim ────────────────────────────────────────────────────
 
 #[test]
+fn test_base_rows_asm_carry_borrow_and_tails() {
+    use crate::utils::{Base, Rows};
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(0x726f_7773);
+    for len in (0..68).chain([255, 256, 257, 258, 1023, 1024, 1025, 1026]) {
+        for pattern in 0..24 {
+            let source: Vec<u64> = (0..len)
+                .map(|i| match pattern {
+                    0..=2 => u64::MAX,
+                    3 => 0,
+                    4 => {
+                        if i % 2 == 0 {
+                            u64::MAX
+                        } else {
+                            0
+                        }
+                    }
+                    _ => rng.gen(),
+                })
+                .collect();
+            let initial: Vec<u64> = (0..len)
+                .map(|_| match pattern {
+                    0 | 3 => 0,
+                    1 | 2 => u64::MAX,
+                    _ => rng.gen(),
+                })
+                .collect();
+            let s = match pattern {
+                0 | 1 | 4 => u64::MAX,
+                2 => 1,
+                3 => 0,
+                _ => rng.gen(),
+            };
+            for op in 0..3 {
+                // An offset output with two extra limbs: rows must touch only source.len().
+                let mut got = vec![0xa55a_a55a_a55a_a55a; len + 4];
+                got[1..len + 1].copy_from_slice(&initial);
+                let mut want = got.clone();
+                let mut carry = 0;
+                for (o, &x) in want[1..len + 1].iter_mut().zip(&source) {
+                    let product = s as u128 * x as u128 + carry as u128;
+                    if op == 2 {
+                        let (r, b) = o.overflowing_sub(product as u64);
+                        *o = r;
+                        carry = (product >> 64) as u64 + b as u64;
+                    } else {
+                        let sum = product + if op == 0 { *o as u128 } else { 0 };
+                        *o = sum as u64;
+                        carry = (sum >> 64) as u64;
+                    }
+                }
+                let top = unsafe {
+                    match op {
+                        0 => Base::add(s, &source, &mut got[1..len + 3]),
+                        1 => Base::set(s, &source, &mut got[1..len + 3]),
+                        _ => Base::sub(s, &source, &mut got[1..len + 3]),
+                    }
+                };
+                assert_eq!(
+                    (got, top),
+                    (want, carry),
+                    "len={len} pattern={pattern} op={op} s={s:#x}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn test_mul_prim_by_zero() {
     let mut v = vec![42u64, 7];
     let c = mul_prim(&mut v, 0);
@@ -573,9 +642,26 @@ fn test_mul_add_prim_asm_loops() {
         _ => rng.gen(),
     };
     for len in (0..MUL_PRIM_ADX_CUTOFF + 40).chain([100, 255, 256, 257, 1000]) {
-        for _ in 0..200 {
-            let v: Vec<u64> = (0..len).map(|_| limb(&mut rng)).collect();
-            let (s, add) = (limb(&mut rng), limb(&mut rng));
+        for case in 0..200 {
+            let v: Vec<u64> = (0..len)
+                .map(|i| match case {
+                    0..=2 => u64::MAX,
+                    3 => {
+                        if i % 2 == 0 {
+                            u64::MAX
+                        } else {
+                            0
+                        }
+                    }
+                    _ => limb(&mut rng),
+                })
+                .collect();
+            let (s, add) = match case {
+                0 | 3 => (u64::MAX, u64::MAX),
+                1 => (0, u64::MAX),
+                2 => (1, u64::MAX),
+                _ => (limb(&mut rng), limb(&mut rng)),
+            };
             let mut want = v.clone();
             let mut c = add;
             for e in &mut want {
@@ -583,9 +669,16 @@ fn test_mul_add_prim_asm_loops() {
                 *e = t as u64;
                 c = (t >> 64) as u64;
             }
-            let mut got = v.clone();
-            let top = mul_add_prim(&mut got, s, add);
-            assert_eq!((got, top), (want, c), "len {len}, s {s:#x}, add {add:#x}");
+            let mut got = vec![0xa55a_a55a_a55a_a55a; len + 2];
+            got[1..len + 1].copy_from_slice(&v);
+            let top = mul_add_prim(&mut got[1..len + 1], s, add);
+            assert_eq!(
+                (&got[1..len + 1], top),
+                (want.as_slice(), c),
+                "len {len}, s {s:#x}, add {add:#x}"
+            );
+            assert_eq!(got[0], 0xa55a_a55a_a55a_a55a);
+            assert_eq!(got[len + 1], got[0]);
         }
     }
 }
@@ -607,9 +700,26 @@ fn test_mul_prim2_asm_loops() {
     };
     let lens = (0..64).chain([100, 255, 256, 257, 258, 1000, 1025]);
     for len in lens {
-        for _ in 0..100 {
-            let v: Vec<u64> = (0..len).map(|_| limb(&mut rng)).collect();
-            let (p0, p1) = (limb(&mut rng), limb(&mut rng));
+        for case in 0..100 {
+            let v: Vec<u64> = (0..len)
+                .map(|i| match case {
+                    0..=2 => u64::MAX,
+                    3 => {
+                        if i % 2 == 0 {
+                            u64::MAX
+                        } else {
+                            0
+                        }
+                    }
+                    _ => limb(&mut rng),
+                })
+                .collect();
+            let (p0, p1) = match case {
+                0 | 3 => (u64::MAX, u64::MAX),
+                1 => (0, u64::MAX),
+                2 => (u64::MAX, 0),
+                _ => (limb(&mut rng), limb(&mut rng)),
+            };
             let mut want = v.clone();
             let (mut c0, mut c1) = (0u64, 0u64);
             for e in &mut want {
@@ -619,10 +729,17 @@ fn test_mul_prim2_asm_loops() {
                 *e = lo as u64;
                 (c0, c1) = (hi as u64, (hi >> 64) as u64);
             }
-            let mut got = v.clone();
-            let top = mul_prim2(&mut got, (p1 as u128) << 64 | p0 as u128);
+            let mut got = vec![0xa55a_a55a_a55a_a55a; len + 2];
+            got[1..len + 1].copy_from_slice(&v);
+            let top = mul_prim2(&mut got[1..len + 1], (p1 as u128) << 64 | p0 as u128);
             let want_top = (c1 as u128) << 64 | c0 as u128;
-            assert_eq!((got, top), (want, want_top), "len {len}, p {p1:#x}:{p0:#x}");
+            assert_eq!(
+                (&got[1..len + 1], top),
+                (want.as_slice(), want_top),
+                "len {len}, p {p1:#x}:{p0:#x}"
+            );
+            assert_eq!(got[0], 0xa55a_a55a_a55a_a55a);
+            assert_eq!(got[len + 1], got[0]);
         }
     }
 }
