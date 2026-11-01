@@ -24,8 +24,9 @@ const GUARD_LIMBS: usize = 1;
 const EXP_RED_GUARD_BITS: u8 = 58;
 const MAX_PAR_CHUNKS: usize = 64;
 
-// hi_mul and div.
+// hi_mul and div, and sqr and hi_sqr.
 type BinOp = fn(&[u64], &[u64], &mut [u64]) -> u64;
+type UnOp = fn(&[u64], &mut [u64]) -> u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpError {
@@ -68,36 +69,22 @@ fn capacity<const N: usize>(min_n: usize) -> Result<(), CapacityError> {
     (N >= min_n).then_some(()).ok_or(CapacityError { min_n })
 }
 
-// A lower bound on log2(n!), Stirling's less half a bit, or 0 for n < 2.
-fn log2_factorial(n: u64) -> u64 {
-    let c = (LOG2_E - PI.log2() - 1.0) * 0.5;
-    let nf = n as f64;
-    ((nf + 0.5) * nf.log2() - nf * LOG2_E - c) as u64
-}
-
-// e^y - 1 for y <= 2^-s <= 1/2 is below 2^(1 - s), and from term n >= 2 its tail is at most
-// 2 y^n / n! <= y^(n - 1) / (n - 1)!.
-fn exp_tail_bits(n: u64, s: i64) -> u64 {
-    let s = s.max(0) as u64;
-    match n.checked_sub(1) {
-        None | Some(0) => s.saturating_sub(1),
-        Some(m) => m.saturating_mul(s).saturating_add(log2_factorial(m)),
-    }
-}
-
-// ATanh(y) for y <= 2^-s <= 1/2 has tail y^n / ((2n + 1)(1 - y)) <= 2 y^n / (2n + 1) from n.
-fn atanh_tail_bits(n: u64, s: i64) -> u64 {
-    let s = s.max(0) as u64;
-    n.saturating_mul(s)
-        .saturating_add((2 * n.min(u64::MAX / 4) + 1).ilog2() as u64)
-        .saturating_sub(1)
-}
-
 pub struct Exp;
 impl EngelSeries for Exp {
     const START: u64 = 1;
+    // e^y - 1 for y <= 2^-s <= 1/2 is below 2^(1 - s), and from term n >= 2 its tail is at most
+    // 2 y^n / n! <= y^(n - 1) / (n - 1)!, with log2((n - 1)!) from Stirling less half a bit.
     fn tail_bits(n: u64, s: i64) -> u64 {
-        exp_tail_bits(n, s)
+        let s = s.max(0) as u64;
+        match n.checked_sub(1) {
+            None | Some(0) => s.saturating_sub(1),
+            Some(m) => {
+                let c = (LOG2_E - PI.log2() - 1.0) * 0.5;
+                let mf = m as f64;
+                let log2_fact = ((mf + 0.5) * mf.log2() - mf * LOG2_E - c) as u64;
+                m.saturating_mul(s).saturating_add(log2_fact)
+            }
+        }
     }
     fn p(_: u64) -> u64 {
         1
@@ -109,7 +96,7 @@ impl EngelSeries for Exp {
 impl HyperSeries for Exp {
     const START: u64 = 1;
     fn tail_bits(n: u64, s: i64) -> u64 {
-        exp_tail_bits(n, s)
+        <Exp as EngelSeries>::tail_bits(n, s)
     }
     fn p(_: u64) -> u64 {
         1
@@ -126,8 +113,12 @@ impl HyperSeries for Exp {
 pub struct ATanh;
 impl BBPSeries for ATanh {
     const START: u64 = 1;
+    // ATanh(y) for y <= 2^-s <= 1/2 has tail y^n / ((2n + 1)(1 - y)) <= 2 y^n / (2n + 1) from n.
     fn tail_bits(n: u64, s: i64) -> u64 {
-        atanh_tail_bits(n, s)
+        let s = s.max(0) as u64;
+        n.saturating_mul(s)
+            .saturating_add((2 * n.min(u64::MAX / 4) + 1).ilog2() as u64)
+            .saturating_sub(1)
     }
     fn p(_: u64) -> u64 {
         1
@@ -139,7 +130,7 @@ impl BBPSeries for ATanh {
 impl HyperSeries for ATanh {
     const START: u64 = 1;
     fn tail_bits(n: u64, s: i64) -> u64 {
-        atanh_tail_bits(n, s)
+        <ATanh as BBPSeries>::tail_bits(n, s)
     }
     fn p(_: u64) -> u64 {
         1
@@ -293,17 +284,14 @@ impl<const N: usize> Eval for StaticEval<N> {
     }
 }
 
-// e^(r 2^-k) - 1's Hyper context, for an odd r with r 2^-k < 1/2.
-fn exp_hyper(r: &[u64], k: u64) -> Hyper<'_, Exp> {
-    Hyper::new(r, k).expect("a chunk's bits lie below 2^-1")
-}
+const EXP_CHUNK: &str = "a chunk's bits lie below 2^-1";
 
-// The zero limbs above e^(r 2^-k) - 1.
+// The zero limbs above e^(r 2^-k) - 1, for an odd r with r 2^-k < 1/2.
 fn exp_zeros(r: &[u64], k: u64) -> usize {
     if r == [1] {
         Engel::<Exp>::new(k).zeros()
     } else {
-        exp_hyper(r, k).zeros()
+        Hyper::<Exp>::new(r, k).expect(EXP_CHUNK).zeros()
     }
 }
 
@@ -313,7 +301,7 @@ fn exp_series<V: Eval>(r: &[u64], k: u64, w: usize, out: &mut [u64]) -> usize {
     if r == [1] {
         V::frame(&Engel::<Exp>::new(k), w, out)
     } else {
-        V::frame(&exp_hyper(r, k), w, out)
+        V::frame(&Hyper::<Exp>::new(r, k).expect(EXP_CHUNK), w, out)
     }
 }
 
@@ -398,7 +386,7 @@ fn exp_reduced(
     div_rem: fn(&mut [u64], &[u64], &mut [u64]) -> u64,
     exp_entry: fn(&[u64], u64, &mut [u64]) -> u64,
     (min, work, rayon): (u64, usize, bool),
-    hi_sqr: fn(&[u64], &mut [u64]) -> u64,
+    hi_sqr: UnOp,
 ) -> Result<u64, ExpError> {
     let (len, o) = (buf_len(x), out.len());
     if len == 0 {
@@ -806,25 +794,16 @@ fn ln_chain(
 }
 
 // Where chunk a = A 2^-k's 2 a S, S = ATanh(a^2) < 2^-(2 lead + 1) for a < 2^-lead, lands in
-// the w-limb frame: S at wi limbs, below at least `zeros` zero limbs (its context's tail bound
-// may find more), then A S shifted down by sh >= bits(A), so S's last-limb error costs under
-// a unit. None when it's below the frame.
-#[derive(Debug, Clone, Copy)]
-struct LnChunk {
-    wi: usize,
-    zeros: usize,
-    sh: u64,
-}
+// the w-limb frame, as (wi, zeros, sh): S at wi limbs, below at least `zeros` zero limbs (its
+// context's tail bound may find more), then A S shifted down by sh >= bits(A), so S's last-limb
+// error costs under a unit. None when it's below the frame.
+type LnChunk = (usize, usize, u64);
 
 fn ln_chunk(a: &[u64], k: u64, w: usize) -> Option<LnChunk> {
     let lead = k - bits(a);
     let wi = w - ((lead - 1) / 64) as usize;
     let zeros = ((2 * lead + 1) / 64) as usize;
-    (zeros < wi).then(|| LnChunk {
-        wi,
-        zeros,
-        sh: 64 * wi as u64 + k - 1 - 64 * w as u64,
-    })
+    (zeros < wi).then(|| (wi, zeros, 64 * wi as u64 + k - 1 - 64 * w as u64))
 }
 
 // 2 a S into t (v + 1 limbs), through sq and s: S is BBP when A = 1, otherwise Hyper in A^2.
@@ -832,20 +811,20 @@ fn ln_chunk(a: &[u64], k: u64, w: usize) -> Option<LnChunk> {
 fn ln_chunk_sum<V: Eval>(
     a: &[u64],
     k: u64,
-    c: LnChunk,
+    (wi, _, sh): LnChunk,
     [sq, s, t]: [&mut [u64]; 3],
-    (sqr, hi_mul): (fn(&[u64], &mut [u64]) -> u64, BinOp),
+    (sqr, hi_mul): (UnOp, BinOp),
 ) -> usize {
     let la = a.len();
     sq[2 * la - 1] = sqr(a, &mut sq[..2 * la - 1]);
     let a2 = &sq[..buf_len(&sq[..2 * la])];
     let sl = if a2 == [1] {
-        V::frame(&Bbp::<ATanh>::new(2 * k), c.wi, s)
+        V::frame(&Bbp::<ATanh>::new(2 * k), wi, s)
     } else {
         let ctx = Hyper::<ATanh>::new(a2, 2 * k).expect("a chunk is below 1/2");
-        V::frame(&ctx, c.wi, s)
+        V::frame(&ctx, wi, s)
     };
-    mul_shr(a, &s[..buf_len(&s[..sl])], c.sh, t, hi_mul)
+    mul_shr(a, &s[..buf_len(&s[..sl])], sh, t, hi_mul)
 }
 
 // The tail 2 n / d < 2^-(sl - 2) into out, skipping its top (sl - 2) / 64 >= z limbs of the
@@ -903,7 +882,7 @@ pub fn ln_dyn_entry(x: &[u64], m: u64, neg: bool, out: &mut [u64]) -> u64 {
         || {
             for_each_slot(par, &chunks, &mut bs, |&(i, l, k, c), b| {
                 let mut sc = ScratchGuard::acquire();
-                let [sq, s] = sc.get_splits([2 * l, c.wi - c.zeros]);
+                let [sq, s] = sc.get_splits([2 * l, c.0 - c.1]);
                 ln_chunk_sum::<DynEval>(&pool[i..i + l], k, c, [sq, s, b], (sqr_dyn, hi_mul_dyn));
             })
         },
@@ -1192,4 +1171,183 @@ pub fn ln_static_at<const N: usize>(
         sqrt_approx_static::<N>,
         |x, m, neg, out| ln_static_entry::<N>(x, m, neg, out).expect("ln_static checks N"),
     )
+}
+
+// Jacobi's θ2(q⁴) = 2 Σ_{k>=0} q^((2k+1)²) and θ3(q⁴) = 1 + 2 Σ_{k>=1} q^((2k)²), for the AGM
+// logarithm ln(1/q) = π / (4 AGM(θ2², θ3²)) (docs/agm-ln-theta.md). Powers A_n = q^(n²) come
+// from B_n = B_(n-1) q² = q^(2n-1) and A_n = A_(n-1) B_n, odd n to θ2 and even n to θ3, each
+// step only as wide as the terms still to come need.
+
+// Where each power lands, for q = u 2^-l with u in [1/2, 1): odd terms in θ2 2^(64 z), g2 limbs
+// below 2^-64z (t = z), even ones in θ3 - 1, g3 limbs below 1 (t = 0), each with a guard limb.
+// last is the last power summed.
+struct ThetaSchedule {
+    l: u64,
+    z: usize,
+    g2: usize,
+    g3: usize,
+    last: u64,
+}
+
+impl ThetaSchedule {
+    fn new(x: &[u64], shift: u64, terms: usize, w2: usize, w3: usize) -> Self {
+        assert!(x.last().is_some_and(|&l| l != 0));
+        assert!(w2 > 0 && w3 > 0, "theta's outputs must be non-empty");
+        let l = shift
+            .checked_sub(bits(x))
+            .filter(|&l| l >= 2)
+            .expect("theta needs q = x 2^-shift < 1/4");
+        let mut s = ThetaSchedule {
+            l,
+            z: ((l - 2) / 64) as usize,
+            g2: w2 + 1,
+            g3: w3,
+            last: 1,
+        };
+        // A parity's terms only shrink, so once neither n nor n + 1 lands, nothing later does.
+        let max = (terms as u64).saturating_mul(2).saturating_add(1);
+        for n in 2..=max {
+            if s.ell(n).is_some() {
+                s.last = n;
+            } else if s.ell(n + 1).is_none() {
+                break;
+            }
+        }
+        s
+    }
+
+    // Term n's frame (t, g).
+    fn frame(&self, n: u64) -> (usize, usize) {
+        if n % 2 == 1 {
+            (self.z, self.g2)
+        } else {
+            (0, self.g3)
+        }
+    }
+
+    // 2 q^(n²) < 2^(1 - l n²) sits z_n limbs into its frame; its window runs from there to a
+    // guard limb past the frame. None once it lies below the frame.
+    fn ell(&self, n: u64) -> Option<usize> {
+        let (t, g) = self.frame(n);
+        let zn = (self.l as u128 * (n as u128 * n as u128) - 1 - 64 * t as u128) / 64;
+        (zn < g as u128).then(|| g - zn as usize + 1)
+    }
+
+    // Step n's width: the widest later window, which is n's or n + 1's, as a parity's windows
+    // only narrow. At least 2 through last, and never grows.
+    fn width(&self, n: u64) -> usize {
+        let w = |n| (n <= self.last).then(|| self.ell(n)).flatten().unwrap_or(0);
+        w(n).max(w(n + 1))
+    }
+
+    // acc += floor(2 q^(n²) 2^(64 (t + g))), for q^(n²) = m 2^(-64 m.len() - e) 2^(-l n²).
+    // tmp holds m.len() limbs.
+    fn place(&self, n: u64, m: &[u64], e: u64, acc: &mut [u64], tmp: &mut [u64]) {
+        let (t, g) = self.frame(n);
+        let sh = 64 * m.len() as u128 + e as u128 + self.l as u128 * (n as u128 * n as u128)
+            - 1
+            - 64 * (t + g) as u128;
+        debug_assert!(sh >= 64);
+        let tmp = &mut tmp[..m.len()];
+        shifted(m, -(sh as i64), tmp);
+        // θ3 - 1 < 2^-7 and θ2 2^(64 z) < 2^(2 - l + 64 z) <= 1.
+        let carry = add_buf(acc, &tmp[..buf_len(tmp)]);
+        debug_assert!(!carry);
+    }
+}
+
+// m <- m 2^s after its top limb is set to top, s that limb's leading zeros. Returns s, at most 1
+// for a product of two normalized mantissas unless rounding put it just below 1/4.
+fn theta_norm(m: &mut [u64], top: u64) -> u64 {
+    let r = m.len();
+    m[r - 1] = top;
+    let s = top.leading_zeros();
+    debug_assert!(s < 64);
+    shl_buf(m, s as u8);
+    s as u64
+}
+
+// Buffers of at least width(1) limbs for a, b and f, width(2) for q2, g2 and g3 for the sums.
+// Mantissas are kept normalized, m 2^(-64 m.len()) in [1/2, 1), with a bit exponent beside them.
+fn theta_core(
+    s: &ThetaSchedule,
+    x: &[u64],
+    th2: &mut [u64],
+    th3: &mut [u64],
+    [mut a, mut b, mut f, q2, acc2, acc3]: [&mut [u64]; 6],
+    hi_mul: BinOp,
+    hi_sqr: UnOp,
+) -> usize {
+    let (acc2, acc3) = (&mut acc2[..s.g2], &mut acc3[..s.g3]);
+    acc2.fill(0);
+    acc3.fill(0);
+    let r1 = s.width(1);
+    shifted(x, 64 * r1 as i64 - bits(x) as i64, &mut a[..r1]);
+    s.place(1, &a[..r1], 0, acc2, f);
+    if s.last >= 2 {
+        let r2 = s.width(2);
+        let q2 = &mut q2[..r2];
+        let top = hi_sqr(&a[r1 - r2..r1], &mut q2[..r2 - 1]);
+        let e2 = theta_norm(q2, top);
+        // A_1 = B_1 = u; each product goes to the free buffer, which then swaps in.
+        b[..r1].copy_from_slice(&a[..r1]);
+        let (mut ea, mut eb, mut r) = (0, 0, r1);
+        for n in 2..=s.last {
+            let rn = s.width(n);
+            let top = hi_mul(&b[r - rn..r], &q2[r2 - rn..], &mut f[..rn - 1]);
+            eb += e2 + theta_norm(&mut f[..rn], top);
+            std::mem::swap(&mut b, &mut f);
+            let top = hi_mul(&a[r - rn..r], &b[..rn], &mut f[..rn - 1]);
+            ea += eb + theta_norm(&mut f[..rn], top);
+            std::mem::swap(&mut a, &mut f);
+            r = rn;
+            if s.ell(n).is_some() {
+                let acc = if n % 2 == 1 { &mut *acc2 } else { &mut *acc3 };
+                s.place(n, &a[..r], ea, acc, f);
+            }
+        }
+    }
+    let w3 = th3.len();
+    th3[..w3 - 1].copy_from_slice(&acc3[1..]);
+    th3[w3 - 1] = 1;
+    th2.copy_from_slice(&acc2[1..]);
+    s.z
+}
+
+// θ2(q⁴) and θ3(q⁴) for q = x 2^-shift < 1/4, x trimmed and nonzero: θ3 sums k = 1..terms and
+// θ2 k = 0..terms (the N of docs/agm-ln-theta.md), less any term below its output. Writes
+// th3 = θ3 2^(64 (th3.len() - 1)), its top limb θ3's integer part (1), and
+// th2 = θ2 2^(64 (th2.len() + z)), returning z = (l - 2) / 64 for l = shift - bits(x). As
+// θ2 ∈ [2^-l, 2^(2 - l)), th2's top limb has at most 64 leading zero bits. Every step only
+// drops bits, so each output is at most 1 unit of its last limb below the truncated sums.
+pub fn theta_dyn(x: &[u64], shift: u64, terms: usize, th2: &mut [u64], th3: &mut [u64]) -> usize {
+    let s = ThetaSchedule::new(x, shift, terms, th2.len(), th3.len());
+    let (r1, r2) = (s.width(1), s.width(2));
+    let mut scratch = ScratchGuard::acquire();
+    let bufs = scratch.get_splits([r1, r1, r1, r2, s.g2, s.g3]);
+    theta_core(&s, x, th2, th3, bufs, hi_mul_dyn, hi_sqr_dyn)
+}
+
+// theta_dyn on the stack. Needs N >= max(th2.len() + 2, th3.len() + 1), checked before any
+// input, leaving th2 and th3 untouched; x itself may be longer.
+pub fn theta_static<const N: usize>(
+    x: &[u64],
+    shift: u64,
+    terms: usize,
+    th2: &mut [u64],
+    th3: &mut [u64],
+) -> Result<usize, CapacityError> {
+    capacity::<N>((th2.len() + 2).max(th3.len() + 1))?;
+    let s = ThetaSchedule::new(x, shift, terms, th2.len(), th3.len());
+    let mut bufs = [[0; N]; 6];
+    let bufs = bufs.each_mut().map(|b| &mut b[..]);
+    Ok(theta_core(
+        &s,
+        x,
+        th2,
+        th3,
+        bufs,
+        hi_mul_static::<N>,
+        hi_sqr_static::<N>,
+    ))
 }

@@ -13,6 +13,7 @@ mod test_series;
 pub(crate) mod test_div;
 mod test_mul;
 mod test_sqrt;
+mod test_theta;
 mod test_trans;
 mod test_utils;
 
