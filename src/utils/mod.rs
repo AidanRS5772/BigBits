@@ -290,12 +290,27 @@ pub const SERIES_NS_CALL: f64 = 0.9307;
 pub const SERIES_NS_ALLOC: f64 = 9.377;
 // A limb of a static [u64; N] array zero-filled or moved.
 pub const SERIES_NS_FILL: f64 = 0.09114;
+// Up to this many output limbs, small ranges go to Horner without the cost model, which
+// there costs about as much as the sum (200-330 ns a call at 1-4 limbs). For a Hyper series
+// with a one-limb x that is every range: logging the model's picks over exp_dyn, ln_dyn and
+// their static twins (116k calls, 1-400 limbs, every m) found it picking Horner for all of
+// them up to 28 limbs, and the first other pick at 29.
+pub const SERIES_HORNER_LIMBS: usize = 28;
+// For BBP and Engel, a range of at most this many terms. Horner alone beat the model plus
+// its pick on every Engel<Exp> and Bbp<ATanh> range of up to 12 terms at 1-28 limbs, dynamic
+// and static (Engel by 1.2-3.7x, as the model picks bin_split for even one term; BBP by
+// 1.06-2.5x). From about 15 terms BBP's bin_split wins even with the model's cost.
+pub const SERIES_HORNER_TERMS: u64 = 12;
 
 // exp_dyn_entry evaluates its chunk series in parallel once it has at least two chunks
 // and chunks * working limbs reaches this, on a pool of two or more threads. Chunks
 // cost about the same at a given precision, so this is one decision for the whole
-// loop. See docs/bin_split_cutoff_tuning.md.
-pub const DYN_EXP_CHUNK_PAR_WORK: usize = 512;
+// loop. exp_dyn takes no squares when its core would go parallel, so this also trades
+// them away: on 12 threads, exp_dyn on X in [1, 2) ran serially with its squares 1.05-1.45x
+// faster than in parallel without them up to 112 limbs (work 1130), tied at 128 (1290-1419)
+// and lost from 144 (1595) on, by 1.4-1.8x. 512 sent 64-128 limbs parallel, up to 1.5x
+// slower. See docs/bin_split_cutoff_tuning.md.
+pub const DYN_EXP_CHUNK_PAR_WORK: usize = 1280;
 
 // exp_dyn_entry's first chunk after x's top bit spans at least this many bits; later chunks
 // each span [s, ~2s). Narrower chunks near the top all sum about as many terms, so each

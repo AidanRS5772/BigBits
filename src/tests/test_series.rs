@@ -1194,7 +1194,11 @@ fn check_node_costs<N: SeriesNode>(ctx: &N::Ctx, max_m: u64, what: &str) {
                 let costs = N::costs(ctx, a, b, len, zeros, None);
                 let what = format!("{what} [{a}, {b}) len {len} zeros {zeros}");
                 check_costs(costs, ok, max_m.min(b - a), &what);
-                assert_eq!(N::dispatch(ctx, a, b, len, zeros), costs.pick(), "{what}");
+                // horner_first skips the model, only for ranges Horner can sum.
+                let first = N::horner_first(ctx, a, b, len, zeros);
+                assert!(!first || ok.horner, "{what}");
+                let want = if first { SeriesAlg::Horner } else { costs.pick() };
+                assert_eq!(N::dispatch(ctx, a, b, len, zeros), want, "{what}");
                 if ok.rect {
                     for m in [1, max_m.min(b - a)] {
                         let at = N::costs(ctx, a, b, len, zeros, Some(m as usize));

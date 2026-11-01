@@ -374,6 +374,37 @@ noise. The one-thread 128-limb row drew two unlucky X; the ten-X repeat above ha
 limbs, where it takes about 0.92× as long: there exp's chunks run in parallel without
 squares.
 
+**Revisited after Horner grouping (2026-10-30, i7-8750H).** The chunk series got several
+times cheaper, which moved the trade-off, and `DYN_EXP_CHUNK_PAR_WORK` = 512 sent 64–128
+limbs parallel, where 12 threads ran exp_dyn up to 1.6× slower than one. Taking the squares
+on the parallel path too was tried first and rejected: it sped up 80–96 limbs but slowed
+every size from 128 limbs on (ms on 12 threads, X in [1, 2)):
+
+| limbs | 1 thread | parallel, no squares | parallel, squares |
+|---:|---:|---:|---:|
+| 64 | 0.117 | 0.183 | 0.171 |
+| 96 | 0.250 | 0.336 | 0.285 |
+| 128 | 0.374 | 0.376 | 0.401 |
+| 256 | 1.37 | 1.01 | 1.14 |
+| 512 | 4.20 | 2.08 | 3.07 |
+| 1024 | 11.0 | 5.61 | 7.05 |
+| 16384 | 469 | 173 | 205 |
+
+Even with the squares, parallel chunks lose to one thread below about 128 limbs, so the
+gate itself fired too early. With it forced each way on 12 threads (three X per size),
+serial with the squares beat parallel without them by 1.05–1.45× up to 112 limbs (chunks ·
+v = 1130), tied at 128 (1290–1419) and lost from 144 (1595) on, by 1.4–1.8×. The gate is
+now 1280, the smallest value in that tie. End to end on 12 threads:
+
+| limbs | 64 | 80 | 96 | 128 | 160 | 256 | 1024 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| gate 512 | 0.187 | 0.275 | 0.344 | 0.393 | 0.537 | 0.971 | 5.80 |
+| gate 1280 | 0.118 | 0.174 | 0.244 | 0.387 | 0.510 | 0.947 | 5.66 |
+
+On the 12-thread pool the serial path is also slower than on a one-thread pool from about
+144 limbs (0.85 against 0.59 ms at 160), presumably the chunk series' own trees splitting
+on rayon; that doesn't move the crossover, as parallel chunks win there either way.
+
 ## Static nodes: bit-level normalization
 
 Static parts used to keep limb exponents, so a truncated part kept its top N limbs

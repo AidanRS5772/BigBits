@@ -261,6 +261,21 @@ follows.
   ns the shared intercept and scheduling noise are also as large as the differences
   between algorithms; small sparse BBP at 2–16 limbs is the largest remaining
   misprediction (up to 1.75× at 2–4 static limbs).
+
+  So up to `SERIES_HORNER_LIMBS` (28) output limbs, `horner_first` takes Horner without
+  the model for two kinds of range. **A Hyper range with a one-limb x:** a log of the
+  model's picks over exp_dyn, ln_dyn and their static twins (116k calls, 1–400 limbs,
+  every m) found Horner for every such range up to 28 limbs, so skipping the model there
+  changes no output. **A BBP or Engel range of at most `SERIES_HORNER_TERMS` (12) terms,**
+  timed on one i7-8750H core over exp's and ln's top-bit series (`Engel<Exp>` at shifts
+  8–64, `Bbp<ATanh>` at 2–24, 1–29 limbs, dynamic and static). There the model cost 60–250
+  ns a call. It also picked bin_split for Engel ranges at the shifts exp uses (25–64), down
+  to a single term, where Horner alone is faster at nearly every size up to 9 limbs, by up
+  to 2.9× (84 against 242 ns for one term at one limb). Horner alone beat the model plus its
+  pick on every such range of up to 12 terms, Engel by 1.2–3.7× and BBP by 1.06–2.5×. From
+  about 15 terms BBP's binary splitting wins even with the model's cost, which is why the
+  check doesn't go higher. That Engel misprediction suggests `SERIES_NS_TERM` (fitted on
+  the M1) is too high for this machine; a refit would show it.
 - **Dynamic NTT** past `FFT_16BIT_CUTOFF` output limbs is costed as the FFT.
 
 ## Verification
