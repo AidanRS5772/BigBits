@@ -605,3 +605,49 @@ fn test_sqrt_only_static_rejects_insufficient_capacity() {
 fn test_sqrt_approx_static_rejects_insufficient_capacity() {
     zimmerman_sqrt_approx_static::<17>(&mut [1; 18], &mut [0; 17]);
 }
+
+// The root outputs take a one-limb x into a one-limb root, X = x B, checked against u128 squares.
+fn assert_one_limb_roots<const N: usize>() {
+    let mut xs = vec![1, 2, 3, 4, 5, 1 << 32, (1 << 62) - 1, 1 << 62, 1 << 63];
+    xs.extend([u64::MAX - 1, u64::MAX]);
+    xs.extend(rand_vec(64, 77).into_iter().filter(|&x| x != 0));
+    let entries: [(&str, fn(&mut [u64], &mut [u64]), bool); 8] = [
+        ("exact dyn", zimmerman_sqrt_only_dyn, false),
+        ("exact static", zimmerman_sqrt_only_static::<N>, false),
+        ("approx dyn", zimmerman_sqrt_approx_dyn, true),
+        ("approx static", zimmerman_sqrt_approx_static::<N>, true),
+        ("dispatched exact dyn", sqrt_only_dyn, false),
+        ("dispatched exact static", sqrt_only_static::<N>, false),
+        ("dispatched approx dyn", sqrt_approx_dyn, true),
+        ("dispatched approx static", sqrt_approx_static::<N>, true),
+    ];
+    for x in xs {
+        let big_x = (x as u128) << 64;
+        let want = big_x.isqrt();
+        assert!(want * want <= big_x);
+        assert!((want + 1).checked_mul(want + 1).map_or(true, |sq| sq > big_x));
+        for (name, entry, approximate) in entries {
+            let mut root = [u64::MAX];
+            entry(&mut [x], &mut root);
+            let got = root[0] as u128;
+            assert!(
+                got == want || (approximate && got == want + 1),
+                "{name}: x={x:#x}, root={got:#x}, want={want:#x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_sqrt_root_outputs_one_limb() {
+    assert_one_limb_roots::<1>();
+    assert_one_limb_roots::<4>();
+}
+
+// The remainder of a one-limb x can take two limbs, so the remainder entries keep x.len() > s.len().
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "x.len() > s.len()")]
+fn test_sqrt_rem_rejects_one_limb() {
+    sqrt_dyn(&mut [5], &mut [0]);
+}

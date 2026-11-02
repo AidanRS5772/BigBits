@@ -1,11 +1,15 @@
-use crate::utils::series::{
-    join2, ratio_to_fraction_dyn, ratio_to_fraction_static, series_eval_dyn, series_eval_static,
-    static_split_stack, BBPSeries, Bbp, Engel, EngelSeries, Hyper, HyperSeries, Series,
+use crate::utils::consts::consts::{
+    ln2_dyn, ln2_static_unguarded, shifted, static_jobs, LN2_LIMBS,
 };
-use crate::utils::consts::consts::{ln2_dyn, ln2_static_unguarded, shifted, LN2_LIMBS};
 use crate::utils::div::{div_dyn, div_rem_dyn, div_rem_static, div_static};
 use crate::utils::mul::{
-    hi_mul_dyn, hi_mul_static, hi_sqr_dyn, hi_sqr_static, mul_prim2, sqr_dyn, sqr_static,
+    hi_mul_dyn, hi_mul_static, hi_sqr_dyn, hi_sqr_static, mul_dyn, mul_prim2, mul_static, sqr_dyn,
+    sqr_static,
+};
+use crate::utils::series::{
+    bits, join2, ratio_to_fraction_dyn, ratio_to_fraction_static, series_eval_dyn,
+    series_eval_static, static_split_stack, BBPSeries, Bbp, Engel, EngelSeries, Hyper, HyperSeries,
+    Series,
 };
 use crate::utils::sqrt::{sqrt_approx_dyn, sqrt_approx_static};
 use crate::utils::utils::{add_buf, buf_len, inc_buf, shl_buf, shr_buf, split_sh, sub_buf};
@@ -16,7 +20,6 @@ use crate::utils::{
     STATIC_LN_CHUNK_PAR_WORK, STATIC_LN_SQRT_A,
 };
 use rayon::prelude::*;
-use std::cmp::Ordering;
 use std::f64::consts::{LOG2_E, PI};
 use std::{fmt, panic, thread};
 
@@ -24,9 +27,10 @@ const GUARD_LIMBS: usize = 1;
 const EXP_RED_GUARD_BITS: u8 = 58;
 const MAX_PAR_CHUNKS: usize = 64;
 
-// hi_mul and div, and sqr and hi_sqr.
+// mul, hi_mul and div; sqr and hi_sqr; sqrt (radicand as scratch, root).
 type BinOp = fn(&[u64], &[u64], &mut [u64]) -> u64;
 type UnOp = fn(&[u64], &mut [u64]) -> u64;
+type SqrtOp = fn(&mut [u64], &mut [u64]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpError {
@@ -40,7 +44,6 @@ pub enum LnError {
     Capacity(CapacityError),
 }
 
-// From<CapacityError>, Display and Error for an error with one other variant.
 macro_rules! capacity_error {
     ($t:ident, $v:ident, $msg:literal) => {
         impl From<CapacityError> for $t {
@@ -72,8 +75,8 @@ fn capacity<const N: usize>(min_n: usize) -> Result<(), CapacityError> {
 pub struct Exp;
 impl EngelSeries for Exp {
     const START: u64 = 1;
-    // e^y - 1 for y <= 2^-s <= 1/2 is below 2^(1 - s), and from term n >= 2 its tail is at most
-    // 2 y^n / n! <= y^(n - 1) / (n - 1)!, with log2((n - 1)!) from Stirling less half a bit.
+    // e^y - 1 < 2^(1 - s) for y <= 2^-s; from n >= 2 the tail is at most y^(n - 1) / (n - 1)!,
+    // with Stirling's log2 less half a bit.
     fn tail_bits(n: u64, s: i64) -> u64 {
         let s = s.max(0) as u64;
         match n.checked_sub(1) {
@@ -113,7 +116,7 @@ impl HyperSeries for Exp {
 pub struct ATanh;
 impl BBPSeries for ATanh {
     const START: u64 = 1;
-    // ATanh(y) for y <= 2^-s <= 1/2 has tail y^n / ((2n + 1)(1 - y)) <= 2 y^n / (2n + 1) from n.
+    // Tail y^n / ((2n + 1)(1 - y)) <= 2 y^n / (2n + 1) for y <= 2^-s <= 1/2.
     fn tail_bits(n: u64, s: i64) -> u64 {
         let s = s.max(0) as u64;
         n.saturating_mul(s)
@@ -143,12 +146,6 @@ impl HyperSeries for ATanh {
     }
 }
 
-// Bits of x, whose top limb is nonzero.
-fn bits(x: &[u64]) -> u64 {
-    x.last()
-        .map_or(0, |&top| 64 * x.len() as u64 - top.leading_zeros() as u64)
-}
-
 // floor(x 2^-lo) mod 2^64.
 fn window(x: &[u64], lo: i64) -> u64 {
     let get = |i: i64| {
@@ -161,8 +158,8 @@ fn window(x: &[u64], lo: i64) -> u64 {
     ((get(l + 1) << 64 | get(l)) >> lo.rem_euclid(64)) as u64
 }
 
-// An entry's result is below 2^-lo with at most one more leading zero bit: z zero limbs,
-// then v working limbs, one more when that bit can cross a limb boundary.
+// An entry's result below 2^-lo, with at most one more leading zero bit: z zero limbs, then v
+// working limbs, one extra when that bit can cross a limb boundary.
 struct Frame {
     z: usize,
     v: usize,
@@ -182,11 +179,11 @@ impl Frame {
         }
     }
 
-    // out <- acc's top limbs, all ones after a carry only rounding causes. Returns the zero
-    // limbs above them.
-    fn out(&self, acc: &mut [u64], carry: bool, out: &mut [u64]) -> u64 {
+    // out <- acc's top limbs, all ones after a rounding carry. Returns the zero limbs above.
+    fn out(&self, acc: &[u64], carry: bool, out: &mut [u64]) -> u64 {
         if carry {
-            acc.fill(u64::MAX);
+            out.fill(u64::MAX);
+            return self.z as u64;
         }
         let d = (self.extra == 1 && acc[self.v - 1] == 0) as usize;
         out.copy_from_slice(&acc[self.v - d - out.len()..self.v - d]);
@@ -194,7 +191,7 @@ impl Frame {
     }
 }
 
-// A chunk from bit s spans [s, ~2s), at least min bits the first time, and stops at end.
+// From bit s, a chunk spans [s, ~2s), at least min bits the first time, and stops at end.
 fn chunk_width(s: u64, end: u64, min: &mut u64) -> u64 {
     (s & !1)
         .max(2)
@@ -212,9 +209,10 @@ fn exp_chunks(mut s: u64, end: u64, mut min: u64) -> impl Iterator<Item = (u64, 
     })
 }
 
-// An entry's frame for x 2^-64(m + x.len()) at o limbs: x's last bit e, its top bit's offset
-// s, and where its chunks end.
+// For x 2^-64(m + x.len()) at o limbs: x's last bit e, its top bit's offset s, the frame, and
+// where its chunks end.
 fn exp_frame(x: &[u64], m: u64, o: usize) -> (u64, u64, Frame, u64) {
+    assert!(x.last().is_some_and(|&l| l != 0));
     let e = 64 * (m + x.len() as u64);
     let s = 64 * m + x[x.len() - 1].leading_zeros() as u64;
     let f = Frame::new(s.saturating_sub(1), o);
@@ -222,8 +220,7 @@ fn exp_frame(x: &[u64], m: u64, o: usize) -> (u64, u64, Frame, u64) {
     (e, s, f, end)
 }
 
-// Whether n chunks of v working limbs, n v >= work, go parallel: on rayon for the dynamic
-// entries, on a scoped thread each for the static ones.
+// Whether n chunks of v limbs go parallel: on rayon, or on a scoped thread each.
 fn chunks_par(n: usize, v: usize, work: usize, rayon: bool) -> bool {
     n >= 2
         && n * v >= work
@@ -234,6 +231,7 @@ fn chunks_par(n: usize, v: usize, work: usize, rayon: bool) -> bool {
         }
 }
 
+// x's chunk [s, s + width) into out as an odd r with its bit offset k, or None when it's 0.
 fn chunk_bits<'r>(
     x: &[u64],
     e: u64,
@@ -255,11 +253,11 @@ fn chunk_bits<'r>(
     Some((r, s + width - 64 * skip as u64 - tz as u64))
 }
 
-// series_eval_dyn or series_eval_static, for the code the dynamic and static entries share.
+// series_eval_dyn or series_eval_static.
 trait Eval {
     fn eval<C: Series>(ctx: &C, out: &mut [u64]);
 
-    // ctx's series in a w-limb frame into out's limbs below its zero limbs. Returns their count.
+    // ctx's series in a w-limb frame, below its zero limbs. Returns its limbs.
     fn frame<C: Series>(ctx: &C, w: usize, out: &mut [u64]) -> usize {
         let l = w - ctx.zeros();
         Self::eval(ctx, &mut out[..l]);
@@ -286,26 +284,14 @@ impl<const N: usize> Eval for StaticEval<N> {
 
 const EXP_CHUNK: &str = "a chunk's bits lie below 2^-1";
 
-// The zero limbs above e^(r 2^-k) - 1, for an odd r with r 2^-k < 1/2.
-fn exp_zeros(r: &[u64], k: u64) -> usize {
-    if r == [1] {
-        Engel::<Exp>::new(k).zeros()
-    } else {
-        Hyper::<Exp>::new(r, k).expect(EXP_CHUNK).zeros()
-    }
-}
-
-// e^(r 2^-k) - 1 in a w-limb frame into out, below its exp_zeros(r, k): an Engel series when
-// r = 1, otherwise a Hyper one. Returns its limbs.
+// e^(r 2^-k) - 1 for an odd r, r 2^-k < 1/2, in a w-limb frame: Engel when r = 1, else Hyper.
 fn exp_series<V: Eval>(r: &[u64], k: u64, w: usize, out: &mut [u64]) -> usize {
-    if r == [1] {
-        V::frame(&Engel::<Exp>::new(k), w, out)
-    } else {
-        V::frame(&Hyper::<Exp>::new(r, k).expect(EXP_CHUNK), w, out)
+    match r {
+        [1] => V::frame(&Engel::<Exp>::new(k), w, out),
+        _ => V::frame(&Hyper::<Exp>::new(r, k).expect(EXP_CHUNK), w, out),
     }
 }
 
-// f over items and their slots, on rayon when par.
 fn for_each_slot<T: Sync>(
     par: bool,
     items: &[T],
@@ -319,6 +305,7 @@ fn for_each_slot<T: Sync>(
     }
 }
 
+// a <- (1 + a)(1 + b) - 1, b below z zero limbs of a's frame.
 fn exp_combine(a: &mut [u64], b: &[u64], z: usize, c: &mut [u64], hi_mul: BinOp) {
     let o = b.len().saturating_sub(z);
     let carry = o != 0 && {
@@ -332,8 +319,6 @@ fn exp_combine(a: &mut [u64], b: &[u64], z: usize, c: &mut [u64], hi_mul: BinOp)
 }
 
 pub fn exp_dyn_entry(x: &[u64], m: u64, out: &mut [u64]) -> u64 {
-    assert!(x.last().is_some_and(|&l| l != 0));
-
     let (e, s, f, end) = exp_frame(x, m, out.len());
     let (z, v, w) = (f.z, f.v, f.w);
     let slot = |width: u64| width.div_ceil(64) as usize + 1;
@@ -348,8 +333,12 @@ pub fn exp_dyn_entry(x: &[u64], m: u64, out: &mut [u64]) -> u64 {
     }
 
     let par = chunks_par(parts.len(), v, DYN_EXP_CHUNK_PAR_WORK, true);
+    let zeros = |r: &[u64], k| match r {
+        [1] => Engel::<Exp>::new(k).zeros(),
+        _ => Hyper::<Exp>::new(r, k).expect(EXP_CHUNK).zeros(),
+    };
     let mut results = ScratchGuard::acquire();
-    let mut bs = results.get_split_vec(parts.iter().map(|&(r, k)| w - exp_zeros(r, k)));
+    let mut bs = results.get_split_vec(parts.iter().map(|&(r, k)| w - zeros(r, k)));
     // The top bit's series beside the chunks'.
     let (top, _) = join2(
         par,
@@ -367,15 +356,15 @@ pub fn exp_dyn_entry(x: &[u64], m: u64, out: &mut [u64]) -> u64 {
     f.out(a, false, out)
 }
 
-// Fraction limbs for j squares. Each at most doubles the error below it and adds about a
-// unit, so j + 4 bits past o keep their 2^(j + 2) units under a quarter of o's last limb.
+// Fraction limbs for j squares: each at most doubles the error below it and adds about a unit,
+// so j + 4 bits past o keep the total under a quarter of o's last limb.
 fn exp_sqr(o: usize, j: u64) -> usize {
     o + (j > 0) as usize * (j + 4).div_ceil(64) as usize
 }
 
-// xr holds o + 3 limbs, l2 and t at least o + 2 and o + 1. The squares run only when l2 also
-// holds fs + 1 and t fs + 3 (the static entry's bound), and when the entry would sum r's
-// chunks serially: in parallel the series they shorten overlap anyway.
+// X = n ln 2 + r by one division, then e^r = (1 + u)^(2^j) with u = e^(r 2^-j) - 1 from the
+// entry. xr holds o + 3 limbs, l2 and t at least o + 2 and o + 1. The squares run only when l2
+// also holds fs + 1 and t fs + 3, and the entry would sum r's chunks serially.
 fn exp_reduced(
     x: &[u64],
     m: i64,
@@ -400,7 +389,8 @@ fn exp_reduced(
     if me > 1 || (me == 1 && x[len - 1] > 22) {
         return Err(ExpError::Overflow);
     }
-    // floor(X B^f) 2^g
+    // floor(X B^f) 2^g over floor(ln 2 B^(o + 2) 2^(g - 64)): guard bits, not a guard limb,
+    // cover n < 2^69 times ln 2's truncation.
     let (f, g) = (o + 1, EXP_RED_GUARD_BITS);
     let lo = (f as i128 + me + 1 - len as i128).max(-(len as i128));
     shifted(x, 64 * lo as i64, xr);
@@ -426,7 +416,6 @@ fn exp_reduced(
         let lead = 64 * rz as u64 + xr[rl - 1].leading_zeros() as u64;
         let mut j = sqr_bits.saturating_sub(lead);
         let mut fs = exp_sqr(o, j);
-        // Whether the entry would sum r's chunks in parallel, counting any without bits.
         let parallel = || {
             let (_, s, fr, end) = exp_frame(&xr[..rl], rz as u64, o);
             chunks_par(exp_chunks(s + 1, end, min).count(), fr.v, work, rayon)
@@ -434,8 +423,7 @@ fn exp_reduced(
         if j > 0 && (fs + 1 > l2.len() || fs + 3 > t.len() || parallel()) {
             (j, fs) = (0, o);
         }
-        // e^r = (1 + u)^(2^j), u = e^(r 2^-j) - 1 at fs fraction limbs. r 2^-j is exact: r
-        // moves up 64 - jb bits into xr[f], under jl more zero limbs.
+        // r 2^-j exactly: r moves up 64 - jb bits into xr[f], under jl more zero limbs.
         let (jl, jb) = split_sh(j);
         let top = f + (jb != 0) as usize;
         let c = shl_buf(&mut xr[..top], (64 - jb) % 64);
@@ -449,8 +437,8 @@ fn exp_reduced(
             t[p - off..fs].fill(0);
             let (u, c) = (&mut t[..fs], &mut l2[..fs + 1]);
             for _ in 0..j {
-                // u <- (1 + u)^2 - 1 = 2u + u^2, with u^2's limbs from fs up in c[1..=sl].
-                // u < 1/2 before the last square, and only rounding carries that past 1.
+                // u <- 2u + u^2, u^2's limbs from fs up in c[1..=sl]. Only rounding carries
+                // the last square past 1.
                 let ul = buf_len(u);
                 let sl = (2 * ul).saturating_sub(fs);
                 if sl != 0 {
@@ -477,7 +465,6 @@ pub fn exp_dyn(x: &[u64], m: i64, out: &mut [u64]) -> Result<u64, ExpError> {
     exp_dyn_at(x, m, out, DYN_EXP_SQR_BITS)
 }
 
-// exp_dyn with an explicit sqr_bits, for tests and tuning.
 #[doc(hidden)]
 pub fn exp_dyn_at(x: &[u64], m: i64, out: &mut [u64], sqr_bits: u64) -> Result<u64, ExpError> {
     let o = out.len();
@@ -513,50 +500,30 @@ fn exp_chunk_static<const N: usize>(
     Some((b, bl))
 }
 
-// Each series needs one guard limb past out, and static finalize 2 more.
+// Each series needs a guard limb past out, and static finalize 2 more.
 pub fn exp_static_entry<const N: usize>(
     x: &[u64],
     m: u64,
     out: &mut [u64],
 ) -> Result<u64, CapacityError> {
     capacity::<N>(out.len() + 3)?;
-    assert!(x.last().is_some_and(|&l| l != 0));
-
     let (e, s, f, end) = exp_frame(x, m, out.len());
     let (z, v, w) = (f.z, f.v, f.w);
     let (mut a, mut c) = ([0; N], [0; N]);
     let a = &mut a[..v];
-    let top_series = |a: &mut [u64]| exp_series::<StaticEval<N>>(&[1], s + 1, w, a);
     let chunks = || exp_chunks(s + 1, end, STATIC_EXP_CHUNK_MIN_BITS);
     let chunk = |(s, width)| exp_chunk_static::<N>(x, e, s, width, w);
-    if chunks_par(chunks().count(), v, STATIC_EXP_CHUNK_PAR_WORK, false) {
-        thread::scope(|sc| {
-            let mut hs: [_; MAX_PAR_CHUNKS] = std::array::from_fn(|_| None);
-            for (h, ch) in hs.iter_mut().zip(chunks()) {
-                let builder = thread::Builder::new().stack_size(static_split_stack(N));
-                *h = Some((ch, builder.spawn_scoped(sc, move || chunk(ch)).ok()));
-            }
-            top_series(a);
-            for (ch, h) in hs.into_iter().flatten() {
-                let b = h.map_or_else(
-                    || chunk(ch),
-                    |h| h.join().unwrap_or_else(|e| panic::resume_unwind(e)),
-                );
-                if let Some((b, bl)) = b {
-                    exp_combine(a, &b[..bl], z, &mut c, hi_mul_static::<N>);
-                }
-            }
-        });
-    } else {
-        top_series(a);
-        for (b, bl) in chunks().filter_map(chunk) {
+    let par = chunks_par(chunks().count(), v, STATIC_EXP_CHUNK_PAR_WORK, false);
+    // The caller sums the top bit's series while the chunks run.
+    static_jobs::<N, MAX_PAR_CHUNKS, _, _, _>(par, chunks().map(|ch| move || chunk(ch)), |bs| {
+        exp_series::<StaticEval<N>>(&[1], s + 1, w, a);
+        for (b, bl) in bs.flatten() {
             exp_combine(a, &b[..bl], z, &mut c, hi_mul_static::<N>);
         }
-    }
+    });
     Ok(f.out(a, false, out))
 }
 
-// The squares run only when N leaves them room.
 pub fn exp_static<const N: usize>(x: &[u64], m: i64, out: &mut [u64]) -> Result<u64, ExpError> {
     exp_static_at::<N>(x, m, out, STATIC_EXP_SQR_BITS)
 }
@@ -585,33 +552,21 @@ pub fn exp_static_at<const N: usize>(
     )
 }
 
-// Whether x's bits from its top one down are at least y's.
-fn mant_ge(x: &[u64], y: &[u64]) -> bool {
-    let (bx, by) = (bits(x) as i64, bits(y) as i64);
-    for j in 1..=x.len().max(y.len()) as i64 + 1 {
-        let (a, b) = (window(x, bx - 64 * j), window(y, by - 64 * j));
-        if a != b {
-            return a > b;
-        }
-    }
-    true
-}
-
-// out <- a b 2^-sh, its bits below 1 dropped, for a result below B^out.len(). hi_mul only
-// drops partial products, so this never rounds up. Returns the result's length.
+// out <- floor(a b 2^-sh) < B^out.len(), never rounded up. Returns its length.
 fn mul_shr(a: &[u64], b: &[u64], sh: u64, out: &mut [u64], hi_mul: BinOp) -> usize {
-    out.fill(0);
     let (sl, sb) = split_sh(sh);
-    let full = a.len() + b.len();
+    let (full, o) = (a.len() + b.len(), out.len());
     if a.is_empty() || b.is_empty() || full <= sl {
+        out.fill(0);
         return 0;
     }
     // The product's limbs from sl up; one past out holds only bits the shift moves down.
-    let (r, o) = (full - sl, out.len());
+    let r = full - sl;
     debug_assert!(r <= o + 1, "a b 2^-sh must fit out");
     let top = hi_mul(a, b, &mut out[..r - 1]);
     if r <= o {
         out[r - 1] = top;
+        out[r..].fill(0);
         shr_buf(&mut out[..r], sb);
     } else {
         debug_assert_eq!(top.checked_shr(sb as u32).unwrap_or(0), 0);
@@ -623,9 +578,8 @@ fn mul_shr(a: &[u64], b: &[u64], sh: u64, out: &mut [u64], hi_mul: BinOp) -> usi
     buf_len(&out[..r.min(o)])
 }
 
-// δ = |u - 1| as fraction limbs below f.len(). For u >= 1 these are f's bits under u's
-// leading one (bit 64 - sh of its top limb), moved up by sh past it, or f itself when sh = 0.
-// For u < 1, δ = !f + 1, whose carry stops at f's lowest nonzero limb l0.
+// δ = |u - 1| as fraction limbs below f.len(): f's bits under u's leading one (moved up sh) for
+// u >= 1, or !f + 1 for u < 1, whose carry stops at f's lowest nonzero limb l0.
 struct Delta<'a> {
     f: &'a [u64],
     sh: u32,
@@ -638,14 +592,13 @@ impl<'a> Delta<'a> {
         Delta { f, sh, l0 }
     }
 
-    // Limb i < f.len().
+    // Limb i < f.len(). Below l0, f's limbs (and so their negation) are 0.
     fn limb(&self, i: i64) -> u64 {
         let l = window(self.f, 64 * i - self.sh as i64);
-        match self.l0.map(|l0| usize::try_from(i).map(|i| i.cmp(&l0))) {
+        match self.l0 {
+            Some(l0) if i > l0 as i64 => !l,
+            Some(_) => l.wrapping_neg(),
             None => l,
-            Some(Ok(Ordering::Greater)) => !l,
-            Some(Ok(Ordering::Equal)) => l.wrapping_neg(),
-            _ => 0,
         }
     }
 
@@ -658,10 +611,10 @@ impl<'a> Delta<'a> {
     }
 }
 
-// |ln(1 ± δ)| < 2^-lo for δ = x 2^-64(m + x.len()): ln(1 + δ) is in (δ / 2, δ) and
-// -ln(1 - δ) in (δ, 2δ) for δ <= 1/2. Chunks stop at end, where 2 atanh(a) - 2a < a^3 is
-// below the frame.
+// |ln(1 ± δ)| < 2^-lo for δ = x 2^-64(m + x.len()), as ln(1 + δ) is in (δ / 2, δ) and
+// -ln(1 - δ) in (δ, 2δ). Chunks end where atanh's cubic term is below the frame.
 fn ln_frame(x: &[u64], m: u64, neg: bool, o: usize) -> (Frame, u64, u64) {
+    assert!(x.last().is_some_and(|&l| l != 0));
     let sd = 64 * m + x[x.len() - 1].leading_zeros() as u64;
     let lo = if neg { sd.saturating_sub(1) } else { sd };
     let f = Frame::new(lo, o);
@@ -669,8 +622,7 @@ fn ln_frame(x: &[u64], m: u64, neg: bool, o: usize) -> (Frame, u64, u64) {
     (f, lo, end)
 }
 
-// n = δ / 4 at 2^-64w and d = (2 ± δ) / 4 at 2^-64v, so n / d = δ / (2 ± δ). d rounds up,
-// which keeps n / d at most that and its top bit at lo + 2 or below.
+// n = δ / 4 at 2^-64w and d = (2 ± δ) / 4 at 2^-64v, d rounded up, so n / d <= δ / (2 ± δ).
 fn ln_init(x: &[u64], m: u64, neg: bool, w: usize, nb: &mut [u64], db: &mut [u64], t: &mut [u64]) {
     let v = db.len();
     let e = (64 * (m + x.len() as u64) + 2) as i64;
@@ -686,9 +638,8 @@ fn ln_init(x: &[u64], m: u64, neg: bool, w: usize, nb: &mut [u64], db: &mut [u64
     debug_assert!(!c);
 }
 
-// A <= z 2^k for z = n / d in [2^-s, 2^(1 - s)) and k = s + wd - 1: floor(z 2^k) less a unit
-// or so, from n's top limbs over d's rounded up, 64 bits past k when the buffers allow, and
-// never below z's top bit. Returns A, in qn.
+// A <= z 2^k for z = n / d in [2^-s, 2^(1 - s)), k = s + wd - 1: floor(z 2^k) less about a
+// unit, from n's top limbs over d's rounded up, and never below z's top bit. Returns A, in qn.
 fn chunk_quotient<'q>(
     (n, d): (&[u64], &[u64]),
     zb: u64,
@@ -711,7 +662,7 @@ fn chunk_quotient<'q>(
         qd[dl] = 1;
         dl += 1;
     }
-    // q = floor(n' 2^c / d') <= z 2^kq, n's limbs counting from 2^-64w and d's from 2^-64v.
+    // q = floor(n' 2^c / d') <= z 2^kq.
     let mut kq = k + 64;
     let mut c = kq as i64 - zb as i64 + 64 * (cn as i64 - cd as i64);
     let nt = &n[cn..];
@@ -739,11 +690,11 @@ fn chunk_quotient<'q>(
     a
 }
 
-// Removes chunks a = A 2^-k <= z, A odd, from z = n / d (n 2^-64w in nb, d 2^-64v in db),
-// passing each to chunk with 2a in the w-limb frame, until z's top bit is past end and the
-// first chunk's. atanh(z) = atanh(a) + atanh((z - a) / (1 - z a)), and that remainder is
-// (n - a d) / (d - a n), so only each chunk's own bits need a (short) division. qd and qq
-// hold at least v + 1 limbs. Returns the remainder's top bit, or u64::MAX once n is 0.
+// Takes chunks a = A 2^-k <= z, A odd, off z = n / d (n 2^-64w in nb, d 2^-64v in db), passing
+// each to chunk with 2a in the w-limb frame, until z's top bit passes end and the first chunk's.
+// atanh(z) = atanh(a) + atanh((n - a d) / (d - a n)), so only each chunk's bits need a (short)
+// division. qd and qq hold at least v + 1 limbs. Returns the remainder's top bit, or u64::MAX
+// once n is 0.
 fn ln_chain(
     (nb, db): (&mut [u64], &mut [u64]),
     z: usize,
@@ -762,8 +713,13 @@ fn ln_chain(
             if n.is_empty() {
                 return u64::MAX;
             }
-            // z in [2^-s, 2^(1 - s))
-            let s = bits(d) + zb + !mant_ge(n, d) as u64 - bits(n);
+            // z in [2^-s, 2^(1 - s)), from whether n's bits from its top one down reach d's.
+            let (bn, bd) = (bits(n), bits(d));
+            let ge = (1..=n.len().max(d.len()) as i64 + 1)
+                .map(|j| (window(n, bn as i64 - 64 * j), window(d, bd as i64 - 64 * j)))
+                .find(|(a, b)| a != b)
+                .map_or(true, |(a, b)| a > b);
+            let s = bd + zb + !ge as u64 - bn;
             let wd = match s0 {
                 None => {
                     s0 = Some(s);
@@ -793,10 +749,9 @@ fn ln_chain(
     }
 }
 
-// Where chunk a = A 2^-k's 2 a S, S = ATanh(a^2) < 2^-(2 lead + 1) for a < 2^-lead, lands in
-// the w-limb frame, as (wi, zeros, sh): S at wi limbs, below at least `zeros` zero limbs (its
-// context's tail bound may find more), then A S shifted down by sh >= bits(A), so S's last-limb
-// error costs under a unit. None when it's below the frame.
+// Where chunk a = A 2^-k's 2 a ATanh(a^2) lands in the w-limb frame, as (wi, zeros, sh): the
+// series at wi limbs below at least `zeros` zero limbs, then A times it shifted down sh >= bits(A),
+// so its last-limb error costs under a unit. None when it's below the frame.
 type LnChunk = (usize, usize, u64);
 
 fn ln_chunk(a: &[u64], k: u64, w: usize) -> Option<LnChunk> {
@@ -806,8 +761,7 @@ fn ln_chunk(a: &[u64], k: u64, w: usize) -> Option<LnChunk> {
     (zeros < wi).then(|| (wi, zeros, 64 * wi as u64 + k - 1 - 64 * w as u64))
 }
 
-// 2 a S into t (v + 1 limbs), through sq and s: S is BBP when A = 1, otherwise Hyper in A^2.
-// Returns its length.
+// 2 a ATanh(a^2) into t (v + 1 limbs): BBP when A = 1, else Hyper in A^2. Returns its length.
 fn ln_chunk_sum<V: Eval>(
     a: &[u64],
     k: u64,
@@ -827,8 +781,9 @@ fn ln_chunk_sum<V: Eval>(
     mul_shr(a, &s[..buf_len(&s[..sl])], sh, t, hi_mul)
 }
 
-// The tail 2 n / d < 2^-(sl - 2) into out, skipping its top (sl - 2) / 64 >= z limbs of the
-// frame but keeping 2, as static finalize expects. Returns its length.
+// The tail 2 n / d < 2^-(sl - 2) into out (0 once n is 0, sl = u64::MAX), skipping its top
+// (sl - 2) / 64 >= z limbs of the frame but keeping 2, as static finalize expects. Returns its
+// length.
 fn ln_tail(
     n: &[u64],
     d: &[u64],
@@ -837,9 +792,6 @@ fn ln_tail(
     out: &mut [u64],
     ratio: fn(&[u64], &[u64], i64, &mut [u64]),
 ) -> usize {
-    if sl == u64::MAX {
-        return 0;
-    }
     let tl = match w.saturating_sub(((sl - 2) / 64) as usize) {
         0 => return 0,
         l => l.max(2).min(w),
@@ -850,8 +802,6 @@ fn ln_tail(
 }
 
 pub fn ln_dyn_entry(x: &[u64], m: u64, neg: bool, out: &mut [u64]) -> u64 {
-    assert!(x.last().is_some_and(|&l| l != 0));
-
     let (f, _, end) = ln_frame(x, m, neg, out.len());
     let (z, v, w) = (f.z, f.v, f.w);
     let cq = 2 * ((end + 64).div_ceil(64) as usize + 1) + 3;
@@ -908,7 +858,7 @@ fn ln_chunk_static<const N: usize>(a: &[u64], k: u64, c: LnChunk, v: usize) -> (
     (t, l)
 }
 
-// Each series needs one guard limb past out, and static finalize 2 more.
+// Each series needs a guard limb past out, and static finalize 2 more.
 pub fn ln_static_entry<const N: usize>(
     x: &[u64],
     m: u64,
@@ -916,8 +866,6 @@ pub fn ln_static_entry<const N: usize>(
     out: &mut [u64],
 ) -> Result<u64, CapacityError> {
     capacity::<N>(out.len() + 3)?;
-    assert!(x.last().is_some_and(|&l| l != 0));
-
     let (f, lo, end) = ln_frame(x, m, neg, out.len());
     let (z, v, w) = (f.z, f.v, f.w);
     let (mut nb, mut db, mut acc) = ([0; N], [0; N], [0; N]);
@@ -987,9 +935,8 @@ pub fn ln_static_entry<const N: usize>(
     Ok(f.out(acc, carry, out))
 }
 
-// j = floor(A log2(64 o)) square roots, less the lead bits u already sits near 1, and the
-// fraction limbs they keep: the entry's window below δ_y's top limb when e = 0, or the
-// absolute frame and j's shift otherwise.
+// j = floor(A log2(64 o)) square roots, less u's lead bits near 1, and the fraction limbs they
+// keep: the entry's window below δ_y's top limb when e = 0, or the absolute frame and j's shift.
 fn ln_sqrt(o: usize, sqrt_a: f64, e0: bool, lead: u64) -> (u64, usize) {
     let j = ((sqrt_a * (64.0 * o as f64).log2()).max(0.0) as u64).saturating_sub(lead);
     let fl = if e0 {
@@ -1000,8 +947,9 @@ fn ln_sqrt(o: usize, sqrt_a: f64, e0: bool, lead: u64) -> (u64, usize) {
     (j, fl)
 }
 
-// ys, sq and ent hold at least o + 4, o + 3 and o + 2 limbs. The square roots run only when sq
-// also holds ln_sqrt's fl + 2, and then ys and ent must hold fl + 1 and o + 2 + ceil(j / 64).
+// |ln X| = |e ln 2 ± 2^j L|, L = |ln y| from the entry, y = (X 2^-e)^(1 / 2^j). ys, sq and ent
+// hold at least o + 4, o + 3 and o + 2 limbs; the square roots run only when sq also holds fl + 2,
+// and then ys and ent must hold fl + 1 and o + 2 + ceil(j / 64).
 fn ln_reduced(
     x: &[u64],
     m: i64,
@@ -1009,7 +957,7 @@ fn ln_reduced(
     [ys, sq, ent]: [&mut [u64]; 3],
     sqrt_a: f64,
     ln2: fn(&mut [u64]),
-    sqrt: fn(&mut [u64], &mut [u64]),
+    sqrt: SqrtOp,
     entry: fn(&[u64], u64, bool, &mut [u64]) -> u64,
 ) -> Result<(i64, bool), LnError> {
     let (len, o) = (buf_len(x), out.len());
@@ -1022,14 +970,13 @@ fn ln_reduced(
     let me = m as i128 - (x.len() - len) as i128;
     let x = &x[..len];
     let lz = x[len - 1].leading_zeros();
-    // u = X 2^-e in [1, 2), except that X in [1/2, 1) stays u = X: -ln 2 + ln 2X would
-    // cancel |ln X|'s leading bits.
+    // u = X 2^-e in [1, 2), except X in [1/2, 1) stays u = X, as -ln 2 + ln 2X would cancel.
     let e = 64 * me + 63 - lz as i128;
     let below = e == -1;
     let e = if below { 0 } else { e };
     let f = o + 1;
     let mut j = 0;
-    // L = |ln y| = ent 2^-64(zl + pe), y = u^(1 / 2^j), unless it's 0 or below the frame.
+    // (pe, zl) with L = ent 2^-64(zl + pe), or None when L is 0 or below the frame.
     let sh = if below { 0 } else { lz + 1 };
     let l = 'l: {
         let src = Delta::new(x, sh, below);
@@ -1045,7 +992,7 @@ fn ln_reduced(
             let yb = &mut ys[..fl + 1];
             shifted(x, 64 * (fl as i64 - len as i64) + sh as i64, yb);
             for _ in 0..j {
-                // sqrt(4y B^(2fl + 1)) = sqrt(y) B^fl 2^33, and 4y's top limb is nonzero.
+                // sqrt(4y B^(2fl + 1)) = sqrt(y) B^fl 2^33, with 4y's top limb nonzero.
                 let rb = &mut sq[..fl + 2];
                 shifted(yb, 66, rb);
                 sqrt(rb, yb);
@@ -1090,9 +1037,8 @@ fn ln_reduced(
         out.copy_from_slice(&ent[t + 1 - o..t + 1]);
         return Ok(((t + jw) as i64 - (zl + pe) as i64, below));
     }
-    // |ln X| = |e ln 2 ± 2^j L| at f fraction limbs. ln 2 at f + 1 limbs keeps |e| < 2^70
-    // times its truncation within r's last limb, and e < 0 is at most -2, so |e| ln 2 >= 2 ln 2
-    // covers 2^j L < ln 2.
+    // At f fraction limbs, ln 2 at f + 1 keeps |e| < 2^70 times its truncation within the last
+    // limb, and e < 0 is at most -2, so |e| ln 2 covers 2^j L < ln 2.
     let r = &mut ys[..f + 3];
     ln2(&mut r[..f + 1]);
     let c = mul_prim2(&mut r[..f + 1], e.unsigned_abs());
@@ -1118,7 +1064,6 @@ pub fn ln_dyn(x: &[u64], m: i64, out: &mut [u64]) -> Result<(i64, bool), LnError
     ln_dyn_at(x, m, out, DYN_LN_SQRT_A)
 }
 
-// ln_dyn with an explicit sqrt_a, for tests and tuning.
 #[doc(hidden)]
 pub fn ln_dyn_at(x: &[u64], m: i64, out: &mut [u64], sqrt_a: f64) -> Result<(i64, bool), LnError> {
     let o = out.len();
@@ -1142,8 +1087,7 @@ pub fn ln_dyn_at(x: &[u64], m: i64, out: &mut [u64], sqrt_a: f64) -> Result<(i64
     )
 }
 
-// The entry at o + 1 limbs needs o + 4, as does ln(2) at o + 2 past its table. The square
-// roots run only when N leaves them room.
+// The entry at o + 1 limbs needs o + 4, as does ln 2 at o + 2 past its table.
 pub fn ln_static<const N: usize>(
     x: &[u64],
     m: i64,
@@ -1173,14 +1117,13 @@ pub fn ln_static_at<const N: usize>(
     )
 }
 
-// Jacobi's θ2(q⁴) = 2 Σ_{k>=0} q^((2k+1)²) and θ3(q⁴) = 1 + 2 Σ_{k>=1} q^((2k)²), for the AGM
-// logarithm ln(1/q) = π / (4 AGM(θ2², θ3²)) (docs/agm-ln-theta.md). Powers A_n = q^(n²) come
-// from B_n = B_(n-1) q² = q^(2n-1) and A_n = A_(n-1) B_n, odd n to θ2 and even n to θ3, each
-// step only as wide as the terms still to come need.
+// θ2(q⁴) = 2 Σ_{k>=0} q^((2k+1)²) and θ3(q⁴) = 1 + 2 Σ_{k>=1} q^((2k)²), for
+// ln(1/q) = π / (4 AGM(θ2², θ3²)) (docs/agm-ln-theta.md). A_n = q^(n²) = A_(n-1) B_n with
+// B_n = B_(n-1) q², odd n to θ2 and even n to θ3, each step as wide as later terms need.
 
-// Where each power lands, for q = u 2^-l with u in [1/2, 1): odd terms in θ2 2^(64 z), g2 limbs
-// below 2^-64z (t = z), even ones in θ3 - 1, g3 limbs below 1 (t = 0), each with a guard limb.
-// last is the last power summed.
+// For q = u 2^-l, u in [1/2, 1): odd terms go to θ2 2^(64 z) with g2 limbs below 2^-64z (t = z),
+// even ones to θ3 - 1 with g3 limbs below 1 (t = 0), each with a guard limb. last is the last
+// power summed.
 struct ThetaSchedule {
     l: u64,
     z: usize,
@@ -1225,23 +1168,21 @@ impl ThetaSchedule {
         }
     }
 
-    // 2 q^(n²) < 2^(1 - l n²) sits z_n limbs into its frame; its window runs from there to a
-    // guard limb past the frame. None once it lies below the frame.
+    // Term n's window, from its top limb in the frame to a guard limb past it, or None when it's
+    // below the frame.
     fn ell(&self, n: u64) -> Option<usize> {
         let (t, g) = self.frame(n);
         let zn = (self.l as u128 * (n as u128 * n as u128) - 1 - 64 * t as u128) / 64;
         (zn < g as u128).then(|| g - zn as usize + 1)
     }
 
-    // Step n's width: the widest later window, which is n's or n + 1's, as a parity's windows
-    // only narrow. At least 2 through last, and never grows.
+    // Step n's width, the wider of n's and n + 1's windows (a parity's only narrow).
     fn width(&self, n: u64) -> usize {
-        let w = |n| (n <= self.last).then(|| self.ell(n)).flatten().unwrap_or(0);
+        let w = |n| self.ell(n).filter(|_| n <= self.last).unwrap_or(0);
         w(n).max(w(n + 1))
     }
 
     // acc += floor(2 q^(n²) 2^(64 (t + g))), for q^(n²) = m 2^(-64 m.len() - e) 2^(-l n²).
-    // tmp holds m.len() limbs.
     fn place(&self, n: u64, m: &[u64], e: u64, acc: &mut [u64], tmp: &mut [u64]) {
         let (t, g) = self.frame(n);
         let sh = 64 * m.len() as u128 + e as u128 + self.l as u128 * (n as u128 * n as u128)
@@ -1250,14 +1191,13 @@ impl ThetaSchedule {
         debug_assert!(sh >= 64);
         let tmp = &mut tmp[..m.len()];
         shifted(m, -(sh as i64), tmp);
-        // θ3 - 1 < 2^-7 and θ2 2^(64 z) < 2^(2 - l + 64 z) <= 1.
+        // θ3 - 1 < 2^-7 and θ2 2^(64 z) <= 1.
         let carry = add_buf(acc, &tmp[..buf_len(tmp)]);
         debug_assert!(!carry);
     }
 }
 
-// m <- m 2^s after its top limb is set to top, s that limb's leading zeros. Returns s, at most 1
-// for a product of two normalized mantissas unless rounding put it just below 1/4.
+// m <- m 2^s after setting its top limb to top, s that limb's leading zeros. Returns s.
 fn theta_norm(m: &mut [u64], top: u64) -> u64 {
     let r = m.len();
     m[r - 1] = top;
@@ -1267,8 +1207,8 @@ fn theta_norm(m: &mut [u64], top: u64) -> u64 {
     s as u64
 }
 
-// Buffers of at least width(1) limbs for a, b and f, width(2) for q2, g2 and g3 for the sums.
-// Mantissas are kept normalized, m 2^(-64 m.len()) in [1/2, 1), with a bit exponent beside them.
+// a, b and f hold width(1) limbs, q2 width(2), acc2 g2 and acc3 g3. Mantissas stay normalized,
+// m 2^(-64 m.len()) in [1/2, 1), with a bit exponent beside them.
 fn theta_core(
     s: &ThetaSchedule,
     x: &[u64],
@@ -1314,12 +1254,10 @@ fn theta_core(
     s.z
 }
 
-// θ2(q⁴) and θ3(q⁴) for q = x 2^-shift < 1/4, x trimmed and nonzero: θ3 sums k = 1..terms and
-// θ2 k = 0..terms (the N of docs/agm-ln-theta.md), less any term below its output. Writes
-// th3 = θ3 2^(64 (th3.len() - 1)), its top limb θ3's integer part (1), and
-// th2 = θ2 2^(64 (th2.len() + z)), returning z = (l - 2) / 64 for l = shift - bits(x). As
-// θ2 ∈ [2^-l, 2^(2 - l)), th2's top limb has at most 64 leading zero bits. Every step only
-// drops bits, so each output is at most 1 unit of its last limb below the truncated sums.
+// θ2(q⁴) and θ3(q⁴) for q = x 2^-shift < 1/4 (x trimmed and nonzero), θ3 over k = 1..terms and
+// θ2 over k = 0..terms, less terms below their output. Writes th3 = θ3 2^(64 (th3.len() - 1))
+// and th2 = θ2 2^(64 (th2.len() + z)), returning z = (l - 2) / 64, l = shift - bits(x). Each is at
+// most a unit below the truncated sum.
 pub fn theta_dyn(x: &[u64], shift: u64, terms: usize, th2: &mut [u64], th3: &mut [u64]) -> usize {
     let s = ThetaSchedule::new(x, shift, terms, th2.len(), th3.len());
     let (r1, r2) = (s.width(1), s.width(2));
@@ -1328,8 +1266,7 @@ pub fn theta_dyn(x: &[u64], shift: u64, terms: usize, th2: &mut [u64], th3: &mut
     theta_core(&s, x, th2, th3, bufs, hi_mul_dyn, hi_sqr_dyn)
 }
 
-// theta_dyn on the stack. Needs N >= max(th2.len() + 2, th3.len() + 1), checked before any
-// input, leaving th2 and th3 untouched; x itself may be longer.
+// Needs N >= max(th2.len() + 2, th3.len() + 1), checked before any input.
 pub fn theta_static<const N: usize>(
     x: &[u64],
     shift: u64,
@@ -1350,4 +1287,87 @@ pub fn theta_static<const N: usize>(
         hi_mul_static::<N>,
         hi_sqr_static::<N>,
     ))
+}
+
+// The running a in out, b in g (out.len() limbs) and a b in prod (2 out.len()): each step's full
+// product over the trimmed pair, rooted back to out.len() limbs.
+fn agm_core(
+    a: &[u64],
+    b: &[u64],
+    iters: usize,
+    out: &mut [u64],
+    [g, prod]: [&mut [u64]; 2],
+    mul: BinOp,
+    sqrt: SqrtOp,
+) {
+    let l = out.len();
+    assert!(
+        a.len() <= l && b.len() <= l,
+        "the AGM's inputs must fit its output"
+    );
+    let (g, prod) = (&mut g[..l], &mut prod[..2 * l]);
+    out[..a.len()].copy_from_slice(a);
+    out[a.len()..].fill(0);
+    g[..b.len()].copy_from_slice(b);
+    g[b.len()..].fill(0);
+    for i in 1..=iters {
+        // The last geometric mean would feed no later mean.
+        let t = (i < iters).then(|| {
+            let (la, lg) = (buf_len(out), buf_len(g));
+            if la == 0 || lg == 0 {
+                return 0;
+            }
+            let p = &mut prod[..la + lg];
+            p[la + lg - 1] = mul(&out[..la], &g[..lg], &mut p[..la + lg - 1]);
+            buf_len(p)
+        });
+        let carry = add_buf(out, g);
+        shr_buf(out, 1);
+        if carry {
+            out[l - 1] |= 1 << 63;
+        }
+        if let Some(t) = t {
+            // An odd t reads as p B, a root 2^32 too high: ⌊⌊√(p B)⌋ / 2^32⌋ = ⌊√p⌋.
+            let sl = t.div_ceil(2);
+            if t > 0 {
+                sqrt(&mut prod[..t], &mut g[..sl]);
+                if t % 2 == 1 {
+                    shr_buf(&mut g[..sl], 32);
+                }
+            }
+            g[sl..].fill(0);
+        }
+    }
+}
+
+// a_iters of the AGM sequence from integers a and b at one scale (a.len(), b.len() <= out.len(),
+// zero-extended): iters arithmetic means and iters - 1 geometric ones. iters = 0 copies a. Each
+// mean is within a unit of its pair's exact mean, but a unit in b_k < a_k costs up to about
+// a_k / b_k units of the result, so the frame must give the smaller input full precision.
+pub fn agm_dyn(a: &[u64], b: &[u64], iters: usize, out: &mut [u64]) {
+    let l = out.len();
+    let mut scratch = ScratchGuard::acquire();
+    let bufs = scratch.get_splits([l, 2 * l]);
+    agm_core(a, b, iters, out, bufs, mul_dyn, sqrt_approx_dyn);
+}
+
+// Needs N >= 2 out.len(), checked before any input.
+pub fn agm_static<const N: usize>(
+    a: &[u64],
+    b: &[u64],
+    iters: usize,
+    out: &mut [u64],
+) -> Result<(), CapacityError> {
+    capacity::<N>(2 * out.len())?;
+    let (mut g, mut prod) = ([0; N], [0; N]);
+    agm_core(
+        a,
+        b,
+        iters,
+        out,
+        [&mut g, &mut prod],
+        mul_static::<N>,
+        sqrt_approx_static::<N>,
+    );
+    Ok(())
 }

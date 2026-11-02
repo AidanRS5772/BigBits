@@ -606,7 +606,8 @@ fn bit_len128(x: u128) -> u64 {
     (128 - x.leading_zeros()) as u64
 }
 
-fn bits(x: &[u64]) -> u64 {
+// Bits of x, whose top limb is nonzero.
+pub(crate) fn bits(x: &[u64]) -> u64 {
     x.last()
         .map_or(0, |&top| 64 * x.len() as u64 - top.leading_zeros() as u64)
 }

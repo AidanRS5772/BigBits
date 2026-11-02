@@ -1,5 +1,5 @@
 use std::{
-    mem, panic,
+    array, mem, panic,
     sync::{PoisonError, RwLock},
     thread,
 };
@@ -94,24 +94,32 @@ fn cached<T: Default>(
     }
 }
 
-fn static_jobs<const N: usize, const K: usize>(
+// Runs main on the caller with the jobs' results in order. When par, the first K jobs start
+// before main, each on a scoped thread with a static split's stack; the rest, those whose
+// thread can't start, and every job otherwise run on the caller as main reaches them.
+pub(crate) fn static_jobs<const N: usize, const K: usize, J, T, R>(
     par: bool,
-    jobs: [&(dyn Fn() -> [u64; N] + Sync); K],
-) -> [[u64; N]; K] {
+    jobs: impl IntoIterator<Item = J>,
+    main: impl FnOnce(&mut dyn Iterator<Item = T>) -> R,
+) -> R
+where
+    J: FnOnce() -> T + Send + Copy,
+    T: Send,
+{
+    let mut jobs = jobs.into_iter();
     if !par {
-        return jobs.map(|j| j());
+        return main(&mut jobs.map(|j| j()));
     }
     thread::scope(|sc| {
-        jobs.map(|j| {
-            (
-                j,
-                thread::Builder::new()
-                    .stack_size(static_split_stack(N))
-                    .spawn_scoped(sc, j)
-                    .ok(),
-            )
-        })
-        .map(|(j, h)| h.map_or_else(j, |h| h.join().unwrap_or_else(|e| panic::resume_unwind(e))))
+        let mut hs: [_; K] = array::from_fn(|_| None);
+        for (h, j) in hs.iter_mut().zip(&mut jobs) {
+            let t = thread::Builder::new().stack_size(static_split_stack(N));
+            *h = Some((j, t.spawn_scoped(sc, j).ok()));
+        }
+        let joined = hs.into_iter().flatten().map(|(j, t)| {
+            t.map_or_else(j, |t| t.join().unwrap_or_else(|e| panic::resume_unwind(e)))
+        });
+        main(&mut joined.chain(jobs.map(|j| j())))
     })
 }
 
@@ -265,20 +273,19 @@ pub(crate) fn ln2_static_sum<const N: usize>(
 
     let n = ln2_end(len);
     let [w1, w2, w3, w4] = LN2_W;
-    let shares = static_jobs::<N, 4>(
-        len >= STATIC_LN2_PAR_CUTOFF,
-        [
-            &|| ln2_share_static::<N, Ln2S<6, 1>>(n, w1, len),
-            &|| ln2_share_static::<N, Ln2S<6, 5>>(n, w2, len),
-            &|| ln2_share_static::<N, Ln2S<2, 1>>(n, w3, len),
-            &|| ln2_share_static::<N, Ln2S<1, 1>>(n, w4, len),
-        ],
-    );
+    let shares: [&(dyn Fn() -> [u64; N] + Sync); 4] = [
+        &|| ln2_share_static::<N, Ln2S<6, 1>>(n, w1, len),
+        &|| ln2_share_static::<N, Ln2S<6, 5>>(n, w2, len),
+        &|| ln2_share_static::<N, Ln2S<2, 1>>(n, w3, len),
+        &|| ln2_share_static::<N, Ln2S<1, 1>>(n, w4, len),
+    ];
     let mut buf = [0; N];
-    for t in &shares {
-        let carry = add_buf(&mut buf[..len], &t[..len]);
-        debug_assert!(!carry, "ln(2) < 1");
-    }
+    static_jobs::<N, 4, _, _, _>(len >= STATIC_LN2_PAR_CUTOFF, shares, |shares| {
+        for t in shares {
+            let carry = add_buf(&mut buf[..len], &t[..len]);
+            debug_assert!(!carry, "ln(2) < 1");
+        }
+    });
     out.copy_from_slice(&buf[guard..len]);
     Ok(())
 }
@@ -468,10 +475,10 @@ pub(crate) fn pi_static_sum<const N: usize>(out: &mut [u64]) -> Result<(), Capac
         pi_root(&mut x[..f + 2], &mut root[..f + 1], sqrt_approx_static::<N>);
         root
     };
-    let [v, root] = static_jobs::<N, 2>(
-        f >= STATIC_PI_PAR_CUTOFF,
-        [&|| pi_ratio_static::<N>(f), &sqrt],
-    );
+    let jobs: [&(dyn Fn() -> [u64; N] + Sync); 2] = [&|| pi_ratio_static::<N>(f), &sqrt];
+    let (v, root) = static_jobs::<N, 2, _, _, _>(f >= STATIC_PI_PAR_CUTOFF, jobs, |r| {
+        (r.next().unwrap(), r.next().unwrap())
+    });
 
     let mut buf = [0; N];
     let top = hi_mul_static::<N>(&root[..f + 1], &v[..f + 1], &mut buf[..f]);

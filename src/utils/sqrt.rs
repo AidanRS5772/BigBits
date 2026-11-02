@@ -86,7 +86,7 @@ pub fn binom_sqrt_core(x: &mut [u64], s: &mut [u64]) {
     let s_len = s.len();
     s.fill(0);
 
-    // x.len == 1 or 2
+    // x.len() == 2
     if s_len == 1 {
         let term = combine_u64(x[0], x[1]);
         let sqrt = term.isqrt();
@@ -354,7 +354,8 @@ pub fn zimmerman_sqrt_dyn(x: &mut [u64], s: &mut [u64]) {
 
 /// Computes only the exact root of `X = value(x) * B^(2*s.len()-x.len())`, where
 /// `B = 2^64`, using pooled dynamic scratch. Writes `floor(sqrt(X))` to `s`.
-/// Requires trimmed nonzero `x` and `s.len() < x.len() <= 2*s.len()`.
+/// Requires trimmed nonzero `x` and `s.len() < x.len() <= 2*s.len()`, or
+/// `x.len() == s.len() == 1` (`X = x * B`).
 /// The input `x` is used as scratch; its contents on return are unspecified.
 pub fn zimmerman_sqrt_only_dyn(x: &mut [u64], s: &mut [u64]) {
     sqrt_only_dyn(x, s);
@@ -364,13 +365,28 @@ pub fn zimmerman_sqrt_only_dyn(x: &mut [u64], s: &mut [u64]) {
 /// `B = 2^64`, using pooled dynamic scratch. The returned integer in `s` is either
 /// `floor(sqrt(X))` or `floor(sqrt(X)) + 1`; small inputs may be computed exactly.
 /// This is a numeric error bound, not a guarantee of identical high limbs.
-/// Requires trimmed nonzero `x` and `s.len() < x.len() <= 2*s.len()`.
+/// Requires trimmed nonzero `x` and `s.len() < x.len() <= 2*s.len()`, or
+/// `x.len() == s.len() == 1` (`X = x * B`).
 /// The input `x` is used as scratch; its contents on return are unspecified.
 pub fn zimmerman_sqrt_approx_dyn(x: &mut [u64], s: &mut [u64]) {
     sqrt_approx_dyn(x, s);
 }
 
+// A one-limb x into a one-limb root, X = x B. It is below the s.len() < x.len() bound, which
+// leaves x room for the remainder (up to 2 sqrt(X), two limbs here), so only the root outputs
+// take it. Returns whether it did.
+fn one_limb_root(x: &[u64], s: &mut [u64], output: SqrtOutput) -> bool {
+    let one = x.len() == 1 && s.len() == 1 && output != SqrtOutput::RootRem;
+    if one {
+        s[0] = ((x[0] as u128) << 64).isqrt() as u64;
+    }
+    one
+}
+
 fn sqrt_dyn_output(x: &mut [u64], s: &mut [u64], output: SqrtOutput) {
+    if one_limb_root(x, s, output) {
+        return;
+    }
     // assume correct size bounds
     debug_assert!(x.len() > s.len());
     debug_assert!(2 * s.len() >= x.len());
@@ -434,6 +450,9 @@ pub fn zimmerman_sqrt_approx_static<const N: usize>(x: &mut [u64], s: &mut [u64]
 }
 
 fn sqrt_static_output<const N: usize>(x: &mut [u64], s: &mut [u64], output: SqrtOutput) {
+    if one_limb_root(x, s, output) {
+        return;
+    }
     // assume correct size bounds
     debug_assert!(x.len() > s.len());
     debug_assert!(2 * s.len() >= x.len());
@@ -503,7 +522,8 @@ pub fn sqrt_dyn(x: &mut [u64], s: &mut [u64]) {
 
 /// Computes only the exact root with the scaling, input requirements, and
 /// algorithms of [`sqrt_dyn`], switching at `DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF`.
-/// Writes `floor(sqrt(X))` to `s`.
+/// Writes `floor(sqrt(X))` to `s`. Without a remainder to hold, it also takes
+/// `x.len() == s.len() == 1` (`X = x * B`).
 /// The input `x` is used as scratch; its contents on return are unspecified.
 pub fn sqrt_only_dyn(x: &mut [u64], s: &mut [u64]) {
     sqrt_dyn_output(x, s, SqrtOutput::Root);
@@ -512,7 +532,8 @@ pub fn sqrt_only_dyn(x: &mut [u64], s: &mut [u64]) {
 /// Computes an approximate root with the scaling, input requirements, and
 /// algorithms of [`sqrt_dyn`], switching at `DYN_SQRT_APPROX_ZIMMERMAN_CUTOFF`.
 /// The result in `s` is either `floor(sqrt(X))` or `floor(sqrt(X)) + 1`; the
-/// binomial path is exact.
+/// binomial path is exact. Without a remainder to hold, it also takes
+/// `x.len() == s.len() == 1` (`X = x * B`).
 /// This is a numeric error bound, not a guarantee of identical high limbs.
 /// The input `x` is used as scratch; its contents on return are unspecified.
 pub fn sqrt_approx_dyn(x: &mut [u64], s: &mut [u64]) {
