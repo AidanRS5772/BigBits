@@ -1,10 +1,9 @@
 use crate::utils::consts::consts::{
-    ln2_dyn, ln2_static_unguarded, shifted, static_jobs, LN2_LIMBS,
+    ln2_dyn, ln2_static_unguarded, pi_dyn, pi_static, shifted, static_jobs, LN2_LIMBS,
 };
 use crate::utils::div::{div_dyn, div_rem_dyn, div_rem_static, div_static};
 use crate::utils::mul::{
-    hi_mul_dyn, hi_mul_static, hi_sqr_dyn, hi_sqr_static, mul_dyn, mul_prim2, mul_static, sqr_dyn,
-    sqr_static,
+    hi_mul_dyn, hi_mul_static, hi_sqr_dyn, hi_sqr_static, mul_prim2, sqr_dyn, sqr_static,
 };
 use crate::utils::series::{
     bits, join2, ratio_to_fraction_dyn, ratio_to_fraction_static, series_eval_dyn,
@@ -12,15 +11,21 @@ use crate::utils::series::{
     Series,
 };
 use crate::utils::sqrt::{sqrt_approx_dyn, sqrt_approx_static};
-use crate::utils::utils::{add_buf, buf_len, inc_buf, shl_buf, shr_buf, split_sh, sub_buf};
+use crate::utils::theta_plan::{ThetaPlan, ThetaPlans, MAX_VALUES};
+use crate::utils::utils::{
+    add_buf, buf_len, cmp_buf, inc_buf, shl_buf, shr_buf, split_sh, sub_buf,
+};
 use crate::utils::{
     CapacityError, ScratchGuard, DYN_EXP_CHUNK_MIN_BITS, DYN_EXP_CHUNK_PAR_WORK, DYN_EXP_SQR_BITS,
-    DYN_LN_CHUNK_MIN_BITS, DYN_LN_CHUNK_PAR_WORK, DYN_LN_SQRT_A, STATIC_EXP_CHUNK_MIN_BITS,
-    STATIC_EXP_CHUNK_PAR_WORK, STATIC_EXP_SQR_BITS, STATIC_LN_CHUNK_MIN_BITS,
-    STATIC_LN_CHUNK_PAR_WORK, STATIC_LN_SQRT_A,
+    DYN_LN_AGM_LIMBS, DYN_LN_AGM_TERMS, DYN_LN_CHUNK_MIN_BITS, DYN_LN_CHUNK_PAR_WORK,
+    DYN_LN_SQRT_A, DYN_THETA_PAR_LIMBS, STATIC_EXP_CHUNK_MIN_BITS, STATIC_EXP_CHUNK_PAR_WORK,
+    STATIC_EXP_SQR_BITS, STATIC_LN_AGM_LIMBS, STATIC_LN_AGM_TERMS, STATIC_LN_CHUNK_MIN_BITS,
+    STATIC_LN_CHUNK_PAR_WORK, STATIC_LN_SQRT_A, STATIC_THETA_PAR_LIMBS, THETA_STATIC_SLOTS,
 };
 use rayon::prelude::*;
-use std::f64::consts::{LOG2_E, PI};
+use std::cmp::Ordering;
+use std::f64::consts::{LN_2, LOG2_E, PI};
+use std::sync::{Condvar, Mutex, PoisonError};
 use std::{fmt, panic, thread};
 
 const GUARD_LIMBS: usize = 1;
@@ -31,6 +36,7 @@ const MAX_PAR_CHUNKS: usize = 64;
 type BinOp = fn(&[u64], &[u64], &mut [u64]) -> u64;
 type UnOp = fn(&[u64], &mut [u64]) -> u64;
 type SqrtOp = fn(&mut [u64], &mut [u64]);
+type Ratio = fn(&[u64], &[u64], i64, &mut [u64]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpError {
@@ -605,9 +611,48 @@ impl<'a> Delta<'a> {
     // δ's top nonzero limb and leading zero bits, or None when δ = 0.
     fn top(&self) -> Option<(usize, u64)> {
         let len = self.f.len();
-        let it = (0..len).rev().find(|&i| self.limb(i as i64) != 0)?;
-        let lead = 64 * (len - 1 - it) as u64 + self.limb(it as i64).leading_zeros() as u64;
-        Some((it, lead))
+        (0..len).rev().find_map(|i| {
+            let l = self.limb(i as i64);
+            (l != 0).then(|| (i, 64 * (len - 1 - i) as u64 + l.leading_zeros() as u64))
+        })
+    }
+}
+
+// X = 2^(64m) x (x's last limb worth 1): x trimmed, e = ⌊log2 X⌋, and δ = |u - 1| for u = X 2^-e,
+// or u = X for X in [1/2, 1) (below), where -ln 2 + ln 2X would cancel.
+struct LnNorm<'a> {
+    x: &'a [u64],
+    e: i128,
+    below: bool,
+    sh: u32,
+}
+
+impl<'a> LnNorm<'a> {
+    // None for X = 0.
+    fn new(x: &'a [u64], m: i64) -> Option<Self> {
+        let len = buf_len(x);
+        if len == 0 {
+            return None;
+        }
+        let me = m as i128 - (x.len() - len) as i128;
+        let x = &x[..len];
+        let lz = x[len - 1].leading_zeros();
+        let e = 64 * me + 63 - lz as i128;
+        let below = e == -1;
+        let sh = if below { 0 } else { lz + 1 };
+        Some(LnNorm { x, e, below, sh })
+    }
+
+    // δ's leading zero bits, or None when δ = 0 (X = 2^e).
+    fn lead(&self) -> Option<u64> {
+        Delta::new(self.x, self.sh, self.below)
+            .top()
+            .map(|(_, lead)| lead)
+    }
+
+    // e ln 2 and ln u cancel only for X in [1/2, 2).
+    fn cancels(&self) -> bool {
+        self.e == 0 || self.below
     }
 }
 
@@ -690,11 +735,10 @@ fn chunk_quotient<'q>(
     a
 }
 
-// Takes chunks a = A 2^-k <= z, A odd, off z = n / d (n 2^-64w in nb, d 2^-64v in db), passing
-// each to chunk with 2a in the w-limb frame, until z's top bit passes end and the first chunk's.
-// atanh(z) = atanh(a) + atanh((n - a d) / (d - a n)), so only each chunk's bits need a (short)
-// division. qd and qq hold at least v + 1 limbs. Returns the remainder's top bit, or u64::MAX
-// once n is 0.
+// Chunks a = A 2^-k <= z (A odd) off z = n / d (n 2^-64w in nb, d 2^-64v in db), each passed to
+// chunk with 2a in the w-limb frame, until z's top bit passes end and the first's.
+// atanh(z) = atanh(a) + atanh((n - a d) / (d - a n)), so only a chunk's bits take a (short)
+// division. qd and qq hold v + 1 limbs. Returns the remainder's top bit, or u64::MAX once n is 0.
 fn ln_chain(
     (nb, db): (&mut [u64], &mut [u64]),
     z: usize,
@@ -790,7 +834,7 @@ fn ln_tail(
     sl: u64,
     (w, v): (usize, usize),
     out: &mut [u64],
-    ratio: fn(&[u64], &[u64], i64, &mut [u64]),
+    ratio: Ratio,
 ) -> usize {
     let tl = match w.saturating_sub(((sl - 2) / 64) as usize) {
         0 => return 0,
@@ -876,59 +920,55 @@ pub fn ln_static_entry<const N: usize>(
     // Chunks start at lo + 3 at the earliest, after the top one.
     let chunks = exp_chunks(lo + 3, end, STATIC_LN_CHUNK_MIN_BITS).count() + 1;
     let ops = (hi_mul_static::<N> as BinOp, div_static::<N> as BinOp);
-    // The chain, then the tail into qq, which the chain is done with.
-    let mut chain = |chunk: &mut dyn FnMut(&[u64], u64, &[u64])| {
-        let bufs = [&mut qn[..], &mut qd[..], &mut qq[..]];
-        let min = STATIC_LN_CHUNK_MIN_BITS;
-        let sl = ln_chain((&mut *nb, &mut *db), z, end, min, bufs, ops, chunk);
-        ln_tail(nb, db, sl, (w, v), &mut qq, ratio_to_fraction_static::<N>)
-    };
+    // The chain, adding each 2a and any series sum returns, then the tail into qq.
+    let mut chain =
+        |acc: &mut [u64],
+         carry: &mut bool,
+         sum: &mut dyn FnMut(&[u64], u64, LnChunk) -> Option<([u64; N], usize)>| {
+            let bufs = [&mut qn[..], &mut qd[..], &mut qq[..]];
+            let min = STATIC_LN_CHUNK_MIN_BITS;
+            let sl = ln_chain((&mut *nb, &mut *db), z, end, min, bufs, ops, |a, k, a2| {
+                *carry |= add_buf(acc, a2);
+                if let Some((b, bl)) = ln_chunk(a, k, w).and_then(|c| sum(a, k, c)) {
+                    *carry |= add_buf(acc, &b[..bl]);
+                }
+            });
+            ln_tail(nb, db, sl, (w, v), &mut qq, ratio_to_fraction_static::<N>)
+        };
     let mut carry = false;
     let tl = if chunks_par(chunks, v, STATIC_LN_CHUNK_PAR_WORK, false) {
         thread::scope(|sc| {
             let mut hs: [_; MAX_PAR_CHUNKS] = std::array::from_fn(|_| None);
             let (mut nh, mut top) = (0, None);
-            let tl = chain(&mut |a, k, a2| {
-                carry |= add_buf(acc, a2);
-                let Some(c) = ln_chunk(a, k, w) else {
-                    return;
-                };
+            let tl = chain(acc, &mut carry, &mut |a, k, c| {
                 let (mut ac, al) = ([0; N], a.len());
                 ac[..al].copy_from_slice(a);
                 let job = move || ln_chunk_static::<N>(&ac[..al], k, c, v);
                 // The caller's thread sums the top chunk once the chain is done.
                 if top.is_none() {
                     top = Some(job);
-                    return;
+                    return None;
                 }
                 if nh < MAX_PAR_CHUNKS {
                     let builder = thread::Builder::new().stack_size(static_split_stack(N));
                     if let Ok(h) = builder.spawn_scoped(sc, job) {
                         hs[nh] = Some(h);
                         nh += 1;
-                        return;
+                        return None;
                     }
                 }
-                let (b, bl) = job();
-                carry |= add_buf(acc, &b[..bl]);
+                Some(job())
             });
-            if let Some(job) = top {
-                let (b, bl) = job();
-                carry |= add_buf(acc, &b[..bl]);
-            }
-            for h in hs.into_iter().flatten() {
-                let (b, bl) = h.join().unwrap_or_else(|e| panic::resume_unwind(e));
+            let joined = hs.into_iter().flatten();
+            let rest = joined.map(|h| h.join().unwrap_or_else(|e| panic::resume_unwind(e)));
+            for (b, bl) in top.map(|job| job()).into_iter().chain(rest) {
                 carry |= add_buf(acc, &b[..bl]);
             }
             tl
         })
     } else {
-        chain(&mut |a, k, a2| {
-            carry |= add_buf(acc, a2);
-            if let Some(c) = ln_chunk(a, k, w) {
-                let (b, bl) = ln_chunk_static::<N>(a, k, c, v);
-                carry |= add_buf(acc, &b[..bl]);
-            }
+        chain(acc, &mut carry, &mut |a, k, c| {
+            Some(ln_chunk_static::<N>(a, k, c, v))
         })
     };
     carry |= add_buf(acc, &qq[..tl]);
@@ -947,9 +987,9 @@ fn ln_sqrt(o: usize, sqrt_a: f64, e0: bool, lead: u64) -> (u64, usize) {
     (j, fl)
 }
 
-// |ln X| = |e ln 2 ± 2^j L|, L = |ln y| from the entry, y = (X 2^-e)^(1 / 2^j). ys, sq and ent
-// hold at least o + 4, o + 3 and o + 2 limbs; the square roots run only when sq also holds fl + 2,
-// and then ys and ent must hold fl + 1 and o + 2 + ceil(j / 64).
+// |ln X| = |e ln 2 + 2^j L|, L = |ln y| from the entry, y = (X 2^-e)^(1 / 2^j). ys, sq and ent
+// hold o + 4, o + 3 and o + 2 limbs; the roots run only when sq holds fl + 2, ys fl + 1 and ent
+// o + 2 + ⌈j / 64⌉.
 fn ln_reduced(
     x: &[u64],
     m: i64,
@@ -960,24 +1000,17 @@ fn ln_reduced(
     sqrt: SqrtOp,
     entry: fn(&[u64], u64, bool, &mut [u64]) -> u64,
 ) -> Result<(i64, bool), LnError> {
-    let (len, o) = (buf_len(x), out.len());
-    if len == 0 {
-        return Err(LnError::Zero);
-    }
+    let nx = LnNorm::new(x, m).ok_or(LnError::Zero)?;
+    let o = out.len();
     if o == 0 {
         return Ok((0, false));
     }
-    let me = m as i128 - (x.len() - len) as i128;
-    let x = &x[..len];
-    let lz = x[len - 1].leading_zeros();
-    // u = X 2^-e in [1, 2), except X in [1/2, 1) stays u = X, as -ln 2 + ln 2X would cancel.
-    let e = 64 * me + 63 - lz as i128;
-    let below = e == -1;
-    let e = if below { 0 } else { e };
+    let (x, below, sh) = (nx.x, nx.below, nx.sh);
+    let len = x.len();
+    let e = if below { 0 } else { nx.e };
     let f = o + 1;
     let mut j = 0;
     // (pe, zl) with L = ent 2^-64(zl + pe), or None when L is 0 or below the frame.
-    let sh = if below { 0 } else { lz + 1 };
     let l = 'l: {
         let src = Delta::new(x, sh, below);
         let Some((it, lead)) = src.top() else {
@@ -1037,31 +1070,54 @@ fn ln_reduced(
         out.copy_from_slice(&ent[t + 1 - o..t + 1]);
         return Ok(((t + jw) as i64 - (zl + pe) as i64, below));
     }
-    // At f fraction limbs, ln 2 at f + 1 keeps |e| < 2^70 times its truncation within the last
-    // limb, and e < 0 is at most -2, so |e| ln 2 covers 2^j L < ln 2.
-    let r = &mut ys[..f + 3];
-    ln2(&mut r[..f + 1]);
-    let c = mul_prim2(&mut r[..f + 1], e.unsigned_abs());
-    (r[f + 1], r[f + 2]) = (c as u64, (c >> 64) as u64);
-    let rr = &mut r[1..];
-    if let Some((pe, zl)) = l {
-        let t = &mut sq[..f + 2];
-        shifted(&ent[..pe], j as i64 + 64 * (f as i64 - (zl + pe) as i64), t);
-        let t = &t[..buf_len(t)];
-        let c = if e > 0 {
-            add_buf(rr, t)
-        } else {
-            sub_buf(rr, t)
-        };
-        debug_assert!(!c);
+    // e < 0 is at most -2, so |e| ln 2 covers 2^j L < ln 2.
+    let t = &mut sq[..f + 2];
+    match l {
+        Some((pe, zl)) => shifted(&ent[..pe], j as i64 + 64 * (f as i64 - (zl + pe) as i64), t),
+        None => t.fill(0),
     }
-    let t = buf_len(rr) - 1;
-    out.copy_from_slice(&rr[t + 1 - o..t + 1]);
-    Ok((t as i64 - f as i64, e < 0))
+    Ok(ln2_combine(e, true, t, ys, ln2, out))
 }
 
+// |c ln 2 ± T| into out, + when add, for T at f = t.len() - 2 fraction limbs; r holds f + 3. ln 2
+// at f + 1 limbs keeps |c| < 2^71 times its truncation within the last limb. Returns (k, neg).
+fn ln2_combine(
+    c: i128,
+    add: bool,
+    t: &mut [u64],
+    r: &mut [u64],
+    ln2: fn(&mut [u64]),
+    out: &mut [u64],
+) -> (i64, bool) {
+    let f = t.len() - 2;
+    let r = &mut r[..f + 3];
+    ln2(&mut r[..f + 1]);
+    let carry = mul_prim2(&mut r[..f + 1], c.unsigned_abs());
+    (r[f + 1], r[f + 2]) = (carry as u64, (carry >> 64) as u64);
+    let rr = &mut r[1..];
+    let (res, neg): (&[u64], bool) = if c == 0 || (c > 0) == add {
+        add_buf(rr, t);
+        (rr, !add)
+    } else if cmp_buf(rr, t) != Ordering::Less {
+        sub_buf(rr, t);
+        (rr, c < 0)
+    } else {
+        sub_buf(t, rr);
+        (t, !add)
+    };
+    let (top, o) = (buf_len(res), out.len());
+    out.copy_from_slice(&res[top - o..top]);
+    (top as i64 - 1 - f as i64, neg)
+}
+
+// The theta–AGM logarithm where agm_wins picks it, else the series.
 pub fn ln_dyn(x: &[u64], m: i64, out: &mut [u64]) -> Result<(i64, bool), LnError> {
-    ln_dyn_at(x, m, out, DYN_LN_SQRT_A)
+    let o = out.len();
+    let (a, cut) = (DYN_LN_SQRT_A, DYN_LN_AGM_LIMBS);
+    if o >= cut && LnNorm::new(x, m).is_some_and(|n| agm_wins(o, n.lead(), n.cancels(), a, cut)) {
+        return ln_agm_dyn_at::<DYN_LN_AGM_TERMS>(x, m, out);
+    }
+    ln_dyn_at(x, m, out, a)
 }
 
 #[doc(hidden)]
@@ -1087,13 +1143,22 @@ pub fn ln_dyn_at(x: &[u64], m: i64, out: &mut [u64], sqrt_a: f64) -> Result<(i64
     )
 }
 
-// The entry at o + 1 limbs needs o + 4, as does ln 2 at o + 2 past its table.
+// The series needs N >= o + 4; the AGM runs where agm_wins picks it and N holds its frame.
 pub fn ln_static<const N: usize>(
     x: &[u64],
     m: i64,
     out: &mut [u64],
 ) -> Result<(i64, bool), LnError> {
-    ln_static_at::<N>(x, m, out, STATIC_LN_SQRT_A)
+    capacity::<N>(out.len() + 4)?;
+    let o = out.len();
+    let (a, cut) = (STATIC_LN_SQRT_A, STATIC_LN_AGM_LIMBS);
+    if o >= cut && LnNorm::new(x, m).is_some_and(|n| agm_wins(o, n.lead(), n.cancels(), a, cut)) {
+        match ln_agm_static_at::<N, STATIC_LN_AGM_TERMS>(x, m, out) {
+            Err(LnError::Capacity(_)) => {}
+            r => return r,
+        }
+    }
+    ln_static_at::<N>(x, m, out, a)
 }
 
 #[doc(hidden)]
@@ -1118,45 +1183,32 @@ pub fn ln_static_at<const N: usize>(
 }
 
 // θ2(q⁴) = 2 Σ_{k>=0} q^((2k+1)²) and θ3(q⁴) = 1 + 2 Σ_{k>=1} q^((2k)²), for
-// ln(1/q) = π / (4 AGM(θ2², θ3²)) (docs/agm-ln-theta.md). A_n = q^(n²) = A_(n-1) B_n with
-// B_n = B_(n-1) q², odd n to θ2 and even n to θ3, each step as wide as later terms need.
+// ln(1/q) = π / (4 AGM(θ2², θ3²)) (docs/agm-ln-theta.md). The powers q^(n²) follow a compile-time
+// plan of squares and products (theta_plan.rs), each value as wide as the terms it feeds.
 
 // For q = u 2^-l, u in [1/2, 1): odd terms go to θ2 2^(64 z) with g2 limbs below 2^-64z (t = z),
-// even ones to θ3 - 1 with g3 limbs below 1 (t = 0), each with a guard limb. last is the last
-// power summed.
+// even ones to θ3 - 1 with g3 limbs below 1 (t = 0), each with a guard limb.
 struct ThetaSchedule {
     l: u64,
     z: usize,
     g2: usize,
     g3: usize,
-    last: u64,
 }
 
 impl ThetaSchedule {
-    fn new(x: &[u64], shift: u64, terms: usize, w2: usize, w3: usize) -> Self {
+    fn new(x: &[u64], shift: u64, w2: usize, w3: usize) -> Self {
         assert!(x.last().is_some_and(|&l| l != 0));
         assert!(w2 > 0 && w3 > 0, "theta's outputs must be non-empty");
         let l = shift
             .checked_sub(bits(x))
             .filter(|&l| l >= 2)
             .expect("theta needs q = x 2^-shift < 1/4");
-        let mut s = ThetaSchedule {
+        ThetaSchedule {
             l,
             z: ((l - 2) / 64) as usize,
             g2: w2 + 1,
             g3: w3,
-            last: 1,
-        };
-        // A parity's terms only shrink, so once neither n nor n + 1 lands, nothing later does.
-        let max = (terms as u64).saturating_mul(2).saturating_add(1);
-        for n in 2..=max {
-            if s.ell(n).is_some() {
-                s.last = n;
-            } else if s.ell(n + 1).is_none() {
-                break;
-            }
         }
-        s
     }
 
     // Term n's frame (t, g).
@@ -1176,12 +1228,6 @@ impl ThetaSchedule {
         (zn < g as u128).then(|| g - zn as usize + 1)
     }
 
-    // Step n's width, the wider of n's and n + 1's windows (a parity's only narrow).
-    fn width(&self, n: u64) -> usize {
-        let w = |n| self.ell(n).filter(|_| n <= self.last).unwrap_or(0);
-        w(n).max(w(n + 1))
-    }
-
     // acc += floor(2 q^(n²) 2^(64 (t + g))), for q^(n²) = m 2^(-64 m.len() - e) 2^(-l n²).
     fn place(&self, n: u64, m: &[u64], e: u64, acc: &mut [u64], tmp: &mut [u64]) {
         let (t, g) = self.frame(n);
@@ -1197,107 +1243,498 @@ impl ThetaSchedule {
     }
 }
 
-// m <- m 2^s after setting its top limb to top, s that limb's leading zeros. Returns s.
-fn theta_norm(m: &mut [u64], top: u64) -> u64 {
-    let r = m.len();
-    m[r - 1] = top;
-    let s = top.leading_zeros();
-    debug_assert!(s < 64);
-    shl_buf(m, s as u8);
-    s as u64
+// Which plan theta runs and how: the gate's (Auto), or forced for tests. Parallel runs the
+// shortest-path plan, threaded or in order; both give the same bits.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThetaMode {
+    Auto,
+    Serial,
+    Parallel { threads: bool },
 }
 
-// a, b and f hold width(1) limbs, q2 width(2), acc2 g2 and acc3 g3. Mantissas stay normalized,
-// m 2^(-64 m.len()) in [1/2, 1), with a bit exponent beside them.
-fn theta_core(
-    s: &ThetaSchedule,
-    x: &[u64],
-    th2: &mut [u64],
-    th3: &mut [u64],
-    [mut a, mut b, mut f, q2, acc2, acc3]: [&mut [u64]; 6],
+// T's plan for g-limb frames, and its workers when threaded (at least 2 when forced): the gate
+// takes the parallel plan from cutoff limbs if it fits, threaded on two or more workers.
+fn theta_plan<const T: usize>(
+    mode: ThetaMode,
+    g: usize,
+    cutoff: usize,
+    fits: bool,
+    cpus: usize,
+) -> (&'static ThetaPlan, Option<usize>) {
+    let par = match mode {
+        ThetaMode::Auto => fits && g >= cutoff,
+        ThetaMode::Serial => false,
+        ThetaMode::Parallel { .. } => {
+            assert!(fits, "theta's parallel plan doesn't fit its slots");
+            true
+        }
+    };
+    if !par {
+        return (const { &ThetaPlans::<T>::SERIAL }, None);
+    }
+    let p = const { &ThetaPlans::<T>::PARALLEL };
+    let w = cpus.min(p.width);
+    let workers = match mode {
+        ThetaMode::Parallel { threads } => threads.then_some(w.max(2)),
+        _ => (w > 1).then_some(w),
+    };
+    (p, workers)
+}
+
+type Acc<'a> = [&'a mut [u64]; 3];
+
+// A plan with its schedule, input and products. Values are normalized mantissas,
+// m 2^(-64 m.len()) in [1/2, 1), each with a bit exponent beside it.
+struct Theta<'a> {
+    s: ThetaSchedule,
+    p: &'a ThetaPlan,
+    x: &'a [u64],
+    // Each value's width: its own term's window, widened to the widest op reading it, or 0 when
+    // nothing it feeds lands in the frame (and then it never runs). q's is the widest.
+    w: [usize; MAX_VALUES],
     hi_mul: BinOp,
     hi_sqr: UnOp,
-) -> usize {
-    let (acc2, acc3) = (&mut acc2[..s.g2], &mut acc3[..s.g3]);
-    acc2.fill(0);
-    acc3.fill(0);
-    let r1 = s.width(1);
-    shifted(x, 64 * r1 as i64 - bits(x) as i64, &mut a[..r1]);
-    s.place(1, &a[..r1], 0, acc2, f);
-    if s.last >= 2 {
-        let r2 = s.width(2);
-        let q2 = &mut q2[..r2];
-        let top = hi_sqr(&a[r1 - r2..r1], &mut q2[..r2 - 1]);
-        let e2 = theta_norm(q2, top);
-        // A_1 = B_1 = u; each product goes to the free buffer, which then swaps in.
-        b[..r1].copy_from_slice(&a[..r1]);
-        let (mut ea, mut eb, mut r) = (0, 0, r1);
-        for n in 2..=s.last {
-            let rn = s.width(n);
-            let top = hi_mul(&b[r - rn..r], &q2[r2 - rn..], &mut f[..rn - 1]);
-            eb += e2 + theta_norm(&mut f[..rn], top);
-            std::mem::swap(&mut b, &mut f);
-            let top = hi_mul(&a[r - rn..r], &b[..rn], &mut f[..rn - 1]);
-            ea += eb + theta_norm(&mut f[..rn], top);
-            std::mem::swap(&mut a, &mut f);
-            r = rn;
-            if s.ell(n).is_some() {
-                let acc = if n % 2 == 1 { &mut *acc2 } else { &mut *acc3 };
-                s.place(n, &a[..r], ea, acc, f);
+}
+
+impl<'a> Theta<'a> {
+    fn new(
+        s: ThetaSchedule,
+        p: &'a ThetaPlan,
+        x: &'a [u64],
+        (hi_mul, hi_sqr): (BinOp, UnOp),
+    ) -> Self {
+        let mut w = [0; MAX_VALUES];
+        for v in (0..p.values).rev() {
+            let o = p.op[v];
+            if o.term != 0 {
+                w[v] = w[v].max(s.ell(o.term as u64).unwrap_or(0));
+            }
+            if v > 0 && w[v] > 0 {
+                for i in [o.a, o.b] {
+                    w[i as usize] = w[i as usize].max(w[v]);
+                }
             }
         }
+        Theta {
+            s,
+            p,
+            x,
+            w,
+            hi_mul,
+            hi_sqr,
+        }
     }
-    let w3 = th3.len();
-    th3[..w3 - 1].copy_from_slice(&acc3[1..]);
-    th3[w3 - 1] = 1;
-    th2.copy_from_slice(&acc2[1..]);
-    s.z
+
+    // Value v into out[..w[v]] from its operands (as stored, with their exponents), by the top
+    // w[v] limbs of each. Returns its exponent.
+    fn value(
+        &self,
+        v: usize,
+        (a, ea): (&[u64], u64),
+        (b, eb): (&[u64], u64),
+        out: &mut [u64],
+    ) -> u64 {
+        let w = self.w[v];
+        let out = &mut out[..w];
+        if v == 0 {
+            shifted(self.x, 64 * w as i64 - bits(self.x) as i64, out);
+            return 0;
+        }
+        let o = self.p.op[v];
+        let (a, b) = (&a[a.len() - w..], &b[b.len() - w..]);
+        out[w - 1] = if o.a == o.b {
+            (self.hi_sqr)(a, &mut out[..w - 1])
+        } else {
+            (self.hi_mul)(a, b, &mut out[..w - 1])
+        };
+        let z = out[w - 1].leading_zeros();
+        debug_assert!(z < 64);
+        shl_buf(out, z as u8);
+        ea + eb + z as u64
+    }
+
+    // Value v's term, if it is one, into θ2 (odd n) or θ3.
+    fn place(&self, v: usize, m: &[u64], e: u64, [acc2, acc3, tmp]: &mut Acc) {
+        let n = self.p.op[v].term as u64;
+        if n != 0 {
+            let acc = if n % 2 == 1 { acc2 } else { acc3 };
+            self.s.place(n, &m[..self.w[v]], e, acc, tmp);
+        }
+    }
+
+    fn out(&self, th2: &mut [u64], th3: &mut [u64], [acc2, acc3, _]: &Acc) -> usize {
+        let w3 = th3.len();
+        th3[..w3 - 1].copy_from_slice(&acc3[1..self.s.g3]);
+        th3[w3 - 1] = 1;
+        th2.copy_from_slice(&acc2[1..self.s.g2]);
+        self.s.z
+    }
+
+    // The ops in order, each value in its plan slot.
+    fn serial(&self, slots: &mut [&mut [u64]], acc: &mut Acc) {
+        let (p, w) = (self.p, &self.w);
+        let mut e = [0u64; MAX_VALUES];
+        for v in (0..p.values).filter(|&v| w[v] > 0) {
+            let (o, d) = (p.op[v], p.slot[v] as usize);
+            let out = std::mem::take(&mut slots[d]);
+            if v == 0 {
+                self.value(0, (&[], 0), (&[], 0), out);
+            } else {
+                let (a, b) = (o.a as usize, o.b as usize);
+                let sa = &slots[p.slot[a] as usize][..w[a]];
+                let sb = &slots[p.slot[b] as usize][..w[b]];
+                e[v] = self.value(v, (sa, e[a]), (sb, e[b]), out);
+            }
+            slots[d] = out;
+            self.place(v, &slots[d][..w[v]], e[v], acc);
+        }
+    }
 }
 
-// θ2(q⁴) and θ3(q⁴) for q = x 2^-shift < 1/4 (x trimmed and nonzero), θ3 over k = 1..terms and
-// θ2 over k = 0..terms, less terms below their output. Writes th3 = θ3 2^(64 (th3.len() - 1))
-// and th2 = θ2 2^(64 (th2.len() + z)), returning z = (l - 2) / 64, l = shift - bits(x). Each is at
-// most a unit below the truncated sum.
-pub fn theta_dyn(x: &[u64], shift: u64, terms: usize, th2: &mut [u64], th3: &mut [u64]) -> usize {
-    let s = ThetaSchedule::new(x, shift, terms, th2.len(), th3.len());
-    let (r1, r2) = (s.width(1), s.width(2));
-    let mut scratch = ScratchGuard::acquire();
-    let bufs = scratch.get_splits([r1, r1, r1, r2, s.g2, s.g3]);
-    theta_core(&s, x, th2, th3, bufs, hi_mul_dyn, hi_sqr_dyn)
+// The dataflow's equal slots. SAFETY: each running op owns its output slot, starts only after its
+// operands completed under the scheduler's lock, and a slot frees only after its last reader.
+struct SlotPool {
+    base: *mut u64,
+    len: usize,
 }
 
-// Needs N >= max(th2.len() + 2, th3.len() + 1), checked before any input.
-pub fn theta_static<const N: usize>(
+unsafe impl Sync for SlotPool {}
+
+impl SlotPool {
+    // SAFETY: see SlotPool; slot i must be one the pool was built with room for.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get(&self, i: u8) -> &mut [u64] {
+        std::slice::from_raw_parts_mut(self.base.add(i as usize * self.len), self.len)
+    }
+}
+
+// An op ready to run: value v into slot out, from its operands' slots and exponents.
+#[derive(Clone, Copy)]
+struct Job {
+    v: u8,
+    out: u8,
+    a: (u8, u64),
+    b: (u8, u64),
+}
+
+impl Job {
+    fn run(self, t: &Theta, pool: &SlotPool) -> u64 {
+        let w = |v: u8| t.w[v as usize];
+        let o = t.p.op[self.v as usize];
+        // SAFETY: the operands are complete and read-only until this op completes; out is ours.
+        unsafe {
+            let a = &pool.get(self.a.0)[..w(o.a)];
+            let b = &pool.get(self.b.0)[..w(o.b)];
+            t.value(
+                self.v as usize,
+                (a, self.a.1),
+                (b, self.b.1),
+                pool.get(self.out),
+            )
+        }
+    }
+}
+
+// Ops dispatch in plan order once their operands are done and a slot is free: with none running,
+// the live values are the in-order ones, so a pool of the plan's slots never stalls. [head, next)
+// is dispatched, not yet taken; a value's readers include its own sum.
+struct Flow<'a> {
+    next: usize,
+    head: usize,
+    left: usize,
+    done: [bool; MAX_VALUES],
+    readers: [u8; MAX_VALUES],
+    slot: [u8; MAX_VALUES],
+    exp: [u64; MAX_VALUES],
+    free: [u8; MAX_VALUES],
+    nfree: usize,
+    failed: bool,
+    acc: Acc<'a>,
+}
+
+impl<'a> Flow<'a> {
+    fn new(t: &Theta, slots: usize, acc: Acc<'a>) -> Self {
+        let mut f = Flow {
+            next: 0,
+            head: 0,
+            left: 0,
+            done: [false; MAX_VALUES],
+            readers: [0; MAX_VALUES],
+            slot: [0; MAX_VALUES],
+            exp: [0; MAX_VALUES],
+            free: std::array::from_fn(|i| i as u8),
+            nfree: slots,
+            failed: false,
+            acc,
+        };
+        for v in (0..t.p.values).filter(|&v| t.w[v] > 0) {
+            f.left += 1;
+            f.readers[v] += 1;
+            let o = t.p.op[v];
+            if v > 0 {
+                f.readers[o.a as usize] += 1;
+                if o.b != o.a {
+                    f.readers[o.b as usize] += 1;
+                }
+            }
+        }
+        f
+    }
+
+    fn dispatch(&mut self, t: &Theta) {
+        while self.next < t.p.values {
+            let v = self.next;
+            let o = t.p.op[v];
+            if t.w[v] > 0 {
+                if v > 0 && !(self.done[o.a as usize] && self.done[o.b as usize]) || self.nfree == 0
+                {
+                    return;
+                }
+                self.nfree -= 1;
+                self.slot[v] = self.free[self.nfree];
+            }
+            self.next += 1;
+        }
+    }
+
+    fn pop(&mut self, t: &Theta) -> Option<Job> {
+        while self.head < self.next && t.w[self.head] == 0 {
+            self.head += 1;
+        }
+        if self.head == self.next {
+            return None;
+        }
+        let v = self.head;
+        self.head += 1;
+        let (a, b) = (t.p.op[v].a as usize, t.p.op[v].b as usize);
+        Some(Job {
+            v: v as u8,
+            out: self.slot[v],
+            a: (self.slot[a], self.exp[a]),
+            b: (self.slot[b], self.exp[b]),
+        })
+    }
+
+    fn release(&mut self, v: usize) {
+        self.readers[v] -= 1;
+        if self.readers[v] == 0 {
+            self.free[self.nfree] = self.slot[v];
+            self.nfree += 1;
+        }
+    }
+
+    // Job's value is in its slot with exponent e: sum its term, release it and its operands,
+    // and dispatch what that allows.
+    fn complete(&mut self, t: &Theta, pool: &SlotPool, j: Job, e: u64) {
+        let v = j.v as usize;
+        (self.exp[v], self.done[v]) = (e, true);
+        self.left -= 1;
+        // SAFETY: v is complete and nothing writes its slot until its readers finish.
+        let m = unsafe { &pool.get(j.out)[..t.w[v]] };
+        t.place(v, m, e, &mut self.acc);
+        if v > 0 {
+            let o = t.p.op[v];
+            self.release(o.a as usize);
+            if o.b != o.a {
+                self.release(o.b as usize);
+            }
+        }
+        self.release(v);
+        self.dispatch(t);
+    }
+}
+
+fn lock<'m, T>(m: &'m Mutex<T>) -> std::sync::MutexGuard<'m, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+// The dataflow on rayon: each finished op dispatches and spawns its successors in one scope.
+fn theta_flow_dyn(t: &Theta, pool: &SlotPool, flow: &Mutex<Flow>) {
+    fn spawn<'s>(sc: &rayon::Scope<'s>, t: &'s Theta, pool: &'s SlotPool, flow: &'s Mutex<Flow>) {
+        let mut f = lock(flow);
+        while let Some(j) = f.pop(t) {
+            sc.spawn(move |sc| {
+                let e = j.run(t, pool);
+                lock(flow).complete(t, pool, j, e);
+                spawn(sc, t, pool, flow);
+            });
+        }
+    }
+    lock(flow).dispatch(t);
+    rayon::scope(|sc| spawn(sc, t, pool, flow));
+}
+
+// The dataflow on scoped threads (the caller and workers - 1 more), waiting on a condvar for ops.
+fn theta_flow_static<const N: usize>(
+    t: &Theta,
+    pool: &SlotPool,
+    flow: &Mutex<Flow>,
+    workers: usize,
+) {
+    let cv = Condvar::new();
+    let work = || {
+        let mut f = lock(flow);
+        while f.left > 0 && !f.failed {
+            let Some(j) = f.pop(t) else {
+                f = cv.wait(f).unwrap_or_else(PoisonError::into_inner);
+                continue;
+            };
+            drop(f);
+            let r = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                let e = j.run(t, pool);
+                lock(flow).complete(t, pool, j, e);
+            }));
+            f = lock(flow);
+            if let Err(e) = r {
+                f.failed = true;
+                cv.notify_all();
+                drop(f);
+                panic::resume_unwind(e);
+            }
+            cv.notify_all();
+        }
+    };
+    lock(flow).dispatch(t);
+    thread::scope(|sc| {
+        for _ in 1..workers {
+            let b = thread::Builder::new().stack_size(static_split_stack(N));
+            if b.spawn_scoped(sc, &work).is_err() {
+                break;
+            }
+        }
+        work();
+    });
+}
+
+// θ2(q⁴) and θ3(q⁴) for q = x 2^-shift < 1/4 (x trimmed, nonzero), θ3 over k = 1..T and θ2 over
+// k = 0..T: th3 = θ3 2^(64 (th3.len() - 1)), th2 = θ2 2^(64 (th2.len() + z)), each at most a unit
+// low. Returns z = (l - 2) / 64, l = shift - bits(x).
+pub fn theta_dyn<const T: usize>(x: &[u64], shift: u64, th2: &mut [u64], th3: &mut [u64]) -> usize {
+    theta_dyn_at::<T>(x, shift, th2, th3, ThetaMode::Auto)
+}
+
+#[doc(hidden)]
+pub fn theta_dyn_at<const T: usize>(
     x: &[u64],
     shift: u64,
-    terms: usize,
+    th2: &mut [u64],
+    th3: &mut [u64],
+    mode: ThetaMode,
+) -> usize {
+    let s = ThetaSchedule::new(x, shift, th2.len(), th3.len());
+    let (g2, g3) = (s.g2, s.g3);
+    let cpus = rayon::current_num_threads();
+    let (p, workers) = theta_plan::<T>(mode, g2.max(g3), DYN_THETA_PAR_LIMBS, true, cpus);
+    let t = Theta::new(s, p, x, (hi_mul_dyn, hi_sqr_dyn));
+    let wq = t.w[0];
+    // θ2, θ3 and a temp, then the pool's slots of q's width or the plan's slots at their widest.
+    let mut lens = [0; MAX_VALUES];
+    let slots = match workers {
+        Some(k) => {
+            lens[0] = (p.slots + k - 1) * wq;
+            1
+        }
+        None => {
+            for v in 0..p.values {
+                let s = p.slot[v] as usize;
+                lens[s] = lens[s].max(t.w[v]);
+            }
+            p.slots
+        }
+    };
+    let mut scratch = ScratchGuard::acquire();
+    let sizes = [g2, g3, wq]
+        .into_iter()
+        .chain(lens[..slots].iter().copied());
+    let mut bufs = scratch.get_split_vec(sizes);
+    let (acc, rest) = bufs.split_at_mut(3);
+    let acc: &mut Acc = acc.try_into().expect("three buffers");
+    acc[0].fill(0);
+    acc[1].fill(0);
+    match workers {
+        Some(k) => {
+            let pool = SlotPool {
+                base: rest[0].as_mut_ptr(),
+                len: wq,
+            };
+            let flow = Mutex::new(Flow::new(
+                &t,
+                p.slots + k - 1,
+                acc.each_mut().map(|a| &mut **a),
+            ));
+            theta_flow_dyn(&t, &pool, &flow);
+        }
+        None => t.serial(rest, acc),
+    }
+    t.out(th2, th3, acc)
+}
+
+// Needs N >= max(th2.len() + 2, th3.len() + 1), checked before any input, and T's least-work plan
+// to fit THETA_STATIC_SLOTS (a compile-time check).
+pub fn theta_static<const N: usize, const T: usize>(
+    x: &[u64],
+    shift: u64,
     th2: &mut [u64],
     th3: &mut [u64],
 ) -> Result<usize, CapacityError> {
-    capacity::<N>((th2.len() + 2).max(th3.len() + 1))?;
-    let s = ThetaSchedule::new(x, shift, terms, th2.len(), th3.len());
-    let mut bufs = [[0; N]; 6];
-    let bufs = bufs.each_mut().map(|b| &mut b[..]);
-    Ok(theta_core(
-        &s,
-        x,
-        th2,
-        th3,
-        bufs,
-        hi_mul_static::<N>,
-        hi_sqr_static::<N>,
-    ))
+    theta_static_at::<N, T>(x, shift, th2, th3, ThetaMode::Auto)
 }
 
-// The running a in out, b in g (out.len() limbs) and a b in prod (2 out.len()): each step's full
-// product over the trimmed pair, rooted back to out.len() limbs.
+#[doc(hidden)]
+pub fn theta_static_at<const N: usize, const T: usize>(
+    x: &[u64],
+    shift: u64,
+    th2: &mut [u64],
+    th3: &mut [u64],
+    mode: ThetaMode,
+) -> Result<usize, CapacityError> {
+    const {
+        assert!(
+            ThetaPlans::<T>::SERIAL.slots <= THETA_STATIC_SLOTS,
+            "theta's least-work plan for T needs more than THETA_STATIC_SLOTS slots"
+        )
+    };
+    capacity::<N>((th2.len() + 2).max(th3.len() + 1))?;
+    let fits = const { ThetaPlans::<T>::PARALLEL.slots <= THETA_STATIC_SLOTS };
+    let s = ThetaSchedule::new(x, shift, th2.len(), th3.len());
+    let cpus = thread::available_parallelism().map_or(1, |c| c.get());
+    let g = s.g2.max(s.g3);
+    let (p, workers) = theta_plan::<T>(mode, g, STATIC_THETA_PAR_LIMBS, fits, cpus);
+    let t = Theta::new(s, p, x, (hi_mul_static::<N>, hi_sqr_static::<N>));
+    let (mut arena, mut acc2, mut acc3, mut tmp) =
+        ([[0; N]; THETA_STATIC_SLOTS], [0; N], [0; N], [0; N]);
+    let mut acc: Acc = [&mut acc2, &mut acc3, &mut tmp];
+    match workers {
+        Some(k) => {
+            // Slots of q's width, as many as the arena holds past the plan's.
+            let wq = t.w[0];
+            let k = k.min(THETA_STATIC_SLOTS * N / wq - p.slots + 1);
+            let pool = SlotPool {
+                base: arena.as_flattened_mut().as_mut_ptr(),
+                len: wq,
+            };
+            let flow = Mutex::new(Flow::new(
+                &t,
+                p.slots + k - 1,
+                acc.each_mut().map(|a| &mut **a),
+            ));
+            theta_flow_static::<N>(&t, &pool, &flow, k);
+        }
+        None => t.serial(&mut arena.each_mut().map(|a| &mut a[..]), &mut acc),
+    }
+    Ok(t.out(th2, th3, &acc))
+}
+
+// a in out, b in g and the top of a b in prod. Each root reads its t-limb product's top ⌈t/2⌉ + 2
+// limbs as padded by zeros, which moves it by under 2^-60 units.
 fn agm_core(
     a: &[u64],
     b: &[u64],
     iters: usize,
     out: &mut [u64],
     [g, prod]: [&mut [u64]; 2],
-    mul: BinOp,
+    hi_mul: BinOp,
     sqrt: SqrtOp,
 ) {
     let l = out.len();
@@ -1305,32 +1742,42 @@ fn agm_core(
         a.len() <= l && b.len() <= l,
         "the AGM's inputs must fit its output"
     );
-    let (g, prod) = (&mut g[..l], &mut prod[..2 * l]);
+    let (g, prod) = (&mut g[..l], &mut prod[..l + 2]);
     out[..a.len()].copy_from_slice(a);
     out[a.len()..].fill(0);
     g[..b.len()].copy_from_slice(b);
     g[b.len()..].fill(0);
     for i in 1..=iters {
-        // The last geometric mean would feed no later mean.
+        // No root after the last mean. (t, h): the product's length and its top limbs in prod.
         let t = (i < iters).then(|| {
             let (la, lg) = (buf_len(out), buf_len(g));
             if la == 0 || lg == 0 {
-                return 0;
+                return (0, 0);
             }
-            let p = &mut prod[..la + lg];
-            p[la + lg - 1] = mul(&out[..la], &g[..lg], &mut p[..la + lg - 1]);
-            buf_len(p)
+            // The larger operand first, so swapped inputs make the same products.
+            let (x, y) = (&out[..la], &g[..lg]);
+            let (x, y) = if cmp_buf(x, y) == Ordering::Less {
+                (y, x)
+            } else {
+                (x, y)
+            };
+            let t0 = la + lg;
+            let h0 = t0.min(t0.div_ceil(2) + 2);
+            prod[h0 - 1] = hi_mul(x, y, &mut prod[..h0 - 1]);
+            let h = buf_len(&prod[..h0]);
+            (t0 - h0 + h, h)
         });
         let carry = add_buf(out, g);
         shr_buf(out, 1);
         if carry {
             out[l - 1] |= 1 << 63;
         }
-        if let Some(t) = t {
-            // An odd t reads as p B, a root 2^32 too high: ⌊⌊√(p B)⌋ / 2^32⌋ = ⌊√p⌋.
+        if let Some((t, h)) = t {
+            // x B^(2 sl - h): the dropped limbs, and for an odd t one more, whose 2^32 the shift
+            // removes exactly, as ⌊⌊√(p B)⌋ / 2^32⌋ = ⌊√p⌋.
             let sl = t.div_ceil(2);
             if t > 0 {
-                sqrt(&mut prod[..t], &mut g[..sl]);
+                sqrt(&mut prod[..h], &mut g[..sl]);
                 if t % 2 == 1 {
                     shr_buf(&mut g[..sl], 32);
                 }
@@ -1340,25 +1787,23 @@ fn agm_core(
     }
 }
 
-// a_iters of the AGM sequence from integers a and b at one scale (a.len(), b.len() <= out.len(),
-// zero-extended): iters arithmetic means and iters - 1 geometric ones. iters = 0 copies a. Each
-// mean is within a unit of its pair's exact mean, but a unit in b_k < a_k costs up to about
-// a_k / b_k units of the result, so the frame must give the smaller input full precision.
+// a_iters from a and b at out's scale (zero-extended): iters arithmetic means, iters - 1 roots.
+// Each mean is within a unit, but a unit in b_k < a_k costs about a_k / b_k units of the result.
 pub fn agm_dyn(a: &[u64], b: &[u64], iters: usize, out: &mut [u64]) {
     let l = out.len();
     let mut scratch = ScratchGuard::acquire();
-    let bufs = scratch.get_splits([l, 2 * l]);
-    agm_core(a, b, iters, out, bufs, mul_dyn, sqrt_approx_dyn);
+    let bufs = scratch.get_splits([l, l + 2]);
+    agm_core(a, b, iters, out, bufs, hi_mul_dyn, sqrt_approx_dyn);
 }
 
-// Needs N >= 2 out.len(), checked before any input.
+// Needs N >= out.len() + 2, checked before any input.
 pub fn agm_static<const N: usize>(
     a: &[u64],
     b: &[u64],
     iters: usize,
     out: &mut [u64],
 ) -> Result<(), CapacityError> {
-    capacity::<N>(2 * out.len())?;
+    capacity::<N>(out.len() + 2)?;
     let (mut g, mut prod) = ([0; N], [0; N]);
     agm_core(
         a,
@@ -1366,8 +1811,173 @@ pub fn agm_static<const N: usize>(
         iters,
         out,
         [&mut g, &mut prod],
-        mul_static::<N>,
+        hi_mul_static::<N>,
         sqrt_approx_static::<N>,
     );
     Ok(())
+}
+
+// The theta–AGM logarithm (docs/agm-ln-exact-chain.md), with q = X 2^-shift, so no reciprocal:
+// ln X = c ln 2 - π / (4 AGM(θ2(q⁴)², θ3(q⁴)²)), c = shift + 64b for X = x 2^(64b).
+
+// Whether the AGM beats the series at P = 64 o bits. Per M(P) the series costs about
+// log2(P / max(λ, j0))², λ = δ's lead, j0 = A log2 P, and the AGM about κ (1 + w / P) log2(P + w),
+// w = λ when it widens. κ ties them at the cutoff for a generic X; below it the AGM never wins.
+pub(crate) fn agm_wins(
+    o: usize,
+    lead: Option<u64>,
+    cancels: bool,
+    sqrt_a: f64,
+    cutoff: usize,
+) -> bool {
+    let cutoff = cutoff.max(1);
+    let Some(lead) = lead.filter(|_| o >= cutoff) else {
+        return false;
+    };
+    let series = |p: f64, lam: f64| {
+        let j0 = (sqrt_a * p.log2()).max(1.0);
+        (p / lam.max(j0)).log2().max(0.0).powi(2)
+    };
+    let ps = 64.0 * cutoff as f64;
+    let (p, lam) = (64.0 * o as f64, lead as f64);
+    let w = if cancels { lam } else { 0.0 };
+    // As ratios, so the cutoff compares equal terms.
+    series(p, lam) / ((1.0 + w / p) * (p + w).log2()) >= series(ps, 0.0) / ps.log2()
+}
+
+// (f, k, (l, g)): T's and ln X's f fraction limbs (more past the cancellation for X in [1/2, 2)),
+// each buffer's k limbs, q's lead l from θ3's tail at p = 64 (f + 1) bits, and the AGM's g
+// fraction limbs, l bits past p for b1 ~ 2q. No (l, g) for X = 2^e.
+fn agm_frame(nx: &LnNorm, o: usize, terms: usize) -> (usize, usize, Option<(u64, usize)>) {
+    let Some(lead) = nx.lead() else {
+        return (o + 1, o + 4, None);
+    };
+    let f = o
+        + 1
+        + if nx.cancels() {
+            (lead + 2).div_ceil(64) as usize
+        } else {
+            0
+        };
+    let n1 = (terms as u64).saturating_add(1);
+    let l = (64 * (f as u64 + 1) + 3)
+        .div_ceil(n1.saturating_mul(n1).saturating_mul(4))
+        .max(2);
+    let g = f + 2 + l.div_ceil(64) as usize;
+    (f, g + 2, Some((l, g)))
+}
+
+// ln X = c ln 2 - T into out, each buffer k limbs.
+fn ln_agm_core(
+    nx: &LnNorm,
+    (f, frame): (usize, Option<(u64, usize)>),
+    out: &mut [u64],
+    [a, b, c, d]: [&mut [u64]; 4],
+    theta: fn(&[u64], u64, &mut [u64], &mut [u64]) -> usize,
+    (hi_mul, agm): (BinOp, fn(&[u64], &[u64], usize, &mut [u64])),
+    (pi, ln2, ratio): (fn(&mut [u64]), fn(&mut [u64]), Ratio),
+) -> (i64, bool) {
+    let x = nx.x;
+    let cl = match frame {
+        // X = 1
+        None if nx.e == 0 => {
+            out.fill(0);
+            return (0, false);
+        }
+        None => {
+            c[..f + 2].fill(0);
+            nx.e
+        }
+        Some((l, g)) => {
+            // θ2 and θ3, both times 2^(64 g).
+            let z = ((l - 2) / 64) as usize;
+            let (th2, th3) = (&mut a[..g - z], &mut b[..g + 1]);
+            let zt = theta(x, bits(x) + l, th2, th3);
+            debug_assert_eq!(zt, z);
+            let th2 = &th2[..buf_len(th2)];
+            // The AGM's first step: b1 = θ2 θ3 and a1 = (θ2 + θ3)² / 2 - b1.
+            let (b1, s) = (&mut c[..g], &mut d[..g + 1]);
+            mul_shr(th2, th3, 64 * g as u64, b1, hi_mul);
+            add_buf(th3, th2);
+            mul_shr(th3, th3, 64 * g as u64, s, hi_mul);
+            shr_buf(s, 1);
+            sub_buf(s, b1);
+            // The doc's (a_n + b_n) / 2 count, ln(1/q) from x's top 64 bits.
+            let top = window(x, bits(x) as i64 - 64) as f64;
+            let ln_q = (l as f64 + 64.0 - top.log2()) * LN_2;
+            let p = 64 * (f as u64 + 1);
+            let arg = 2.0 * ln_q * (p as f64 + 3.0) * LN_2 / (PI * PI) * (1.0 + 1e-12);
+            let mm = &mut a[..g];
+            agm(&s[..g], b1, arg.log2().ceil().max(0.0) as usize, mm);
+            // T = π / (4M), its integer part on top.
+            let pb = &mut b[..f + 2];
+            pi(pb);
+            let t = &mut c[..f + 2];
+            t[f + 1] = 0;
+            ratio(
+                pb,
+                &mm[..buf_len(mm)],
+                64 * (f as i64 + 2 - g as i64) + 2,
+                &mut t[..f + 1],
+            );
+            nx.e + 1 + l as i128
+        }
+    };
+    ln2_combine(cl, false, &mut c[..f + 2], d, ln2, out)
+}
+
+// ln_dyn through the theta–AGM logarithm with T theta terms.
+#[doc(hidden)]
+pub fn ln_agm_dyn_at<const T: usize>(
+    x: &[u64],
+    m: i64,
+    out: &mut [u64],
+) -> Result<(i64, bool), LnError> {
+    let nx = LnNorm::new(x, m).ok_or(LnError::Zero)?;
+    if out.is_empty() {
+        return Ok((0, false));
+    }
+    let (f, k, frame) = agm_frame(&nx, out.len(), T);
+    let mut scratch = ScratchGuard::acquire();
+    Ok(ln_agm_core(
+        &nx,
+        (f, frame),
+        out,
+        scratch.get_splits([k; 4]),
+        theta_dyn::<T>,
+        (hi_mul_dyn, agm_dyn),
+        (pi_dyn, ln2_dyn, ratio_to_fraction_dyn),
+    ))
+}
+
+// N is checked once X sets the frame, before out is touched.
+#[doc(hidden)]
+#[inline(never)]
+pub fn ln_agm_static_at<const N: usize, const T: usize>(
+    x: &[u64],
+    m: i64,
+    out: &mut [u64],
+) -> Result<(i64, bool), LnError> {
+    let nx = LnNorm::new(x, m).ok_or(LnError::Zero)?;
+    if out.is_empty() {
+        return Ok((0, false));
+    }
+    let (f, k, frame) = agm_frame(&nx, out.len(), T);
+    capacity::<N>(k)?;
+    let mut bufs = [[0; N]; 4];
+    Ok(ln_agm_core(
+        &nx,
+        (f, frame),
+        out,
+        bufs.each_mut().map(|b| &mut b[..k]),
+        |x, s, a, b| theta_static::<N, T>(x, s, a, b).expect("ln_agm checks N"),
+        (hi_mul_static::<N>, |a, b, n, o| {
+            agm_static::<N>(a, b, n, o).expect("ln_agm checks N")
+        }),
+        (
+            |o| pi_static::<N>(o).expect("ln_agm checks N"),
+            |o| ln2_static_unguarded::<N>(o).expect("ln_agm checks N"),
+            ratio_to_fraction_static::<N>,
+        ),
+    ))
 }

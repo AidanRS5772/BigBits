@@ -1,5 +1,5 @@
 use super::{mul_ref, rand_nonzero_vec};
-use crate::utils::trans::{theta_dyn, theta_static};
+use crate::utils::trans::{theta_dyn, theta_dyn_at, theta_static, theta_static_at, ThetaMode};
 use crate::utils::utils::{add_buf, buf_len, cmp_buf, sub_buf, trim_lz};
 use crate::utils::CapacityError;
 use std::cmp::Ordering;
@@ -86,32 +86,88 @@ fn assert_within_unit(got: &[u64], want: &[u64], what: &str) {
     );
 }
 
-type ThetaFn<'a> = &'a dyn Fn(&[u64], u64, usize, &mut [u64], &mut [u64]) -> usize;
+type ThetaFn<'a> = &'a dyn Fn(&[u64], u64, usize, &mut [u64], &mut [u64], ThetaMode) -> usize;
 
-// theta at q = x 2^-(bits(x) + l) against the oracle; exact demands bit-identical outputs.
+const MODES: [ThetaMode; 4] = [
+    ThetaMode::Auto,
+    ThetaMode::Serial,
+    ThetaMode::Parallel { threads: false },
+    ThetaMode::Parallel { threads: true },
+];
+
+// theta_dyn_at at T = terms, for the T these tests use.
+fn theta_dyn_terms(
+    x: &[u64],
+    shift: u64,
+    terms: usize,
+    th2: &mut [u64],
+    th3: &mut [u64],
+    mode: ThetaMode,
+) -> usize {
+    macro_rules! at {
+        ($($t:literal)*) => {
+            match terms {
+                $($t => theta_dyn_at::<$t>(x, shift, th2, th3, mode),)*
+                _ => panic!("no plan instantiated for T = {terms}"),
+            }
+        };
+    }
+    at!(0 1 2 3 7 10 16)
+}
+
+// theta_static_at::<N, T> at T = terms; its plans must fit THETA_STATIC_SLOTS.
+fn theta_static_terms<const N: usize>(
+    x: &[u64],
+    shift: u64,
+    terms: usize,
+    th2: &mut [u64],
+    th3: &mut [u64],
+    mode: ThetaMode,
+) -> Result<usize, CapacityError> {
+    macro_rules! at {
+        ($($t:literal)*) => {
+            match terms {
+                $($t => theta_static_at::<N, $t>(x, shift, th2, th3, mode),)*
+                _ => panic!("no plan instantiated for T = {terms}"),
+            }
+        };
+    }
+    at!(0 1 2 3 6)
+}
+
+// theta at q = x 2^-(bits(x) + l) against the oracle in every mode; exact demands bit-identical
+// outputs. The parallel plan must give the same bits threaded or in order.
 fn check(theta: ThetaFn, x: &[u64], l: u64, terms: usize, w2: usize, w3: usize, exact: bool) {
     let shift = bits(x) + l;
     let (want2, want3, wz) = theta_oracle(x, shift, terms, w2, w3);
-    let (mut th2, mut th3) = (vec![0; w2], vec![0; w3]);
-    let z = theta(x, shift, terms, &mut th2, &mut th3);
-    let what = format!("x.len()={} l={l} terms={terms} w2={w2} w3={w3}", x.len());
-    assert_eq!(z, wz, "z {what}");
-    if exact {
-        assert_eq!(th2, want2, "th2 {what}");
-        assert_eq!(th3, want3, "th3 {what}");
-    } else {
-        assert_within_unit(&th2, &want2, &format!("th2 {what}"));
-        assert_within_unit(&th3, &want3, &format!("th3 {what}"));
+    let mut parallel: Option<(Vec<u64>, Vec<u64>)> = None;
+    for mode in MODES {
+        let (mut th2, mut th3) = (vec![0; w2], vec![0; w3]);
+        let z = theta(x, shift, terms, &mut th2, &mut th3, mode);
+        let what = format!("x.len()={} l={l} terms={terms} w2={w2} w3={w3} {mode:?}", x.len());
+        assert_eq!(z, wz, "z {what}");
+        if exact {
+            assert_eq!(th2, want2, "th2 {what}");
+            assert_eq!(th3, want3, "th3 {what}");
+        } else {
+            assert_within_unit(&th2, &want2, &format!("th2 {what}"));
+            assert_within_unit(&th3, &want3, &format!("th3 {what}"));
+        }
+        if let ThetaMode::Parallel { .. } = mode {
+            let got = (th2, th3);
+            assert_eq!(parallel.get_or_insert_with(|| got.clone()), &got, "threads {what}");
+        }
     }
 }
 
 const LS: [u64; 11] = [2, 3, 63, 64, 65, 66, 127, 128, 129, 130, 1000];
 
-// x shorter and longer than both frames, at every l in LS, with terms both capped by N and by
-// the frames (50), and outputs of very different lengths, so the step width follows the wider.
+// x shorter and longer than both frames, at every l in LS, with terms both capped by T and by
+// the frames (16 at small l), and outputs of very different lengths, so a value's width follows
+// the wider of the terms it feeds.
 fn theta_random(theta: ThetaFn, ws: &[(usize, usize)], mut seed: u64) {
     for &l in &LS {
-        for terms in [0, 1, 2, 3, 7, 50] {
+        for terms in [0, 1, 2, 3, 7, 16] {
             for &(w2, w3) in ws {
                 for xl in [1, w2.max(w3) + 3] {
                     let x = rand_nonzero_vec(xl, seed);
@@ -126,7 +182,7 @@ fn theta_random(theta: ThetaFn, ws: &[(usize, usize)], mut seed: u64) {
 #[test]
 fn test_theta_dyn_random() {
     let ws = [(1, 1), (2, 5), (5, 2), (17, 17), (40, 3), (3, 40)];
-    theta_random(&theta_dyn, &ws, 1);
+    theta_random(&theta_dyn_terms, &ws, 1);
 }
 
 // q a power of two makes every power and product exact (u = 1/2, so each product
@@ -137,7 +193,7 @@ fn test_theta_dyn_exact_powers_of_two() {
         for &l in &LS {
             for x in [vec![1u64 << k], vec![0, 0, 1u64 << k]] {
                 for (w2, w3) in [(1, 1), (3, 7), (9, 2)] {
-                    check(&theta_dyn, &x, l, 20, w2, w3, true);
+                    check(&theta_dyn_terms, &x, l, 16, w2, w3, true);
                 }
             }
         }
@@ -156,29 +212,42 @@ fn test_theta_dyn_sparse_and_all_ones() {
     for x in &xs {
         for &l in &LS {
             for (w2, w3) in [(1, 1), (4, 4), (12, 3)] {
-                check(&theta_dyn, x, l, 20, w2, w3, false);
+                check(&theta_dyn_terms, x, l, 16, w2, w3, false);
             }
         }
     }
 }
 
 // Past DYN_PARTIAL_MUL_CUTOFF and STATIC_PARTIAL_SQR_CUTOFF, so the guarded high products and
-// the transforms run: l for N = 3 (p / (4 (N + 1)²)), and a small l capped by the frame.
+// the transforms run, and past DYN_THETA_PAR_LIMBS, so Auto takes the threaded parallel plan: l
+// for N = 3 (p / (4 (N + 1)²)), and a small l capped by the frame.
 #[test]
 fn test_theta_dyn_large() {
     let x = rand_nonzero_vec(702, 7000);
-    check(&theta_dyn, &x, 2800, 3, 700, 700, false);
-    check(&theta_dyn, &x, 700, 50, 700, 650, false);
+    check(&theta_dyn_terms, &x, 2800, 3, 700, 700, false);
+    check(&theta_dyn_terms, &x, 700, 16, 700, 650, false);
+}
+
+// On a one-thread pool the threaded plan still runs (its tasks in turn) and gives the same bits.
+#[test]
+fn test_theta_dyn_one_thread_pool() {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    pool.install(|| {
+        let x = rand_nonzero_vec(40, 7100);
+        for terms in [1, 3, 16] {
+            check(&theta_dyn_terms, &x, 130, terms, 37, 40, false);
+        }
+    });
 }
 
 fn theta_static_cases<const N: usize>(seed: u64) {
-    let theta = |x: &[u64], s, t, a: &mut [u64], b: &mut [u64]| {
-        theta_static::<N>(x, s, t, a, b).expect("within N")
+    let theta = |x: &[u64], s, t, a: &mut [u64], b: &mut [u64], m| {
+        theta_static_terms::<N>(x, s, t, a, b, m).expect("within N")
     };
     let ws = [(N - 2, N - 1), (1, N - 1), (N - 2, 1), (1, 1)];
     let mut seed = seed;
     for l in [2, 65, 130, 16 * N as u64] {
-        for terms in [1, 3, 50] {
+        for terms in [1, 3, 6] {
             for &(w2, w3) in &ws {
                 for xl in [1, N + 3] {
                     let x = rand_nonzero_vec(xl, seed);
@@ -192,7 +261,7 @@ fn theta_static_cases<const N: usize>(seed: u64) {
     let x = rand_nonzero_vec(3, seed);
     for (w2, w3) in [(N - 1, 1), (1, N)] {
         let (mut th2, mut th3) = (vec![0xAA; w2], vec![0xAA; w3]);
-        let r = theta_static::<N>(&x, bits(&x) + 70, 3, &mut th2, &mut th3);
+        let r = theta_static::<N, 3>(&x, bits(&x) + 70, &mut th2, &mut th3);
         assert_eq!(r, Err(CapacityError { min_n: N + 1 }));
         assert!(th2.iter().chain(&th3).all(|&l| l == 0xAA));
     }
@@ -209,8 +278,8 @@ fn test_theta_static() {
 
 #[test]
 fn test_theta_static_large() {
-    let theta = |x: &[u64], s, t, a: &mut [u64], b: &mut [u64]| {
-        theta_static::<702>(x, s, t, a, b).expect("within N")
+    let theta = |x: &[u64], s, t, a: &mut [u64], b: &mut [u64], m| {
+        theta_static_terms::<702>(x, s, t, a, b, m).expect("within N")
     };
     let x = rand_nonzero_vec(702, 7001);
     check(&theta, &x, 2800, 3, 700, 700, false);
@@ -227,7 +296,7 @@ fn test_theta_agm_identity() {
             seed += 1;
             let shift = bits(&x) + l;
             let (mut th2, mut th3) = ([0; 3], [0; 2]);
-            let z = theta_dyn(&x, shift, 10, &mut th2, &mut th3);
+            let z = theta_dyn::<10>(&x, shift, &mut th2, &mut th3);
             let b64 = 2f64.powi(-64);
             let t2 = (th2[2] as f64 + th2[1] as f64 * b64) * 2f64.powi(-64 * (z as i32 + 1));
             let t3 = th3[1] as f64 + th3[0] as f64 * b64;
@@ -249,11 +318,11 @@ fn test_theta_agm_identity() {
 #[test]
 #[should_panic]
 fn test_theta_q_at_least_quarter_panics() {
-    theta_dyn(&[1], 2, 3, &mut [0; 2], &mut [0; 2]);
+    theta_dyn::<3>(&[1], 2, &mut [0; 2], &mut [0; 2]);
 }
 
 #[test]
 #[should_panic]
 fn test_theta_untrimmed_x_panics() {
-    theta_dyn(&[1, 0], 200, 3, &mut [0; 2], &mut [0; 2]);
+    theta_dyn::<3>(&[1, 0], 200, &mut [0; 2], &mut [0; 2]);
 }

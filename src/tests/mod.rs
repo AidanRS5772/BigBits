@@ -15,6 +15,7 @@ mod test_mul;
 mod test_agm;
 mod test_sqrt;
 mod test_theta;
+mod test_theta_plan;
 mod test_trans;
 mod test_utils;
 

@@ -266,8 +266,8 @@ fn test_agm_input_longer_than_out_panics() {
 
 fn check_static<const N: usize>(seed: &mut u64) {
     let f: AgmFn = &agm_static_fn::<N>;
-    for l in [1, 2, N / 4, N / 2 - 1, N / 2] {
-        if l == 0 || l > N / 2 {
+    for l in [1, 2, N / 4, N / 2, N - 3, N - 2] {
+        if l == 0 || l + 2 > N {
             continue;
         }
         for n in ITERS {
@@ -283,7 +283,7 @@ fn check_static<const N: usize>(seed: &mut u64) {
 #[test]
 fn test_agm_static_against_oracle() {
     let mut seed = 4000;
-    check_static::<2>(&mut seed);
+    check_static::<3>(&mut seed);
     check_static::<8>(&mut seed);
     check_static::<26>(&mut seed);
     check_static::<128>(&mut seed);
@@ -295,11 +295,11 @@ fn test_agm_static_capacity() {
     let (a, b) = (rand_nonzero_vec(4, 5000), rand_nonzero_vec(4, 5001));
     let mut out = [7; 4];
     assert_eq!(
-        agm_static::<7>(&a, &b, 3, &mut out),
-        Err(CapacityError { min_n: 8 })
+        agm_static::<5>(&a, &b, 3, &mut out),
+        Err(CapacityError { min_n: 6 })
     );
     assert_eq!(out, [7; 4]);
-    assert_eq!(agm_static::<8>(&a, &b, 3, &mut out), Ok(()));
+    assert_eq!(agm_static::<6>(&a, &b, 3, &mut out), Ok(()));
 }
 
 // ln(1/q) = π / (4 AGM(θ2², θ3²)) at q = 2^-s. theta_dyn's outputs are squared into one frame
@@ -313,7 +313,7 @@ fn check_ln_identity(agm: AgmFn, f: usize, s: u64) {
     let z = ((s - 3) / 64) as usize;
     let w2 = fp - 2 * z + 2;
     let (mut th2, mut th3) = (vec![0; w2], vec![0; l]);
-    assert_eq!(theta_dyn(&[1], s, 64, &mut th2, &mut th3), z);
+    assert_eq!(theta_dyn::<16>(&[1], s, &mut th2, &mut th3), z);
     let a = window(&mul_ref(&th3, &th3), fp, l);
     let b = window(&mul_ref(&th2, &th2), 2 * (w2 + z) - fp, l);
 

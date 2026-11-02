@@ -5,6 +5,7 @@ pub mod div;
 pub mod mul;
 pub mod series;
 pub mod sqrt;
+pub mod theta_plan;
 pub mod trans;
 pub mod utils;
 
@@ -352,6 +353,31 @@ pub const STATIC_LN_CHUNK_MIN_BITS: u64 = 2;
 // ln_dyn_entry and ln_static_entry go parallel as exp's entries do. GUESS
 pub const DYN_LN_CHUNK_PAR_WORK: usize = 512;
 pub const STATIC_LN_CHUNK_PAR_WORK: usize = 768;
+
+// ln_dyn takes the theta-AGM logarithm from this many output limbs for a generic X, where
+// ln(1 + δ)'s series and the AGM tie. Past it, trans.rs's agm_wins weighs the series' cost,
+// about log2(P / δ's lead)² per M(P), against the AGM's, about log2 P (widened by the lead when
+// e ln 2 and ln u cancel), so X near 1 or near a power of 2 stays on the series longer. GUESS
+pub const DYN_LN_AGM_LIMBS: usize = 1024;
+// GUESS: the dynamic value. ln_static also needs N to have room for the AGM's frame.
+pub const STATIC_LN_AGM_LIMBS: usize = 1024;
+
+// The theta-AGM logarithm's theta terms N (θ3 over k = 1..N, θ2 over k = 0..N). Each doubling
+// of N + 1 saves two AGM steps and costs theta terms, so the best N is about 2 / (R ln 2) for R
+// = a term's cost over a step's, independent of precision (docs/agm-ln-theta.md). A term pair is
+// four shrinking high products against a step's product and root, R ~ 0.7. GUESS
+pub const DYN_LN_AGM_TERMS: usize = 3;
+pub const STATIC_LN_AGM_TERMS: usize = 3;
+
+// theta runs its parallel plan (the shortest dependency path) on frames of this many limbs,
+// threaded when it has two or more workers, and its least-work plan below. The plan depends only
+// on the size, so threads never change the result. GUESS
+pub const DYN_THETA_PAR_LIMBS: usize = 256;
+// GUESS: a scoped thread costs about 10 us to start, against rayon's few.
+pub const STATIC_THETA_PAR_LIMBS: usize = 1024;
+// [u64; N] slots theta_static keeps for its powers. Its least-work plan must fit (to T = 9) and
+// its parallel plan runs only if it fits too (to T = 6).
+pub const THETA_STATIC_SLOTS: usize = 8;
 
 thread_local! {
     static SCRATCH_POOL: RefCell<Vec<Vec<u64>>> = RefCell::new(Vec::new());

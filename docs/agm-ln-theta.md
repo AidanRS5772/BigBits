@@ -131,3 +131,20 @@ p  →  (n, N)  →  window for log2 s  →  m = log2 s − log2 x
 | 7 | 258 | 22 | 21.64 |
 
 `N = 4` gives the same `n` as `N = 3`, which is the discreteness described in step 1.
+
+## Computing the powers (`src/utils/theta_plan.rs`)
+
+The series needs q^(n²) for n = 1..2N+1: odd n go to θ2 and even n to θ3. A power's window is about a fraction `1 − n²/(4(N+1)²)` of the frame, which depends only on N. So for each N the cheapest way to build the powers can be fixed at compile time.
+
+Squares cost about ⅔ of a product. The old recurrence, `q^((n+1)²) = q^(n²)·q^(2n+1)`, spends two products per term. The plans mix squares and products instead: for N = 3, `2 4 8 9 16 25 18 36 13 49` is 6 squares and 4 products, about 0.59× the old work once each step is weighted by its width.
+
+There are two plans per N:
+
+| plan | built by | objective |
+|---|---|---|
+| `SERIAL` | greedy, targets in order (one op if possible, else one helper) | least width-weighted work |
+| `PARALLEL` | earliest-finish DP over every exponent ≤ (2N+1)² (squares 2, products 3) | shortest dependency path |
+
+`SERIAL` takes whichever of the two does less work. Small frames run `SERIAL` in order. Large frames run `PARALLEL`, threaded as a dataflow with one join: each op starts once its operands finish and a slot is free. The plan depends only on the frame size, so threading never changes the result.
+
+Because the work per term pair stays roughly constant (about 1.46 product-widths asymptotically, against a floor near 1.1), theta's cost still grows linearly in N while the AGM saves only 2 steps per doubling of N+1. Cheaper powers move the best N from about 3 to about 5–6, not further.

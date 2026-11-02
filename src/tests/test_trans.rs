@@ -3,10 +3,15 @@ use crate::utils::consts::consts::ln2_dyn;
 use crate::utils::div::div_prim;
 use crate::utils::mul::{mul_buf, mul_prim};
 use crate::utils::trans::{
-    exp_dyn, exp_dyn_at, exp_dyn_entry, exp_static, exp_static_at, exp_static_entry, ln_dyn,
-    ln_dyn_at, ln_dyn_entry, ln_static, ln_static_at, ln_static_entry, ExpError, LnError,
+    agm_wins, exp_dyn, exp_dyn_at, exp_dyn_entry, exp_static, exp_static_at, exp_static_entry,
+    ln_agm_dyn_at, ln_agm_static_at, ln_dyn, ln_dyn_at, ln_dyn_entry, ln_static, ln_static_at,
+    ln_static_entry, ExpError, LnError,
 };
-use crate::utils::CapacityError;
+use crate::utils::{
+    CapacityError, DYN_LN_AGM_LIMBS, DYN_LN_AGM_TERMS, DYN_LN_SQRT_A, STATIC_LN_AGM_LIMBS,
+    STATIC_LN_AGM_TERMS,
+};
+use std::cell::Cell;
 use crate::utils::utils::{buf_len, cmp_buf, shl_buf, shr_buf, split_sh, sub_buf, trim_lz};
 use std::cmp::Ordering;
 
@@ -750,18 +755,25 @@ fn check_ln_full(x: &[u64], m: i64, l: usize, ln: LnFn) {
     let mut got = vec![0; l];
     let (k, neg) = ln(x, m, &mut got).unwrap_or_else(|e| panic!("{what}: {e}"));
     let (want, kw, nw) = ln_full_oracle(x, m, l);
+    assert_ln_close((&got, k, neg), (&want, kw, nw), &what);
+}
+
+// Two (o, k, neg) results of an l-limb ln within 1 ulp, allowing either exponent next to a power
+// of 2^64.
+fn assert_ln_close((got, k, neg): (&[u64], i64, bool), (want, kw, nw): (&[u64], i64, bool), what: &str) {
+    let l = got.len();
     let what = format!("{what} k={k} kw={kw} neg={neg}");
     if want.iter().all(|&d| d == 0) {
-        assert_eq!((k, neg, &got), (0, false, &want), "{what}: ln 1 = 0");
+        assert_eq!((k, neg, got), (0, false, want), "{what}: ln 1 = 0");
         return;
     }
     assert_eq!(neg, nw, "{what}: sign");
     assert_ne!(got[l - 1], 0, "{what}: out's top limb must be nonzero");
     let coarse = |v: &[u64]| [&v[1..], &[0]].concat();
     match k.cmp(&kw) {
-        Ordering::Equal => assert_within_ulp(&got, &want, &what),
-        Ordering::Less if k + 1 == kw => assert_within_ulp(&coarse(&got), &want, &what),
-        Ordering::Greater if kw + 1 == k => assert_within_ulp(&got, &coarse(&want), &what),
+        Ordering::Equal => assert_within_ulp(got, want, &what),
+        Ordering::Less if k + 1 == kw => assert_within_ulp(&coarse(got), want, &what),
+        Ordering::Greater if kw + 1 == k => assert_within_ulp(got, &coarse(want), &what),
         _ => panic!("{what}: exponents too far apart"),
     }
 }
@@ -1085,4 +1097,221 @@ fn test_ln_static_past_ln2_table() {
     }
     check::<1026>(1022);
     check::<1027>(1023);
+}
+
+// The theta–AGM logarithm, forced at every size through the ln_dyn cases, at T from 0 (one θ2
+// term, Brent–Salamin's pair) through the default to 16, where q's lead is its floor of 2 at small
+// sizes and theta stops at its frame.
+#[test]
+fn test_ln_agm_dyn_random() {
+    let lns: [(u64, LnFn); 5] = [
+        (0, &|x, m, out| ln_agm_dyn_at::<0>(x, m, out)),
+        (1, &|x, m, out| ln_agm_dyn_at::<1>(x, m, out)),
+        (DYN_LN_AGM_TERMS as u64, &|x, m, out| ln_agm_dyn_at::<DYN_LN_AGM_TERMS>(x, m, out)),
+        (8, &|x, m, out| ln_agm_dyn_at::<8>(x, m, out)),
+        (16, &|x, m, out| ln_agm_dyn_at::<16>(x, m, out)),
+    ];
+    for (t, ln) in lns {
+        ln_random(ln, &[1, 2, 3, 8, 20], 20_000 + 100 * t);
+    }
+}
+
+// X = 2^e (no AGM), X = 1, X within 2^-64t of 1 from either side (where c ln 2 - T cancels and the
+// frame widens), X in [1/2, 1), and m = ±2^60 (|c| near 2^66).
+#[test]
+fn test_ln_agm_dyn_special() {
+    let lns: [LnFn; 3] = [
+        &|x, m, out| ln_agm_dyn_at::<0>(x, m, out),
+        &|x, m, out| ln_agm_dyn_at::<DYN_LN_AGM_TERMS>(x, m, out),
+        &|x, m, out| ln_agm_dyn_at::<16>(x, m, out),
+    ];
+    for ln in lns {
+        ln_special(ln, &[1, 2, 5]);
+        ln_zero(ln, 3);
+        let mut out = [7; 2];
+        assert_eq!(ln(&[0, 0], 1, &mut out), Err(LnError::Zero));
+        assert_eq!(ln(&[5], 1, &mut []), Ok((0, false)));
+    }
+}
+
+#[test]
+fn test_ln_agm_dyn_large() {
+    let ln: LnFn = &|x, m, out| ln_agm_dyn_at::<DYN_LN_AGM_TERMS>(x, m, out);
+    for (l, m) in [(40, 0), (40, -1), (64, 3)] {
+        check_ln_full(&rand_vec(l + 1, l as u64 + 21_000), m, l, ln);
+    }
+}
+
+// ln against the series' ln_dyn_at, within 1 ulp.
+fn check_ln_vs_series(x: &[u64], m: i64, l: usize, ln: LnFn) {
+    let what = format!("x.len()={} m={m} l={l}", x.len());
+    let (mut got, mut want) = (vec![0; l], vec![0; l]);
+    let (k, neg) = ln(x, m, &mut got).unwrap();
+    let (kw, nw) = ln_dyn_at(x, m, &mut want, DYN_LN_SQRT_A).unwrap();
+    assert_ln_close((&got, k, neg), (&want, kw, nw), &what);
+}
+
+// Random X and X near 1 from both sides at l limbs, by a 64t-bit cancellation.
+fn ln_vs_series_cases(ln: LnFn, l: usize, seed: u64) {
+    for (i, m) in [0, -1, 3, -5].into_iter().enumerate() {
+        check_ln_vs_series(&rand_vec(l + 1, seed + i as u64), m, l, ln);
+    }
+    for t in [1, 3, l / 2] {
+        // 1 + 2^-64t (1 + ...) and 1 - 2^-64t (1 + ...)
+        let mut x = rand_vec(l + t + 1, seed + 10 + t as u64);
+        x[l + 1..].fill(0);
+        x[l + t] = 1;
+        check_ln_vs_series(&x, 0, l, ln);
+        let mut x = rand_vec(l + t, seed + 20 + t as u64);
+        x[l..].fill(u64::MAX);
+        check_ln_vs_series(&x, -1, l, ln);
+    }
+}
+
+// Past the guarded high products and the FFT square tiers.
+#[test]
+fn test_ln_agm_dyn_matches_series() {
+    let ln: LnFn = &|x, m, out| ln_agm_dyn_at::<DYN_LN_AGM_TERMS>(x, m, out);
+    for (l, seed) in [(200, 22_000), (700, 23_000)] {
+        ln_vs_series_cases(ln, l, seed);
+    }
+}
+
+// ln_agm_static_at::<N>, or where N is short of the frame X needs, a CapacityError that leaves out
+// alone and the dynamic AGM in its place, counted in fell.
+fn agm_static_or_dyn<const N: usize>(
+    fell: &Cell<usize>,
+) -> impl Fn(&[u64], i64, &mut [u64]) -> Result<(i64, bool), LnError> + '_ {
+    move |x, m, out| {
+        let before = out.to_vec();
+        match ln_agm_static_at::<N, STATIC_LN_AGM_TERMS>(x, m, out) {
+            Err(LnError::Capacity(e)) => {
+                assert!(e.min_n > N, "N = {N} >= min_n = {}", e.min_n);
+                assert_eq!(out, &before[..], "a capacity error leaves out alone");
+                fell.set(fell.get() + 1);
+                ln_agm_dyn_at::<STATIC_LN_AGM_TERMS>(x, m, out)
+            }
+            r => r,
+        }
+    }
+}
+
+// A frame is about l + 6 limbs without cancellation, so N - 7 leaves random X room.
+fn ln_agm_static_cases<const N: usize>() {
+    let fell = Cell::new(0);
+    let f = agm_static_or_dyn::<N>(&fell);
+    let mut ls = vec![1, 3, N / 2, N - 7];
+    ls.retain(|&l| l >= 1 && l + 7 <= N);
+    ls.dedup();
+    ln_random(&f, &ls, 24_000 + N as u64);
+    assert_eq!(fell.get(), 0, "random X fit N = {N}");
+    ls.retain(|&l| l <= 12);
+    ln_special(&f, &ls);
+    ln_zero(&f, ls[0]);
+}
+
+#[test]
+fn test_ln_agm_static() {
+    ln_agm_static_cases::<8>();
+    ln_agm_static_cases::<16>();
+    ln_agm_static_cases::<40>();
+    ln_agm_static_cases::<64>();
+}
+
+#[test]
+fn test_ln_agm_static_large() {
+    let fell = Cell::new(0);
+    ln_vs_series_cases(&agm_static_or_dyn::<300>(&fell), 280, 25_000);
+    assert!(fell.get() < 5, "the static AGM ran");
+}
+
+// o = 4 without cancellation: f = 5, p = 384, l = ⌈387 / 64⌉ = 7 and g = 8, so N >= g + 2 = 10.
+#[test]
+fn test_ln_agm_static_capacity() {
+    let x = rand_vec(5, 26_000);
+    let mut out = [7; 4];
+    assert_eq!(
+        ln_agm_static_at::<9, 3>(&x, 2, &mut out),
+        Err(LnError::Capacity(CapacityError { min_n: 10 }))
+    );
+    assert_eq!(out, [7; 4]);
+    let k = ln_agm_static_at::<10, 3>(&x, 2, &mut out).unwrap();
+    let mut want = [0; 4];
+    let kw = ln_agm_dyn_at::<3>(&x, 2, &mut want).unwrap();
+    assert_ln_close((&out, k.0, k.1), (&want, kw.0, kw.1), "N = 10");
+    // X = 0 is an error before any capacity, X = 2^e needs only ln 2's frame.
+    assert_eq!(ln_agm_static_at::<4, 3>(&[], 0, &mut out), Err(LnError::Zero));
+    assert!(ln_agm_static_at::<8, 3>(&[1 << 5], 2, &mut out).is_ok());
+}
+
+#[test]
+fn test_agm_wins_shape() {
+    let (a, c) = (0.25, 1024);
+    // Never below the cutoff, whatever δ.
+    for o in [1, 100, 1023] {
+        for lead in [0, 1, 5, 100] {
+            assert!(!agm_wins(o, Some(lead), false, a, c), "o={o} lead={lead}");
+        }
+    }
+    // A generic X (λ below the square roots' reach, no cancellation) from the cutoff on.
+    for (o, sa) in [(1024, a), (1025, a), (4096, a), (1 << 20, a), (1024, 0.0), (5000, 0.0)] {
+        for lead in [0, 1] {
+            assert!(agm_wins(o, Some(lead), false, sa, c), "o={o} lead={lead} A={sa}");
+        }
+    }
+    // X = 2^e needs no series, and from P / 3 the series is only its tail.
+    assert!(!agm_wins(1 << 20, None, false, a, c));
+    for o in [1024, 1 << 16, 1 << 24] {
+        let third = 64 * o as u64 / 3;
+        assert!(!agm_wins(o, Some(third), false, a, c) && !agm_wins(o, Some(third), true, a, c));
+    }
+    // Once the series wins at some λ it wins at every larger one, and cancellation only adds to
+    // the AGM.
+    let leads: Vec<u64> = (0..64).chain((6..40).map(|i| 1 << i)).collect();
+    for o in [1024, 2048, 1 << 14, 1 << 20, 1 << 26] {
+        for cancels in [false, true] {
+            let wins: Vec<bool> = leads.iter().map(|&l| agm_wins(o, Some(l), cancels, a, c)).collect();
+            assert!(wins.windows(2).all(|w| w[0] || !w[1]), "o={o} cancels={cancels}");
+        }
+        for &l in &leads {
+            assert!(!agm_wins(o, Some(l), true, a, c) || agm_wins(o, Some(l), false, a, c));
+        }
+    }
+    // The AGM's edge grows only like log P: at 4096 limbs it takes leads up to 8 bits.
+    assert!(agm_wins(4096, Some(8), false, a, c) && !agm_wins(4096, Some(9), false, a, c));
+}
+
+// ln against the forced theta–AGM logarithm, within 1 ulp.
+fn check_ln_vs_agm(x: &[u64], m: i64, l: usize, ln: LnFn) {
+    let what = format!("x.len()={} m={m} l={l}", x.len());
+    let (mut got, mut want) = (vec![0; l], vec![0; l]);
+    let (k, neg) = ln(x, m, &mut got).unwrap();
+    let (kw, nw) = ln_agm_dyn_at::<DYN_LN_AGM_TERMS>(x, m, &mut want).unwrap();
+    assert_ln_close((&got, k, neg), (&want, kw, nw), &what);
+}
+
+// Above the cutoff the dispatchers take the AGM for a generic X, checked against the series, and
+// the series for X = 1 + δ with δ's lead at 100 bits, checked against the AGM.
+#[test]
+fn test_ln_dispatch_past_agm_cutoff() {
+    let o = DYN_LN_AGM_LIMBS.max(STATIC_LN_AGM_LIMBS) + 8;
+    let x = rand_vec(o + 1, 27_000);
+    let mut near = rand_vec(o + 1, 27_001);
+    (near[o], near[o - 1]) = (1, near[o - 1] >> 36);
+    assert!(agm_wins(o, Some(0), false, DYN_LN_SQRT_A, DYN_LN_AGM_LIMBS));
+    assert!(!agm_wins(o, Some(100), true, DYN_LN_SQRT_A, DYN_LN_AGM_LIMBS));
+    let ln: LnFn = &|x, m, out| ln_dyn(x, m, out);
+    check_ln_vs_series(&x, 2, o, ln);
+    check_ln_vs_agm(&near, 0, o, ln);
+    // Past π's and ln 2's tables, whose static sums need large stacks.
+    std::thread::Builder::new()
+        .stack_size(1 << 28)
+        .spawn(move || {
+            let ln: LnFn = &|x, m, out| ln_static::<1100>(x, m, out);
+            check_ln_vs_series(&x, 2, o, ln);
+            check_ln_vs_agm(&near, 0, o, ln);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
