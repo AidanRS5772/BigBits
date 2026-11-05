@@ -7,7 +7,7 @@ use crate::utils::sqrt::{
 };
 use crate::utils::utils::{add_buf, cmp_buf, dec_buf, eq_buf, inc_buf, sub_buf};
 use crate::utils::{
-    DYN_SQRT_APPROX_ZIMMERMAN_CUTOFF, DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF,
+    DYN_SQRT_APPROX_ZIMMERMAN_CUTOFF, DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF, DYN_SQRT_RCP_CARRY_CUTOFF,
     DYN_SQRT_REM_ZIMMERMAN_CUTOFF, DYN_SQRT_WRAPPED_REM_CUTOFF,
     STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF, STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF,
     STATIC_SQRT_REM_ZIMMERMAN_CUTOFF, ZIMMERMAN_SQRT_LEAF_CUTOFF,
@@ -788,6 +788,102 @@ fn test_sqrt_wrapped_remainder_edges() {
             assert_ne!(x[x.len() - 1], 0, "{name}: untrimmed input");
             println!("{name}, root_len={root_len}");
             assert_wrapped_matches_classic(&x, root_len);
+        }
+    }
+}
+
+// ─── carried reciprocals ────────────────────────────────────────────────────
+
+// From DYN_SQRT_RCP_CARRY_CUTOFF root limbs each NR stage resumes from the last one's reciprocal,
+// which changes how a quotient is reached, not its value. Every output mode against schoolbook.
+fn assert_carried_roots(x: &[u64], root_len: usize) {
+    assert_sqrt_contract_with(x, root_len, sqrt_dyn);
+    let mut work = x.to_vec();
+    let mut floor = vec![u64::MAX; root_len];
+    sqrt_dyn(&mut work, &mut floor);
+    let mut above = floor.clone();
+    let wrapped = inc_buf(&mut above);
+
+    let shape = format!("root_len={root_len} x.len()={}", x.len());
+    let mut work = x.to_vec();
+    let mut root = vec![u64::MAX; root_len];
+    sqrt_only_dyn(&mut work, &mut root);
+    assert_eq!(root, floor, "sqrt_only_dyn: {shape}");
+
+    let mut work = x.to_vec();
+    let mut root = vec![u64::MAX; root_len];
+    sqrt_approx_dyn(&mut work, &mut root);
+    assert!(
+        root == floor || (!wrapped && root == above),
+        "sqrt_approx_dyn: {shape}"
+    );
+}
+
+// Across the carry's cutoff and past the first stage that reads it, at every top-level shape. The
+// padded ones leave the top stage a short quotient: its reciprocal can be no wider than the one
+// kept below it, which needs no refinement at all.
+#[test]
+fn test_sqrt_carried_reciprocal_all_shapes() {
+    for root_len in [
+        DYN_SQRT_RCP_CARRY_CUTOFF - 1,
+        DYN_SQRT_RCP_CARRY_CUTOFF,
+        680,
+        1044,
+        2084,
+    ] {
+        let k = root_len;
+        for (i, x_len) in [
+            2 * k,
+            2 * k - 1,
+            2 * k - k / 8,
+            2 * k - k / 4,
+            k + k / 2 + 1,
+            k + 2,
+            k + 1,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut x = rand_vec(x_len, 0x5_6000 + (k * 10 + i) as u64);
+            x[x_len - 1] |= 1 << 63;
+            assert_carried_roots(&x, k);
+        }
+    }
+}
+
+// Inputs that test what a resume assumes: a root whose low limbs are zero, so that the final -1
+// borrows up through the limbs a lower stage divided by and its divisor is no longer a prefix;
+// perfect squares, whose exact quotients take the correction path; and a saturated stage, which
+// doesn't divide, so that the stage above it resumes from further back.
+#[test]
+fn test_sqrt_carried_reciprocal_structured_roots() {
+    for k in [700usize, 1500] {
+        let mut y = rand_vec(k, 0x5_7000 + k as u64);
+        y[k - 1] |= 1 << 63;
+        let mut cases = vec![square_plus(&y, 2 * k, 0), square_plus(&y, 2 * k, -1)];
+        for zeros in [k / 2, 3 * k / 4, 7 * k / 8, k - 1] {
+            let mut sparse = y.clone();
+            sparse[..zeros].fill(0);
+            cases.push(square_plus(&sparse, 2 * k, 0));
+            cases.push(square_plus(&sparse, 2 * k, -1));
+        }
+        // A run of all-ones root limbs, for all-ones quotient limbs.
+        let mut run = y.clone();
+        run[k / 3..2 * k / 3].fill(u64::MAX);
+        cases.push(square_plus(&run, 2 * k, 0));
+        cases.push(square_plus(&run, 2 * k, -1));
+        // (t + 1)^2 - 1 in the top 2w limbs saturates the stage above the w-limb root.
+        let mut w = k - (k - 1) / 2;
+        while w >= 170 {
+            let mut t = rand_vec(w, 0x5_8000 + (k * 10 + w) as u64);
+            t[w - 1] |= 1 << 63;
+            let mut x = rand_vec(2 * k, 0x5_9000 + (k * 10 + w) as u64);
+            x[2 * k - 2 * w..].copy_from_slice(&square_plus(&t, 2 * w, 2));
+            cases.push(x);
+            w -= (w - 1) / 2;
+        }
+        for x in cases {
+            assert_carried_roots(&x, k);
         }
     }
 }

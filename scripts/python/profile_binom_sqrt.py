@@ -41,7 +41,6 @@ def phase(frames: list[tuple[str, str]], symbol: str) -> str:
     for needle, category in [
         ("sub_mul_of", "quotient multiply/subtract"),
         ("knuth_est", "quotient estimate/correction"),
-        ("sqrt_4x2", "initial root seed"),
         ("isqrt", "initial root seed"),
         ("int_sqrt", "initial root seed"),
         ("udivti", "initial root seed (u128 division)"),
@@ -56,7 +55,6 @@ def phase(frames: list[tuple[str, str]], symbol: str) -> str:
         ("cmp_buf", "remainder comparison"),
         ("add_buf", "limb addition (shared callers)"),
         ("sub_buf", "limb subtraction (shared callers)"),
-        ("binom_sqrt_est_reduced", "root digit estimate bookkeeping"),
         ("binom_sqrt_core", "core control/memory"),
         ("big_bits::utils::sqrt::binom_sqrt", "wrapper/control"),
         ("memcpy", "memory (includes input reset)"),

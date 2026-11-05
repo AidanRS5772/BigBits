@@ -1,6 +1,6 @@
 # Binomial sqrt validation and before/after benchmarks
 
-Validated the working-tree halved-numerator `sqrt_4x2`, its four-limb window
+Validated the working-tree halved-numerator `sqrt_4x2` (now inside `binom_sqrt_core`), its four-limb window
 refactor, and merged-carry `sub_mul_of` assembly against commit `d655804`.
 The fixed-width seed correction and saturated-digit `knuth_est` bypass remain
 prototypes; neither is included in these production measurements.

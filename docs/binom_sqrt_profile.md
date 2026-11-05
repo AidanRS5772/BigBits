@@ -55,7 +55,7 @@ Independent input-copy controls cost about 7 ns, 13 ns, 78 ns, and 657 ns for
 
 1. **Improve the multiply/subtract kernel for large roots.**
    [`sub_mul_of_x86`](../src/utils/div.rs:103), reached through
-   [`knuth_est`](../src/utils/div.rs:200), is the largest hotspot. Disassembly
+   [`knuth_est`](../src/utils/div.rs:821), is the largest hotspot. Disassembly
    confirms one multiply plus carry/borrow handling, pointer increments, and
    loop control per limb. Benchmark two- or four-limb unrolling and a better
    carry/borrow schedule. A BMI2/ADX implementation is another candidate with
@@ -64,7 +64,7 @@ Independent input-copy controls cost about 7 ns, 13 ns, 78 ns, and 657 ns for
    kernel's cost would save about one third of total runtime at 1,024 limbs.
 
 2. **Reduce the number of complete limb passes per root digit.**
-   The loop in [`binom_sqrt_core`](../src/utils/sqrt.rs:132) reduces the current
+   The loop in [`binom_sqrt_core`](../src/utils/sqrt.rs:87) reduces the current
    remainder, estimates/subtracts a quotient product, restores a root multiple
    for odd quotients, and applies a square correction. The add/sub helpers
    alone consume another 28–29% at 512–1,024 limbs. A sqrt-specific estimator
@@ -84,7 +84,7 @@ Independent input-copy controls cost about 7 ns, 13 ns, 78 ns, and 657 ns for
    roots: the same hardware-divide site is only 2.3% at 1,024 limbs.
 
 4. **Simplify the initial two-limb root seed for small roots.**
-   [`sqrt_4x2`](../src/utils/sqrt.rs:25) and the integer-square-root implementation
+   `sqrt_4x2` (now the seed inside [`binom_sqrt_core`](../src/utils/sqrt.rs:32)) and the integer-square-root implementation
    dominate two-limb cases. Out-of-line 128-bit division support alone accounts
    for 42.0%. After `s_hi = floor(sqrt(x_hi))`, the remainder satisfies
    `0 <= rem <= 2*s_hi`, so `rem / s_hi` and `rem % s_hi` can be replaced with
@@ -221,7 +221,7 @@ changed by these experiments.
 
 ## Follow-up: simplify the two-limb sqrt seed
 
-An isolated probe of `sqrt_4x2` is in
+An isolated probe of `sqrt_4x2` (now inside `binom_sqrt_core`) is in
 [`binom_sqrt_seed.rs`](../benches/probes/binom_sqrt_seed.rs). It uses copies of
 the seed arithmetic and the existing `correct_sqrt` helper; it does not change
 production sqrt or division. The helper was linked from the earlier profiling
@@ -294,7 +294,7 @@ below 1% at thirty-two. These projections need end-to-end measurements before
 retuning cutoffs. One-limb roots do not call this seed. ARM has not been timed.
 
 There is also a separate, unbenchmarked control-flow opportunity in
-`binom_sqrt_est_reduced`. Its divisor has at least two limbs. If `c == 2`, the
+`binom_sqrt_est_reduced` (now inside `binom_sqrt_core`). Its divisor has at least two limbs. If `c == 2`, the
 previous exact remainder must have been `2*S`; reducing it leaves zero, so the
 next division numerator consists only of the incoming single limb. It is
 strictly less than `S`, hence `t == 0`. That branch can skip `knuth_est`, add

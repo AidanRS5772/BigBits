@@ -1,4 +1,4 @@
-//! Isolated sqrt_4x2 experiments. No production algorithms are changed.
+//! Isolated experiments on the two-limb seed in binom_sqrt_core. No production algorithms are changed.
 //! Build after `cargo build --profile prof` (substitute the rlib's actual hash):
 //! rustc --edition=2021 -O -g benches/probes/binom_sqrt_seed.rs \
 //!   --extern big_bits=target/prof/deps/libbig_bits-HASH.rlib \

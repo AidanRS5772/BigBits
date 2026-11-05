@@ -234,6 +234,14 @@ By expected gain on the pure AGM:
    about 2% more folded into `ln_agm_core`. Low risk with existing primitives.
 3. **Reciprocal chaining through the root's recursion** (Proposal 1, item 2): an estimated 5–8%,
    but the most complex.
+
+   *Implemented 2026-11-05* for the dynamic root, and simpler than expected: the recursion is linear,
+   so the reciprocal lives in `sqrt_dyn_output`'s division closure and the stages never see it. See the
+   reciprocal-carry section of `docs/sqrt_cutoff_tuning.md`. `agm_dyn` takes 0.974 of its time at
+   g = 1044, 0.968 at 2084, 0.950 at 4164, 0.933 at 8324 and 0.922 at 16644, with the root's outputs
+   unchanged. Rec 1 is why it reaches down to 1024 output limbs: its wrapped stages divide quotient-only,
+   which takes NR from about 126 limbs, where the "every core division is BZ or Knuth" under *Inside the
+   root* described the `div_rem` stages before it.
 4. **A narrower frame.** The slack above shows the steps from b2 on need about l/2 fewer bits, and
    l/2^(k−1) fewer after step k. Shifting a and b down by whole limbs after each early step (or a
    floating layout with separate exponents for a and b, each at p plus guard bits) saves up to

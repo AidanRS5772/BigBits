@@ -259,6 +259,10 @@ pub const DYN_SQR_BNM1_FFT_CUTOFF: usize = FFT_SQR_CUTOFF;
 // the division's remainder and subtract the low root's square. GUESS: every level whose wrapped
 // square is on the FFT.
 pub const DYN_SQRT_WRAPPED_REM_CUTOFF: usize = DYN_SQR_BNM1_FFT_CUTOFF + 1;
+// Root limbs from which a dynamic root keeps a reciprocal between its stages' divisions. Not a
+// crossover: a reciprocal needs two NR stages to be read (about 680 root limbs at the cutoffs above),
+// so smaller roots just skip its scratch acquisition.
+pub const DYN_SQRT_RCP_CARRY_CUTOFF: usize = 256;
 
 // The dynamic constant caches (ln2_dyn, pi_dyn) copy requests of up to their tables' 1024
 // limbs from them, and past that build in parallel (rayon) when

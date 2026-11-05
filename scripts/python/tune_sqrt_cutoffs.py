@@ -37,7 +37,7 @@ def build(output, rlib):
     source = source.replace("sqrt_dyn_output(x,", "sqrt_dyn_output::<17, 17>(x,")
     source = source.replace("sqrt_static_output::<N>(x,", "sqrt_static_output::<N, 17, 17>(x,")
     # Force precisely the outer core step while letting its child use LEAF. MODE 3 passes no
-    # wrapped-remainder hook, so it times the classic step (division remainder and low square).
+    # wrapped-remainder cutoff, so it times the classic step (division remainder and low square).
     # Calling core::<4096> directly would simply measure binomial twice.
     core = source[source.index("fn zimmermann_sqrt_core<"):source.index("// The sole entry into the recursive stack.")]
     core = replace_once(core, "fn zimmermann_sqrt_core<", "fn one_descent<")

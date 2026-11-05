@@ -27,7 +27,7 @@ The existing benchmark alias, run on the same snapshot for the dynamic 128-limb 
 
 ## Exact root without an exact remainder
 
-At `src/utils/sqrt.rs:236`, the core always squares `s_lo`, subtracts it, and restores the remainder if correction is required. Only the sign of that subtraction is needed to produce an exact root.
+At `src/utils/sqrt.rs:317`, the core always squares `s_lo`, subtracts it, and restores the remainder if correction is required. Only the sign of that subtraction is needed to produce an exact root.
 
 Let `B = 2^64`, `l = s_lo.len()`, and `q = value(s_lo)`. Immediately before the square, call the pre-subtraction remainder `Rpre`. Since `q < B^l`, we know `q^2 < B^(2l)`. Therefore:
 
@@ -87,10 +87,10 @@ For AGM, the product may therefore be rounded to working precision plus guards b
 
 ## Other optimizations within the current exact implementation
 
-1. **Skip zero work in denormalization.** At `src/utils/sqrt.rs:169`, return immediately when `sh == 0`. When the discarded root bits `d` are zero, omit `add_mul` and subtraction of `d^2`, while retaining the shifts if `sh != 0`. The existing shifts already handle zero shifts, but `add_mul` still traverses every root limb with a zero multiplier. This is a modest measured gain and particularly relevant to already-normalized floating-point inputs.
+1. **Skip zero work in denormalization.** At `src/utils/sqrt.rs:122`, return immediately when `sh == 0` (done 2026-11-05). When the discarded root bits `d` are zero, omit `add_mul` and subtraction of `d^2`, while retaining the shifts if `sh != 0`. The existing shifts already handle zero shifts, but `add_mul` still traverses every root limb with a zero multiplier. This is a modest measured gain and particularly relevant to already-normalized floating-point inputs.
 2. **Specialize the normalized division interface.** The recursive root `s_hi` has its top bit set. Its division does not need fresh divisor normalization, and the dividend is expendable scratch. A normalized, destructive quotient-only interface could avoid `div_dyn`'s preserving copy in its Knuth path. Keep backend selection: forcing Knuth at large sizes would defeat the fast arithmetic. Benchmark the actual square-root quotient/divisor shapes before changing dispatch cutoffs.
 3. **Inspect squaring transitions.** Dynamic squaring currently goes from schoolbook directly to FFT above 33 limbs, whereas static squaring includes Karatsuba. The outer square is a large part of the 128-limb-root cost. A dynamic Karatsuba square tier is a tuning candidate, not a demonstrated win; removing unnecessary outer squares is already measured.
-4. **Optimize the small seed if small sizes matter.** In `sqrt_4x2`, `rem / s_hi` is in `{0,1,2}` because `rem <= 2*s_hi`; comparisons and subtraction can replace that quotient/remainder calculation. Verify generated code and measure before replacing the other division. The `/` and `%` expressions do not by themselves prove that the compiler emits two divisions.
+4. **Optimize the small seed if small sizes matter.** In `sqrt_4x2` (now inside `binom_sqrt_core`), `rem / s_hi` is in `{0,1,2}` because `rem <= 2*s_hi`; comparisons and subtraction can replace that quotient/remainder calculation. Verify generated code and measure before replacing the other division. The `/` and `%` expressions do not by themselves prove that the compiler emits two divisions.
 5. **Retune around the actual cutoff.** `ZIMMERMAN_SQRT_CUTOFF` is 17. Several tests named for cutoff boundaries still use 49/50/51. Add 16/17/18 and odd/even cases when implementing changes. Existing cutoff probes compare one descent with binomial arithmetic, so root-only and approximate entries may need separate top-level decisions. Generic callbacks could also be compared with `dyn FnMut`, but this is a lower priority than arithmetic elimination and may already benefit from LTO.
 
 ## Suitability for AGM
@@ -124,7 +124,7 @@ let mut root = vec![0_u64; 17];
 zimmerman_sqrt_dyn(&mut x, &mut root);
 ```
 
-This is an exact power-of-two square. The observed panic is “slice index starts at 8 but ends at 0.” At `src/utils/sqrt.rs:225`, `buf_len(&x[..s_len + lo])` can return a length smaller than `lo`, making `x[lo..d_len]` invalid. Slice the numerator window first and trim within it, allowing the division preflight to handle an empty numerator. This fix and a regression test should precede relying on the kernel in AGM.
+This is an exact power-of-two square. The observed panic is “slice index starts at 8 but ends at 0.” At what is now `src/utils/sqrt.rs:282`, `buf_len(&x[..s_len + lo])` can return a length smaller than `lo`, making `x[lo..d_len]` invalid. Slice the numerator window first and trim within it, allowing the division preflight to handle an empty numerator. This fix and a regression test should precede relying on the kernel in AGM.
 
 ## Validation and reproduction
 

@@ -20,7 +20,7 @@ Newton-Raphson (NR), but not for the entire division stack:
   for the dynamic FFT cases and 83–95% for the static NTT cases.
 
 The main optimization target inside `div.rs` is
-[`knuth_est`](../src/utils/div.rs#L302). On this AArch64 machine it accounts for
+[`knuth_est`](../src/utils/div.rs#L821). On this AArch64 machine it accounts for
 roughly 86–88% of end-to-end Knuth division. The compiler-supported 128÷64
 operation around it contributes another 10–12%, much of it symbolized as
 `<u128>::leading_zeros`. The same estimator and support code consume about 61–63%
@@ -29,7 +29,7 @@ of the Karatsuba-region BZ profiles because BZ reaches Knuth base cases.
 The primary large-NR target is therefore not dispatch or wrapper cleanup. It is
 the middle/high multiplication pipeline in `mul.rs`, especially transform
 memory movement and NTT parallel scheduling. A division-specific opportunity
-also exists in [`nr_rem_finish`](../src/utils/div.rs#L1417): it computes a full
+also exists in [`nr_rem_finish`](../src/utils/div.rs#L1622): it computes a full
 `d * q_low` product even though it consumes only the low `d.len() + 1` limbs.
 
 ## Harness and method
@@ -160,7 +160,7 @@ On the 88×88 quotient profiles:
 well below 1%.
 
 The Karatsuba-region BZ profiles spend 50–51% directly in `knuth_est` and
-10–12% in its 128-bit support. [`div_3_2`](../src/utils/div.rs#L516) itself is
+10–12% in its 128-bit support. [`div_3_2`](../src/utils/div.rs#L990) itself is
 only about 1% of total time. In other words, the observed 65% division share is
 mostly BZ's Knuth leaves, not recursive BZ bookkeeping.
 
@@ -171,10 +171,10 @@ accounts for about 29% of the complete call, while multiplication accounts for
 ### NR quotient and reciprocal refinement
 
 The relevant stages are
-[`nr_err_band`](../src/utils/div.rs#L975),
-[`nr_refine_rcp`](../src/utils/div.rs#L1075),
-[`nr_rcp_chain`](../src/utils/div.rs#L1111), and
-[`nr_refine_quo`](../src/utils/div.rs#L1243).
+[`nr_err_band`](../src/utils/div.rs#L1171),
+[`nr_refine_rcp`](../src/utils/div.rs#L1242),
+[`nr_rcp_chain`](../src/utils/div.rs#L1276), and
+[`nr_refine_quo`](../src/utils/div.rs#L1375).
 
 At 89 limbs, their own instructions account for only a few percent; the
 schoolbook middle and high products beneath them account for 92–96%. At FFT

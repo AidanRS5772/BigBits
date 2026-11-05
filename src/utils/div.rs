@@ -156,6 +156,50 @@ pub fn rcp_static<const N: usize>(d: &[u64], rcp: &mut [u64]) {
     let algorithm = rcp_alg_dispatch(rcp.len(), STATIC_RCP_KNUTH_NR_CUTOFF);
     rcp_prepared_static::<N>(d, rcp, algorithm);
 }
+/// The reciprocal a dynamic NR division leaves for the next division by a longer prefix of the same
+/// divisor, as a Zimmermann root's stages are: each divisor is the previous stage's whole root. Its
+/// limbs x[..=p] are the normalized reciprocal at precision p (p = 0: none yet).
+#[doc(hidden)]
+pub struct RcpCarry<'a> {
+    x: &'a mut [u64],
+    p: usize,
+}
+
+impl<'a> RcpCarry<'a> {
+    pub fn new(x: &'a mut [u64]) -> Self {
+        Self { x, p: 0 }
+    }
+
+    // A reciprocal wider than the buffer is the top stage's, which nothing reads. One whose quotient
+    // failed its band isn't trusted, so the next division starts over.
+    fn keep(&mut self, x: &[u64], good: bool) {
+        if !good {
+            self.p = 0;
+        } else if let Some(slot) = self.x.get_mut(..x.len()) {
+            slot.copy_from_slice(x);
+            self.p = x.len() - 1;
+        }
+    }
+}
+
+/// [`div_dyn`], reading and leaving `carry`.
+#[doc(hidden)]
+pub fn div_carry_dyn(n: &[u64], d: &[u64], q: &mut [u64], carry: &mut RcpCarry) -> u64 {
+    let Some(r) = division_preflight(n, d, q) else {
+        return 0;
+    };
+    div_prepared_carry_dyn(n, d, q, r, div_alg_dispatch(&r, DYN_DIV), Some(carry))
+}
+
+/// [`div_rem_dyn`], reading and leaving `carry`.
+#[doc(hidden)]
+pub fn div_rem_carry_dyn(n: &mut [u64], d: &[u64], q: &mut [u64], carry: &mut RcpCarry) -> u64 {
+    let Some(r) = division_preflight(n, d, q) else {
+        return 0;
+    };
+    div_rem_prepared_carry_dyn(n, d, q, r, div_alg_dispatch(&r, DYN_DIV_REM), Some(carry))
+}
+
 /// Minimum quotient-buffer width for trimmed little-endian operands.
 ///
 /// A quotient can have one additional structural top limb. Standard division
@@ -306,13 +350,24 @@ pub fn div_prepared_dyn(
     d: &[u64],
     q: &mut [u64],
     request: DivisionRequest,
+    algorithm: DivAlg,
+) -> u64 {
+    div_prepared_carry_dyn(n, d, q, request, algorithm, None)
+}
+
+fn div_prepared_carry_dyn(
+    n: &[u64],
+    d: &[u64],
+    q: &mut [u64],
+    request: DivisionRequest,
     mut algorithm: DivAlg,
+    mut carry: Option<&mut RcpCarry>,
 ) -> u64 {
     let (n, d) = (&n[request.n_start..], &d[request.d_start..]);
     if algorithm == DivAlg::NR {
         let attempt = |q: &mut [u64]| {
             debug_assert_full_division_shape(n, d, q);
-            match nr_quo_est_dyn(n, d, q) {
+            match nr_quo_est_dyn(n, d, q, carry.as_deref_mut()) {
                 NrEstimate::Exact => true,
                 NrEstimate::Failed => false,
                 NrEstimate::NeedsCorrection => {
@@ -362,13 +417,24 @@ pub fn div_rem_prepared_dyn(
     d: &[u64],
     q: &mut [u64],
     request: DivisionRequest,
+    algorithm: DivAlg,
+) -> u64 {
+    div_rem_prepared_carry_dyn(n, d, q, request, algorithm, None)
+}
+
+fn div_rem_prepared_carry_dyn(
+    n: &mut [u64],
+    d: &[u64],
+    q: &mut [u64],
+    request: DivisionRequest,
     mut algorithm: DivAlg,
+    mut carry: Option<&mut RcpCarry>,
 ) -> u64 {
     let (n, d) = (&mut n[request.n_start..], &d[request.d_start..]);
     if algorithm == DivAlg::NR {
         let attempt = |q: &mut [u64]| {
             debug_assert_full_division_shape(n, d, q);
-            if nr_quo_est_dyn(n, d, q) == NrEstimate::Failed {
+            if nr_quo_est_dyn(n, d, q, carry.as_deref_mut()) == NrEstimate::Failed {
                 return false;
             }
             // Even a proven quotient needs the windowed product for the remainder.
@@ -1229,8 +1295,19 @@ fn nr_rcp_chain(
         end_mut(rcp, seed_r),
     );
     inc_buf(end_mut(rcp, seed_r));
-
-    let mut p = 1;
+    nr_rcp_steps(d_work, rcp, err, cor, 1, sizes, mid, short)
+}
+// The chain from a precision-p reciprocal at rcp's top.
+fn nr_rcp_steps(
+    d_work: &[u64],
+    rcp: &mut [u64],
+    err: &mut [u64],
+    cor: &mut [u64],
+    mut p: usize,
+    sizes: &[usize],
+    mid: &mut dyn FnMut(&[u64], &[u64], &mut [u64]) -> (u64, u64),
+    short: &mut dyn FnMut(&[u64], &[u64], &mut [u64]) -> u64,
+) -> bool {
     for &q in sizes.iter().rev() {
         if !nr_refine_rcp(
             end_ref(d_work, 2 * p + 1),
@@ -1329,18 +1406,25 @@ fn nr_refine_quo(
     let k = e_len + l - h + 1;
     let c = &mut corr[..k + 1];
     c[k] = short(x_norm, &err[..e_len], &mut c[..k]);
-    if neg {
+    // x_norm's limbs below k aren't subtracted, so a |c| under that error comes out positive: the
+    // sign has to come from c. c is narrower than q, so a wrong-signed c wouldn't wrap.
+    let neg = neg && {
         sub_buf(&mut c[1..], end_ref(x_norm, k));
+        c[k] >> 63 != 0
+    };
+    if neg {
         twos_comp(c);
     }
 
     q[..l - 1].fill(0);
     q[l - 1] = hq[2];
     q[l..].copy_from_slice(&hq[3..]);
+    // The estimate is y - c: floor(y + |c|) drops c's fraction, floor(y - c) = y - ceil(c) borrows
+    // it. A c with no fraction reads guard 0 below, so correction restores the extra 1.
     let wrapped = if neg {
         add_buf(q, &c[GUARD..])
     } else {
-        sub_buf(q, &c[GUARD..])
+        sub_buf(q, &c[GUARD..]) || dec_buf(q)
     };
     if wrapped {
         return NrEstimate::Failed;
@@ -1363,9 +1447,47 @@ fn nr_split(n_len: usize, q_len: usize) -> Option<(usize, usize)> {
     (q_len >= 2 * GUARD + 2 && n_len >= 2 * h + 1).then(|| (h, q_len - h))
 }
 
+// Resumes the chain from a carried reciprocal, at the widest step it reaches. A good one's first
+// band is p + 1 limbs, so anything wider rejects it and the caller starts the chain over. A zero
+// reciprocal is the one bad seed its band can't see (d 0 has no error limbs); the quotient's band
+// rejects that, and the driver retries through BZ.
+fn nr_rcp_resume(
+    c: &RcpCarry,
+    d_work: &[u64],
+    x: &mut [u64],
+    err: &mut [u64],
+    cor: &mut [u64],
+    sizes: &[usize],
+    mid: &mut dyn FnMut(&[u64], &[u64], &mut [u64]) -> (u64, u64),
+    short: &mut dyn FnMut(&[u64], &[u64], &mut [u64]) -> u64,
+) -> bool {
+    let Some(i) = sizes.iter().position(|&p| p <= c.p) else {
+        return false;
+    };
+    let p = sizes[i];
+    end_mut(x, p + 1).copy_from_slice(end_ref(&c.x[..=c.p], p + 1));
+    let done = i == 0 || {
+        let first = sizes[i - 1];
+        nr_refine_rcp(
+            end_ref(d_work, 2 * p + 1),
+            end_mut(x, first + 1),
+            &mut err[..p + 2],
+            cor,
+            p,
+            first & 1 == 1,
+            mid,
+            short,
+        ) && nr_rcp_steps(d_work, x, err, cor, first, &sizes[..i - 1], mid, short)
+    };
+    if !done {
+        x.fill(0);
+    }
+    done
+}
+
 // Newton division's estimate: a half-precision reciprocal and one quotient refinement put q within
 // one of the true quotient.
-fn nr_quo_est_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> NrEstimate {
+fn nr_quo_est_dyn(n: &[u64], d: &[u64], q: &mut [u64], carry: Option<&mut RcpCarry>) -> NrEstimate {
     let Some((h, l)) = nr_split(n.len(), q.len()) else {
         return NrEstimate::Failed;
     };
@@ -1393,37 +1515,45 @@ fn nr_quo_est_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> NrEstimate {
     let sh = d[d.len() - 1].leading_zeros() as u8;
     x.fill(0);
     shl_top_copy(d, d_work, sh);
-    if !nr_rcp_chain(
-        d_work,
-        x,
-        rcp_err,
-        rcp_cor,
-        seed_n,
-        &sizes[..steps],
-        &mut |a, b, o| mid_mul_dyn(a, b, o),
-        &mut |a, b, o| hi_mul_dyn(a, b, o),
-    ) {
+    let (mut mid, mut short) = (
+        |a: &[u64], b: &[u64], o: &mut [u64]| mid_mul_dyn(a, b, o),
+        |a: &[u64], b: &[u64], o: &mut [u64]| hi_mul_dyn(a, b, o),
+    );
+    let resumed = carry.as_deref().is_some_and(|c| {
+        nr_rcp_resume(
+            c,
+            d_work,
+            x,
+            rcp_err,
+            rcp_cor,
+            &sizes[..steps],
+            &mut mid,
+            &mut short,
+        )
+    });
+    if !resumed
+        && !nr_rcp_chain(
+            d_work,
+            x,
+            rcp_err,
+            rcp_cor,
+            seed_n,
+            &sizes[..steps],
+            &mut mid,
+            &mut short,
+        )
+    {
         // Exact normalized quotient plus Newton division's upward bias.
         knuth_rcp_normalized(d_work, x, &mut rcp_err[..d_len], 1);
         inc_buf(x);
     }
-    nr_refine_quo(
-        n,
-        d,
-        sh,
-        x,
-        x_norm,
-        d_top,
-        n_top,
-        hq,
-        err,
-        corr,
-        q,
-        h,
-        l,
-        &mut |a, b, o| mid_mul_dyn(a, b, o),
-        &mut |a, b, o| hi_mul_dyn(a, b, o),
-    )
+    let estimate = nr_refine_quo(
+        n, d, sh, x, x_norm, d_top, n_top, hq, err, corr, q, h, l, &mut mid, &mut short,
+    );
+    if let Some(c) = carry {
+        c.keep(x_norm, estimate != NrEstimate::Failed);
+    }
+    estimate
 }
 
 fn nr_quo_est_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) -> NrEstimate {
@@ -2007,3 +2137,7 @@ pub unsafe fn mul_u64_asm(a: u64, b: u64) -> (u64, u64) {
     let t = a as u128 * b as u128;
     ((t >> 64) as u64, t as u64)
 }
+
+#[cfg(test)]
+#[path = "../tests/test_div_nr.rs"]
+mod test_div_nr;

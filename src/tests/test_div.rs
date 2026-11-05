@@ -2208,3 +2208,99 @@ fn test_nr_reciprocal_static_high_precision_regressions() {
         assert_rcp_precision(&format!("static dispatcher r={r}"), &rcp, &exact);
     }
 }
+
+// Karp-Markstein's y can round up across its cut when the true quotient has a run of all-ones limbs
+// just below it (or d's top limbs are all ones). Then err > 0, and the floor of y - c is y - ceil(c).
+#[test]
+fn test_nr_quotient_floor_when_estimate_rounds_up() {
+    use crate::utils::mul::mul_buf;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(0x4e52_464c_4f4f52);
+    for &(dl, ql) in &[(128usize, 128usize), (200, 200), (256, 256), (400, 400), (512, 512), (1024, 512), (2000, 300)] {
+        let qlog = ql + 1;
+        let l = qlog - (qlog / 2 + 1);
+        for _ in 0..16 {
+            let mut d: Vec<u64> = (0..dl).map(|_| rng.gen()).collect();
+            d[dl - 1] |= 1 << 63;
+            let mut q: Vec<u64> = (0..ql).map(|_| rng.gen()).collect();
+            q[ql - 1] = (q[ql - 1] >> 1) | (1 << 62);
+            q[l - 4..l].fill(u64::MAX);
+            let mut r: Vec<u64> = (0..dl).map(|_| rng.gen()).collect();
+            r[dl - 1] = rng.gen::<u64>() >> 2;
+            let mut n = vec![0u64; dl + ql];
+            mul_buf(&q, &d, &mut n);
+            add_buf(&mut n, &r);
+            while n.last() == Some(&0) {
+                n.pop();
+            }
+            let mut got = vec![0u64; n.len() - dl + 1];
+            div_dyn(&n, &d, &mut got);
+            assert_eq!(&got[..ql], &q[..], "div_dyn {dl}x{ql}");
+            let req = division_preflight(&n, &d, &mut got).unwrap();
+            div_prepared_dyn(&n, &d, &mut got, req, DivAlg::NR);
+            assert_eq!(&got[..ql], &q[..], "forced NR {dl}x{ql}");
+            if dl + ql <= 1000 {
+                div_static::<1100>(&n, &d, &mut got);
+                assert_eq!(&got[..ql], &q[..], "div_static {dl}x{ql}");
+            }
+        }
+    }
+    // An all-ones divisor with a run of ones on top of n: x = 1.000..., so y is n's own limbs.
+    for &(dl, nl) in &[(128usize, 256usize), (300, 620), (884, 1729)] {
+        for k in (dl..nl - nl / 8).step_by(7) {
+            let d = vec![u64::MAX; dl];
+            let mut n: Vec<u64> = (0..nl).map(|_| rng.gen()).collect();
+            n[k..].fill(u64::MAX);
+            let qlen = nl - dl + 1;
+            let (mut qk, mut rk, mut qn) = (vec![0u64; qlen], n.clone(), vec![0u64; qlen]);
+            let req = division_preflight(&n, &d, &mut qk).unwrap();
+            div_rem_prepared_dyn(&mut rk, &d, &mut qk, req, DivAlg::Knuth);
+            let req = division_preflight(&n, &d, &mut qn).unwrap();
+            div_prepared_dyn(&n, &d, &mut qn, req, DivAlg::NR);
+            assert_eq!(qn, qk, "all-ones d={dl} n={nl} ones from {k}");
+        }
+    }
+}
+
+// n = (d m) B^k + small, with the quotient's low part all zero, leaves |c| below x_norm's truncation:
+// the subtraction comes out positive, and negating it put q off by about B^(k - 2). div_rem's window
+// accepts that when d has a zero limb in the right place.
+#[test]
+fn test_nr_rem_scaled_multiple_of_sparse_divisor() {
+    use crate::utils::{mul::mul_buf, utils::add_prim};
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(0x4e52_5245_4d);
+    for &(dl, ql) in &[(136usize, 140usize), (308, 94), (400, 200), (1283, 41), (800, 800)] {
+        let qlog = ql + 1;
+        let l = qlog - (qlog / 2 + 1);
+        for t in 0..64u64 {
+            let mut d: Vec<u64> = (0..dl).map(|_| if rng.gen::<u64>() % 8 == 0 { rng.gen() } else { 0 }).collect();
+            d[dl - 1] |= 1 << 63;
+            let mut q: Vec<u64> = (0..ql).map(|_| rng.gen()).collect();
+            q[ql - 1] |= 1;
+            let k = (l + (t % 6) as usize).saturating_sub(2).min(ql - 1);
+            q[..k].fill(0);
+            let mut n = vec![0u64; dl + ql + 1];
+            mul_buf(&q, &d, &mut n[..dl + ql]);
+            let delta = t % 4;
+            add_prim(&mut n, delta);
+            while n.last() == Some(&0) {
+                n.pop();
+            }
+            let qlen = n.len() - dl + 1;
+            let (mut got, mut r) = (vec![0u64; qlen], n.clone());
+            let req = division_preflight(&n, &d, &mut got).unwrap();
+            div_rem_prepared_dyn(&mut r, &d, &mut got, req, DivAlg::NR);
+            assert_eq!(&got[..ql], &q[..], "forced NR q {dl}x{ql} t={t}");
+            assert_eq!(r[0], delta, "forced NR r {dl}x{ql} t={t}");
+            assert!(r[1..].iter().all(|&x| x == 0), "forced NR r {dl}x{ql} t={t}");
+            let (mut got, mut r) = (vec![0u64; qlen], n.clone());
+            div_rem_dyn(&mut r, &d, &mut got);
+            assert_eq!(&got[..ql], &q[..], "div_rem_dyn q {dl}x{ql} t={t}");
+            assert_eq!(r[0], delta, "div_rem_dyn r {dl}x{ql} t={t}");
+            let mut got = vec![0u64; qlen];
+            div_dyn(&n, &d, &mut got);
+            assert_eq!(&got[..ql], &q[..], "div_dyn {dl}x{ql} t={t}");
+        }
+    }
+}

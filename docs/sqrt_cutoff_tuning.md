@@ -42,7 +42,7 @@ is used; the recursion is shared by both allocation models.
 
 ## Top-level cutoffs
 
-Each output mode and allocation model compares `binom_sqrt_output` against the
+Each output mode and allocation model compares the binomial path (`normalized` around `binom_sqrt_core`) against the
 Zimmermann entry (leaf 15) for root widths 4-48 across four input shapes:
 `full` (`x.len() = 2n`), `near` (`2n-1`), `mid` (`3n/2+1`) and `padded` (`n+1`),
 with alternating normalized and shifted top limbs. The cutoff minimizes the
@@ -192,5 +192,97 @@ hundred limbs loses, probably because its wrapped square of k limbs runs an FFT 
 square of k/2 is still Karatsuba, and the classic division keeps its remainder cheaply through BZ
 there (neither cause was timed separately). To tune it, time the forced entries per root width, or one
 stage at a time as `core` mode does for the leaf. The `one_descent` probe passes no
-wrapped hook, so it still times the classic stage. A static version needs a cyclic NTT square
+wrapped cutoff, so it still times the classic stage. A static version needs a cyclic NTT square
 with all three primes at one transform length.
+
+## Reciprocal carry (2026-11-05)
+
+Each Zimmermann stage divides by the whole root of the stage below, so the last stage's reciprocal is
+a reciprocal of the top of this stage's divisor. A dynamic root keeps it in an `RcpCarry`, and a stage's
+NR division resumes its chain from there. The recursion is linear, so the carry lives in
+`sqrt_dyn_output`'s division closure and the stages never see it. The schedules line up:
+in a model of every root width to 40000 limbs, for full inputs and the AGM's (k + 2)-limb ones, the child's
+precision passes the parent's second-to-last step by 1 or 2 limbs, so only the last refinement runs.
+
+| Constant | Value | Meaning |
+|---|---:|---|
+| `DYN_SQRT_RCP_CARRY_CUTOFF` | 256 | Root limbs from which a root acquires the carry's scratch. Not a crossover: without it, roots of at most 32 limbs lost 5–8 ns (1–2%) to a carry they can't read |
+
+New time ÷ old time, M1, one thread, release without LTO. Each process gets a different heap layout from a
+padding global allocator (every allocation shifted by a random multiple of 16 bytes up to 8 KiB), and a
+cell is the median over 9 processes of the fastest batches. A second copy of the old binary with other
+seeds is the control, within about ±1% here. Comparing identical binaries without the padding hides
+layout noise: 128-limb roots, which can't read a carry, read up to 16% faster by luck.
+
+These builds don't pin code alignment, and relinking identical code has moved `sqrt_dyn` at 16384 limbs by
+6% on its own, as rustfft's loops shift, so the table's large sizes share that uncertainty. Turning only the
+seed off in one binary doesn't: `sqrt_approx_dyn` then takes 4.6% longer at g = 1044, 6.9% at 2084, 9.4% at
+4164 and 11% at 8324. To pin alignment, build every crate and the harness with
+`-C llvm-args=-align-all-functions=6 -C llvm-args=-align-all-nofallthru-blocks=6`, which brought an A/B of
+builds doing the same work to within ±1%.
+
+| Limbs | ~1024 | ~2048 | ~4096 | ~8192 | ~16384 |
+|---|---:|---:|---:|---:|---:|
+| `agm_dyn` (g = 1044 ...) | 0.974 | 0.968 | 0.950 | 0.933 | 0.922 |
+| `ln_agm_dyn_at::<3>` | 0.979 | 0.962 | 0.949 | 0.939 | 0.922 |
+| `sqrt_approx_dyn`, (g + 2) → g | 0.958 | 0.941 | 0.916 | 0.889 | 0.875 |
+| `sqrt_dyn`, 2k → k | 0.974 | 0.941 | 0.929 | 0.907 | 0.891 |
+| `sqrt_only_dyn`, 2k → k | 1.001 | 0.943 | 0.928 | 0.909 | 0.901 |
+
+`sqrt_only_dyn` at 1024 has no gain because its top stage keeps a remainder, and `div_rem_dyn` takes BZ
+there. Elsewhere nothing moved. As geometric means over their cases, 33 roots from 11 to 192 limbs came to 1.002
+(control 1.000); `div_dyn`, `div_rem_dyn`, `hi_div_dyn`, `rcp_dyn`, `exp_dyn` and `ln_dyn_at` to 0.998–1.002; and
+the static entries, whose logic didn't change, to 0.993–1.011, inside their control's case-by-case spread.
+
+### Forcing NR at smaller sizes
+
+Does a carry make NR worth taking lower than dispatch does? No, at least on this machine. The carry
+makes NR cheaper, but NR's cost at small sizes is its remainder, and only NR stages can leave a carry.
+
+One balanced division, n = 2d − 1 limbs, against Knuth (d ≤ 140) or BZ, one fixed-layout run, with the
+child's reciprocal for "seeded":
+
+| d | 48 | 64 | 96 | 128 | 192 | 256 | 384 | 512 | 768 | 1024 | 1536 | 2048 | 4096 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Quotient only: NR | 1.00 | 0.96 | 0.88 | 0.84 | 0.87 | 0.82 | 0.91 | 0.97 | 1.03 | 1.05 | 0.90 | 0.89 | 0.83 |
+| Quotient only: seeded NR | 0.88 | 0.83 | 0.79 | 0.77 | 0.80 | 0.77 | 0.85 | 0.90 | 0.94 | 0.94 | 0.81 | 0.79 | 0.71 |
+| With remainder: NR | 1.77 | 1.56 | 1.50 | 1.40 | 1.47 | 1.32 | 1.37 | 1.37 | 1.34 | 1.34 | 1.17 | 1.14 | 1.04 |
+| With remainder: seeded NR | 1.64 | 1.44 | 1.41 | 1.31 | 1.40 | 1.28 | 1.32 | 1.29 | 1.27 | 1.24 | 1.09 | 1.03 | 0.92 |
+
+End to end, from the same kind of sweep (forced NR from a given divisor width, whole roots):
+
+- **With remainder (classic stages):** it loses. `sqrt_only_dyn`'s top stage forced to NR takes 1.20× at 512
+  limbs, 1.15× at 768, 1.07× at 1024 and 1.12× at 1536. `sqrt_approx_dyn` with its classic stages forced takes
+  1.03–1.06× at 524 limbs and stays within noise from 1044 up, where those stages are a small share of the
+  root. Running it with the seed off shows what the extra seeds repay: about a point (0 to 2.4), no more
+  than the forced stages cost.
+- **Lower wrapped cutoff (to make small stages quotient-only):** it loses. Below `FFT_SQR_CUTOFF` the wrapped
+  square is a whole square and a fold, 3–3.7× the classic low-half square. A cutoff of 64–192 takes 1.06–1.25×
+  from 384 to 768 limbs, and up to 1.04× above that.
+- **Quotient only:** every wrapped stage already takes NR, so the only stage left is the top of a small
+  `sqrt_approx_dyn`, whose child is Knuth and has no seed. Forcing it helps, but not because of the carry:
+  0.974 at 110 limbs, 0.970 at 128, 0.946 at 160, 0.928 at 192 and 0.911 at 224, within 0.7% of that with
+  the seed off. From 256 limbs dispatch already takes NR, and at 96 limbs and below NR wins nothing. This is `div_dyn`'s
+  crossover (`DYN_DIV_FFT_NR_BZ_CUTOFF`, about 126 limbs on balanced shapes), which looks high on the M1,
+  and belongs with the planned tuning revamp rather than in the root.
+
+### The wrapped cutoff, with the carry
+
+The sweep points the other way: at the placeholder, NR starts too low. Whole-root time ÷ time at 341:
+
+| `DYN_SQRT_WRAPPED_REM_CUTOFF` = 1024 | 384 | 512 | 768 | 1024 | 1536 | 2048 | 3072 | 4096 | 8192 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `sqrt_dyn` | 0.859 | 0.891 | 0.927 | 1.003 | 1.010 | 1.000 | 1.013 | 0.999 | 0.999 |
+| `sqrt_only_dyn` | 0.996 | 1.000 | 0.926 | 0.955 | 0.967 | 1.008 | 1.004 | 1.008 | 0.994 |
+
+`sqrt_approx_dyn` stays within noise at the AGM's sizes (0.999 at g = 524, 0.988 at 1044, 0.999 at 2084, 1.000
+at 4164, 1.005 at 8324, 0.990 at 16644). A cutoff of 1366 costs up to 14% (`sqrt_approx_dyn` at g = 2084),
+and no wrapping up to 21%. The cutoff is left at the placeholder, as a tuning pass should also look at
+`bnm1_size`: it takes the smallest 7-smooth transform, and a root of exactly 2^k limbs needs m ≥ 2^k + 1, so
+its transform is mixed-radix (m = 525 for k = 512). rustfft on NEON has cost up to twice as much per point at
+such sizes, which may be part of the mid-size losses, but it wasn't timed separately here.
+
+The balanced row above also shows `div_rem_dyn` taking NR too early on the M1: dispatch switches from BZ at
+d = 778, where NR takes 1.34× at 1024 limbs, 1.17× at 1536 and 1.14× at 2048. Its constants were measured
+on an i7-8750H.
+

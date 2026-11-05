@@ -118,7 +118,7 @@ allocation model. Raw medians and ranges are in `stages_refactored.csv`.
 
 ## 2. Exploit the known saturated root digit
 
-In `zimmermann_sqrt_core` and the outer entry, the saturated branch sets all
+In `zimmerman_sqrt_entry`, the saturated branch sets all
 low root limbs to `u64::MAX`. The correction step subsequently calls a general
 square for root+remainder output. That square is already known:
 
@@ -149,6 +149,8 @@ Both `sqrt_dyn_output` and `sqrt_static_output` unconditionally call
 `add_mul` still walks the whole root before subtraction of a zero square.
 An outer `if sh != 0` avoids this no-op work. The binomial wrapper already
 uses that guard.
+
+*Done 2026-11-05: `sqrt_denormalization` returns at once when `sh == 0`.*
 
 The measured change is small/noisy for ordinary random operands; sampled
 cost is roughly 1–2% near the lower end and below 1% from 128 limbs upward.
