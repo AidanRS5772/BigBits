@@ -2,11 +2,11 @@ use super::{mul_ref, rand_nonzero_vec, to_u128};
 use crate::utils::mul::*;
 use crate::utils::utils::trim_lz;
 use crate::utils::{
-    CHUNKING_KARATSUBA_CUTOFF, FFT_16BIT_CUTOFF, FFT_CHUNKING_KARATSUBA_CUTOFF,
-    FFT_KARATSUBA_CUTOFF, FFT_MID_CUTOFF, FFT_SQR_CUTOFF, KARATSUBA_CUTOFF, KARATSUBA_SQR_CUTOFF,
-    DYN_PARTIAL_MUL_CUTOFF, DYN_PARTIAL_SQR_CUTOFF, NTT_CHUNKING_KARATSUBA_CUTOFF,
-    NTT_KARATSUBA_CUTOFF, NTT_MID_CUTOFF, STATIC_NTT_SQR_CUTOFF, STATIC_PARTIAL_MUL_CUTOFF,
-    STATIC_PARTIAL_SQR_CUTOFF,
+    CHUNKING_KARATSUBA_CUTOFF, DYN_PARTIAL_MUL_CUTOFF, DYN_PARTIAL_SQR_CUTOFF, FFT_16BIT_CUTOFF,
+    FFT_BNM1_16BIT_CUTOFF, FFT_CHUNKING_KARATSUBA_CUTOFF, FFT_KARATSUBA_CUTOFF,
+    FFT_MID_16BIT_CUTOFF, FFT_MID_CUTOFF, FFT_SQR_16BIT_CUTOFF, FFT_SQR_CUTOFF, KARATSUBA_CUTOFF,
+    KARATSUBA_SQR_CUTOFF, NTT_CHUNKING_KARATSUBA_CUTOFF, NTT_KARATSUBA_CUTOFF, NTT_MID_CUTOFF,
+    STATIC_NTT_SQR_CUTOFF, STATIC_PARTIAL_MUL_CUTOFF, STATIC_PARTIAL_SQR_CUTOFF,
 };
 use rustfft::num_complex::Complex;
 use rustfft::num_traits::Zero;
@@ -329,7 +329,10 @@ fn test_fft_size_and_standard_helpers() {
         Complex::new(-2.5, -3.5),
         Complex::new(8.5, -8.5),
     ];
-    scale_and_round_standard(&mut rounded, 2.0);
+    // The largest rounding distance: 5.0 / 2 = 2.5 rounds (to even) by 0.5, the rest by 0.25. The
+    // peak is the largest rounded magnitude, |-8.5 / 2| rounded to 4.
+    let rounding = scale_and_round_standard(&mut rounded, 2.0);
+    assert_eq!((rounding.err, rounding.peak), (0.5, 4.0));
     assert_eq!(rounded[0], Complex::new(2.0, 4.0));
     assert_eq!(rounded[1], Complex::new(-1.0, -2.0));
     assert_eq!(rounded[2], Complex::new(4.0, -4.0));
@@ -2517,7 +2520,7 @@ fn test_mid_mul_dyn_fft_path() {
 
 #[test]
 fn test_mid_mul_dyn_ntt_sparse_shift() {
-    let n = FFT_16BIT_CUTOFF / 2;
+    let n = FFT_MID_16BIT_CUTOFF + 1;
     let mut long = vec![0u64; 2 * n - 1];
     long[n - 1] = 1;
     let short = rand_nonzero_vec(n, 7700);
@@ -3507,66 +3510,300 @@ fn test_dispatch_cost_helpers() {
     );
 }
 
-// ─── Section 9: FFT Accuracy at Cutoff ──────────────────────────────────────
+// ─── Section 9: FFT round-off check ─────────────────────────────────────────
 
+// Shapes whose unchecked FFT gives wrong limbs on worst-case operands (fft_worst_operand kinds),
+// measured on the M1 with benches/probes/fft_precision.rs: the all-ones square at 23814 limbs and
+// product at 30012 x 30012 (wrong under the old 2^16 limits), and high random digits in the
+// middle product at n = 24575 and the cyclic square at m = 34992. Their largest coefficients pass
+// 2^48, so the size gate trips them whatever their rounding error reads. (op, l, s, kinds): l is
+// the operand (squares), the long side (products), n (middle products) or m (cyclic, with s
+// operand limbs).
+fn fft_failing_shapes() -> [(&'static str, usize, usize, &'static [usize]); 4] {
+    [
+        ("sqr", 23814, 0, &[0]),
+        ("mul", 30012, 30012, &[0]),
+        ("mid", 24575, 0, &[2, 3, 4]),
+        ("cyclic", 34992, 34992, &[2, 3, 4]),
+    ]
+}
+
+// One worst-case call of a shape through the raw (unchecked) entry and the checked one: (whether
+// the raw result is wrong, its rounding, whether the checked result is exact). Products and squares
+// are judged by the residue verifier, middle products and cyclic squares against the NTT; the
+// middle products differ by design in their lowest two limbs, which are left out.
+fn fft_check_case(
+    op: &str,
+    l: usize,
+    s: usize,
+    kind: usize,
+    rng: &mut rand::rngs::StdRng,
+) -> (bool, FftRounding, bool) {
+    use super::fft_worst_operand as worst;
+    use crate::utils::utils::fold_mod_bnm1;
+    use crate::utils::verify::{verify_mul, verify_sqr};
+    let full = |f: &mut dyn FnMut(&mut [u64]) -> u64, len: usize| {
+        let mut out = vec![0u64; len];
+        out[len - 1] = f(&mut out[..len - 1]);
+        out
+    };
+    let mut err = FftRounding::default();
+    match op {
+        "sqr" => {
+            let a = worst(kind, l, rng);
+            let raw = full(
+                &mut |o| {
+                    let (top, e) = fft_sqr_entry_raw(&a, o);
+                    err = e;
+                    top
+                },
+                2 * l,
+            );
+            let checked = full(&mut |o| fft_sqr_entry(&a, o), 2 * l);
+            (!verify_sqr(&a, &raw), err, verify_sqr(&a, &checked))
+        }
+        "mul" => {
+            let (a, b) = (worst(kind, l, rng), worst(kind, s, rng));
+            let raw = full(
+                &mut |o| {
+                    let (top, e) = fft_entry_raw(&a, &b, o);
+                    err = e;
+                    top
+                },
+                l + s,
+            );
+            let checked = full(&mut |o| fft_entry(&a, &b, o), l + s);
+            (!verify_mul(&a, &b, &raw), err, verify_mul(&a, &b, &checked))
+        }
+        "mid" => {
+            let (long, short) = (worst(kind, 2 * l - 1, rng), worst(kind, l, rng));
+            let mut exact = vec![0u64; l];
+            let exact_carry = ntt_mid_mul_dyn(&long, &short, &mut exact);
+            let same = |got: &[u64], carry| got[2..] == exact[2..] && carry == exact_carry;
+            let mut raw = vec![0u64; l];
+            let (raw_carry, e) = fft_mid_mul_raw(&long, &short, &mut raw);
+            let mut checked = vec![0u64; l];
+            let checked_carry = fft_mid_mul(&long, &short, &mut checked);
+            (!same(&raw, raw_carry), e, same(&checked, checked_carry))
+        }
+        "cyclic" => {
+            let a = worst(kind, s, rng);
+            let mut exact = vec![0u64; l];
+            fold_mod_bnm1(&full(&mut |o| ntt_sqr_entry_dyn(&a, o), 2 * s), &mut exact);
+            let mut raw = vec![0u64; l];
+            let e = fft_sqr_mod_bnm1_raw(&a, &mut raw);
+            let mut checked = vec![0u64; l];
+            fft_sqr_mod_bnm1(&a, &mut checked);
+            (raw != exact, e, checked == exact)
+        }
+        _ => unreachable!(),
+    }
+}
+
+// Every wrong unchecked result trips the round-off check, and the checked entries reroute it to
+// the NTT and come out exact.
+#[test]
+fn test_fft_roundoff_check_catches_wrong_results() {
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0xf1f1);
+    let reroutes = fft_reroutes();
+    for (op, l, s, kinds) in fft_failing_shapes() {
+        let mut wrong = 0;
+        for &kind in kinds {
+            let (raw_wrong, rounding, checked_exact) = fft_check_case(op, l, s, kind, &mut rng);
+            assert!(
+                checked_exact,
+                "{op} ({l}, {s}) kind {kind}: the checked result is wrong"
+            );
+            if raw_wrong {
+                wrong += 1;
+                assert!(
+                    rounding.trips(),
+                    "{op} ({l}, {s}) kind {kind}: a wrong raw result passed with {rounding:?}"
+                );
+            }
+        }
+        // The shapes were picked by their M1 rounding; another FPU path may round them right.
+        #[cfg(target_arch = "aarch64")]
+        assert!(
+            wrong > 0,
+            "{op} ({l}, {s}): no raw result is wrong; pick a shape that fails"
+        );
+        let _ = wrong;
+    }
+    assert!(fft_reroutes() > reroutes, "no checked entry rerouted");
+}
+
+// Wrong results whose error the rounding distance can't show: past FFT_COEFF_LIMIT a coefficient's
+// error comes in steps of ulp(N·c)/N. At N = 2^15·7 (the cyclic square at m = 57344) and
+// 2^16·7 (the middle product at n = 57343), with coefficients near 2^49.7, the only readings are 0,
+// 1/8, 1/4 and 3/8, so a coefficient off by 4/7 reads 0.375. Found by the soundness run on the M1;
+// the size gate catches them.
+#[test]
+fn test_fft_coeff_gate_catches_unreadable_errors() {
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0xf1f2);
+    for (op, l, s) in [("cyclic", 57344, 57344), ("mid", 57343, 0)] {
+        let (raw_wrong, rounding, checked_exact) = fft_check_case(op, l, s, 2, &mut rng);
+        assert!(
+            checked_exact,
+            "{op} ({l}, {s}): the checked result is wrong"
+        );
+        assert!(
+            rounding.peak >= crate::utils::FFT_COEFF_LIMIT && rounding.trips(),
+            "{op} ({l}, {s}): {rounding:?} should reach the size gate"
+        );
+        // The M1's rounding; another FPU path may land elsewhere.
+        #[cfg(target_arch = "aarch64")]
+        assert!(
+            raw_wrong && rounding.err <= crate::utils::FFT_ROUNDOFF_LIMIT,
+            "{op} ({l}, {s}): expected a wrong raw result that reads under the limit, got \
+             wrong = {raw_wrong}, {rounding:?}"
+        );
+        let _ = raw_wrong;
+    }
+}
+
+// With the round-off check off, the residue check alone catches the wrong all-ones square and
+// product and redoes them on the NTT. It runs in debug builds and with FFT_RESIDUE_CHECK.
+#[test]
+fn test_fft_residue_check_catches_wrong_results() {
+    use crate::utils::verify::{verify_mul, verify_sqr};
+    if !(cfg!(debug_assertions) || crate::utils::FFT_RESIDUE_CHECK) {
+        return;
+    }
+    let before = fft_residue_reroutes();
+    let a = vec![u64::MAX; 23814];
+    let mut sq = vec![0u64; 2 * a.len()];
+    let (body, top) = sq.split_at_mut(2 * a.len() - 1);
+    top[0] = fft_sqr_entry_checked(&a, body, false);
+    assert!(verify_sqr(&a, &sq), "the 23814-limb all-ones square");
+    let b = vec![u64::MAX; 30012];
+    let mut prod = vec![0u64; 2 * b.len()];
+    let (body, top) = prod.split_at_mut(2 * b.len() - 1);
+    top[0] = fft_entry_checked(&b, &b, body, false);
+    assert!(
+        verify_mul(&b, &b, &prod),
+        "the 30012 x 30012 all-ones product"
+    );
+    // Both raw results are wrong on the M1, so both went through the residue check's reroute.
+    #[cfg(target_arch = "aarch64")]
+    assert!(
+        fft_residue_reroutes() >= before + 2,
+        "the residue check rerouted neither"
+    );
+    let _ = before;
+}
+
+// The dynamic dispatchers on a worst-case and a random operand at each FFT limit (the FFT, which
+// the worst case trips at the size gate and reroutes) and one past it (the NTT), plus the all-ones
+// square and product that were wrong under the old 2^16 limits: exact every time. In debug builds
+// the FFT products and squares also check their residues, and mul_dyn and sqr_dyn assert their
+// NTT results.
+#[test]
+fn test_dyn_dispatch_exact_around_fft_limits() {
+    use super::fft_worst_operand as worst;
+    use crate::utils::utils::fold_mod_bnm1;
+    use crate::utils::verify::{verify_mul, verify_sqr};
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0xd15b);
+    let operand = |kind: usize, len: usize, rng: &mut rand::rngs::StdRng| match kind {
+        5 => rand_nonzero_vec(len, rng.gen()),
+        k => worst(k, len, rng),
+    };
+    let both: &[usize] = &[0, 5];
+    for (n, kinds) in [
+        (FFT_SQR_16BIT_CUTOFF, both),
+        (FFT_SQR_16BIT_CUTOFF + 1, both),
+        (23814, &[0]),
+    ] {
+        for &kind in kinds {
+            let a = operand(kind, n, &mut rng);
+            let mut got = vec![0u64; 2 * n];
+            sqr_dyn(&a, &mut got);
+            assert!(verify_sqr(&a, &got), "sqr_dyn n={n} kind {kind}");
+        }
+    }
+    let half = |out: usize| ((out + 2) / 2, out + 1 - (out + 2) / 2);
+    for ((l, s), kinds) in [
+        (half(FFT_16BIT_CUTOFF), both),
+        (half(FFT_16BIT_CUTOFF + 1), both),
+        ((30012, 30012), &[0]),
+    ] {
+        for &kind in kinds {
+            let (a, b) = (operand(kind, l, &mut rng), operand(kind, s, &mut rng));
+            let mut got = vec![0u64; l + s];
+            mul_dyn(&a, &b, &mut got);
+            assert!(verify_mul(&a, &b, &got), "mul_dyn {l} x {s} kind {kind}");
+        }
+    }
+    for n in [FFT_MID_16BIT_CUTOFF, FFT_MID_16BIT_CUTOFF + 1] {
+        for kind in [2, 5] {
+            let (long, short) = (
+                operand(kind, 2 * n - 1, &mut rng),
+                operand(kind, n, &mut rng),
+            );
+            let (mut got, mut exact) = (vec![0u64; n], vec![0u64; n]);
+            let carry = mid_mul_dyn(&long, &short, &mut got);
+            let exact_carry = ntt_mid_mul_dyn(&long, &short, &mut exact);
+            assert!(
+                got[2..] == exact[2..] && carry == exact_carry,
+                "mid_mul_dyn n={n} kind {kind}"
+            );
+        }
+    }
+    // The cyclic square at its limit and the next modulus, with the Zimmermann stages' k < m.
+    let m = FFT_BNM1_16BIT_CUTOFF;
+    for (len, m) in [(m - 1, m), (m, bnm1_size(m + 1))] {
+        for kind in [2, 5] {
+            let a = operand(kind, len, &mut rng);
+            let mut sq = vec![0u64; 2 * len];
+            sq[2 * len - 1] = ntt_sqr_entry_dyn(&a, &mut sq[..2 * len - 1]);
+            let mut exact = vec![0u64; m];
+            fold_mod_bnm1(&sq, &mut exact);
+            let mut got = vec![0u64; m];
+            sqr_mod_bnm1_dyn(&a, &mut got);
+            assert!(got == exact, "sqr_mod_bnm1_dyn len={len} m={m} kind {kind}");
+        }
+    }
+}
+
+// The soundness check at scale: many worst-case and random operands at the failing shapes and a
+// few sizes around them, in parallel, each wrong raw result tripping the check and each checked
+// result exact. Run with --features _fft_cutoffs (in release: the raw and checked transforms and
+// the NTT oracles run per operand).
 #[cfg(feature = "_fft_cutoffs")]
 mod fft_cutoff {
     use super::*;
+    use rand::SeedableRng;
     use rayon::prelude::*;
 
     const TEST_CNT: u64 = 1 << 7;
 
     #[test]
-    fn test_fft_mul_accuracy_at_16bit_cutoff() {
-        for &offset in &[1, 2, 4] {
-            let s = FFT_16BIT_CUTOFF - offset;
-            let l = s + 100;
-            (0u64..TEST_CNT).into_par_iter().for_each(|seed| {
-                let long = rand_nonzero_vec(l, seed);
-                let short = rand_nonzero_vec(s, seed + 5000);
-
-                let mut out_fft = vec![0u64; l + s - 1];
-                let c_fft = fft_entry(&long, &short, &mut out_fft);
-
-                let mut out_ntt = vec![0u64; l + s - 1];
-                let c_ntt = ntt_entry_dyn(&long, &short, &mut out_ntt);
-
-                if let Some(report) = diff_report(
-                    &out_fft,
-                    c_fft,
-                    &out_ntt,
-                    c_ntt,
-                    &format!("FFT 16-bit accuracy s={s} seed={seed}"),
-                ) {
-                    panic!("{report}");
-                }
-            });
-        }
-    }
-
-    #[test]
-    fn test_fft_sqr_accuracy_at_16bit_cutoff() {
-        for &offset in &[1, 2] {
-            let n = FFT_16BIT_CUTOFF - offset;
-            (0u64..TEST_CNT).into_par_iter().for_each(|seed| {
-                let a = rand_nonzero_vec(n, seed);
-
-                let mut out_fft = vec![0u64; 2 * n - 1];
-                let c_fft = fft_sqr_entry(&a, &mut out_fft);
-
-                let mut out_ntt = vec![0u64; 2 * n - 1];
-                let c_ntt = ntt_sqr_entry_dyn(&a, &mut out_ntt);
-
-                if let Some(report) = diff_report(
-                    &out_fft,
-                    c_fft,
-                    &out_ntt,
-                    c_ntt,
-                    &format!("FFT sqr 16-bit accuracy n={n} seed={seed}"),
-                ) {
-                    panic!("{report}");
-                }
-            });
+    fn test_fft_roundoff_check_with_many_worst_case_operands() {
+        for (op, l, s, _) in fft_failing_shapes() {
+            for shrink in [0, 64, 1024] {
+                let (l, s) = match op {
+                    "cyclic" => (l, s - shrink),
+                    _ => (l - shrink, s.saturating_sub(shrink)),
+                };
+                let (wrong, missed, inexact) = (0..TEST_CNT)
+                    .into_par_iter()
+                    .map(|seed| {
+                        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+                        let kind = seed as usize % crate::tests::FFT_WORST_KINDS;
+                        let (raw_wrong, rounding, exact) = fft_check_case(op, l, s, kind, &mut rng);
+                        let missed = raw_wrong && !rounding.trips();
+                        (raw_wrong as usize, missed as usize, !exact as usize)
+                    })
+                    .reduce(|| (0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
+                assert_eq!(
+                    (missed, inexact),
+                    (0, 0),
+                    "{op} ({l}, {s}): {wrong} wrong raw results"
+                );
+            }
         }
     }
 }
@@ -3663,29 +3900,12 @@ fn test_ntt_entry_dyn_nested_in_rayon() {
 fn test_mul_structured_operand_fuzz() {
     use rand::{rngs::StdRng, Rng, SeedableRng};
     let mut rng = StdRng::seed_from_u64(424242);
-    let tops = [1u64, 1 << 32, 1 << 58, 1 << 63, 3 << 50, u64::MAX];
     let (mut trials, mut bad) = (0, 0);
     for _ in 0..2000 {
         let l = rng.gen_range(3..320usize);
         let s = rng.gen_range(3..=l);
-        let gen = |n: usize, rng: &mut StdRng| {
-            let zp = [0.0, 0.3, 0.7, 0.95][rng.gen_range(0..4)];
-            let mut v: Vec<u64> = (0..n)
-                .map(|_| {
-                    if rng.gen_bool(zp) {
-                        0
-                    } else if rng.gen_bool(0.2) {
-                        tops[rng.gen_range(0..tops.len())]
-                    } else {
-                        rng.gen()
-                    }
-                })
-                .collect();
-            v[n - 1] = tops[rng.gen_range(0..tops.len())];
-            v
-        };
-        let a = gen(l, &mut rng);
-        let b = gen(s, &mut rng);
+        let a = super::structured_vec(l, &mut rng);
+        let b = super::structured_vec(s, &mut rng);
         let (expected, exp_carry) = mul_ref_parts(&a, &b);
         let mut out = vec![0xdead_beef_u64; l + s - 1];
         let c1 = mul_dyn(&a, &b, &mut out);
@@ -3868,6 +4088,120 @@ fn test_hi_mul_guard_terms_match_exact_window() {
             assert_eq!((&out, of), (&expected.0, expected.1), "hi_sqr_dyn {msg}");
             let of = hi_sqr_static::<2048>(&a, &mut out);
             assert_eq!((&out, of), (&expected.0, expected.1), "hi_sqr_static {msg}");
+        }
+    }
+}
+
+// ─── square mod B^m − 1 ─────────────────────────────────────────────────────
+
+fn sqr_mod_bnm1_ref(a: &[u64], m: usize) -> Vec<u64> {
+    let mut out = vec![0; m];
+    crate::utils::utils::fold_mod_bnm1(&mul_ref(a, a), &mut out);
+    out
+}
+
+#[test]
+fn test_bnm1_size_is_an_fft_size() {
+    let mut last = 0;
+    for t in 1..=5000 {
+        let m = bnm1_size(t);
+        assert!(m >= t, "bnm1_size({t}) = {m}");
+        assert_eq!(
+            find_fft_size(4 * m),
+            4 * m,
+            "4 bnm1_size({t}) is not an FFT size"
+        );
+        assert_eq!(bnm1_size(m), m, "bnm1_size is not idempotent at {m}");
+        assert!(m >= last, "bnm1_size not monotone at {t}");
+        last = m;
+    }
+}
+
+// Every a.len() <= m against the schoolbook square folded, through the dispatcher and the forced
+// cyclic FFT (exercised below its cutoff too), for random, all-ones (a = B^m - 1 is zero, and
+// otherwise every coefficient is maximal), power-of-two and structured operands.
+#[test]
+fn test_sqr_mod_bnm1_matches_folded_square() {
+    use rand::{rngs::StdRng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(0xb_7000);
+    for t in [
+        1usize, 2, 3, 5, 7, 12, 30, 64, 100, 171, 300, 341, 342, 500, 700,
+    ] {
+        let m = bnm1_size(t);
+        let mut lens = vec![1, m / 2, m.saturating_sub(1), m];
+        lens.retain(|&l| l >= 1);
+        lens.dedup();
+        for len in lens {
+            let mut pow2 = vec![0; len];
+            pow2[len - 1] = 1 << (len % 64);
+            let cases = [
+                rand_nonzero_vec(len, 0xb_8000 + (t * 10 + len) as u64),
+                vec![u64::MAX; len],
+                pow2,
+                super::structured_vec(len, &mut rng),
+            ];
+            for a in cases {
+                let expected = sqr_mod_bnm1_ref(&a, m);
+                let mut out = vec![0xdead_beef; m];
+                sqr_mod_bnm1_dyn(&a, &mut out);
+                assert_eq!(out, expected, "sqr_mod_bnm1_dyn m={m} len={len}");
+                let mut out = vec![0xdead_beef; m];
+                fft_sqr_mod_bnm1(&a, &mut out);
+                assert_eq!(out, expected, "fft_sqr_mod_bnm1 m={m} len={len}");
+            }
+        }
+    }
+}
+
+// An m whose 4m is not an FFT size takes the folded sqr_dyn, as does a zero operand.
+#[test]
+fn test_sqr_mod_bnm1_non_fft_modulus_and_zero() {
+    let m = (1..1000)
+        .find(|&m| m > FFT_SQR_CUTOFF && bnm1_size(m) != m)
+        .unwrap();
+    for len in [1, m / 2, m] {
+        let a = rand_nonzero_vec(len, 0xb_9000 + len as u64);
+        let mut out = vec![0xdead_beef; m];
+        sqr_mod_bnm1_dyn(&a, &mut out);
+        assert_eq!(out, sqr_mod_bnm1_ref(&a, m), "m={m} len={len}");
+    }
+    let mut out = vec![7; 5];
+    sqr_mod_bnm1_dyn(&[0, 0], &mut out);
+    assert_eq!(out, vec![0; 5]);
+}
+
+// Large moduli against the full NTT square (exact modular arithmetic) folded, at and just past
+// the cyclic FFT's dispatch limit (in modulus limbs): all-ones operands of m limbs make every
+// cyclic coefficient maximal, and m - 1 is the Zimmermann stages' shape.
+#[test]
+fn test_sqr_mod_bnm1_large_against_full_square() {
+    let bound = FFT_BNM1_16BIT_CUTOFF;
+    assert_eq!(
+        bnm1_size(bound),
+        bound,
+        "the bound must be a cyclic FFT size"
+    );
+    assert!(bnm1_fft(bound, bound));
+    assert!(!bnm1_fft(bound, bnm1_size(bound + 1)));
+    for (len, m) in [
+        (4096usize, bnm1_size(4097)),
+        (bound - 1, bound),
+        (bound, bound),
+        (bound, bnm1_size(bound + 1)),
+    ] {
+        for (kind, a) in [
+            ("ones", vec![u64::MAX; len]),
+            ("random", rand_nonzero_vec(len, 0xb_a000 + len as u64)),
+        ] {
+            let mut full = vec![0; 2 * len];
+            let of = ntt_sqr_entry_dyn(&a, &mut full[..2 * len - 1]);
+            full[2 * len - 1] = of;
+            let mut expected = vec![0; m];
+            crate::utils::utils::fold_mod_bnm1(&full, &mut expected);
+            let mut out = vec![0xdead_beef; m];
+            sqr_mod_bnm1_dyn(&a, &mut out);
+            let first_bad = out.iter().zip(&expected).position(|(a, b)| a != b);
+            assert_eq!(first_bad, None, "{kind} len={len} m={m}");
         }
     }
 }

@@ -28,8 +28,10 @@ and the results.
 | `mid` | `FFT_MID_CUTOFF` | `mid_mul_buf` → `fft_mid_mul` |
 | `midntt` | `NTT_MID_CUTOFF` | `mid_mul_buf` → `ntt_mid_mul_static` |
 
-Not tuned: `FFT_16BIT_CUTOFF` is the f64 precision bound of the 16-bit FFT,
-not a speed choice; the `NTT_PAR_*` cutoffs decide threading, which the
+Not tuned here: `FFT_16BIT_CUTOFF`, `FFT_SQR_16BIT_CUTOFF` and
+`FFT_MID_16BIT_CUTOFF` are where random operands trip the 16-bit FFT's round-off
+check more than 2^-10 of the time (measured with the precision probe; see
+`docs/fft_precision.md`); the `NTT_PAR_*` cutoffs decide threading, which the
 schoolbook rewrite doesn't affect and a single core can't measure;
 `HI_MUL_GUARD_LIMBS` is an accuracy setting.
 

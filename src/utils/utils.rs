@@ -539,6 +539,44 @@ pub fn twos_comp(buf: &mut [u64]) {
     inc_buf(buf);
 }
 
+// Residues mod B^m - 1, m = buf.len(), B = 2^64. Zero has two forms there, 0 and all ones; the
+// canonical one is 0, so a canonical residue lies in [0, B^m - 1).
+
+// Turns the all-ones form of zero into 0.
+#[inline]
+pub fn canon_mod_bnm1(buf: &mut [u64]) {
+    if buf.iter().all(|&limb| limb == u64::MAX) {
+        buf.fill(0);
+    }
+}
+
+// out = x mod (B^m - 1), canonical, for m = out.len() >= 1 and any x. Since B^m = 1 there, it
+// adds x's m-limb chunks, and a carry out of the top wraps to the bottom.
+pub fn fold_mod_bnm1(x: &[u64], out: &mut [u64]) {
+    let m = out.len();
+    assert!(m != 0, "mod B^m - 1 needs m >= 1");
+    let first = x.len().min(m);
+    out[..first].copy_from_slice(&x[..first]);
+    out[first..].fill(0);
+    for chunk in x[first..].chunks(m) {
+        // The sum is at most 2B^m - 2, so out + chunk - B^m + 1 can't carry again.
+        if add_buf(out, chunk) {
+            inc_buf(out);
+        }
+    }
+    canon_mod_bnm1(out);
+}
+
+// a = (a - b) mod (B^m - 1) for canonical a and b of m limbs; the result is canonical.
+pub fn sub_mod_bnm1(a: &mut [u64], b: &[u64]) {
+    debug_assert_eq!(a.len(), b.len());
+    // On a borrow a holds a - b + B^m >= 2 (b <= B^m - 2), so taking 1 off can't borrow, and
+    // without one a - b <= B^m - 2.
+    if sub_buf(a, b) {
+        dec_buf(a);
+    }
+}
+
 // buf >> sh in place, returning the bits shifted out of the bottom (at the top of the
 // returned limb). Plain Rust, reading each limb's upper neighbour before it is overwritten,
 // which LLVM vectorizes: about 1.5 cycles a limb from 64 limbs, against 3 for one shrd asm

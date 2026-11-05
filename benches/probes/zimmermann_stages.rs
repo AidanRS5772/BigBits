@@ -115,6 +115,8 @@ mod measured {
                 let mut guard = ScratchGuard::acquire();
                 finish(guard.get(square_len));
             },
+            // Classic stages throughout, so the stage timers keep their meaning.
+            None,
         );
         if output == SqrtOutput::RootRem {
             if !SKIP_NOOP || sh != 0 {

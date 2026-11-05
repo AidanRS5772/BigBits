@@ -18,6 +18,7 @@ mod test_theta;
 mod test_theta_plan;
 mod test_trans;
 mod test_utils;
+mod test_verify;
 
 use crate::utils::div::div_dyn;
 use crate::utils::mul::{mul_buf, mul_vec};
@@ -47,6 +48,51 @@ pub(super) fn rand_nonzero_vec(len: usize, seed: u64) -> Vec<u64> {
     if v[len - 1] == 0 {
         v[len - 1] = 1;
     }
+    v
+}
+
+// Operand kinds that round worst in the 16-bit FFT (unsigned digits near their maximum put most of
+// the spectrum in one huge zero-frequency term, which every rounding error scales with): all ones,
+// a step, and random digits all at least 0xF000, 0xFF00 or 0xE000. Measured against the exact NTT,
+// these round worse than random operands by 3-4x, and the middle product's worst is not all ones.
+pub(super) const FFT_WORST_KINDS: usize = 5;
+
+pub(super) fn fft_worst_operand(kind: usize, len: usize, rng: &mut StdRng) -> Vec<u64> {
+    let mut v: Vec<u64> = match kind % FFT_WORST_KINDS {
+        0 => vec![u64::MAX; len],
+        1 => (0..len)
+            .map(|i| if i >= len / 2 { u64::MAX } else { 0 })
+            .collect(),
+        k => {
+            let digits = [
+                0xF000_F000_F000_F000u64,
+                0xFF00_FF00_FF00_FF00,
+                0xE000_E000_E000_E000,
+            ];
+            (0..len).map(|_| rng.gen::<u64>() | digits[k - 2]).collect()
+        }
+    };
+    v[len - 1] |= 1 << 63;
+    v
+}
+
+// A trimmed `n`-limb operand biased toward zero limbs and powers of two, which random limbs
+// almost never produce: structured operands catch carry and offset bugs that random ones miss.
+pub(super) fn structured_vec(n: usize, rng: &mut StdRng) -> Vec<u64> {
+    const TOPS: [u64; 6] = [1, 1 << 32, 1 << 58, 1 << 63, 3 << 50, u64::MAX];
+    let zp = [0.0, 0.3, 0.7, 0.95][rng.gen_range(0..4)];
+    let mut v: Vec<u64> = (0..n)
+        .map(|_| {
+            if rng.gen_bool(zp) {
+                0
+            } else if rng.gen_bool(0.2) {
+                TOPS[rng.gen_range(0..TOPS.len())]
+            } else {
+                rng.gen()
+            }
+        })
+        .collect();
+    v[n - 1] = TOPS[rng.gen_range(0..TOPS.len())];
     v
 }
 

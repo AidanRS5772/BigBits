@@ -8,6 +8,7 @@ pub mod sqrt;
 pub mod theta_plan;
 pub mod trans;
 pub mod utils;
+pub mod verify;
 
 // A static entry's request needs more limbs than its N provides. This is a limit of
 // the stack buffers, not an arithmetic failure: the same call succeeds once N >= min_n.
@@ -109,8 +110,43 @@ pub const KARATSUBA_CUTOFF: f64 = 52.0;
 // shapes: 0.19% (regular) and 0.33% (chunking).
 pub const FFT_CHUNKING_KARATSUBA_CUTOFF: f64 = 1.88;
 pub const FFT_KARATSUBA_CUTOFF: f64 = 1.96;
-// The 16-bit FFT's f64 precision bound, not a speed choice.
-pub const FFT_16BIT_CUTOFF: usize = 1 << 16;
+// The 16-bit FFT entries' round-off check. A call is redone on the NTT when its largest rounding
+// distance (|x − round(x)| over every coefficient) passes FFT_ROUNDOFF_LIMIT, or when its largest
+// coefficient reaches FFT_COEFF_LIMIT. A wrong limb needs a coefficient off by more than 0.5, which
+// reads 1 − e: one off by less than 0.6 passes 0.4 by itself (Prime95's convention).
+pub const FFT_ROUNDOFF_LIMIT: f64 = 0.4;
+// The distance can only be read as finely as the coefficients are stored. Before the 1/N scaling,
+// an output near N·c is a multiple of ulp(N·c), so a coefficient's error is a multiple of
+// ulp(N·c)/N ≤ c·2^-52: under 1/16 below 2^48. Past it the steps coarsen until no reading can pass
+// 0.4. At N = 2^15·7 and c ≈ 2^49.7 the only readings are 0, 1/8, 1/4 and 3/8, and wrong cyclic
+// squares and middle products read 0.375 (docs/fft_precision.md). Random operands stay below 2^48
+// up to the dispatch limits; operands with digits near 2^16 reach it from about 18000 limbs.
+pub const FFT_COEFF_LIMIT: f64 = (1u64 << 48) as f64;
+// Whether fft_entry and fft_sqr_entry also check every result by its residues mod the NTT primes
+// (utils::verify) in release builds, redoing a mismatch on the NTT. Debug builds always do. It
+// catches any wrong product whose error fits in 188 bits, whatever the rounding read, and costs a
+// pass over the operands and the result: see docs/fft_precision.md for its share of the FFT's
+// time. Middle products and squares mod B^m − 1 have no such check.
+pub const FFT_RESIDUE_CHECK: bool = false;
+// The 16-bit FFT entries' dispatch limits, past which the dynamic dispatchers take the NTT. They
+// are speed choices, not accuracy bounds: the round-off check redoes any call that could be wrong.
+// Each is the largest size below the first transform size where uniformly random operands trip the
+// check (FFT_ROUNDOFF_LIMIT or FFT_COEFF_LIMIT) more than 1 in 2^10 times (over 16 trips in 2^14
+// operands), so random-like operands rarely pay for both transforms. Operands with digits near
+// 2^16 (all ones, say) reach FFT_COEFF_LIMIT from about 18000 limbs and cost the FFT plus the NTT
+// above that. Measured on the M1 (rustfft's NEON paths); remeasure on x86. See
+// docs/fft_precision.md.
+// Products: output limbs l + s − 1 (transform 423360: 0 trips in 2^14, largest coefficient
+// 2^47.71; 17 in 12727 at 428652, all past 0.4).
+pub const FFT_16BIT_CUTOFF: usize = 105839;
+// Squares: operand limbs (transform 442368: 0 trips in 2^14, 2^47.77; 17 in 11323 at 444528).
+pub const FFT_SQR_16BIT_CUTOFF: usize = 55296;
+// Middle products: short limbs n (transform 518616: 0 trips in 2^14, 2^47.998; 17 in 10875 at
+// 524288).
+pub const FFT_MID_16BIT_CUTOFF: usize = 64826;
+// Squares mod B^m − 1: modulus limbs m, a bnm1_size (transform 259200: 11 trips in 2^14, all at
+// FFT_COEFF_LIMIT; 17 in 8845 at 259308, from the same gate).
+pub const FFT_BNM1_16BIT_CUTOFF: usize = 64800;
 
 // is_karatsuba's cost ratios, karatsuba_entry_static against ntt_entry_static with
 // the NTT's three convolutions on rayon: squares switch from about 2500 limbs. On one
@@ -213,6 +249,16 @@ pub const DYN_SQRT_APPROX_ZIMMERMAN_CUTOFF: usize = 11;
 pub const STATIC_SQRT_REM_ZIMMERMAN_CUTOFF: usize = 16;
 pub const STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF: usize = 11;
 pub const STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF: usize = 11;
+
+// sqr_mod_bnm1_dyn runs its cyclic FFT on operands above this many limbs, and squares with
+// sqr_dyn then folds below. GUESS: a full square's FFT crossover; the wrapped transform is half as
+// long, so the true crossover is probably lower.
+pub const DYN_SQR_BNM1_FFT_CUTOFF: usize = FFT_SQR_CUTOFF;
+// Dynamic Zimmermann levels (and sqrt_dyn's top level) with at least this many root limbs form
+// their remainder X - s^2 from one square mod B^m - 1 and divide quotient-only, rather than take
+// the division's remainder and subtract the low root's square. GUESS: every level whose wrapped
+// square is on the FFT.
+pub const DYN_SQRT_WRAPPED_REM_CUTOFF: usize = DYN_SQR_BNM1_FFT_CUTOFF + 1;
 
 // The dynamic constant caches (ln2_dyn, pi_dyn) copy requests of up to their tables' 1024
 // limbs from them, and past that build in parallel (rayon) when

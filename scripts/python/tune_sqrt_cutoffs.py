@@ -36,7 +36,8 @@ def build(output, rlib):
     # Production wrappers keep compiling; probes call run_dyn/run_static instead.
     source = source.replace("sqrt_dyn_output(x,", "sqrt_dyn_output::<17, 17>(x,")
     source = source.replace("sqrt_static_output::<N>(x,", "sqrt_static_output::<N, 17, 17>(x,")
-    # Force precisely the outer core step while letting its child use LEAF.
+    # Force precisely the outer core step while letting its child use LEAF. MODE 3 passes no
+    # wrapped-remainder hook, so it times the classic step (division remainder and low square).
     # Calling core::<4096> directly would simply measure binomial twice.
     core = source[source.index("fn zimmermann_sqrt_core<"):source.index("// The sole entry into the recursive stack.")]
     core = replace_once(core, "fn zimmermann_sqrt_core<", "fn one_descent<")
@@ -46,16 +47,16 @@ def build(output, rlib):
 pub fn run_dyn<const TOP: usize, const LEAF: usize, const MODE: u8>(x: &mut [u64], s: &mut [u64]) {
     if MODE == 3 {
         if TOP == usize::MAX { binom_sqrt_core(x, s); }
-        else { one_descent::<LEAF>(x, s, &mut div_rem_dyn, &mut sqr_dyn); }
+        else { one_descent::<LEAF>(x, s, &mut dyn_div, &mut sqr_dyn, None); }
     } else {
         let output = match MODE { 0 => SqrtOutput::RootRem, 1 => SqrtOutput::Root, 2 => SqrtOutput::ApproxRoot, _ => unreachable!() };
-        sqrt_dyn_output::<TOP, LEAF>(x, s, output);
+        sqrt_dyn_output::<TOP, LEAF>(x, s, output, DYN_SQRT_WRAPPED_REM_CUTOFF);
     }
 }
 pub fn run_static<const N: usize, const TOP: usize, const LEAF: usize, const MODE: u8>(x: &mut [u64], s: &mut [u64]) {
     if MODE == 3 {
         if TOP == usize::MAX { binom_sqrt_core(x, s); }
-        else { one_descent::<LEAF>(x, s, &mut div_rem_static::<N>, &mut sqr_static::<N>); }
+        else { one_descent::<LEAF>(x, s, &mut static_div::<N>, &mut sqr_static::<N>, None); }
     } else {
         let output = match MODE { 0 => SqrtOutput::RootRem, 1 => SqrtOutput::Root, 2 => SqrtOutput::ApproxRoot, _ => unreachable!() };
         sqrt_static_output::<N, TOP, LEAF>(x, s, output);

@@ -223,6 +223,13 @@ By expected gain on the pure AGM:
 1. **Wrapped-square remainder in the Zimmermann core** (Proposal 1, item 1): an estimated 7–11%
    from 4096 limbs. It also speeds `sqrt_dyn`, `sqrt_only_dyn` and, in its general form, every NR
    `div_rem`.
+
+   *Implemented 2026-11-02* for the dynamic core and `sqrt_dyn`'s top stage, with untuned
+   placeholder cutoffs (see the wrapped-remainder section of `docs/sqrt_cutoff_tuning.md`). The
+   AGM's root, (g + 2) → g limbs, takes 0.93 of its old time at g = 2084, 0.88 at 4164, 0.86 at
+   8324 and 0.85 at 16644, but 1.04 at 1044. By the root's share above, that is about 4%, 8%, 10%
+   and 11% off the AGM, and 2% onto it at 1024 output limbs, until tuning. The AGM itself wasn't
+   re-timed. Its outputs are unchanged, because the roots are bit-identical.
 2. **Closed-form tail** (Proposal 2): 4–5.6% measured, an estimated 5–6% with one reciprocal, and
    about 2% more folded into `ln_agm_core`. Low risk with existing primitives.
 3. **Reciprocal chaining through the root's recursion** (Proposal 1, item 2): an estimated 5–8%,

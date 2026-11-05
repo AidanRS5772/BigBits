@@ -1,15 +1,16 @@
 use super::{mul_ref, rand_vec};
 use crate::utils::sqrt::{
-    binom_sqrt, sqrt_approx_dyn, sqrt_approx_static, sqrt_dyn, sqrt_only_dyn, sqrt_only_static,
-    sqrt_static, zimmerman_sqrt_approx_dyn, zimmerman_sqrt_approx_static, zimmerman_sqrt_dyn,
-    zimmerman_sqrt_only_dyn, zimmerman_sqrt_only_static, zimmerman_sqrt_static,
+    binom_sqrt, sqrt_approx_dyn, sqrt_approx_dyn_at, sqrt_approx_static, sqrt_dyn, sqrt_dyn_at,
+    sqrt_only_dyn, sqrt_only_dyn_at, sqrt_only_static, sqrt_static, zimmerman_sqrt_approx_dyn,
+    zimmerman_sqrt_approx_static, zimmerman_sqrt_dyn, zimmerman_sqrt_only_dyn,
+    zimmerman_sqrt_only_static, zimmerman_sqrt_static,
 };
 use crate::utils::utils::{add_buf, cmp_buf, dec_buf, eq_buf, inc_buf, sub_buf};
 use crate::utils::{
     DYN_SQRT_APPROX_ZIMMERMAN_CUTOFF, DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF,
-    DYN_SQRT_REM_ZIMMERMAN_CUTOFF, STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF,
-    STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF, STATIC_SQRT_REM_ZIMMERMAN_CUTOFF,
-    ZIMMERMAN_SQRT_LEAF_CUTOFF,
+    DYN_SQRT_REM_ZIMMERMAN_CUTOFF, DYN_SQRT_WRAPPED_REM_CUTOFF,
+    STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF, STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF,
+    STATIC_SQRT_REM_ZIMMERMAN_CUTOFF, ZIMMERMAN_SQRT_LEAF_CUTOFF,
 };
 
 /// Verify both outputs for
@@ -650,4 +651,143 @@ fn test_sqrt_root_outputs_one_limb() {
 #[should_panic(expected = "x.len() > s.len()")]
 fn test_sqrt_rem_rejects_one_limb() {
     sqrt_dyn(&mut [5], &mut [0]);
+}
+
+// ─── wrapped remainder ──────────────────────────────────────────────────────
+
+// Every dynamic stage from the recursive leaf up forms its remainder from a wrapped square.
+fn sqrt_dyn_wrapped_all(x: &mut [u64], s: &mut [u64]) {
+    sqrt_dyn_at(x, s, ZIMMERMAN_SQRT_LEAF_CUTOFF);
+}
+
+// The wrapped stages change how a remainder is formed, not the root or remainder, so every output
+// mode must match the classic stages (cutoff usize::MAX) bit for bit: the root everywhere, and
+// the remainder for sqrt_dyn. The root-and-remainder output is also checked against schoolbook.
+fn assert_wrapped_matches_classic(x: &[u64], root_len: usize) {
+    type At = fn(&mut [u64], &mut [u64], usize);
+    let mut cutoffs = vec![
+        ZIMMERMAN_SQRT_LEAF_CUTOFF,
+        (root_len / 2).max(ZIMMERMAN_SQRT_LEAF_CUTOFF),
+        DYN_SQRT_WRAPPED_REM_CUTOFF,
+    ];
+    cutoffs.dedup();
+    let modes: [(&str, At, bool); 3] = [
+        ("rem", sqrt_dyn_at, true),
+        ("only", sqrt_only_dyn_at, false),
+        ("approx", sqrt_approx_dyn_at, false),
+    ];
+    for (name, at, remainder) in modes {
+        let mut classic_x = x.to_vec();
+        let mut classic_s = vec![u64::MAX; root_len];
+        at(&mut classic_x, &mut classic_s, usize::MAX);
+        for &cutoff in &cutoffs {
+            let mut wrapped_x = x.to_vec();
+            let mut wrapped_s = vec![0xdead_beef; root_len];
+            at(&mut wrapped_x, &mut wrapped_s, cutoff);
+            let shape = format!("root_len={root_len} x.len()={} cutoff={cutoff}", x.len());
+            assert_eq!(wrapped_s, classic_s, "{name} root differs: {shape}");
+            if remainder {
+                assert_eq!(wrapped_x, classic_x, "{name} remainder differs: {shape}");
+            }
+        }
+    }
+    assert_sqrt_contract_with(x, root_len, sqrt_dyn_wrapped_all);
+}
+
+// Random inputs of every top-level shape (full, one short, three quarters, and the most padded),
+// with and without a normalization shift, at sizes whose stages run the folded fallback (small)
+// and the cyclic FFT (from DYN_SQR_BNM1_FFT_CUTOFF limbs).
+#[test]
+fn test_sqrt_wrapped_remainder_matches_classic() {
+    for root_len in [24usize, 50, 101, 400, 700, 1500] {
+        let mut x_lens = vec![
+            2 * root_len,
+            2 * root_len - 1,
+            3 * root_len / 2 + 1,
+            root_len + 1,
+        ];
+        x_lens.dedup();
+        for (i, x_len) in x_lens.into_iter().enumerate() {
+            let mut x = rand_vec(x_len, 0x5_0000 + 100 * root_len as u64 + x_len as u64);
+            x[x_len - 1] = match i % 3 {
+                0 => x[x_len - 1] | (1 << 63),
+                1 => (x[x_len - 1] >> 5) | 1,
+                _ => 1,
+            };
+            assert_wrapped_matches_classic(&x, root_len);
+        }
+    }
+}
+
+// y^2 + delta (delta in {-1, 0, 2y}) at `len` limbs.
+fn square_plus(y: &[u64], len: usize, delta: i8) -> Vec<u64> {
+    let mut v = mul_ref(y, y);
+    v.resize(len, 0);
+    match delta {
+        -1 => assert!(!sub_buf(&mut v, &[1])),
+        0 => {}
+        _ => {
+            add_buf(&mut v, y);
+            add_buf(&mut v, y);
+        }
+    }
+    v
+}
+
+// Remainder edge cases at the top stage and at the core's top stage, where the wrapped residue
+// is zero (perfect squares), negative (s one too big: Y^2 - 1), at its 2s maximum, or where a
+// stage saturates (its child's remainder is twice its root).
+#[test]
+fn test_sqrt_wrapped_remainder_edges() {
+    for root_len in [50usize, 400, 700] {
+        let x_len = 2 * root_len;
+        let mut y = rand_vec(root_len, 0x5_1000 + root_len as u64);
+        y[root_len - 1] |= 1 << 63;
+        let mut sparse_y = vec![0; root_len];
+        sparse_y[root_len - 1] = 1 << 63;
+        sparse_y[0] = 1;
+
+        let mut cases = vec![
+            ("Y^2", square_plus(&y, x_len, 0)),
+            ("Y^2 - 1", square_plus(&y, x_len, -1)),
+            ("(Y + 1)^2 - 1", square_plus(&y, x_len, 2)),
+            ("sparse Y^2", square_plus(&sparse_y, x_len, 0)),
+            ("sparse Y^2 - 1", square_plus(&sparse_y, x_len, -1)),
+            ("all ones", vec![u64::MAX; x_len]),
+        ];
+        let mut min = vec![0; x_len];
+        min[x_len - 1] = 1 << 62;
+        cases.push(("smallest normalized", min));
+
+        // Saturate the top stage (its child has hi_e limbs) and the core's top stage (its child
+        // has h limbs): (t + 1)^2 - 1 in the top 2w limbs makes the child's remainder 2t.
+        let hi_e = root_len - (root_len - 1) / 2;
+        let h = hi_e - (hi_e - 1) / 2;
+        for (name, w) in [("saturated top stage", hi_e), ("saturated core stage", h)] {
+            let mut t = rand_vec(w, 0x5_2000 + (root_len * 10 + w) as u64);
+            t[w - 1] |= 1 << 63;
+            let mut x = rand_vec(x_len, 0x5_3000 + (root_len * 10 + w) as u64);
+            x[x_len - 2 * w..].copy_from_slice(&square_plus(&t, 2 * w, 2));
+            cases.push((name, x));
+        }
+
+        // Padded tops (X = x B^p): a perfect square with p low zero limbs, and one less than it
+        // by B^p (a negative tentative remainder at the top stage).
+        for p in [2usize, 2 * ((root_len - 1) / 2)] {
+            let mut yp = vec![0; root_len];
+            yp[p / 2..].copy_from_slice(&y[p / 2..]);
+            let full = square_plus(&yp, x_len, 0);
+            assert!(full[..p].iter().all(|&limb| limb == 0));
+            cases.push(("padded Y^2", full[p..].to_vec()));
+            let mut less = full[p..].to_vec();
+            assert!(!sub_buf(&mut less, &[1]));
+            cases.push(("padded Y^2 - B^p", less));
+        }
+
+        for (name, x) in cases {
+            assert_ne!(x[x.len() - 1], 0, "{name}: untrimmed input");
+            println!("{name}, root_len={root_len}");
+            assert_wrapped_matches_classic(&x, root_len);
+        }
+    }
 }

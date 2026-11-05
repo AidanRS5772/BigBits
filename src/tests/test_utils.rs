@@ -1082,3 +1082,105 @@ fn test_to_u128_values() {
     assert_eq!(to_u128(&[0, 1]), 1u128 << 64);
     assert_eq!(to_u128(&[u64::MAX, u64::MAX]), u128::MAX);
 }
+
+// ─── residues mod B^m − 1 ───────────────────────────────────────────────────
+
+// x mod (B^m − 1) through the division code, independently of fold_mod_bnm1: the remainder of x
+// by the all-ones m-limb divisor.
+fn mod_bnm1_ref(x: &[u64], m: usize) -> Vec<u64> {
+    let d = vec![u64::MAX; m];
+    let mut n = x[..buf_len(x)].to_vec();
+    let mut q = vec![0; n.len().saturating_sub(m) + 1];
+    crate::utils::div::div_rem_dyn(&mut n, &d, &mut q);
+    let mut out = vec![0; m];
+    let r = buf_len(&n);
+    assert!(r <= m, "remainder wider than the divisor");
+    out[..r].copy_from_slice(&n[..r]);
+    out
+}
+
+fn fold_of(x: &[u64], m: usize) -> Vec<u64> {
+    let mut out = vec![0xdead_beef; m];
+    fold_mod_bnm1(x, &mut out);
+    out
+}
+
+#[test]
+fn test_fold_mod_bnm1_matches_division() {
+    use rand::{rngs::StdRng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(0xb_0001);
+    for m in [1usize, 2, 3, 5, 8, 17] {
+        for len in 0..=4 * m + 1 {
+            let mut cases = vec![
+                rand_vec(len, 0xb_1000 + (m * 100 + len) as u64),
+                vec![u64::MAX; len],
+            ];
+            if len > 0 {
+                cases.push(super::structured_vec(len, &mut rng));
+            }
+            for x in cases {
+                assert_eq!(fold_of(&x, m), mod_bnm1_ref(&x, m), "m={m} x={x:#x?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_fold_mod_bnm1_edges() {
+    for m in [1usize, 3, 8] {
+        let zero = vec![0; m];
+        // B^m − 1 itself, and two chunks summing to it without a carry, are zero.
+        assert_eq!(fold_of(&vec![u64::MAX; m], m), zero);
+        let low = rand_vec(m, 0xb_2000 + m as u64);
+        let mut x = low.clone();
+        x.extend(low.iter().map(|&limb| !limb));
+        assert_eq!(fold_of(&x, m), zero, "chunks summing to B^m - 1, m={m}");
+        // (B^m − 1) + B^m carries out of the top, which wraps to 1.
+        let mut x = vec![u64::MAX; m];
+        x.push(1);
+        let mut one = zero.clone();
+        one[0] = 1;
+        assert_eq!(fold_of(&x, m), one, "wrapping carry, m={m}");
+        // Shorter than m: unchanged, zero-padded.
+        assert_eq!(fold_of(&[5], m)[0], 5);
+        assert_eq!(fold_of(&[], m), zero);
+    }
+    // m = 1 against u128.
+    for seed in 0..20 {
+        let x = rand_vec(2, 0xb_3000 + seed);
+        let expected = (to_u128(&x) % u64::MAX as u128) as u64;
+        assert_eq!(fold_of(&x, 1), vec![expected]);
+    }
+}
+
+#[test]
+fn test_sub_mod_bnm1() {
+    for m in [1usize, 2, 3, 8] {
+        for seed in 0..50 {
+            let a = fold_of(&rand_vec(m + 1, 0xb_4000 + seed), m);
+            let b = fold_of(&rand_vec(m + 1, 0xb_5000 + seed), m);
+            let mut d = a.clone();
+            sub_mod_bnm1(&mut d, &b);
+            assert!(
+                d.iter().any(|&limb| limb != u64::MAX),
+                "non-canonical difference"
+            );
+            let mut sum = d.clone();
+            sum.push(0);
+            add_buf(&mut sum, &b);
+            assert_eq!(fold_of(&sum, m), a, "m={m} seed={seed}");
+        }
+        let a = rand_vec(m, 0xb_6000 + m as u64);
+        let mut d = a.clone();
+        sub_mod_bnm1(&mut d, &a);
+        assert_eq!(d, vec![0; m], "a - a");
+        // 0 − (B^m − 2) = 1.
+        let mut b = vec![u64::MAX; m];
+        b[0] -= 1;
+        let mut d = vec![0; m];
+        sub_mod_bnm1(&mut d, &b);
+        let mut one = vec![0; m];
+        one[0] = 1;
+        assert_eq!(d, one, "0 - (B^m - 2)");
+    }
+}

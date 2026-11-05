@@ -159,3 +159,38 @@ taskset -c 2 ./sqrt_cutoffs --sizes 4:48 --leaves 0,11 --modes rem,only,approx \
   --shapes full,near,mid,padded --pattern mixed --rounds 15 --ms 15 --families dyn,static \
   --seed 12345
 ```
+
+## Wrapped remainder (untuned, 2026-11-02)
+
+Dynamic Zimmermann stages can form their remainder R = X − s² from residues mod B^m − 1
+instead of from the division's remainder and the low root's square (see `sqrt.rs` in
+`CLAUDE.md`, and recommendation 1 of `docs/agm_profile.md`). The roots and remainders are
+bit-identical either way, so only the time moves. There are two placeholders, both `// GUESS`, and
+the cyclic FFT's dispatch limit:
+
+| Constant | Value | Decides |
+|---|---:|---|
+| `DYN_SQRT_WRAPPED_REM_CUTOFF` | 341 | Root limbs from which a dynamic stage (and `sqrt_dyn`'s top stage) takes the wrapped remainder |
+| `DYN_SQR_BNM1_FFT_CUTOFF` | 340 | Operand limbs above which `sqr_mod_bnm1_dyn` runs the cyclic FFT rather than `sqr_dyn` and a fold |
+| `FFT_BNM1_16BIT_CUTOFF` | 64800 | The cyclic FFT's dispatch limit in modulus limbs: the largest `bnm1_size` below where random operands trip its round-off check (here its 2^48 size gate) more than 1 in 2^10 times, not timed against the stages (`docs/fft_precision.md`). Stages whose `bnm1_size(k + 1)` passes it stay classic |
+
+The placeholders follow `FFT_SQR_CUTOFF`: every stage whose wrapped square is on the FFT takes it.
+That isn't measured, and it costs time at the small end. Release A/B against the classic stages
+(cutoff `usize::MAX` through `sqrt_approx_dyn_at`/`sqrt_dyn_at`), M1, `prof`, one thread, minimum
+of 15 alternating rounds, with identical outputs asserted. Wrapped time ÷ classic time:
+
+| `sqrt_approx_dyn`, (g + 2) → g | 264 | 524 | 1044 | 2084 | 4164 | 8324 | 16644 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| wrapped / classic | 1.00 | 1.00 | 1.04 | 0.93 | 0.88 | 0.86 | 0.85 |
+
+| `sqrt_dyn`, 2k → k | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| wrapped / classic | 1.00 | 1.12 | 1.04 | 0.95 | 0.88 | 0.87 | 0.87 |
+
+A second run agreed within 1%. Through 524 limbs no stage reaches the cutoff. A stage of a few
+hundred limbs loses, probably because its wrapped square of k limbs runs an FFT while the classic
+square of k/2 is still Karatsuba, and the classic division keeps its remainder cheaply through BZ
+there (neither cause was timed separately). To tune it, time the forced entries per root width, or one
+stage at a time as `core` mode does for the leaf. The `one_descent` probe passes no
+wrapped hook, so it still times the classic stage. A static version needs a cyclic NTT square
+with all three primes at one transform length.

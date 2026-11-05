@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use crate::utils::verify::Residues;
 use crate::utils::{utils::*, *};
 use core::task;
 use rayon::*;
@@ -1709,67 +1710,138 @@ pub const fn find_fft_size(n: usize) -> usize {
     return fft_log_prim_search(4, n, FFT_RADIX.len(), &FFT_RADIX);
 }
 
+/// One FFT call's rounding: `err` is the largest distance from a scaled coefficient to the integer
+/// it rounded to, and `peak` the largest rounded coefficient's magnitude. The checked entries keep
+/// a result only while [`FftRounding::trips`] is false; the raw ones return it for the probe and
+/// the tests.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FftRounding {
+    pub err: f64,
+    pub peak: f64,
+}
+
+impl FftRounding {
+    /// Whether a checked entry redoes the call on the NTT: its error passes `FFT_ROUNDOFF_LIMIT`
+    /// or its peak reaches `FFT_COEFF_LIMIT`, where the error can no longer be read finely enough.
+    /// NaN trips, though finite inputs never make one.
+    pub fn trips(self) -> bool {
+        !(self.err <= FFT_ROUNDOFF_LIMIT && self.peak < FFT_COEFF_LIMIT)
+    }
+
+    fn max(self, o: Self) -> Self {
+        FftRounding {
+            err: self.err.max(o.err),
+            peak: self.peak.max(o.peak),
+        }
+    }
+}
+
+// Each scale_and_round divides the inverse transform's coefficients by its length, rounds them to
+// the nearest integer and returns the call's FftRounding: the largest distance it rounded across
+// and the largest rounded magnitude. Coefficients are finite (bounded integers plus rounding
+// error), so the maxima need no NaN handling.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn scale_and_round_x86(x: &mut [Complex<f64>], scale: f64) {
+unsafe fn scale_and_round_x86(x: &mut [Complex<f64>], scale: f64) -> FftRounding {
     let coefs = std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut f64, x.len() * 2);
     let divisor = _mm256_set1_pd(scale);
+    let sign = _mm256_set1_pd(-0.0);
+    // Two accumulators each, so the maxima's loop-carried chains don't hold up the loop.
+    let (mut err0, mut err1) = (_mm256_setzero_pd(), _mm256_setzero_pd());
+    let (mut peak0, mut peak1) = (_mm256_setzero_pd(), _mm256_setzero_pd());
     const ROUND: i32 = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
-    let chunks = coefs.len() / 4;
+    let chunks = coefs.len() / 8;
     let ptr = coefs.as_mut_ptr();
     for i in 0..chunks {
-        let offset = i * 4;
-        // Load 4 f64s
-        let v = _mm256_loadu_pd(ptr.add(offset));
-        // Divide by scale
-        let scaled = _mm256_div_pd(v, divisor);
-        // Round
-        let rounded = _mm256_round_pd::<ROUND>(scaled);
-        // Store
-        _mm256_storeu_pd(ptr.add(offset), rounded);
+        let offset = i * 8;
+        // Load 8 f64s, divide by scale and round
+        let s0 = _mm256_div_pd(_mm256_loadu_pd(ptr.add(offset)), divisor);
+        let s1 = _mm256_div_pd(_mm256_loadu_pd(ptr.add(offset + 4)), divisor);
+        let r0 = _mm256_round_pd::<ROUND>(s0);
+        let r1 = _mm256_round_pd::<ROUND>(s1);
+        // |scaled - rounded| and |rounded|: clear the sign bits
+        err0 = _mm256_max_pd(err0, _mm256_andnot_pd(sign, _mm256_sub_pd(s0, r0)));
+        err1 = _mm256_max_pd(err1, _mm256_andnot_pd(sign, _mm256_sub_pd(s1, r1)));
+        peak0 = _mm256_max_pd(peak0, _mm256_andnot_pd(sign, r0));
+        peak1 = _mm256_max_pd(peak1, _mm256_andnot_pd(sign, r1));
+        _mm256_storeu_pd(ptr.add(offset), r0);
+        _mm256_storeu_pd(ptr.add(offset + 4), r1);
     }
+    let (mut errs, mut peaks) = ([0.0f64; 4], [0.0f64; 4]);
+    _mm256_storeu_pd(errs.as_mut_ptr(), _mm256_max_pd(err0, err1));
+    _mm256_storeu_pd(peaks.as_mut_ptr(), _mm256_max_pd(peak0, peak1));
+    let tail = scale_and_round_slice(&mut coefs[chunks * 8..], scale);
+    errs.iter()
+        .zip(&peaks)
+        .fold(tail, |m, (&err, &peak)| m.max(FftRounding { err, peak }))
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn scale_and_round_aarch(x: &mut [Complex<f64>], scale: f64) {
+unsafe fn scale_and_round_aarch(x: &mut [Complex<f64>], scale: f64) -> FftRounding {
     let coefs = std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut f64, x.len() * 2);
     let divisor = vdupq_n_f64(scale);
-    let chunks = coefs.len() / 2;
+    // Two accumulators each, so the maxima's loop-carried chains don't hold up the loop.
+    let (mut err0, mut err1) = (vdupq_n_f64(0.0), vdupq_n_f64(0.0));
+    let (mut peak0, mut peak1) = (vdupq_n_f64(0.0), vdupq_n_f64(0.0));
+    let chunks = coefs.len() / 4;
     let ptr = coefs.as_mut_ptr();
     for i in 0..chunks {
-        let offset = i * 2;
-        // Load 2 f64s
-        let v = vld1q_f64(ptr.add(offset));
-        // Divide by scale
-        let scaled = vdivq_f64(v, divisor);
-        // Round
-        let rounded = vrndnq_f64(scaled);
-        vst1q_f64(ptr.add(offset), rounded);
+        let offset = i * 4;
+        // Load 4 f64s, divide by scale and round
+        let s0 = vdivq_f64(vld1q_f64(ptr.add(offset)), divisor);
+        let s1 = vdivq_f64(vld1q_f64(ptr.add(offset + 2)), divisor);
+        let r0 = vrndnq_f64(s0);
+        let r1 = vrndnq_f64(s1);
+        // |scaled - rounded| and |rounded|
+        err0 = vmaxq_f64(err0, vabdq_f64(s0, r0));
+        err1 = vmaxq_f64(err1, vabdq_f64(s1, r1));
+        peak0 = vmaxq_f64(peak0, vabsq_f64(r0));
+        peak1 = vmaxq_f64(peak1, vabsq_f64(r1));
+        vst1q_f64(ptr.add(offset), r0);
+        vst1q_f64(ptr.add(offset + 2), r1);
     }
+    let tail = scale_and_round_slice(&mut coefs[chunks * 4..], scale);
+    tail.max(FftRounding {
+        err: vmaxvq_f64(vmaxq_f64(err0, err1)),
+        peak: vmaxvq_f64(vmaxq_f64(peak0, peak1)),
+    })
 }
 
-pub fn scale_and_round_standard(x: &mut [Complex<f64>], scale: f64) {
-    let coefs = unsafe { std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut f64, x.len() * 2) };
+fn scale_and_round_slice(coefs: &mut [f64], scale: f64) -> FftRounding {
+    let mut r = FftRounding::default();
     for c in coefs {
-        *c /= scale;
-        *c = c.round_ties_even();
+        let scaled = *c / scale;
+        *c = scaled.round_ties_even();
+        r.err = r.err.max((scaled - *c).abs());
+        r.peak = r.peak.max(c.abs());
     }
+    r
 }
 
-fn scale_and_round(x: &mut [Complex<f64>], scale: f64) {
+pub fn scale_and_round_standard(x: &mut [Complex<f64>], scale: f64) -> FftRounding {
+    let coefs = unsafe { std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut f64, x.len() * 2) };
+    scale_and_round_slice(coefs, scale)
+}
+
+fn scale_and_round(x: &mut [Complex<f64>], scale: f64) -> FftRounding {
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
-        unsafe {
-            scale_and_round_x86(x, scale);
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { scale_and_round_x86(x, scale) };
         }
-    } else {
-        scale_and_round_standard(x, scale);
+        return scale_and_round_standard(x, scale);
     }
 
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        scale_and_round_aarch(x, scale);
+    {
+        return unsafe { scale_and_round_aarch(x, scale) };
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        return scale_and_round_standard(x, scale);
     }
 }
 
@@ -1805,12 +1877,12 @@ fn fft_core(
     bwd: &dyn Fft<f64>,
     tw: &[Complex<f64>],
     fft_scratch: &mut [Complex<f64>],
-) {
+) -> FftRounding {
     let n = x.len();
     fwd.process_with_scratch(x, fft_scratch);
     recombine(x, n / 2, n, tw);
     bwd.process_with_scratch(&mut x[..n / 2], fft_scratch);
-    scale_and_round(&mut x[..n / 2], n as f64);
+    scale_and_round(&mut x[..n / 2], n as f64)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2008,12 +2080,103 @@ fn bit16_length(sz: usize, last: u64) -> usize {
     (sz - 1) * 4 + (last.ilog2() as usize) / 16 + 1
 }
 
+// THE ROUND-OFF CHECK
+//
+// Every 16-bit FFT entry measures its call's rounding (scale_and_round) before it reads the
+// coefficients: the largest distance between a coefficient and the integer it rounds to, and the
+// largest coefficient. A wrong limb needs some coefficient off by more than 0.5, which reads at
+// least 0.4 unless it is off by 0.6 or more, and rounding errors spread over many coefficients, so
+// a wrong call shows a distance past FFT_ROUNDOFF_LIMIT. That holds only while the distance can be
+// read finely: a coefficient's error comes in steps of up to c·2^-52, so from FFT_COEFF_LIMIT
+// (2^48) the call trips whatever it reads. A tripped call's transform is discarded and the call is
+// redone on the NTT, which is exact. FFT products and squares then check their result by its
+// residues mod the NTT primes (always in debug builds, in release with FFT_RESIDUE_CHECK) and redo
+// a mismatch too. The dispatch limits (FFT_16BIT_CUTOFF and its siblings) only keep reroutes rare
+// for random operands. The *_raw entries skip every check, for the precision probe and the tests,
+// and return the call's FftRounding beside the result.
+
+static FFT_REROUTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FFT_RESIDUE_REROUTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// Whether fft_entry and fft_sqr_entry check their results by residues.
+const FFT_RESIDUES: bool = cfg!(debug_assertions) || FFT_RESIDUE_CHECK;
+
+/// How many FFT calls the checked entries have redone on the NTT in this process, for any reason
+/// (a diagnostic).
+#[doc(hidden)]
+pub fn fft_reroutes() -> u64 {
+    FFT_REROUTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many of [`fft_reroutes`] passed the round-off check and failed only the residue check: wrong
+/// results the round-off check missed. It should stay 0.
+#[doc(hidden)]
+pub fn fft_residue_reroutes() -> u64 {
+    FFT_RESIDUE_REROUTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// Whether a call with this rounding must be redone: never for the raw entries.
+#[inline(always)]
+fn fft_trips(rounding: FftRounding, checked: bool) -> bool {
+    checked && rounding.trips()
+}
+
+#[inline]
+fn note_reroute() {
+    FFT_REROUTES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn note_residue_reroute() {
+    FFT_RESIDUE_REROUTES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// long × short into `out` by the 16-bit FFT. The call is redone on the NTT ([`ntt_entry_dyn`])
+/// when its rounding trips the round-off check ([`FftRounding::trips`]), and, in debug builds or
+/// with `FFT_RESIDUE_CHECK`, when its result fails the residue check ([`crate::utils::verify`]).
 pub fn fft_entry(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
+    fft_entry_checked(long, short, out, true)
+}
+
+// fft_entry with the round-off check optional: the tests turn it off to reach the residue check.
+pub(crate) fn fft_entry_checked(
+    long: &[u64],
+    short: &[u64],
+    out: &mut [u64],
+    roundoff: bool,
+) -> u64 {
+    if let Some(overflow) = fft_entry_impl(long, short, out, roundoff).0 {
+        if !FFT_RESIDUES
+            || Residues::of_with_top(out, overflow) == Residues::of(long).mul(Residues::of(short))
+        {
+            return overflow;
+        }
+        note_residue_reroute();
+    }
+    note_reroute();
+    ntt_entry_dyn(&long[..buf_len(long)], &short[..buf_len(short)], out)
+}
+
+/// [`fft_entry`] without any check: the FFT's own result, which may be wrong past the dispatch
+/// limit, and the call's rounding. For the precision probe and the tests.
+#[doc(hidden)]
+pub fn fft_entry_raw(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, FftRounding) {
+    let (overflow, rounding) = fft_entry_impl(long, short, out, false);
+    (overflow.expect("the raw entry never trips"), rounding)
+}
+
+// The FFT product, or None (out untouched) when `checked` and the call's rounding trips.
+fn fft_entry_impl(
+    long: &[u64],
+    short: &[u64],
+    out: &mut [u64],
+    checked: bool,
+) -> (Option<u64>, FftRounding) {
     let l_len = buf_len(long);
     let s_len = buf_len(short);
     if l_len == 0 || s_len == 0 {
         out.fill(0);
-        return 0;
+        return (Some(0), FftRounding::default());
     }
 
     let long = &long[..l_len];
@@ -2034,7 +2197,7 @@ pub fn fft_entry(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
         bit16_length(short.len(), short[short.len() - 1]),
     );
     let n = find_fft_size(l_len16 + s_len16 - 1);
-    let mut overflow = FFT_CACHE.with(|cell| {
+    let (overflow, rounding) = FFT_CACHE.with(|cell| {
         let fft_cache = &mut *cell.borrow_mut();
         let (fwd, bwd, tw, scratch_sz) = fft_cache.prep_mul(n);
         let mut scratch_gaurd = ScratchGuard::acquire();
@@ -2043,15 +2206,16 @@ pub fn fft_entry(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
         let (x, fft_scratch) = complex_scratch.split_at_mut(n);
 
         decompose(long, short, x);
-        fft_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
-        fft_accumulate(&mut x[..n / 2], out_core)
+        let rounding = fft_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
+        if fft_trips(rounding, checked) {
+            return (None, rounding);
+        }
+        (Some(fft_accumulate(&mut x[..n / 2], out_core)), rounding)
     });
-    if let Some((carry_limb, rest)) = out_tail.split_first_mut() {
-        *carry_limb = overflow;
-        rest.fill(0);
-        overflow = 0;
-    }
-    overflow
+    (
+        overflow.map(|overflow| absorb_overflow(out_tail, overflow)),
+        rounding,
+    )
 }
 
 //NTT MULTIPLICATION
@@ -2285,7 +2449,7 @@ pub fn reduce_no_asm(t: u128, p: u64, p_inv: u64) -> u64 {
 }
 
 #[inline]
-fn reduce_mont(t: u128, p: u64, p_inv: u64) -> u64 {
+pub(crate) fn reduce_mont(t: u128, p: u64, p_inv: u64) -> u64 {
     #[cfg(target_arch = "x86_64")]
     unsafe {
         return reduce_x86(t, p, p_inv);
@@ -3887,7 +4051,8 @@ pub fn mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     );
     let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
     let out_core = &mut out[..out_len];
-    let overflow = match dyn_dispatch(long.len(), short.len()) {
+    let alg = dyn_dispatch(long.len(), short.len());
+    let overflow = match alg {
         MulDynDispatch::Prim => {
             out_core[..long.len()].copy_from_slice(long);
             mul_prim(out_core, short[0])
@@ -3902,6 +4067,18 @@ pub fn mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
         MulDynDispatch::FFT => fft_entry(long, short, out_core),
         MulDynDispatch::NTT => ntt_entry_dyn(long, short, out_core),
     };
+    // Debug builds check every NTT product by its residues mod the NTT primes (linear); FFT
+    // products check themselves in fft_entry and redo a mismatch.
+    #[cfg(debug_assertions)]
+    if matches!(alg, MulDynDispatch::NTT) {
+        assert_eq!(
+            Residues::of_with_top(out_core, overflow),
+            Residues::of(long).mul(Residues::of(short)),
+            "mul_dyn: the {}x{} NTT product fails its residue check",
+            long.len(),
+            short.len()
+        );
+    }
     if out.len() > out_len {
         out[out_len] = overflow;
         out[out_len + 1..].fill(0);
@@ -4243,12 +4420,12 @@ fn fft_sqr_core(
     bwd: &dyn Fft<f64>,
     tw: &[Complex<f64>],
     fft_scratch: &mut [Complex<f64>],
-) {
+) -> FftRounding {
     let m = x.len();
     fwd.process_with_scratch(x, fft_scratch);
     sqr_recombine(x, m, tw);
     bwd.process_with_scratch(x, fft_scratch);
-    scale_and_round(x, m as f64);
+    scale_and_round(x, m as f64)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -4319,11 +4496,40 @@ fn sqr_decompose(buf: &[u64], x: &mut [Complex<f64>]) {
     }
 }
 
+/// buf² into `out` by the 16-bit FFT, redone on the NTT ([`ntt_sqr_entry_dyn`]) when the round-off
+/// check trips or the result fails the residue check, as [`fft_entry`] does.
 pub fn fft_sqr_entry(buf: &[u64], out: &mut [u64]) -> u64 {
+    fft_sqr_entry_checked(buf, out, true)
+}
+
+// fft_sqr_entry with the round-off check optional, as fft_entry_checked.
+pub(crate) fn fft_sqr_entry_checked(buf: &[u64], out: &mut [u64], roundoff: bool) -> u64 {
+    if let Some(overflow) = fft_sqr_entry_impl(buf, out, roundoff).0 {
+        if !FFT_RESIDUES || {
+            let r = Residues::of(buf);
+            Residues::of_with_top(out, overflow) == r.mul(r)
+        } {
+            return overflow;
+        }
+        note_residue_reroute();
+    }
+    note_reroute();
+    ntt_sqr_entry_dyn(&buf[..buf_len(buf)], out)
+}
+
+/// [`fft_sqr_entry`] without any check, returning the call's rounding beside the FFT's own result.
+/// For the precision probe and the tests.
+#[doc(hidden)]
+pub fn fft_sqr_entry_raw(buf: &[u64], out: &mut [u64]) -> (u64, FftRounding) {
+    let (overflow, rounding) = fft_sqr_entry_impl(buf, out, false);
+    (overflow.expect("the raw entry never trips"), rounding)
+}
+
+fn fft_sqr_entry_impl(buf: &[u64], out: &mut [u64], checked: bool) -> (Option<u64>, FftRounding) {
     let len = buf_len(buf);
     if len == 0 {
         out.fill(0);
-        return 0;
+        return (Some(0), FftRounding::default());
     }
 
     let buf = &buf[..len];
@@ -4336,7 +4542,7 @@ pub fn fft_sqr_entry(buf: &[u64], out: &mut [u64]) -> u64 {
     let bit_len = bit16_length(buf.len(), buf.last().copied().unwrap());
     let n = find_fft_size(2 * bit_len - 1);
     let m = n / 2;
-    let mut overflow = FFT_CACHE.with(|cell| {
+    let (overflow, rounding) = FFT_CACHE.with(|cell| {
         let fft_cache = &mut *cell.borrow_mut();
         let (fwd, bwd, tw, scratch_sz) = fft_cache.prep_sqr(m);
         let mut scratch_gaurd = ScratchGuard::acquire();
@@ -4345,15 +4551,115 @@ pub fn fft_sqr_entry(buf: &[u64], out: &mut [u64]) -> u64 {
         let (x, fft_scratch) = complex_scratch.split_at_mut(m);
 
         sqr_decompose(buf, x);
-        fft_sqr_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
-        fft_accumulate(x, out_core)
+        let rounding = fft_sqr_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
+        if fft_trips(rounding, checked) {
+            return (None, rounding);
+        }
+        (Some(fft_accumulate(x, out_core)), rounding)
     });
-    if let Some((carry_limb, rest)) = out_tail.split_first_mut() {
-        *carry_limb = overflow;
-        rest.fill(0);
-        overflow = 0;
+    (
+        overflow.map(|overflow| absorb_overflow(out_tail, overflow)),
+        rounding,
+    )
+}
+
+// WRAPPED SQUARE (mod B^m - 1)
+
+/// The smallest m >= `min` whose cyclic square mod B^m - 1 runs on an FFT of exactly 4m 16-bit
+/// digits: m = 2^a 3^b 5^c 7^d, since every FFT size is 4 times one (GMP's
+/// mpn_mulmod_bnm1_next_size). Any m >= min serves a caller that only needs the modulus to pass
+/// a bound, so rounding up to this size lets the transform wrap at exactly B^m.
+pub fn bnm1_size(min: usize) -> usize {
+    find_fft_size(4 * min.max(1)) / 4
+}
+
+/// Whether [`sqr_mod_bnm1_dyn`] squares an `a_len`-limb operand mod B^m − 1 by the cyclic FFT
+/// (above `DYN_SQR_BNM1_FFT_CUTOFF` limbs, with 4m an FFT size of at most its dispatch limit,
+/// `FFT_BNM1_16BIT_CUTOFF` modulus limbs), rather than by `sqr_dyn` and a fold.
+pub fn bnm1_fft(a_len: usize, m: usize) -> bool {
+    a_len > DYN_SQR_BNM1_FFT_CUTOFF && m <= FFT_BNM1_16BIT_CUTOFF && find_fft_size(4 * m) == 4 * m
+}
+
+// a^2 mod B^m - 1, canonical, m = out.len(), for nonzero a with a.len() <= m and 4m an FFT size.
+// It is fft_sqr_entry without the zero padding: a length-4m cyclic convolution of 16-bit digits is
+// the square mod 2^(64m) - 1. When the round-off check trips it is redone as the NTT's full square,
+// folded (not through sqr_dyn, whose FFT square would round about as badly). There is no residue
+// check: the primes don't divide B^m − 1. Public (hidden) for benches/probes/fft_precision.rs.
+#[doc(hidden)]
+pub fn fft_sqr_mod_bnm1(a: &[u64], out: &mut [u64]) {
+    if fft_sqr_mod_bnm1_impl(a, out, true).0 {
+        return;
     }
-    overflow
+    note_reroute();
+    let mut scratch = ScratchGuard::acquire();
+    let full = scratch.get(2 * a.len());
+    let top = ntt_sqr_entry_dyn(a, &mut full[..2 * a.len() - 1]);
+    full[2 * a.len() - 1] = top;
+    fold_mod_bnm1(full, out);
+}
+
+/// [`fft_sqr_mod_bnm1`] without the round-off check, returning the call's rounding. For the
+/// precision probe and the tests.
+#[doc(hidden)]
+pub fn fft_sqr_mod_bnm1_raw(a: &[u64], out: &mut [u64]) -> FftRounding {
+    fft_sqr_mod_bnm1_impl(a, out, false).1
+}
+
+// Whether the cyclic square was written (false: `checked` and its rounding tripped, out
+// untouched), and its rounding.
+fn fft_sqr_mod_bnm1_impl(a: &[u64], out: &mut [u64], checked: bool) -> (bool, FftRounding) {
+    let n = 4 * out.len();
+    debug_assert_eq!(find_fft_size(n), n, "4m must be an FFT size");
+    debug_assert!(!a.is_empty() && a.len() <= out.len());
+    let half = n / 2;
+    let (carry, rounding) = FFT_CACHE.with(|cell| {
+        let fft_cache = &mut *cell.borrow_mut();
+        let (fwd, bwd, tw, scratch_sz) = fft_cache.prep_sqr(half);
+        let mut scratch_gaurd = ScratchGuard::acquire();
+        let complex_scratch: &mut [Complex<f64>] =
+            unsafe { std::mem::transmute(scratch_gaurd.get(scratch_sz)) };
+        let (x, fft_scratch) = complex_scratch.split_at_mut(half);
+
+        sqr_decompose(a, x);
+        let rounding = fft_sqr_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
+        if fft_trips(rounding, checked) {
+            return (None, rounding);
+        }
+        // All n coefficients land in exactly m limbs; the carry out of the top (below 2^35, as
+        // each coefficient is below 2^50) counts multiples of B^m, which is 1.
+        (Some(fft_accumulate(x, out)), rounding)
+    });
+    let Some(carry) = carry else {
+        return (false, rounding);
+    };
+    // out + carry - B^m + 1 is far below B^m, so the wrap can't carry again.
+    if add_prim(out, carry) {
+        inc_buf(out);
+    }
+    canon_mod_bnm1(out);
+    (true, rounding)
+}
+
+/// Computes a² mod (B^m − 1), m = `out.len()`, `B = 2^64`, as the canonical residue in
+/// [0, B^m − 1). Requires a's trimmed length to be at most m. When [`bnm1_fft`] allows (m from
+/// [`bnm1_size`], at most `FFT_BNM1_16BIT_CUTOFF`, and a above `DYN_SQR_BNM1_FFT_CUTOFF` limbs)
+/// it is one cyclic FFT square, half the transform of a full square of a; otherwise it squares a
+/// with `sqr_dyn` and folds the product.
+pub fn sqr_mod_bnm1_dyn(a: &[u64], out: &mut [u64]) {
+    let a = &a[..buf_len(a)];
+    assert!(a.len() <= out.len(), "a must fit the modulus's m limbs");
+    if a.is_empty() {
+        out.fill(0);
+        return;
+    }
+    if bnm1_fft(a.len(), out.len()) {
+        fft_sqr_mod_bnm1(a, out);
+    } else {
+        let mut guard = ScratchGuard::acquire();
+        let square = guard.get(2 * a.len());
+        sqr_dyn(a, square);
+        fold_mod_bnm1(square, out);
+    }
 }
 
 //NTT SQUARE
@@ -4517,7 +4823,7 @@ fn dyn_sqr_dispatch(n: usize) -> DynSqrDispatch {
         DynSqrDispatch::School
     } else if n <= FFT_SQR_CUTOFF {
         DynSqrDispatch::Karatsuba
-    } else if n <= FFT_16BIT_CUTOFF {
+    } else if n <= FFT_SQR_16BIT_CUTOFF {
         DynSqrDispatch::FFT
     } else {
         DynSqrDispatch::NTT
@@ -4534,12 +4840,25 @@ pub fn sqr_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
         "out is not large enough for multiplication"
     );
     let (out_core, out_tail) = out.split_at_mut(out_len);
-    let overflow = match dyn_sqr_dispatch(buf.len()) {
+    let alg = dyn_sqr_dispatch(buf.len());
+    let overflow = match alg {
         DynSqrDispatch::School => sqr_buf(buf, out_core),
         DynSqrDispatch::Karatsuba => karatsuba_sqr_entry_dyn(buf, out_core),
         DynSqrDispatch::FFT => fft_sqr_entry(buf, out_core),
         DynSqrDispatch::NTT => ntt_sqr_entry_dyn(buf, out_core),
     };
+    // Debug builds check every NTT square by its residues mod the NTT primes (linear); FFT squares
+    // check themselves in fft_sqr_entry and redo a mismatch.
+    #[cfg(debug_assertions)]
+    if matches!(alg, DynSqrDispatch::NTT) {
+        let r = Residues::of(buf);
+        assert_eq!(
+            Residues::of_with_top(out_core, overflow),
+            r.mul(r),
+            "sqr_dyn: the {}-limb NTT square fails its residue check",
+            buf.len()
+        );
+    }
     absorb_overflow(out_tail, overflow)
 }
 
@@ -5121,7 +5440,34 @@ fn fft_accumulate_mid(
     (lo, hi)
 }
 
+/// The middle product long[2n-1] × short[n] → out[n] by the 16-bit FFT, redone on the NTT
+/// ([`ntt_mid_mul_dyn`], within the same documented error) when the round-off check trips. The check
+/// covers every coefficient of the transform, not only the band it reads. There is no residue
+/// check, as the band omits an unknown part of the product.
 pub fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
+    match fft_mid_mul_impl(long, short, out, true).0 {
+        Some(of) => of,
+        None => {
+            note_reroute();
+            ntt_mid_mul_dyn(long, short, out)
+        }
+    }
+}
+
+/// [`fft_mid_mul`] without the round-off check, returning the call's rounding beside the FFT's own
+/// result. For the precision probe and the tests.
+#[doc(hidden)]
+pub fn fft_mid_mul_raw(long: &[u64], short: &[u64], out: &mut [u64]) -> ((u64, u64), FftRounding) {
+    let (of, rounding) = fft_mid_mul_impl(long, short, out, false);
+    (of.expect("the raw entry never trips"), rounding)
+}
+
+fn fft_mid_mul_impl(
+    long: &[u64],
+    short: &[u64],
+    out: &mut [u64],
+    checked: bool,
+) -> (Option<(u64, u64)>, FftRounding) {
     debug_assert_mid_mul_shape(long, short, out);
     let sz = short.len();
     // Inputs may carry zero top limbs (quotient-refinement operands are not
@@ -5137,7 +5483,7 @@ pub fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
     let (next_col_lo, next_col_hi, _) = mul_column_parts(long, short, 2 * sz - 1);
     let (next_next_col_lo, _, _) = mul_column_parts(long, short, 2 * sz);
     let next_col = (next_col_lo, next_col_hi);
-    let mut of = FFT_CACHE.with(|cell| {
+    let (of, rounding) = FFT_CACHE.with(|cell| {
         let fft_cache = &mut *cell.borrow_mut();
         let (fwd, bwd, tw, scratch_sz) = fft_cache.prep_mul(n);
         let mut scratch_gaurd = ScratchGuard::acquire();
@@ -5146,18 +5492,25 @@ pub fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
         let (x, fft_scratch) = complex_scratch.split_at_mut(n);
 
         decompose(long, short, x);
-        fft_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
-        fft_accumulate_mid(
+        let rounding = fft_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
+        if fft_trips(rounding, checked) {
+            return (None, rounding);
+        }
+        let of = fft_accumulate_mid(
             &x[start_coef / 2..end_coef / 2],
             out,
             next_col,
             next_next_col_lo,
-        )
+        );
+        (Some(of), rounding)
     });
+    let Some(mut of) = of else {
+        return (None, rounding);
+    };
     let (c0, c1) = middle_correction(long, short);
     add_mid_overflow(&mut of, add_prim(out, c0));
     add_mid_overflow(&mut of, add_prim(&mut out[1..], c1));
-    return of;
+    (Some(of), rounding)
 }
 
 // out[0] is coefficient lo of the convolution: s - 1 for a canonical middle
@@ -5419,7 +5772,7 @@ enum DynMidDispatch {
 fn dyn_mid_dispatch(n: usize) -> DynMidDispatch {
     return if n < FFT_MID_CUTOFF {
         DynMidDispatch::School
-    } else if 2 * n < FFT_16BIT_CUTOFF {
+    } else if n <= FFT_MID_16BIT_CUTOFF {
         DynMidDispatch::FFT
     } else {
         DynMidDispatch::NTT
