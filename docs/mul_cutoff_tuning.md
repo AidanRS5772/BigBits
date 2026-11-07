@@ -34,10 +34,10 @@ faster at most lengths and its steps larger, and they have not been retuned, so 
 below describe the old sizes.
 
 Not tuned here: `FFT_16BIT_CUTOFF`, `FFT_SQR_16BIT_CUTOFF` and
-`FFT_MID_16BIT_CUTOFF` are where random operands tripped the 16-bit FFT's old round-off
-check more than 2^-10 of the time, and they now also keep coefficients under 2^48 (see
-`docs/fft_precision.md`); the `NTT_PAR_*` cutoffs decide threading, which the
-schoolbook rewrite doesn't affect and a single core can't measure;
+`FFT_MID_16BIT_CUTOFF` are the largest that keep the 16-bit FFT's coefficients under
+2^48, which its fold check relies on (see `docs/fft_precision.md`); the `NTT_PAR_*`
+cutoffs decide threading, which the schoolbook rewrite doesn't affect and a single core
+can't measure;
 `HI_MUL_GUARD_LIMBS` is an accuracy setting.
 
 ## Method

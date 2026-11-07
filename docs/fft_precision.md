@@ -10,8 +10,11 @@ speed and soundness. This note records the checks, the evidence behind them, how
 and how to remeasure them. Measured on the Apple M1 (rustfft's NEON paths) unless noted.
 
 **What's current.** The balanced digits, fold check, soundness and cost sections below were measured
-2026-11-06 at the current sizes. The dispatch limits were measured 2026-11-02/04 on unsigned digits at
-the old sizes and haven't been remeasured; they are conservative for random operands now.
+2026-11-06 at the current sizes, with that day's limits. On 2026-11-07 the product, square and
+middle-product limits rose to the most the 2^48 bound allows (see the dispatch limits), so "the limit" in
+those sections means the old one for them (52920 × 52920 products, 55296-limb squares, n = 64826), and
+products and squares now reach transform 524288, where the soundness sweep never ran them. The cyclic
+limit was measured 2026-11-02/04 on unsigned digits at the old sizes and hasn't been remeasured.
 
 ## Transform sizes
 
@@ -106,13 +109,13 @@ The largest reading, unsigned against balanced, on the same operands:
 
 | Operands | Shape | Unsigned | Balanced |
 |---|---|---:|---:|
-| Random | Products at the limit (52920 × 52920) | 0.219 | 0.0007 |
+| Random | Products at the old limit (52920 × 52920) | 0.219 | 0.0007 |
 | Random | Products, 49152 × 49152 (3·2^17) | 0.312 | 0.0016 |
-| Random | Middle products at the limit | 0.188 | 0.0010 |
+| Random | Middle products at the old limit (n = 64826) | 0.188 | 0.0010 |
 | Random | Cyclic squares at the limit | 0.188 | 0.0010 |
 | Digits at least 0xC000 | Products, 52920 × 52920 | 0.5 | 0.0137 |
 | Digits near −2^15, one sign | Products, 52920 × 52920 | 0.219 | 0.219 |
-| Period 12, full size | Middle products at the limit | 0.188 | 0.438 |
+| Period 12, full size | Middle products at the old limit | 0.188 | 0.438 |
 
 Random and high-digit operands read about 35–300× lower. The rows that don't improve are what balancing can't
 help: digits of one sign at full size don't cancel, and repeating patterns concentrate into a few
@@ -237,7 +240,7 @@ Outputs matched at every point but one `rcp_dyn` (19324 limbs), whose new value 
 old one's low limb differed, which the contract allows. Against the commit before this branch's FFT work the
 whole tree is about 0.69×.
 
-A fired fold check, on top of the FFT at the limits (three runs): 4–7% on a product, 8–10% on a middle
+A fired fold check, on top of the FFT at the old limits (three runs): 4–7% on a product, 8–10% on a middle
 product and 9–10% on a cyclic square. On one thread a redo costs about 2–3× the FFT on top of it, or up to 6×
 for a cyclic square (the old-size timings below).
 
@@ -250,7 +253,7 @@ limb (`Residues::of`, below):
 | 1024 × 1024 | 10.6 µs | 69.7 µs | 15% |
 | 4096 × 4096 | 41.9 µs | 318 µs | 13% |
 | 16384 × 16384 | 166 µs | 1390 µs | 12% |
-| 52920 × 52920 (the limit) | 534 µs | 9550 µs | 5.6% |
+| 52920 × 52920 (the old limit) | 534 µs | 9550 µs | 5.6% |
 
 That is why `FFT_RESIDUE_CHECK` is off by default.
 
@@ -258,8 +261,8 @@ That is why `FFT_RESIDUE_CHECK` is off by default.
 
 **Same operands, old check and new.** Nineteen operand kinds (unsigned worst cases, random limbs, chirps,
 and balanced worst cases: one sign at full size, random signs, periods 3 and 12) at every transform size
-in the upper tiers, FILLS 1, 0.5 and 0.01, ratios from 1 to 16 for products, only shapes a dispatcher can
-reach, 8 operands each. The residue verifier judged products and squares, the NTT middle products and
+in the upper tiers, FILLS 1, 0.5 and 0.01, ratios from 1 to 16 for products, only shapes a dispatcher could
+reach under the 2026-11-06 limits (so products and squares stopped at transform 458752), 8 operands each. The residue verifier judged products and squares, the NTT middle products and
 cyclic squares.
 
 | | Calls | Wrong | Redone on the NTT | Of those, right anyway | Fold checks run | Missed |
@@ -280,8 +283,8 @@ cautious one), counting only the size of the error and not the second condition:
 
 | Operands | Old, error ≥ 0.6 under the gate | New, error ≥ 0.75 |
 |---|---:|---:|
-| Random, products or squares at the limits | 10^-8 to 10^-13 | below 10^-1000 |
-| Random, middle or cyclic at the limits | too coarse to fit | below 10^-1000 |
+| Random, products or squares at the old limits | 10^-8 to 10^-13 | below 10^-1000 |
+| Random, middle or cyclic at the old limits | too coarse to fit | below 10^-1000 |
 | Random, 32768-limb operands | 10^-22 | below 10^-1000 |
 | One-sign digits, 52920 × 52920 | 10^-11 | 10^-15 |
 | One-sign digits, 55296-limb squares | 10^-10 | 10^-10 |
@@ -351,12 +354,56 @@ well below 2^48 (1985 of 2247 wrong in 27648 calls, mostly at 3·2^k with ratios
 
 ## The dispatch limits
 
-The limits in `mod.rs` were set when digits were unsigned, by how often a call paid for the FFT and then
-the NTT. Each is the largest size below the first transform size where uniformly random operands
-tripped the old check, either the distance or the gate, more than 1 in 2^10 times. Balanced random
-operands now read about 0.001 at them, so as speed choices they're conservative, but they also keep
-coefficients under 2^48, which the check now relies on. The operands have every limb uniform and a
-nonzero top limb, at the transform size's widest shape: balanced products, full-length squares,
+**Products, squares and middle products** (2026-11-07). Their limits are the largest the compile-time
+assert in `mod.rs` allows: 131066 output limbs, 65533 operand limbs and n = 65533. One-sign digits then
+give coefficients up to 4·65533·2^30 ≈ 2^47.99, and one more limb could reach 2^48, past which a wrong
+coefficient's reading can fall under the trigger (see the balanced digits section). So soundness sets these
+limits, not speed. All three land on transform 524288 (2^19). They were 105839, 55296 and 64826, the
+trip-rate limits below. Products and squares used to stop at transform 458752, so the soundness sweep
+never ran worst-case operands for them on 524288; middle products already reached it.
+
+A checked entry vouches for every size up to its dispatcher's largest transform, now 524288 for all
+three. So a direct call to `fft_entry` or `fft_sqr_entry` with 65534–65536-limb operands (`fft_mid_mul`:
+n up to 65535, as before) also runs the FFT, with one-sign coefficients up to about 2^48.
+
+**The cyclic square** keeps its trip-rate limit (below). The next `bnm1_size`, 65536, puts 4m·2^30 at
+2^48 and fails the assert by its margin of 8.
+
+**Speed at the limits.** Release, M1, `benches/probes/fft_sizes.rs` in `entry` mode: the raw FFT against
+the NTT on random operands of the widest shape, fastest of five, one process per point, on one thread
+and on the default 8-thread pool (`RAYON_NUM_THREADS`). The FFT runs on one thread either way, and its
+times on the pool matched these.
+
+| Entry, size | FFT | NTT, 1 thread | NTT, 8 threads |
+|---|---:|---:|---:|
+| Products, 52920 × 52920 (old limit) | 6.4 ms | 21.5 ms | 6.8 ms |
+| Products, 65533 × 65533 (limit) | 6.7 ms | 25.8 ms | 10.3 ms |
+| Products, 73728 × 73728 | 9.0 ms | 26.5 ms | 8.5 ms |
+| Products, 98304 × 98304 | 10.7 ms | 40.2 ms | 13.6 ms |
+| Squares, 55296 limbs (old limit) | 4.1 ms | 13.7 ms | 5.0 ms |
+| Squares, 65533 limbs (limit) | 4.1 ms | 17.7 ms | 8.1 ms |
+| Squares, 73728 limbs | 5.6 ms | 18.2 ms | 6.7 ms |
+| Middle products, n = 64826 (old limit) | 6.7 ms | 24.8 ms | 8.5 ms |
+| Middle products, n = 65533 (limit) | 6.7 ms | 24.8 ms | 8.8 ms |
+| Middle products, n = 73728 | 9.8 ms | 34.7 ms | 9.3 ms |
+| Middle products, n = 98304 | 15.0 ms | 45.6 ms | 12.1 ms |
+| Cyclic squares, m = 57344 (limit) | 2.0 ms | 17.1 ms | 5.9 ms |
+| Cyclic squares, m = 65536 | 1.9 ms | 17.7 ms | 7.8 ms |
+
+At the new limits the FFT is 3.7–4.3× faster than the NTT on one thread and 1.3–2× faster than the
+NTT on 8 threads. Since the old table below, the FFT's product at the old limit went from 9.58 ms to
+6.4 ms, so the pool's NTT no longer leads there; the two tie. Past 2^19 the 8-thread NTT ties or wins at
+some sizes (products at 73728, middle products from 73728), so a further raise needs thread-aware
+dispatch as well as a new answer to the 2^48 bound. Random operands read 0.0007–0.0027 at every size
+here, and none came out wrong.
+
+### History: the trip-rate limits
+
+Until 2026-11-07 every limit in `mod.rs` was the one set when digits were unsigned, by how often a call
+paid for the FFT and then the NTT. Each was the largest size below the first transform size where
+uniformly random operands tripped the old check, either the distance or the gate, more than 1 in 2^10
+times. Balanced random operands read about 0.001 at them, so as speed choices they were conservative. The
+cyclic limit is still this one. The operands had every limb uniform and a nonzero top limb, at the transform size's widest shape: balanced products, full-length squares,
 `long[2n − 1] × short[n]` and m-limb cyclic operands. The probe ran in `rate` mode in two passes,
 one thread per process:
 
@@ -383,8 +430,8 @@ Only the cyclic limit moved, from 65536 to 64800 modulus limbs.
 | Middle products (short limbs n) | 64826 | 518616 | 0 in 2^14 | 524288: 17 in 10875 | 16799 |
 | Cyclic squares (modulus limbs m) | 64800 (now 57344) | 259200 | 11 in 2^14, all at the gate | 259308: 17 in 8845, the same | 23040 |
 
-These limits were measured at the old transform sizes and have not been remeasured. They now land on
-458752 (products and squares) and 524288 (middle products). 64800 is no longer a `bnm1_size`, so the
+These limits were measured at the old transform sizes and were never remeasured. At the current sizes
+they landed on 458752 (products and squares) and 524288 (middle products). 64800 is no longer a `bnm1_size`, so the
 cyclic limit is the largest one below it, 57344 (7·2^13), which dispatches the same: the next one up,
 65536, is past 64800 either way. A stage whose `bnm1_size(k + 1)` is 65536 (k from 57344 to 65535) now
 stays classic, where k up to 64799 used to wrap.
@@ -401,8 +448,9 @@ a limit can trip more than the limit itself. The most trips at or below each lim
 
 Sizes past a first failure that round better stay on the NTT.
 
-**Speed at the limits.** The trip-rate rule doesn't weigh the NTT's speed. Release, M1, random
-operands, minimum of five alternating rounds, on one thread and on the default 8-thread pool:
+**Speed at those limits, before 2026-11-05.** The trip-rate rule didn't weigh the NTT's speed. Measured
+before the FFT work of 2026-11-05/06, at the old sizes. Release, M1, random operands, minimum of five
+alternating rounds, on one thread and on the default 8-thread pool:
 
 | Entry, size | FFT, 1 thread | NTT, 1 thread | FFT, pool | NTT, pool |
 |---|---:|---:|---:|---:|
@@ -415,10 +463,10 @@ operands, minimum of five alternating rounds, on one thread and on the default 8
 | Cyclic squares, m = 23040 (old) | 0.90 ms | 5.81 ms | 0.90 ms | 2.28 ms |
 | Cyclic squares, m = 64800 | 3.24 ms | 19.43 ms | 3.21 ms | 7.74 ms |
 
-On one thread the FFT is 1.9–6× faster at every limit. The FFT runs on one thread and the NTT
+On one thread the FFT was 1.9–6× faster at every limit. The FFT runs on one thread and the NTT
 runs its three primes on the pool, so with 8 threads the NTT already matched the FFT for squares
-and middle products at the old limits. It is about 30% faster at the new product and
-middle-product limits. Only the cyclic square keeps a clear FFT lead (2.4×). A dispatch that
+and middle products at the limits before those, and was about 30% faster at the trip-rate product
+and middle-product limits. Only the cyclic square kept a clear FFT lead (2.4×). A dispatch that
 weighed the pool's size would switch earlier on many threads; that is not done.
 
 On unsigned digits, operands with digits near 2^16 reached the gate from about 18000 limbs and paid the FFT

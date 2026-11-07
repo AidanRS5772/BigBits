@@ -124,33 +124,33 @@ pub const FFT_FOLD_TRIGGER: f64 = 0.25;
 // pass over the operands and the result: see docs/fft_precision.md for its share of the FFT's
 // time. Middle products and squares mod B^m − 1 have no such check.
 pub const FFT_RESIDUE_CHECK: bool = false;
-// The 16-bit FFT entries' dispatch limits, past which the dynamic dispatchers take the NTT. Each
-// was the largest size below the first transform size where uniformly random operands, in unsigned
-// digits, tripped the old check (a reading of 0.4 or a 2^48 coefficient gate) more than 1 in 2^10 times. Balanced
-// digits read far below that, so as speed choices they are now conservative; they haven't been
-// remeasured. They are also what keeps the removed gate unnecessary, as asserted below. Measured on
-// the M1 (rustfft's NEON paths); remeasure on x86. See docs/fft_precision.md.
-// These were measured before find_fft_size moved to its stricter set of sizes: the transforms named
-// here are the ones they were measured at, and each limit now lands on the transform given after
-// "now".
-// Products: output limbs l + s − 1 (transform 423360: 0 trips in 2^14, largest coefficient
-// 2^47.71; 17 in 12727 at 428652, all past 0.4). Now 458752.
-pub const FFT_16BIT_CUTOFF: usize = 105839;
-// Squares: operand limbs (transform 442368: 0 trips in 2^14, 2^47.77; 17 in 11323 at 444528).
-// Now 458752.
-pub const FFT_SQR_16BIT_CUTOFF: usize = 55296;
-// Middle products: short limbs n (transform 518616: 0 trips in 2^14, 2^47.998; 17 in 10875 at
-// 524288). Now 524288.
-pub const FFT_MID_16BIT_CUTOFF: usize = 64826;
-// Squares mod B^m − 1: modulus limbs m, a bnm1_size. Measured at 64800 (transform 259200: 11 trips
-// in 2^14, all at the old gate; 17 in 8845 at 259308, from the same gate), which is no longer a
-// bnm1_size; this is the largest one below it, so the dispatch is the same as it would be at 64800.
+// The 16-bit FFT entries' dispatch limits, past which the dynamic dispatchers take the NTT. The
+// product, square and middle-product limits are the largest the assert below allows, so they're set
+// by soundness, not speed: one limb more and a coefficient can reach 2^48. All three land on the
+// 2^19-digit transform (524288). There the FFT beat the NTT with random operands on the M1: about 4×
+// on one thread, and 1.3–2× against the NTT on the default 8-thread pool (docs/fft_precision.md).
+// Products and squares used to stop at 458752; worst-case operands haven't been swept on 524288 for
+// them yet (middle products were).
+// Products: output limbs l + s − 1 (was 105839).
+pub const FFT_16BIT_CUTOFF: usize = 131066;
+// Squares: operand limbs (was 55296).
+pub const FFT_SQR_16BIT_CUTOFF: usize = 65533;
+// Middle products: short limbs n (was 64826, on the same transform).
+pub const FFT_MID_16BIT_CUTOFF: usize = 65533;
+// Squares mod B^m − 1: modulus limbs m, a bnm1_size. This one is still the old speed limit: the
+// largest size below the first transform where uniformly random operands, in unsigned digits,
+// tripped the old check (a reading of 0.4 or a 2^48 coefficient gate) more than 1 in 2^10 times.
+// That was 64800 (transform 259200: 11 trips in 2^14, all at the old gate; 17 in 8845 at 259308,
+// from the same gate), measured before find_fft_size's stricter sizes, and is no longer a
+// bnm1_size. This is the largest one below it, so the dispatch is the same as it would be at 64800.
+// The next one, 65536, would fail the assert below by 8.
 pub const FFT_BNM1_16BIT_CUTOFF: usize = 57344;
 // Why no coefficient gate is needed: a balanced coefficient sums at most 4 min(l, s) digit products
 // of magnitude at most 2^30, plus a little for the operands' unsigned top digits, which is under
-// 2^48 at every limit. Below 2^48 a coefficient's error is a multiple of at most 1/16, so readings
-// stay fine enough for the fold check's trigger to mean something. Raising a limit past this needs a new
-// answer to that, not only a new measurement.
+// 2^48 at every limit (2^47.99 for products, squares and middle products). Below 2^48 a
+// coefficient's error is a multiple of at most 1/16, so readings stay fine enough for the fold
+// check's trigger to mean something. Raising a limit past this needs a new answer to that, not only
+// a new measurement.
 const _: () = {
     let room = 1u64 << 18;
     assert!(4 * ((FFT_16BIT_CUTOFF as u64 + 1) / 2) + 8 < room);
