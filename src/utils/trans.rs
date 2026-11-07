@@ -18,10 +18,11 @@ use crate::utils::utils::{
 use crate::utils::{
     CapacityError, ScratchGuard, DYN_AGM_TAIL_TERMS, DYN_EXP_CHUNK_MIN_BITS,
     DYN_EXP_CHUNK_PAR_WORK, DYN_EXP_SQR_BITS, DYN_LN_AGM_LIMBS, DYN_LN_AGM_TERMS,
-    DYN_LN_CHUNK_MIN_BITS, DYN_LN_CHUNK_PAR_WORK, DYN_LN_SQRT_A, DYN_THETA_PAR_LIMBS,
-    STATIC_AGM_TAIL_TERMS, STATIC_EXP_CHUNK_MIN_BITS, STATIC_EXP_CHUNK_PAR_WORK,
-    STATIC_EXP_SQR_BITS, STATIC_LN_AGM_LIMBS, STATIC_LN_AGM_TERMS, STATIC_LN_CHUNK_MIN_BITS,
-    STATIC_LN_CHUNK_PAR_WORK, STATIC_LN_SQRT_A, STATIC_THETA_PAR_LIMBS, THETA_STATIC_SLOTS,
+    DYN_LN_CHUNK_MIN_BITS, DYN_LN_CHUNK_PAR_WORK, DYN_LN_SERIES_PAR_FRACTION, DYN_LN_SQRT_A,
+    DYN_THETA_PAR_LIMBS, STATIC_AGM_TAIL_TERMS, STATIC_EXP_CHUNK_MIN_BITS,
+    STATIC_EXP_CHUNK_PAR_WORK, STATIC_EXP_SQR_BITS, STATIC_LN_AGM_LIMBS, STATIC_LN_AGM_TERMS,
+    STATIC_LN_CHUNK_MIN_BITS, STATIC_LN_CHUNK_PAR_WORK, STATIC_LN_SERIES_PAR_FRACTION,
+    STATIC_LN_SQRT_A, STATIC_THETA_PAR_LIMBS, THETA_STATIC_SLOTS,
 };
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -1125,14 +1126,37 @@ fn ln2_combine(
     (top as i64 - 1 - f as i64, neg)
 }
 
-// The theta–AGM logarithm where agm_wins picks it, else the series.
+// The series' speedup on threads threads, by Amdahl's law with parallel fraction frac: its chunks
+// and their trees split across the threads, while ln_chain's residual updates, the tail's ratio
+// and the final combine run on one. The AGM has no such speedup (its steps are a serial chain, and
+// only theta and products past the 16-bit FFT run in parallel).
+pub(crate) fn ln_series_speedup(threads: usize, frac: f64) -> f64 {
+    1.0 / ((1.0 - frac) + frac / threads.max(1) as f64)
+}
+
+// Whether ln_dyn (or ln_static, with its CPUs and constants) takes the AGM for X at o limbs on
+// threads threads: agm_wins with the series' cost divided by its speedup there.
+pub(crate) fn ln_takes_agm(
+    x: &[u64],
+    m: i64,
+    o: usize,
+    (sqrt_a, cut, frac): (f64, usize, f64),
+    threads: usize,
+) -> bool {
+    let speedup = ln_series_speedup(threads, frac);
+    o >= cut
+        && LnNorm::new(x, m)
+            .is_some_and(|n| agm_wins(o, n.lead(), n.cancels(), sqrt_a, cut, speedup))
+}
+
+// The theta–AGM logarithm where ln_takes_agm picks it on the current rayon pool, else the series.
 pub fn ln_dyn(x: &[u64], m: i64, out: &mut [u64]) -> Result<(i64, bool), LnError> {
     let o = out.len();
-    let (a, cut) = (DYN_LN_SQRT_A, DYN_LN_AGM_LIMBS);
-    if o >= cut && LnNorm::new(x, m).is_some_and(|n| agm_wins(o, n.lead(), n.cancels(), a, cut)) {
+    let knobs = (DYN_LN_SQRT_A, DYN_LN_AGM_LIMBS, DYN_LN_SERIES_PAR_FRACTION);
+    if ln_takes_agm(x, m, o, knobs, rayon::current_num_threads()) {
         return ln_agm_dyn_at::<DYN_LN_AGM_TERMS>(x, m, out);
     }
-    ln_dyn_at(x, m, out, a)
+    ln_dyn_at(x, m, out, DYN_LN_SQRT_A)
 }
 
 #[doc(hidden)]
@@ -1158,7 +1182,8 @@ pub fn ln_dyn_at(x: &[u64], m: i64, out: &mut [u64], sqrt_a: f64) -> Result<(i64
     )
 }
 
-// The series needs N >= o + 4; the AGM runs where agm_wins picks it and N holds its frame.
+// The series needs N >= o + 4; the AGM runs where ln_takes_agm picks it on the machine's CPUs
+// (which the static series' threads use, like theta's) and N holds its frame.
 pub fn ln_static<const N: usize>(
     x: &[u64],
     m: i64,
@@ -1166,14 +1191,19 @@ pub fn ln_static<const N: usize>(
 ) -> Result<(i64, bool), LnError> {
     capacity::<N>(out.len() + 4)?;
     let o = out.len();
-    let (a, cut) = (STATIC_LN_SQRT_A, STATIC_LN_AGM_LIMBS);
-    if o >= cut && LnNorm::new(x, m).is_some_and(|n| agm_wins(o, n.lead(), n.cancels(), a, cut)) {
+    let knobs = (
+        STATIC_LN_SQRT_A,
+        STATIC_LN_AGM_LIMBS,
+        STATIC_LN_SERIES_PAR_FRACTION,
+    );
+    let cpus = thread::available_parallelism().map_or(1, |c| c.get());
+    if ln_takes_agm(x, m, o, knobs, cpus) {
         match ln_agm_static_at::<N, STATIC_LN_AGM_TERMS>(x, m, out) {
             Err(LnError::Capacity(_)) => {}
             r => return r,
         }
     }
-    ln_static_at::<N>(x, m, out, a)
+    ln_static_at::<N>(x, m, out, STATIC_LN_SQRT_A)
 }
 
 #[doc(hidden)]
@@ -2052,14 +2082,16 @@ pub fn agm_static_at<const N: usize>(
 // ln X = c ln 2 - π / (4 AGM(θ2(q⁴)², θ3(q⁴)²)), c = shift + 64b for X = x 2^(64b).
 
 // Whether the AGM beats the series at P = 64 o bits. Per M(P) the series costs about
-// log2(P / max(λ, j0))², λ = δ's lead, j0 = A log2 P, and the AGM about κ (1 + w / P) log2(P + w),
-// w = λ when it widens. κ ties them at the cutoff for a generic X; below it the AGM never wins.
+// log2(P / max(λ, j0))² / speedup, λ = δ's lead, j0 = A log2 P and speedup its gain from the
+// threads it runs on (1 on one), and the AGM about κ (1 + w / P) log2(P + w), w = λ when it
+// widens. κ ties them at the cutoff for a generic X on one thread; below it the AGM never wins.
 pub(crate) fn agm_wins(
     o: usize,
     lead: Option<u64>,
     cancels: bool,
     sqrt_a: f64,
     cutoff: usize,
+    speedup: f64,
 ) -> bool {
     let cutoff = cutoff.max(1);
     let Some(lead) = lead.filter(|_| o >= cutoff) else {
@@ -2073,7 +2105,7 @@ pub(crate) fn agm_wins(
     let (p, lam) = (64.0 * o as f64, lead as f64);
     let w = if cancels { lam } else { 0.0 };
     // As ratios, so the cutoff compares equal terms.
-    series(p, lam) / ((1.0 + w / p) * (p + w).log2()) >= series(ps, 0.0) / ps.log2()
+    series(p, lam) / speedup / ((1.0 + w / p) * (p + w).log2()) >= series(ps, 0.0) / ps.log2()
 }
 
 // (f, k, (l, g)): T's and ln X's f fraction limbs (more past the cancellation for X in [1/2, 2)),

@@ -4,12 +4,12 @@ use crate::utils::div::div_prim;
 use crate::utils::mul::{mul_buf, mul_prim};
 use crate::utils::trans::{
     agm_wins, exp_dyn, exp_dyn_at, exp_dyn_entry, exp_static, exp_static_at, exp_static_entry,
-    ln_agm_dyn_at, ln_agm_static_at, ln_dyn, ln_dyn_at, ln_dyn_entry, ln_static, ln_static_at,
-    ln_static_entry, ExpError, LnError,
+    ln_agm_dyn_at, ln_agm_static_at, ln_dyn, ln_dyn_at, ln_dyn_entry, ln_series_speedup,
+    ln_static, ln_static_at, ln_static_entry, ln_takes_agm, ExpError, LnError,
 };
 use crate::utils::{
-    CapacityError, DYN_LN_AGM_LIMBS, DYN_LN_AGM_TERMS, DYN_LN_SQRT_A, STATIC_LN_AGM_LIMBS,
-    STATIC_LN_AGM_TERMS,
+    CapacityError, DYN_LN_AGM_LIMBS, DYN_LN_AGM_TERMS, DYN_LN_SERIES_PAR_FRACTION, DYN_LN_SQRT_A,
+    STATIC_LN_AGM_LIMBS, STATIC_LN_AGM_TERMS, STATIC_LN_SERIES_PAR_FRACTION, STATIC_LN_SQRT_A,
 };
 use std::cell::Cell;
 use crate::utils::utils::{buf_len, cmp_buf, shl_buf, shr_buf, split_sh, sub_buf, trim_lz};
@@ -1247,6 +1247,8 @@ fn test_ln_agm_static_capacity() {
 #[test]
 fn test_agm_wins_shape() {
     let (a, c) = (0.25, 1024);
+    // One thread's rule, the series unsped.
+    let agm_wins = |o, lead, cancels, a, c| agm_wins(o, lead, cancels, a, c, 1.0);
     // Never below the cutoff, whatever δ.
     for o in [1, 100, 1023] {
         for lead in [0, 1, 5, 100] {
@@ -1281,6 +1283,60 @@ fn test_agm_wins_shape() {
     assert!(agm_wins(4096, Some(8), false, a, c) && !agm_wins(4096, Some(9), false, a, c));
 }
 
+// The series' speedup divides its cost: a faster series only takes sizes from the AGM, and with
+// the default fraction 2 threads keep the series to 1M limbs and 4 to 2^34.
+#[test]
+fn test_agm_wins_threads() {
+    let (a, c) = (DYN_LN_SQRT_A, DYN_LN_AGM_LIMBS);
+    let f = DYN_LN_SERIES_PAR_FRACTION;
+    assert_eq!(ln_series_speedup(1, f), 1.0);
+    assert_eq!(ln_series_speedup(0, f), 1.0);
+    let s: Vec<f64> = [1, 2, 3, 4, 8, 16, 64, 1 << 20].map(|k| ln_series_speedup(k, f)).to_vec();
+    assert!(s.windows(2).all(|w| w[0] < w[1]) && s[7] < 1.0 / (1.0 - f));
+    for o in [c, 2 * c, 1 << 14, 1 << 20, 1 << 26] {
+        for lead in [0, 1, 8, 100] {
+            for cancels in [false, true] {
+                let wins: Vec<bool> = s.iter().map(|&s| agm_wins(o, Some(lead), cancels, a, c, s)).collect();
+                assert!(wins.windows(2).all(|w| w[0] || !w[1]), "o={o} lead={lead}");
+            }
+        }
+    }
+    for o in [c, 4096, 1 << 15, 1 << 20] {
+        assert!(agm_wins(o, Some(0), false, a, c, s[0]), "o={o}, 1 thread");
+        assert!(!agm_wins(o, Some(0), false, a, c, s[1]), "o={o}, 2 threads");
+    }
+    assert!(agm_wins(1 << 21, Some(0), false, a, c, s[1]));
+    assert!(!agm_wins(1 << 34, Some(0), false, a, c, s[3]));
+}
+
+// ln_dyn reads the pool's threads: a generic X past the cutoff takes the AGM on one thread and
+// the series on two or more, whose results agree within 1 ulp.
+#[test]
+fn test_ln_dyn_dispatch_by_threads() {
+    let o = DYN_LN_AGM_LIMBS + 8;
+    let x = rand_vec(o + 1, 27_100);
+    let knobs = (DYN_LN_SQRT_A, DYN_LN_AGM_LIMBS, DYN_LN_SERIES_PAR_FRACTION);
+    assert!(ln_takes_agm(&x, 2, o, knobs, 1));
+    for k in [2, 4, 8, 64] {
+        assert!(!ln_takes_agm(&x, 2, o, knobs, k), "{k} threads");
+    }
+    let static_knobs = (STATIC_LN_SQRT_A, STATIC_LN_AGM_LIMBS, STATIC_LN_SERIES_PAR_FRACTION);
+    assert!(ln_takes_agm(&x, 2, o, static_knobs, 1));
+    assert!(!ln_takes_agm(&x, 2, o, static_knobs, 8));
+    let run = |threads: usize| {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        pool.install(|| {
+            assert_eq!(ln_takes_agm(&x, 2, o, knobs, rayon::current_num_threads()), threads == 1);
+            let mut out = vec![0; o];
+            let (k, neg) = ln_dyn(&x, 2, &mut out).unwrap();
+            (out, k, neg)
+        })
+    };
+    let (one, two) = (run(1), run(2));
+    assert_ln_close((&one.0, one.1, one.2), (&two.0, two.1, two.2), "1 thread vs 2");
+    check_ln_vs_series(&x, 2, o, &|x, m, out| ln_dyn_at(x, m, out, DYN_LN_SQRT_A));
+}
+
 // ln against the forced theta–AGM logarithm, within 1 ulp.
 fn check_ln_vs_agm(x: &[u64], m: i64, l: usize, ln: LnFn) {
     let what = format!("x.len()={} m={m} l={l}", x.len());
@@ -1298,8 +1354,8 @@ fn test_ln_dispatch_past_agm_cutoff() {
     let x = rand_vec(o + 1, 27_000);
     let mut near = rand_vec(o + 1, 27_001);
     (near[o], near[o - 1]) = (1, near[o - 1] >> 36);
-    assert!(agm_wins(o, Some(0), false, DYN_LN_SQRT_A, DYN_LN_AGM_LIMBS));
-    assert!(!agm_wins(o, Some(100), true, DYN_LN_SQRT_A, DYN_LN_AGM_LIMBS));
+    assert!(agm_wins(o, Some(0), false, DYN_LN_SQRT_A, DYN_LN_AGM_LIMBS, 1.0));
+    assert!(!agm_wins(o, Some(100), true, DYN_LN_SQRT_A, DYN_LN_AGM_LIMBS, 1.0));
     let ln: LnFn = &|x, m, out| ln_dyn(x, m, out);
     check_ln_vs_series(&x, 2, o, ln);
     check_ln_vs_agm(&near, 0, o, ln);

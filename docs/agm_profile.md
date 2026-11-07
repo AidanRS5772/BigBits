@@ -272,6 +272,11 @@ The default 8-thread pool gave the same ranking at 1024, 4096 and 16384 limbs.
 - **Static: j = 2.** Its geometric mean is 1.003, against 1.009 for j = 3.
 - **Caps.** The switch is a rule on the term count, so each cap sits between the last count that
   won and the first that lost: `DYN_AGM_TAIL_TERMS` = 10 and `STATIC_AGM_TAIL_TERMS` = 4.
+- **Rechecked at T = 5**, the theta term count `ln_dyn` takes since the same day's
+  `cargo bench-bin-split lnagm` sweep (`docs/agm-ln-theta.md`). There the switch points take 1, 2,
+  5 and 11 terms, still inside the 2^(j−1) to 2^j − 1 bands. The dynamic cap of 10 (5 terms, 3
+  roots replaced) was best at 256 and 1024 limbs and within 0.6% at 4096 and 16384, where 11
+  terms won. The static cap of 4 was within 0.3% from 1024 limbs.
 
 **Inside the tail** (phase timers in a scratch copy, means of repeated calls):
 
@@ -350,7 +355,7 @@ By expected gain on the pure AGM:
    floating layout with separate exponents for a and b, each at p plus guard bits) saves up to
    ⌈l/64⌉ limbs per operand: at most about 1.6% at T = 3, more at smaller T. Small, but it needs
    its own error analysis, since b1's error does use all l bits.
-5. **Multiple cores.** The chain is serial, and threads changed nothing here. The only way in is
+5. **Multiple cores.** The chain is serial, and threads changed nothing here. *Measured 2026-11-07, end to end:* the series logarithm uses threads and the AGM doesn't, so on 2 or more threads the series beat the theta–AGM logarithm at every size measured (to 262144 limbs on 8). `ln_dyn` now divides the series' predicted cost by its Amdahl speedup on the pool (`DYN_LN_SERIES_PAR_FRACTION`, the Dispatch section of `docs/agm-ln-exact-chain.md`), so the AGM keeps the one-thread case. The only way in is
    inside each multiplication: running a product's two forward FFTs in parallel, or a parallel
    transform. With the FFT at 75–82% of samples from 4096 limbs, this is the largest multi-core
    lever, but it lives in `mul.rs`, not in the AGM.

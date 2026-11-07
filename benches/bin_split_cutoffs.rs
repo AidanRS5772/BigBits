@@ -2,14 +2,16 @@
 //
 //   cargo bench --bench bin_split_cutoffs -- <family> [--limbs 8,16,max] [--terms 1,4]
 //       [--par 256,max] [--cands 0/31/max,64/1/max] [--rounds 9] [--sizes 256,1024]
-//       [--a 0,0.5,1] [--j 0,16,24] [--tail 0,1,3,7,15]
+//       [--a 0,0.5,1] [--j 0,16,24] [--tail 0,1,3,7,15] [--t 0,1,3,6]
 //
 // Families: bbp, engel, hyper, sbbp, sengel, shyper (leaf sweeps, serial), par (parallel
 // cutoff, all threads, default leaves), e2e (old term cutoffs against the defaults), ln
 // (ln_dyn end to end against its square-root scale A, all threads) and exp (exp_dyn end to
 // end against its square count j, with ln_dyn on the same X for scale, all threads) and agm
 // (agm_dyn_at and agm_static_at on ln_agm's inputs against the tail's term cap, with the roots
-// each cap took and ln_agm_dyn_at::<3> on the same X for scale).
+// each cap took and ln_dyn's AGM on the same X for scale) and lnagm (ln_agm_dyn_at::<T>
+// and ln_agm_static_at::<N, T> end to end against theta's term count T, with the series ln_dyn_at
+// on the same X for scale).
 // Each candidate times a tree build only: finalize doesn't depend on the tree's shape.
 // Candidates alternate within each round and each one reports its median over rounds,
 // relative to the workload's best; the summary is the geometric mean over workloads.
@@ -22,10 +24,11 @@ use big_bits::utils::{
         StaticNodeEngel, StaticNodeHyper,
     },
     trans::{
-        agm_dyn_at, agm_static_at, exp_dyn_at, exp_dyn_entry, ln_agm_dyn_at, ln_dyn, ln_dyn_at,
-        theta_dyn, Exp,
+        agm_dyn_at, agm_static_at, exp_dyn_at, exp_dyn_entry, ln_agm_dyn_at, ln_agm_static_at,
+        ln_dyn, ln_dyn_at, theta_dyn, Exp,
     },
 };
+use big_bits::utils::{DYN_LN_AGM_TERMS, DYN_LN_SQRT_A};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::cell::RefCell;
 use std::{env, hint::black_box, time::Instant};
@@ -334,6 +337,8 @@ struct Args {
     j: Option<Vec<u64>>,
     // The AGM tail's term caps.
     tail: Option<Vec<u64>>,
+    // ln_agm's theta term counts.
+    t: Option<Vec<u64>>,
 }
 
 // "limbs/terms/par" candidates, comma separated.
@@ -372,6 +377,7 @@ fn args() -> Args {
         a: None,
         j: None,
         tail: None,
+        t: None,
     };
     while let Some(flag) = it.next() {
         let val = it.next().expect("flag value");
@@ -385,6 +391,7 @@ fn args() -> Args {
             "--a" => a.a = Some(val.split(',').map(|t| t.parse().expect("numbers")).collect()),
             "--j" => a.j = Some(parse_list(&val)),
             "--tail" => a.tail = Some(parse_list(&val)),
+            "--t" => a.t = Some(parse_list(&val)),
             f => panic!("unknown flag {f}"),
         }
     }
@@ -616,17 +623,19 @@ fn limbs_from(x: &[u64], lo: usize, n: usize) -> Vec<u64> {
     (0..n).map(|i| x.get(lo + i).copied().unwrap_or(0)).collect()
 }
 
-// ln_agm_dyn_at::<3>'s AGM inputs at o output limbs for an X of 64 (o + 1) random bits (no
-// cancellation), with agm_frame's f, l and g: θ from theta_dyn::<3> at q = x 2^-(bits(x) + l),
+// ln_dyn's AGM inputs (ln_agm_dyn_at::<DYN_LN_AGM_TERMS>) at o output limbs for an X of
+// 64 (o + 1) random bits (no cancellation), with agm_frame's f, l and g: θ from theta_dyn at
+// q = x 2^-(bits(x) + l),
 // b1 = θ2 θ3 and a1 = (θ2 + θ3)² / 2 - b1, from exact products floored to g fraction limbs
 // (ln_agm_core's high products can differ in the last limbs).
 fn agm_inputs(x: &[u64], o: usize) -> (Vec<u64>, Vec<u64>) {
     let f = o as u64 + 1;
-    let l = (64 * (f + 1) + 3).div_ceil(64).max(2);
+    let n1 = DYN_LN_AGM_TERMS as u64 + 1;
+    let l = (64 * (f + 1) + 3).div_ceil(4 * n1 * n1).max(2);
     let g = (f + 2 + l.div_ceil(64)) as usize;
     let z = ((l - 2) / 64) as usize;
     let (mut th2, mut th3) = (vec![0; g - z], vec![0; g + 1]);
-    theta_dyn::<3>(x, 64 * x.len() as u64 + l, &mut th2, &mut th3);
+    theta_dyn::<DYN_LN_AGM_TERMS>(x, 64 * x.len() as u64 + l, &mut th2, &mut th3);
     let th2 = &th2[..th2.iter().rposition(|&v| v != 0).unwrap() + 1];
     let b1 = limbs_from(&full_mul(th2, &th3), g, g);
     let mut sum = th3.clone();
@@ -702,7 +711,7 @@ fn agm_family(args: &Args) {
         let lo = RefCell::new(vec![0; o]);
         let ln = measure(
             &|_: ()| {
-                black_box(ln_agm_dyn_at::<3>(&x, 0, &mut lo.borrow_mut()).unwrap());
+                black_box(ln_agm_dyn_at::<DYN_LN_AGM_TERMS>(&x, 0, &mut lo.borrow_mut()).unwrap());
             },
             &[()],
             args.rounds,
@@ -742,6 +751,116 @@ fn agm_family(args: &Args) {
         .unwrap();
     for (name, t, steps) in rows {
         report(name, &t, &steps, None);
+    }
+}
+
+// An ln entry for the T sweep: X = x 2^(64 m) into out, unwrapped.
+type LnAt = fn(&[u64], i64, &mut [u64]);
+
+// ln_agm_dyn_at::<t>, for t up to theta's 16.
+fn ln_agm_dyn_t(t: usize) -> LnAt {
+    macro_rules! by_t {
+        ($($n:literal)*) => {
+            match t {
+                $($n => |x, m, o| {
+                    black_box(ln_agm_dyn_at::<$n>(x, m, o).unwrap());
+                },)*
+                _ => panic!("theta takes at most 16 terms"),
+            }
+        };
+    }
+    by_t!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)
+}
+
+// ln_agm_static_at::<N, t>, for t up to static theta's 9.
+fn ln_agm_static_t<const N: usize>(t: usize) -> LnAt {
+    macro_rules! by_t {
+        ($($n:literal)*) => {
+            match t {
+                $($n => |x, m, o| {
+                    black_box(ln_agm_static_at::<N, $n>(x, m, o).expect("N fits the frame"));
+                },)*
+                _ => panic!("static theta takes at most 9 terms"),
+            }
+        };
+    }
+    by_t!(0 1 2 3 4 5 6 7 8 9)
+}
+
+// ln_agm end to end against theta's T at each size, on X = x 2^(-64 o) in [2^63, 2^64) with o + 1
+// random limbs (no cancellation), relative to the best T, with the series ln_dyn_at on the same X
+// for scale. Then the static entry at N with room for T = 0's frame.
+fn lnagm_family(args: &Args) {
+    let list = |default: &[u64]| -> Vec<usize> {
+        args.t.as_deref().unwrap_or(default).iter().map(|&t| t as usize).collect()
+    };
+    let ts = list(&[0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 16]);
+    let header: Vec<String> = ts.iter().map(|t| format!("T={t}")).collect();
+    let w = header.iter().map(|h| h.len()).max().unwrap().max(6);
+    let head = |ts: &[usize]| {
+        let cells: Vec<String> = ts.iter().map(|t| format!("{:>w$}", format!("T={t}"))).collect();
+        println!("{:<22} {:>10} {:>10}  {}", "workload", "best ms", "series ms", cells.join(" "));
+    };
+    let row = |name: String, t: &[f64], series: Option<f64>| {
+        let best = t.iter().cloned().fold(f64::MAX, f64::min);
+        let cells: Vec<String> = t.iter().map(|&x| format!("{:>w$.3}", x / best)).collect();
+        let s = series.map_or(String::new(), |v| format!("{:.3}", v * 1e3));
+        println!("{name:<22} {:>10.3} {s:>10}  {}", best * 1e3, cells.join(" "));
+    };
+    let input = |o: usize, rng: &mut StdRng| {
+        let mut x = rand_x(64 * (o as u64 + 1), rng);
+        x[o] |= 1 << 63;
+        x
+    };
+    head(&ts);
+    let mut rng = StdRng::seed_from_u64(37);
+    for o in sizes_or(args, &[256, 512, 1024, 2048, 4096, 8192, 16384, 32768]) {
+        let x = input(o, &mut rng);
+        let m = -(o as i64);
+        let out = RefCell::new(vec![0; o]);
+        let fs: Vec<LnAt> = ts.iter().map(|&t| ln_agm_dyn_t(t)).collect();
+        let t = measure(&|i: usize| fs[i](&x, m, &mut out.borrow_mut()), &(0..ts.len()).collect::<Vec<_>>(), args.rounds);
+        let series = measure(
+            &|_: ()| {
+                black_box(ln_dyn_at(&x, m, &mut out.borrow_mut(), DYN_LN_SQRT_A).unwrap());
+            },
+            &[()],
+            args.rounds,
+        );
+        row(format!("ln_agm_dyn {o}"), &t, Some(series[0]));
+    }
+
+    // Static T stops at 9, where theta's least-work plan still fits its slots.
+    let sts: Vec<usize> = list(&[0, 1, 2, 3, 4, 5, 6, 8, 9]).into_iter().filter(|&t| t <= 9).collect();
+    fn static_row<const N: usize>(o: usize, ts: &[usize], rounds: usize) -> (String, Vec<f64>) {
+        let mut rng = StdRng::seed_from_u64(41);
+        let mut x = rand_x(64 * (o as u64 + 1), &mut rng);
+        x[o] |= 1 << 63;
+        let m = -(o as i64);
+        let out = RefCell::new(vec![0; o]);
+        let fs: Vec<LnAt> = ts.iter().map(|&t| ln_agm_static_t::<N>(t)).collect();
+        let idx: Vec<usize> = (0..ts.len()).collect();
+        let t = measure(&|i: usize| fs[i](&x, m, &mut out.borrow_mut()), &idx, rounds);
+        (format!("ln_agm_static {o} N={N}"), t)
+    }
+    head(&sts);
+    let rounds = args.rounds;
+    let rows = std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || {
+            prefer_fast_cores();
+            // T = 0's frame: g = o + 3 + ceil(l / 64), l = ceil((64 (o + 2) + 3) / 4).
+            [
+                static_row::<330>(256, &sts, rounds),
+                static_row::<1300>(1024, &sts, rounds),
+                static_row::<5160>(4096, &sts, rounds),
+            ]
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    for (name, t) in rows {
+        row(name, &t, None);
     }
 }
 
@@ -807,6 +926,7 @@ fn main() {
             })),
         ),
         "agm" => agm_family(&a),
+        "lnagm" => lnagm_family(&a),
         f @ ("sbbp" | "sengel" | "shyper") => {
             // Static trees need far more stack than the main thread has.
             let f = f.to_string();

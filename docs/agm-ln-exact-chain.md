@@ -210,4 +210,32 @@ The AGM frame: its smaller input after the first step is b1 = θ2θ3 ≈ 2q, and
 - **Series:** about L², with L = log2(P / max(λ, j0)). Bit-burst chunk [s, 2s) sums in log2(P/s) binary-splitting levels, chunks run up to P/3, and j0 = A·log2 P is how far the series' square roots move δ.
 - **AGM:** about κ·(1 + w/P)·log2(P + w), with w = λ when it must widen.
 
-The constant κ makes the two tie at the cutoff for a generic X. Since L²/log2 P grows with P, the AGM takes a generic X exactly from the cutoff. It never takes any X below the cutoff: the series only gets cheaper as λ grows and the AGM only dearer. At fixed P it takes leads up to about P^(1 − √(log P*/log P)), so X near 1, or near any power of 2, stays on the series longer.
+The constant κ makes the two tie at the cutoff for a generic X on one thread. Since L²/log2 P grows with P, the AGM takes a generic X exactly from the cutoff. It never takes any X below the cutoff: the series only gets cheaper as λ grows and the AGM only dearer. At fixed P it takes leads up to about P^(1 − √(log P*/log P)), so X near 1, or near any power of 2, stays on the series longer.
+
+**Threads.** The two methods use extra threads very differently, so the series' cost is divided by its speedup S(k) on k threads (`ln_series_speedup`, `ln_takes_agm`):
+- **Series:** each bit-burst chunk's series and its binary-splitting tree run on their own threads. Only `ln_chain`'s residual updates, the tail's ratio and the final combine are serial.
+- **AGM:** a chain of means, each step needing the one before. Only theta's powers run in parallel, plus products past the 16-bit FFT's limit (about 65533 limbs), which go to the NTT and its thread pool.
+- **The model:** Amdahl's law, S(k) = 1/((1 − p) + p/k), with p = 0.85 (`DYN_LN_SERIES_PAR_FRACTION`). k is the rayon pool's size for `ln_dyn`, and `available_parallelism` for `ln_static`, whose series and theta use scoped threads.
+
+Measured on the M1 (4 performance and 4 efficiency cores) on generic X at T = 5, as the AGM's time over the series' (below 1, the AGM wins):
+
+| Limbs | 1 thread | 2 threads | 4 threads | 8 threads |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 | 1.06 | 1.52 | 2.29 | 2.47 |
+| 1024 | 0.84 | 1.44 | 2.17 | 2.38 |
+| 2048 | 0.77 | 1.37 | 2.10 | 2.30 |
+| 4096 | 0.70 | 1.29 | 2.01 | 2.51 |
+| 16384 | 0.66 | 1.14 | 1.77 | 1.87 |
+| 32768 | 0.60 | | | 1.74 |
+| 65536 | 1.08 | 1.36 | 1.63 | 1.46 |
+| 131072 | | 1.02 | | 1.22 |
+| 262144 | | | | 1.06 |
+
+- **Series speedup:** 1.5–1.9× on 2 threads, 2.2–2.9× on 4 and 2.4–3.7× on 8, which p = 0.85 fits (1.74, 2.76, 3.90). The 8-thread figure is held down by the efficiency cores.
+- **AGM speedup:** 1.02–1.05× wherever its products stay on the FFT, and 1.4–1.8× at 65536 limbs, where they run on the parallel NTT.
+- **Where the AGM wins under the model:** on one thread from the cutoff; on 2 threads from 1M–2M limbs; on 3 from 2^29 limbs; and from 4 threads on, effectively never.
+- **Unmodeled, at the top of the range:**
+  - Past the FFT's limit the AGM gains threads the model doesn't credit, and the gap narrows to 1.02× on 2 threads at 131072 limbs and 1.06× on 8 at 262144, so the AGM may win beyond the measured sizes.
+  - On one thread the same limit costs the AGM its lead at 65536 limbs (1.08), which the model doesn't see either.
+- **Accuracy:** both methods returned bit-identical results at every size measured.
+- **Static:** only measured on 8 CPUs, since macOS can't limit `available_parallelism`. There the series won by 2.3–2.5× from 1024 to 4096 limbs.

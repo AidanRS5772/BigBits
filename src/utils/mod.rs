@@ -415,25 +415,48 @@ pub const STATIC_LN_CHUNK_MIN_BITS: u64 = 2;
 pub const DYN_LN_CHUNK_PAR_WORK: usize = 512;
 pub const STATIC_LN_CHUNK_PAR_WORK: usize = 768;
 
-// ln_dyn takes the theta-AGM logarithm from this many output limbs for a generic X, where
-// ln(1 + δ)'s series and the AGM tie. Past it, trans.rs's agm_wins weighs the series' cost,
+// ln_dyn takes the theta-AGM logarithm from this many output limbs for a generic X on one thread,
+// where ln(1 + δ)'s series and the AGM tie. Past it, trans.rs's agm_wins weighs the series' cost,
 // about log2(P / δ's lead)² per M(P), against the AGM's, about log2 P (widened by the lead when
-// e ln 2 and ln u cancel), so X near 1 or near a power of 2 stays on the series longer. GUESS
+// e ln 2 and ln u cancel), so X near 1 or near a power of 2 stays on the series longer. On one
+// thread (M1, T = 5) the AGM won from 1024 to 32768 limbs (0.60-0.88 of the series' time) and lost
+// at 65536 (1.08), where its full-width products pass the 16-bit FFT's limit. GUESS
 pub const DYN_LN_AGM_LIMBS: usize = 1024;
 // GUESS: the dynamic value. ln_static also needs N to have room for the AGM's frame.
 pub const STATIC_LN_AGM_LIMBS: usize = 1024;
 
+// The share of the series logarithm's work that runs in parallel, for its speedup on k threads,
+// 1 / ((1 - p) + p / k), by which agm_wins divides the series' cost. The thread count flips the
+// dispatch: the series' chunks and their trees split across the threads, while the AGM's steps are
+// one serial chain (its own gain on 8 threads was 1.03 below the 16-bit FFT's limit, and 1.4-1.8
+// at 65536 limbs, where its products run on the parallel NTT). On the M1 the series ran 1.5-1.9x
+// faster on 2 threads, 2.2-2.9x on 4 and 2.4-3.7x on 8 (4 performance and 4 efficiency cores),
+// which p = 0.85 fits (1.74, 2.76, 3.90). With it the AGM keeps one thread from the cutoff, needs
+// 1M-2M limbs on 2 and 2^29 on 3, and from 4 threads (2^35 limbs) on effectively never wins. Measured, the series won at every size on
+// 2 threads (to 131072 limbs, by 1.02-1.52x) and on 8 (to 262144, by 1.06-3.6x), and the two
+// approach each other at the top, so the AGM may win past the measured range. Static's threads
+// come from available_parallelism, which macOS can't limit, so only its 8-CPU case was measured
+// (the series won 2.3-2.5x from 1024 to 4096 limbs). GUESS for static.
+pub const DYN_LN_SERIES_PAR_FRACTION: f64 = 0.85;
+pub const STATIC_LN_SERIES_PAR_FRACTION: f64 = 0.85;
+
 // The theta-AGM logarithm's theta terms N (θ3 over k = 1..N, θ2 over k = 0..N). Each doubling
 // of N + 1 saves two AGM steps and costs theta terms, so the best N is about 2 / (R ln 2) for R
-// = a term's cost over a step's, independent of precision (docs/agm-ln-theta.md). A term pair is
-// four shrinking high products against a step's product and root, R ~ 0.7. GUESS
-pub const DYN_LN_AGM_TERMS: usize = 3;
-pub const STATIC_LN_AGM_TERMS: usize = 3;
+// = a term's cost over a step's, independent of precision (docs/agm-ln-theta.md).
+// `cargo bench-bin-split lnagm` (M1, 256 to 32768 limbs): on one thread the dynamic entry is best
+// at 5 (3 to 5 within 0.7% from 1024 limbs). On the 8-thread pool it is best at 10 to 12 and 5
+// loses 2.4-5.5%, as theta's terms run in parallel and the AGM's steps don't, but there the
+// series beats the AGM about 2x at every size measured. Static is best at 6 on both (1024 and
+// 4096 limbs), the most whose parallel plan fits THETA_STATIC_SLOTS.
+pub const DYN_LN_AGM_TERMS: usize = 5;
+pub const STATIC_LN_AGM_TERMS: usize = 6;
 
 // agm_dyn and agm_static run means until the closed-form series of the AGM's limit needs at most
 // this many terms, then sum it (trans.rs's agm_tail, docs/agm_profile.md). The gap a - b doubles
 // each step, so the series j steps before the means alone would finish needs about 2^(j-1) to
-// 2^j - 1 terms; from 64 to 16384 limbs replacing j = 1, 2, 3, 4 roots took 1, 3, 6-7 and 12-14.
+// 2^j - 1 terms; from 64 to 16384 limbs replacing j = 1, 2, 3, 4 roots took 1, 3, 6-7 and 12-14
+// on ln_agm's inputs at 3 theta terms, and 1, 2, 5 and 11 at 5 (where the caps rechecked within
+// 0.6% of the best).
 // `cargo bench-bin-split agm` (M1): dyn's best is j = 3 at every size (0.95-0.96 of no tail;
 // 6-7 terms won, 12-14 lost by up to 3%), static's j = 2 (3 terms won, 6-7 lost by up to 1.5%,
 // as its quotient is a reciprocal and a product), so each cap sits between the two. At most

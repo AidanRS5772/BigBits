@@ -148,3 +148,13 @@ There are two plans per N:
 `SERIAL` takes whichever of the two does less work. Small frames run `SERIAL` in order. Large frames run `PARALLEL`, threaded as a dataflow with one join: each op starts once its operands finish and a slot is free. The plan depends only on the frame size, so threading never changes the result.
 
 Because the work per term pair stays roughly constant (about 1.46 product-widths asymptotically, against a floor near 1.1), theta's cost still grows linearly in N while the AGM saves only 2 steps per doubling of N+1. Cheaper powers move the best N from about 3 to about 5–6, not further.
+
+Measured end to end (`cargo bench-bin-split lnagm`, M1, 2026-11-07, with the AGM's closed-form tail), on generic X:
+
+| | best N | N = 3 | N = 5 | N = 6 | N = 8 |
+|---|---|---|---|---|---|
+| dynamic, 1 thread, 1024–32768 limbs | 5 | 1.000–1.007 | 1.000 | 1.000–1.017 | 1.012–1.045 |
+| dynamic, 8 threads, 1024–32768 limbs | 10–12 (8 at 32768) | 1.044–1.087 | 1.024–1.055 | 1.014–1.040 | 1.000–1.022 |
+| static, 1024 and 4096 limbs (1 and 8 threads) | 6 | 1.017–1.027 | 1.007–1.016 | 1.000 | 1.049–1.065 |
+
+The defaults are N = 5 (`DYN_LN_AGM_TERMS`) and 6 (`STATIC_LN_AGM_TERMS`). On several threads the parallel plan's terms are nearly free next to the serial AGM, which moves the best N past 10, but there the series logarithm is about twice as fast as the AGM at every size to 32768 limbs. Static's theta threads through `available_parallelism`, not the rayon pool, so its rows hardly move with the pool. Past N = 6 its parallel plan no longer fits `THETA_STATIC_SLOTS` (8 and 9 run the in-order plan), and N = 8 and 9 measured 5–7% slower.
