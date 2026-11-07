@@ -217,6 +217,102 @@ Stopping four or more roots early was slower at every size (and needed more than
 - **The ceiling is low.** Each removed root is worth 1/(n − 1) of the AGM (3.8% at 4096 limbs),
   and the tail's cost grows with every term, so the best case removes two or three roots.
 
+### Implemented 2026-11-07
+
+`agm_dyn` and `agm_static` now end in this tail (`agm_tail` in `src/utils/trans.rs`), in the form
+suggested under "Room left in the prototype": one quotient ε = D/m and a Horner pass at shrinking
+precision.
+
+- **No final product by m.** The correction is C = m·u·H(u) = D·ε·H(u), with
+  H = Σ g_i u^(i−1) ∈ [1/4, 0.26).
+- **Frames.** Each value is a floor one guard past what C needs, and level i of the Horner pass
+  runs 2t(i − 1) bits narrower than ε (u < 2^-2t).
+  - ε·H = ε/4 + ε·(u·h_2), so only the quotient and the last product D·(ε·H) run at C's width.
+  - The tail's error is within 2 units of the limit of the pair it starts from. The tests measure
+    1, against 2–3 for ending on means.
+- **Stopping rule.** The AGM now stops on its own gap rather than on `ln_agm_core`'s count.
+  - Before each step, a bound on the tail's term count is read from the bit lengths of a, b and
+    a − b. The tail runs once that bound is at most a cap, `DYN_AGM_TAIL_TERMS` or
+    `STATIC_AGM_TAIL_TERMS`.
+  - The gap doubles each step, so a tail that starts j roots early needs about 2^(j−1) to 2^j − 1
+    terms. At every size measured, j = 1, 2, 3 and 4 took 1, 3, 6–7 and 12–14 terms.
+  - So the cap is the number of roots replaced, in another unit.
+- **Harness.** `cargo bench-bin-split agm` builds this profile's inputs from public items: X with
+  64(o + 1) random bits, θ from `theta_dyn::<3>`, and a1 and b1 from exact products. It sweeps
+  the cap through `agm_dyn_at` and `agm_static_at`.
+
+**Time against the tail's start** (one thread, 11 rounds). Each entry is a time relative to that
+size's best. The columns are the roots replaced (j) and the tail's terms. Equal-work caps (7 and
+10, 15 and 19) differ by up to 0.5%. Every time here is lower than in the tables above (27.7 ms at
+4096 limbs, against 45), because Recs 1 and 3 and the FFT pass landed in between. What transfers
+is the saving counted in steps.
+
+| | Best ms | j = 0 (0 terms) | j = 1 (1) | j = 2 (3) | j = 3 (6–7) | j = 4 (12–14) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| dyn 64 | 0.042 | 1.067 | 1.018 | 1.004 | **1.000** | 1.024 |
+| dyn 128 | 0.135 | 1.074 | 1.027 | **1.000** | 1.001 | 1.031 |
+| dyn 256 | 0.485 | 1.062 | 1.019 | **1.000** | 1.003 | 1.017 |
+| dyn 512 | 1.55 | 1.058 | 1.021 | **1.000** | 1.007 | 1.032 |
+| dyn 1024 | 4.36 | 1.045 | 1.020 | 1.005 | **1.003** | 1.015 |
+| dyn 2048 | 11.3 | 1.040 | 1.019 | 1.005 | **1.000** | 1.008 |
+| dyn 4096 | 27.7 | 1.056 | 1.032 | 1.011 | **1.000** | 1.007 |
+| dyn 8192 | 66.0 | 1.047 | 1.025 | 1.009 | **1.002** | 1.005 |
+| dyn 16384 | 155 | 1.047 | 1.021 | 1.005 | **1.000** | 1.002 |
+| static N = 72 (64) | 0.042 | 1.072 | 1.032 | 1.011 | **1.000** | 1.037 |
+| static N = 272 (256) | 0.507 | 1.038 | 1.009 | **1.000** | 1.006 | 1.025 |
+| static N = 1048 (1024) | 6.79 | 1.035 | 1.004 | **1.000** | 1.013 | 1.048 |
+| static N = 4168 (4096) | 72.9 | 1.031 | 1.008 | **1.000** | 1.015 | 1.043 |
+
+The default 8-thread pool gave the same ranking at 1024, 4096 and 16384 limbs.
+
+**Choices.**
+
+- **Dynamic: j = 3.** It is within 0.7% of the best at every size, a geometric mean of 1.002,
+  against 1.004 for j = 2.
+- **Static: j = 2.** Its geometric mean is 1.003, against 1.009 for j = 3.
+- **Caps.** The switch is a rule on the term count, so each cap sits between the last count that
+  won and the first that lost: `DYN_AGM_TAIL_TERMS` = 10 and `STATIC_AGM_TAIL_TERMS` = 4.
+
+**Inside the tail** (phase timers in a scratch copy, means of repeated calls):
+
+| | Tail ms | In steps | ε | u | Horner | V = ε·H | C = D·V |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| dyn 4096, j = 2 | 1.09 | 0.98 | 43% | 9% | 14% | 13% | 20% |
+| dyn 4096, j = 3 | 1.98 | 1.77 | 34% | 8% | 31% | 11% | 15% |
+| dyn 4096, j = 4 | 3.18 | 2.85 | 21% | 6% | 54% | 9% | 9% |
+| dyn 16384, j = 3 | 8.87 | 1.63 | 34% | 8% | 30% | 11% | 16% |
+| static 4096, j = 2 | 3.45 | 1.20 | 53% | 5% | 8% | 8% | 26% |
+| static 4096, j = 3 | 6.97 | 2.43 | 35% | 8% | 27% | 13% | 18% |
+
+- **Dynamic.** From 256 to 16384 limbs, j = 3's tail costs 1.6–2.0 steps in place of 3, a saving
+  of 1.0–1.4. j = 4's costs 2.7–3.4 in place of 4, a saving of 0.6–1.3, and it lost by 0.2–3% in
+  the sweep.
+  - The Horner pass is the part that grows with j: it has I − 1 products, and their widths shrink
+    linearly.
+  - Rectangular splitting of H (√I full products, the rest scalar) would cut that part. It is the
+    remaining lever for j = 4.
+- **Static.** ε costs 2.5–3.9× the dynamic one (1024 and 4096 limbs). Static can't hold the 2w-limb dividend, so its ε
+  is a reciprocal and a high product (`ratio_to_fraction_static`), and its products are on the
+  NTT. Each term is therefore dearer, and j = 3 already costs 2.4 steps.
+
+**End to end, against HEAD (`7139beb`).**
+
+- **Method.** Both sides were built without LTO, with every function and block aligned to 64
+  bytes, and linked to one scratch harness. HEAD's side ran `agm_dyn(a1, b1, n)` with
+  `ln_agm_core`'s n. The table gives geometric means of 4 alternating runs, with per-run ratios
+  within ±1.2%.
+- **Outputs.** `ln_agm_dyn_at::<3>`'s results were bit-identical between the two builds. The AGM's
+  results differed by 1–3 units of the frame's last limb.
+
+| Out limbs | 64 | 256 | 1024 | 4096 | 16384 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `agm_dyn`, new ÷ old | 0.935 | 0.943 | 0.953 | 0.951 | 0.953 |
+| `ln_agm_dyn_at::<3>`, new ÷ old | 0.942 | 0.957 | 0.955 | 0.956 | 0.960 |
+
+That is 4.7–6.5% off the AGM, which matches the 5–6% estimated above. The fold into `ln_agm_core`
+under "Cheaper inside ln" is not done: there the tail's quotient would be π's division, and it
+would save its own division too.
+
 ## Recommendations
 
 By expected gain on the pure AGM:
@@ -233,6 +329,12 @@ By expected gain on the pure AGM:
    re-timed. Its outputs are unchanged, because the roots are bit-identical.
 2. **Closed-form tail** (Proposal 2): 4–5.6% measured, an estimated 5–6% with one reciprocal, and
    about 2% more folded into `ln_agm_core`. Low risk with existing primitives.
+
+   *Implemented 2026-11-07* in the pure AGM: `agm_dyn` and `agm_static` stop on their own gap and
+   end in the tail. Dynamic replaces 3 roots and static 2 (the "Implemented" section under
+   Proposal 2). `agm_dyn` takes 0.935–0.953 of its old time from 64 to 16384 output limbs, and
+   `ln_agm_dyn_at::<3>` 0.94–0.96, with the logarithm's outputs unchanged. The fold into
+   `ln_agm_core` remains.
 3. **Reciprocal chaining through the root's recursion** (Proposal 1, item 2): an estimated 5–8%,
    but the most complex.
 
@@ -271,6 +373,8 @@ detached worktree, run with `RAYON_NUM_THREADS=1`. It:
 - for the tail, runs K full steps with the same kernels, then the series with `sqr_dyn`, `mul_dyn`
   and `div_dyn` on truncated operands, and compares both results with `agm_dyn` from the same
   inputs at 3 more limbs and one more mean;
+- (since 2026-11-07, `agm_dyn` takes no count, and `cargo bench-bin-split agm` builds these inputs
+  and sweeps the tail;)
 - loops `agm_dyn` at one size for samply:
   `samply record --save-only --unstable-presymbolicate --rate 4000 -o agm.json.gz <bin> loop 4096 12`,
   with per-function self and inclusive shares read through the `.syms.json` symbol table.

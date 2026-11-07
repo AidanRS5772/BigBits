@@ -598,7 +598,7 @@ fn product(a: &[u64], b: &[u64]) -> Vec<u64> {
     v
 }
 
-fn bit_len(x: u64) -> u64 {
+pub(crate) fn bit_len(x: u64) -> u64 {
     (64 - x.leading_zeros()) as u64
 }
 
@@ -803,7 +803,8 @@ pub fn ratio_to_fraction_static<const N: usize>(p: &[u64], q: &[u64], shift: i64
     let x = &mut x[..len + 2];
     rcp_static::<N>(q, x);
     let bits = 64 * (q.len() + x.len() - 1 - len) as i64 + shift;
-    debug_assert!(bits >= 128, "finalize needs w >= 2 whole limbs");
+    // At w = 1 the window below is the whole product, exactly.
+    debug_assert!(bits >= 64, "finalize needs w >= 1 whole limb");
     let (w, v) = split_sh(bits as u64);
     let full = p.len() + x.len();
     if full < w {

@@ -430,6 +430,17 @@ pub const STATIC_LN_AGM_LIMBS: usize = 1024;
 pub const DYN_LN_AGM_TERMS: usize = 3;
 pub const STATIC_LN_AGM_TERMS: usize = 3;
 
+// agm_dyn and agm_static run means until the closed-form series of the AGM's limit needs at most
+// this many terms, then sum it (trans.rs's agm_tail, docs/agm_profile.md). The gap a - b doubles
+// each step, so the series j steps before the means alone would finish needs about 2^(j-1) to
+// 2^j - 1 terms; from 64 to 16384 limbs replacing j = 1, 2, 3, 4 roots took 1, 3, 6-7 and 12-14.
+// `cargo bench-bin-split agm` (M1): dyn's best is j = 3 at every size (0.95-0.96 of no tail;
+// 6-7 terms won, 12-14 lost by up to 3%), static's j = 2 (3 terms won, 6-7 lost by up to 1.5%,
+// as its quotient is a reciprocal and a product), so each cap sits between the two. At most
+// AGM_TAIL's 19.
+pub const DYN_AGM_TAIL_TERMS: usize = 10;
+pub const STATIC_AGM_TAIL_TERMS: usize = 4;
+
 // theta runs its parallel plan (the shortest dependency path) on frames of this many limbs,
 // threaded when it has two or more workers, and its least-work plan below. The plan depends only
 // on the size, so threads never change the result. GUESS

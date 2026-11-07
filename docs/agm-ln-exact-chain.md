@@ -194,14 +194,15 @@ The chain above applies unchanged with this s. With shift = bits(x) + l, q ∈ [
 | `p` | `64(f + 1)` | the chain's working precision: relative error 2^-p in λ is absolute error T·2^-p, T < 2^64 |
 | `l` | `max(2, ⌈(p + 3)/(4(N+1)²)⌉)` | Stage 2's L_min; theta needs q < 1/4 |
 | `g` | `f + 2 + ⌈l/64⌉` | the AGM's fraction limbs; see below |
-| `n` | `⌈log2(2·ln(1/q)·(p+3)·ln2/π²)⌉` | Stage 3's (a_n + b_n)/2 row |
+| `n` | none: the AGM stops on its own gap | Stage 3's "stop when gap < ε′" row, read from bit lengths each step; with no tail it takes the (a_n + b_n)/2 row's n |
 
 The AGM frame: its smaller input after the first step is b1 = θ2θ3 ≈ 2q, and ∂ln λ/∂b1 ≈ 1/(b1·ln(4a1/b1)) ≈ 2^l/(l·ln2). A unit at 2^-64g therefore moves T ≈ l·ln2 by about 2^(l − 64g), and the 1/l cancels. So 64g ≥ 64f + l + O(1), and the two extra limbs absorb the rounding of every step.
 
-**Two free iterations.**
+**Free and replaced iterations.**
 - The first step's pair is formed directly: a1 = (θ2² + θ3²)/2 = (θ2 + θ3)²/2 − θ2θ3 and b1 = θ2θ3, one square and one product instead of two squares, a product and a root.
-- The AGM returns a_(n+1) = (a_n + b_n)/2 without its last root.
-- Starting from (a1, b1), n means take n − 1 roots, against the n + 1 roots of returning a_n from (θ2², θ3²).
+- The AGM ends in the closed-form series of its limit, AGM(m + D, m − D) = m·(1 − u/4 − 5u²/64 − 11u³/256 − …), u = (D/m)², whose zeroth term is the old final (a_n + b_n)/2 without its root. Each step before it doubles the gap and halves the terms, so ending j steps early takes about 2^(j−1)…2^j − 1 terms. `agm_dyn` ends 3 roots early (6–7 terms) and `agm_static` 2 (3 terms), set by `DYN_AGM_TAIL_TERMS`/`STATIC_AGM_TAIL_TERMS`; see `docs/agm_profile.md`.
+- Starting from (a1, b1), the means-only AGM takes n − 1 roots (n from the table above), against the n + 1 roots of returning a_n from (θ2², θ3²); the tail leaves n − 1 − j.
+- The AGM targets its own frame's last unit, about l + 64 bits finer than p, which the series reaches with at most a term more.
 
 **Geometric means from half the product.** √(a·b) to ⌈t/2⌉ limbs needs only the product's top ⌈t/2⌉ + 2 limbs. The root reads them as padded by zeros, which moves it by under 2^-33 units. Each step's buffers then fit out.len() + 2 limbs, which lets the static AGM run at N ≈ g + 2.
 

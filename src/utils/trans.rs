@@ -6,25 +6,26 @@ use crate::utils::mul::{
     hi_mul_dyn, hi_mul_static, hi_sqr_dyn, hi_sqr_static, mul_prim2, sqr_dyn, sqr_static,
 };
 use crate::utils::series::{
-    bits, join2, ratio_to_fraction_dyn, ratio_to_fraction_static, series_eval_dyn,
+    bit_len, bits, join2, ratio_to_fraction_dyn, ratio_to_fraction_static, series_eval_dyn,
     series_eval_static, static_split_stack, BBPSeries, Bbp, Engel, EngelSeries, Hyper, HyperSeries,
     Series,
 };
 use crate::utils::sqrt::{sqrt_approx_dyn, sqrt_approx_static};
 use crate::utils::theta_plan::{ThetaPlan, ThetaPlans, MAX_VALUES};
 use crate::utils::utils::{
-    add_buf, buf_len, cmp_buf, inc_buf, shl_buf, shr_buf, split_sh, sub_buf,
+    add_buf, add_prim, buf_len, cmp_buf, inc_buf, shl_buf, shr_buf, split_sh, sub_buf, twos_comp,
 };
 use crate::utils::{
-    CapacityError, ScratchGuard, DYN_EXP_CHUNK_MIN_BITS, DYN_EXP_CHUNK_PAR_WORK, DYN_EXP_SQR_BITS,
-    DYN_LN_AGM_LIMBS, DYN_LN_AGM_TERMS, DYN_LN_CHUNK_MIN_BITS, DYN_LN_CHUNK_PAR_WORK,
-    DYN_LN_SQRT_A, DYN_THETA_PAR_LIMBS, STATIC_EXP_CHUNK_MIN_BITS, STATIC_EXP_CHUNK_PAR_WORK,
+    CapacityError, ScratchGuard, DYN_AGM_TAIL_TERMS, DYN_EXP_CHUNK_MIN_BITS,
+    DYN_EXP_CHUNK_PAR_WORK, DYN_EXP_SQR_BITS, DYN_LN_AGM_LIMBS, DYN_LN_AGM_TERMS,
+    DYN_LN_CHUNK_MIN_BITS, DYN_LN_CHUNK_PAR_WORK, DYN_LN_SQRT_A, DYN_THETA_PAR_LIMBS,
+    STATIC_AGM_TAIL_TERMS, STATIC_EXP_CHUNK_MIN_BITS, STATIC_EXP_CHUNK_PAR_WORK,
     STATIC_EXP_SQR_BITS, STATIC_LN_AGM_LIMBS, STATIC_LN_AGM_TERMS, STATIC_LN_CHUNK_MIN_BITS,
     STATIC_LN_CHUNK_PAR_WORK, STATIC_LN_SQRT_A, STATIC_THETA_PAR_LIMBS, THETA_STATIC_SLOTS,
 };
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::f64::consts::{LN_2, LOG2_E, PI};
+use std::f64::consts::{LOG2_E, PI};
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::{fmt, panic, thread};
 
@@ -560,16 +561,30 @@ pub fn exp_static_at<const N: usize>(
 
 // out <- floor(a b 2^-sh) < B^out.len(), never rounded up. Returns its length.
 fn mul_shr(a: &[u64], b: &[u64], sh: u64, out: &mut [u64], hi_mul: BinOp) -> usize {
+    if a.is_empty() || b.is_empty() {
+        out.fill(0);
+        return 0;
+    }
+    shr_prod(a.len() + b.len(), sh, out, |w| hi_mul(a, b, w))
+}
+
+// mul_shr(a, a, ..) through a high square.
+fn sqr_shr(a: &[u64], sh: u64, out: &mut [u64], hi_sqr: UnOp) -> usize {
+    shr_prod(2 * a.len(), sh, out, |w| hi_sqr(a, w))
+}
+
+// mul_shr for a product of full limbs whose window below its top limb hi writes, as hi_mul does.
+fn shr_prod(full: usize, sh: u64, out: &mut [u64], hi: impl FnOnce(&mut [u64]) -> u64) -> usize {
     let (sl, sb) = split_sh(sh);
-    let (full, o) = (a.len() + b.len(), out.len());
-    if a.is_empty() || b.is_empty() || full <= sl {
+    let o = out.len();
+    if full <= sl {
         out.fill(0);
         return 0;
     }
     // The product's limbs from sl up; one past out holds only bits the shift moves down.
     let r = full - sl;
     debug_assert!(r <= o + 1, "a b 2^-sh must fit out");
-    let top = hi_mul(a, b, &mut out[..r - 1]);
+    let top = hi(&mut out[..r - 1]);
     if r <= o {
         out[r - 1] = top;
         out[r..].fill(0);
@@ -1726,95 +1741,311 @@ pub fn theta_static_at<const N: usize, const T: usize>(
     Ok(t.out(th2, th3, &acc))
 }
 
-// a in out, b in g and the top of a b in prod. Each root reads its t-limb product's top ⌈t/2⌉ + 2
-// limbs as padded by zeros, which moves it by under 2^-60 units.
+// AGM(m + D, m - D) = m (1 - Σ g_i u^i) with u = (D / m)² and g_i = N_i 2^-e_i, the inverse of
+// K's series Σ (C(2i, i) / 4^i)² u^i, since AGM(1 + ε, 1 - ε) = π / (2 K(ε)). Every g_i is
+// positive and they fall, so the next term bounds the rest. N_20 passes u64.
+#[doc(hidden)]
+pub const AGM_TAIL: [(u64, u32); 19] = [
+    (1, 2),
+    (5, 6),
+    (11, 8),
+    (469, 14),
+    (1379, 16),
+    (17223, 20),
+    (56001, 22),
+    (11998869, 30),
+    (41064827, 32),
+    (571915951, 36),
+    (2018982161, 38),
+    (115338112823, 44),
+    (415720532641, 46),
+    (6041874952949, 50),
+    (22103950817043, 52),
+    (20825721430968213, 62),
+    (77047750289886219, 64),
+    (1145470055108455527, 68),
+    (4274935497276922857, 70),
+];
+
+// Bits the tail's quotient ε keeps past those its correction C needs.
+const AGM_TAIL_GUARD: i64 = 24;
+
+// The AGM's kernels: high product, high square, approximate root, and the tail's ratio.
+type AgmOps = (BinOp, UnOp, SqrtOp, Ratio);
+
+// The fewest terms I whose remainder m Σ_(i>I) g_i u^i is at most half a unit, for m < 2^bm and
+// u < 2^(-2t): under 2^(bm + 1) g_(I+1) u^(I+1), as u < 1/4 needs t >= 1. None past the table.
+fn agm_tail_terms(bm: u64, t: u64) -> Option<usize> {
+    if t == 0 {
+        return None;
+    }
+    (0..=AGM_TAIL.len()).find(|&i| {
+        let (n, e) = AGM_TAIL[i.min(AGM_TAIL.len() - 1)];
+        2 * t * (i as u64 + 1) + e as u64 >= bm + 2 + bit_len(n)
+    })
+}
+
+// ε's limbs, for a correction C < 2^cb.
+fn agm_ratio_limbs(cb: i64) -> usize {
+    ((cb + AGM_TAIL_GUARD).max(1) as u64).div_ceil(64) as usize
+}
+
+// Whether the tail can finish from (a, b) in at most cap terms with ε in at most ratio_max limbs,
+// by bounds the tail's exact m = (a + b) / 2 and D = |a - b| / 2 meet: bits(m) in [top - 1, top]
+// and bits(D) <= diff - 1, from the top limb where a and b differ.
+fn agm_tail_ready(a: &[u64], b: &[u64], cap: usize, ratio_max: usize) -> bool {
+    let top = bits(&a[..buf_len(a)]).max(bits(&b[..buf_len(b)]));
+    let diff = (0..a.len())
+        .rev()
+        .find(|&i| a[i] != b[i])
+        .map_or(0, |i| 64 * i as u64 + bit_len(a[i].abs_diff(b[i])));
+    // |a - b| <= 1 leaves D = 0.
+    if diff <= 1 {
+        return true;
+    }
+    match agm_tail_terms(top, top.saturating_sub(diff + 1)) {
+        Some(0) => true,
+        Some(i) if i <= cap => agm_ratio_limbs(2 * diff as i64 - top as i64 - 1) <= ratio_max,
+        _ => false,
+    }
+}
+
+// x += floor(n 2^sh), which fits x.
+fn add_shifted(x: &mut [u64], n: u64, sh: i64) {
+    let c = if sh < 0 {
+        add_prim(x, n.checked_shr(sh.unsigned_abs() as u32).unwrap_or(0))
+    } else {
+        let (w, v) = split_sh(sh as u64);
+        let wide = (n as u128) << v;
+        let parts = [wide as u64, (wide >> 64) as u64];
+        add_buf(&mut x[w..], &parts[..buf_len(&parts)])
+    };
+    debug_assert!(!c);
+}
+
+// AGM(a, b) into out, from a in out and b in g (both nonzero), as m - C with
+// C = m u H(u) = D ε H(u), ε = D / m and H = Σ g_i u^(i - 1) in [1/4, 0.26). Returns its terms.
+// Each value is a floor at a frame one guard past what C needs, which shrinks by 2t bits a level
+// (u < 2^-2t): ε at f1 = 64 we fraction bits past 2^-t, u at f1, Horner's h_i at f1 - 2t (i - 1),
+// so only ε's division and the last product D (ε H) run at C's width. out is within 2 units.
+fn agm_tail(
+    out: &mut [u64],
+    [g, d, e, u, h]: [&mut [u64]; 5],
+    (hi_mul, hi_sqr, ratio): (BinOp, UnOp, Ratio),
+) -> usize {
+    let l = out.len();
+    // D = |a - b| / 2 and m = lo + D = (a + b) / 2, floored alike (a ± b share a parity).
+    let (b, d) = (&g[..l], &mut d[..l]);
+    d.copy_from_slice(out);
+    let out_lo = sub_buf(d, b);
+    if out_lo {
+        twos_comp(d);
+    }
+    shr_buf(d, 1);
+    if !out_lo {
+        out.copy_from_slice(b);
+    }
+    let c = add_buf(out, d);
+    debug_assert!(!c, "m < B^l");
+    let (ml, dl) = (buf_len(out), buf_len(d));
+    if dl == 0 {
+        return 0;
+    }
+    let (bm, bd) = (bits(&out[..ml]), bits(&d[..dl]));
+    let t = bm - bd - 1;
+    let terms = agm_tail_terms(bm, t).expect("agm_tail_ready bounds the terms");
+    if terms == 0 {
+        return 0;
+    }
+    let dv = &d[..dl];
+    // ε 2^(64 we + t) < B^we, at least 64 we - 2 bits.
+    let we = agm_ratio_limbs(2 * bd as i64 - bm as i64);
+    let e = &mut e[..we];
+    ratio(dv, &out[..ml], -(t as i64), e);
+    let f1 = 64 * we as u64;
+    // ε from the limbs u and ε W read: each one below costs under a unit.
+    let ke = ((2 * t).saturating_sub(1) / 64).min(we as u64 - 1) as usize;
+    let ev = &e[ke..buf_len(e)];
+    let (mut cur, mut nxt) = (g, h);
+    // W = u h_2 at f1 in cur[..cl], for I >= 2.
+    let mut cl = 0;
+    if terms >= 2 {
+        // U = u 2^f1 < 2^(f1 - 2t).
+        sqr_shr(ev, f1 + 2 * t - 128 * ke as u64, &mut u[..we], hi_sqr);
+        let ul = buf_len(&u[..we]);
+        // h_I = g_I, then h_i = g_i + u h_(i+1) at f_i = f1 - 2t (i - 1), ending at W.
+        let level = |i: usize| f1 - 2 * t * (i as u64 - 1);
+        let place = |x: &mut [u64], i: usize| {
+            let (n, ei) = AGM_TAIL[i - 1];
+            add_shifted(x, n, level(i) as i64 - ei as i64);
+        };
+        let top = level(terms).div_ceil(64) as usize;
+        cur[..top].fill(0);
+        place(&mut cur[..top], terms);
+        cl = buf_len(&cur[..top]);
+        for i in (1..terms).rev() {
+            // u's limbs below level i's frame cost under a unit there.
+            let ku = ((2 * t * (i as u64 - 1)) / 64) as usize;
+            let ol = level(i).div_ceil(64) as usize;
+            let sh = f1 - 2 * t - 64 * ku as u64;
+            mul_shr(&u[ku..ul], &cur[..cl], sh, &mut nxt[..ol], hi_mul);
+            if i > 1 {
+                place(&mut nxt[..ol], i);
+            }
+            cl = buf_len(&nxt[..ol]);
+            std::mem::swap(&mut cur, &mut nxt);
+        }
+    }
+    // V = ε H 2^(64 we + t) = ε / 4 + ε W, in u.
+    let v = &mut u[..we];
+    mul_shr(ev, &cur[..cl], f1 - 64 * ke as u64, v, hi_mul);
+    shr_buf(e, 2);
+    let c = add_buf(v, e);
+    debug_assert!(!c);
+    let vl = buf_len(v);
+    // Y = C 2^64 from D's limbs at and above C's (the dropped ones cost under 2^-10 units).
+    let kd = (t.saturating_sub(9) / 64) as usize;
+    let y = &mut cur[..l + 2];
+    mul_shr(&dv[kd..], &v[..vl], f1 + t - 64 - 64 * kd as u64, y, hi_mul);
+    let y = &y[1..];
+    let b = sub_buf(out, &y[..buf_len(y)]);
+    debug_assert!(!b, "C < m");
+    terms
+}
+
+// The limit of a and b's AGM at out's scale (zero-extended), within a few units: means until the
+// closed-form tail needs at most cap terms (or ε would pass ratio_max limbs), then the tail. Each
+// mean is within a unit, but a unit in b_k < a_k costs about a_k / b_k units of the result. Each
+// root reads its t-limb product's top ⌈t/2⌉ + 2 limbs (in prod) as padded by zeros, which moves it
+// by under 2^-60 units. Returns (roots, tail terms).
 fn agm_core(
     a: &[u64],
     b: &[u64],
-    iters: usize,
+    cap: usize,
     out: &mut [u64],
-    [g, prod]: [&mut [u64]; 2],
-    hi_mul: BinOp,
-    sqrt: SqrtOp,
-) {
+    bufs: [&mut [u64]; 5],
+    ops: AgmOps,
+    ratio_max: usize,
+) -> (usize, usize) {
     let l = out.len();
     assert!(
         a.len() <= l && b.len() <= l,
         "the AGM's inputs must fit its output"
     );
-    let (g, prod) = (&mut g[..l], &mut prod[..l + 2]);
+    let [g, prod, e, u, h] = bufs.map(|x| &mut x[..l + 2]);
     out[..a.len()].copy_from_slice(a);
     out[a.len()..].fill(0);
     g[..b.len()].copy_from_slice(b);
     g[b.len()..].fill(0);
-    for i in 1..=iters {
-        // No root after the last mean. (t, h): the product's length and its top limbs in prod.
-        let t = (i < iters).then(|| {
-            let (la, lg) = (buf_len(out), buf_len(g));
-            if la == 0 || lg == 0 {
-                return (0, 0);
-            }
-            // The larger operand first, so swapped inputs make the same products.
-            let (x, y) = (&out[..la], &g[..lg]);
-            let (x, y) = if cmp_buf(x, y) == Ordering::Less {
-                (y, x)
-            } else {
-                (x, y)
-            };
-            let t0 = la + lg;
-            let h0 = t0.min(t0.div_ceil(2) + 2);
-            prod[h0 - 1] = hi_mul(x, y, &mut prod[..h0 - 1]);
-            let h = buf_len(&prod[..h0]);
-            (t0 - h0 + h, h)
-        });
-        let carry = add_buf(out, g);
+    // AGM(x, 0) = 0, which halving would take 64 l steps to reach.
+    if buf_len(out) == 0 || buf_len(&g[..l]) == 0 {
+        out.fill(0);
+        return (0, 0);
+    }
+    let (hi_mul, hi_sqr, sqrt, ratio) = ops;
+    // Halving log2(a / b), then doubling the gap.
+    let most = 2 * bit_len(64 * l as u64) as usize + 16;
+    let mut roots = 0;
+    while !agm_tail_ready(out, &g[..l], cap, ratio_max) {
+        debug_assert!(roots < most, "the AGM takes O(log P) steps");
+        roots += 1;
+        // (t, hl): the product's length and its top limbs in prod. Neither operand is ever 0.
+        let (la, lg) = (buf_len(out), buf_len(&g[..l]));
+        // The larger operand first, so swapped inputs make the same products.
+        let (x, y) = (&out[..la], &g[..lg]);
+        let (x, y) = if cmp_buf(x, y) == Ordering::Less {
+            (y, x)
+        } else {
+            (x, y)
+        };
+        let t0 = la + lg;
+        let h0 = t0.min(t0.div_ceil(2) + 2);
+        prod[h0 - 1] = hi_mul(x, y, &mut prod[..h0 - 1]);
+        let hl = buf_len(&prod[..h0]);
+        let t = t0 - h0 + hl;
+        let carry = add_buf(out, &g[..l]);
         shr_buf(out, 1);
         if carry {
             out[l - 1] |= 1 << 63;
         }
-        if let Some((t, h)) = t {
-            // x B^(2 sl - h): the dropped limbs, and for an odd t one more, whose 2^32 the shift
-            // removes exactly, as ⌊⌊√(p B)⌋ / 2^32⌋ = ⌊√p⌋.
-            let sl = t.div_ceil(2);
-            if t > 0 {
-                sqrt(&mut prod[..h], &mut g[..sl]);
-                if t % 2 == 1 {
-                    shr_buf(&mut g[..sl], 32);
-                }
-            }
-            g[sl..].fill(0);
+        // x B^(2 sl - hl): the dropped limbs, and for an odd t one more, whose 2^32 the shift
+        // removes exactly, as ⌊⌊√(p B)⌋ / 2^32⌋ = ⌊√p⌋.
+        let sl = t.div_ceil(2);
+        sqrt(&mut prod[..hl], &mut g[..sl]);
+        if t % 2 == 1 {
+            shr_buf(&mut g[..sl], 32);
         }
+        g[sl..l].fill(0);
     }
+    (
+        roots,
+        agm_tail(out, [g, prod, e, u, h], (hi_mul, hi_sqr, ratio)),
+    )
 }
 
-// a_iters from a and b at out's scale (zero-extended): iters arithmetic means, iters - 1 roots.
-// Each mean is within a unit, but a unit in b_k < a_k costs about a_k / b_k units of the result.
-pub fn agm_dyn(a: &[u64], b: &[u64], iters: usize, out: &mut [u64]) {
+// AGM(a, b) at out's scale: the tail from DYN_AGM_TAIL_TERMS terms.
+pub fn agm_dyn(a: &[u64], b: &[u64], out: &mut [u64]) {
+    agm_dyn_at(a, b, DYN_AGM_TAIL_TERMS, out);
+}
+
+// agm_dyn with the tail from at most max_terms terms (any cap past AGM_TAIL's 19 acts as 19),
+// returning (roots, tail terms).
+#[doc(hidden)]
+pub fn agm_dyn_at(a: &[u64], b: &[u64], max_terms: usize, out: &mut [u64]) -> (usize, usize) {
     let l = out.len();
     let mut scratch = ScratchGuard::acquire();
-    let bufs = scratch.get_splits([l, l + 2]);
-    agm_core(a, b, iters, out, bufs, hi_mul_dyn, sqrt_approx_dyn);
+    let bufs = scratch.get_splits([l + 2; 5]);
+    agm_core(
+        a,
+        b,
+        max_terms,
+        out,
+        bufs,
+        (
+            hi_mul_dyn,
+            hi_sqr_dyn,
+            sqrt_approx_dyn,
+            ratio_to_fraction_dyn,
+        ),
+        usize::MAX,
+    )
 }
 
 // Needs N >= out.len() + 2, checked before any input.
 pub fn agm_static<const N: usize>(
     a: &[u64],
     b: &[u64],
-    iters: usize,
     out: &mut [u64],
 ) -> Result<(), CapacityError> {
+    agm_static_at::<N>(a, b, STATIC_AGM_TAIL_TERMS, out).map(|_| ())
+}
+
+// agm_static's agm_dyn_at. The tail waits a step while its quotient wouldn't fit N, which only
+// frames of a few limbs reach.
+#[doc(hidden)]
+pub fn agm_static_at<const N: usize>(
+    a: &[u64],
+    b: &[u64],
+    max_terms: usize,
+    out: &mut [u64],
+) -> Result<(usize, usize), CapacityError> {
     capacity::<N>(out.len() + 2)?;
-    let (mut g, mut prod) = ([0; N], [0; N]);
-    agm_core(
+    let mut bufs = [[0; N]; 5];
+    Ok(agm_core(
         a,
         b,
-        iters,
+        max_terms,
         out,
-        [&mut g, &mut prod],
-        hi_mul_static::<N>,
-        sqrt_approx_static::<N>,
-    );
-    Ok(())
+        bufs.each_mut().map(|x| &mut x[..]),
+        (
+            hi_mul_static::<N>,
+            hi_sqr_static::<N>,
+            sqrt_approx_static::<N>,
+            ratio_to_fraction_static::<N>,
+        ),
+        // ratio_to_fraction_static's out.len() + 2 <= N.
+        N - 2,
+    ))
 }
 
 // The theta–AGM logarithm (docs/agm-ln-exact-chain.md), with q = X 2^-shift, so no reciprocal:
@@ -1874,7 +2105,7 @@ fn ln_agm_core(
     out: &mut [u64],
     [a, b, c, d]: [&mut [u64]; 4],
     theta: fn(&[u64], u64, &mut [u64], &mut [u64]) -> usize,
-    (hi_mul, agm): (BinOp, fn(&[u64], &[u64], usize, &mut [u64])),
+    (hi_mul, agm): (BinOp, fn(&[u64], &[u64], &mut [u64])),
     (pi, ln2, ratio): (fn(&mut [u64]), fn(&mut [u64]), Ratio),
 ) -> (i64, bool) {
     let x = nx.x;
@@ -1902,13 +2133,9 @@ fn ln_agm_core(
             mul_shr(th3, th3, 64 * g as u64, s, hi_mul);
             shr_buf(s, 1);
             sub_buf(s, b1);
-            // The doc's (a_n + b_n) / 2 count, ln(1/q) from x's top 64 bits.
-            let top = window(x, bits(x) as i64 - 64) as f64;
-            let ln_q = (l as f64 + 64.0 - top.log2()) * LN_2;
-            let p = 64 * (f as u64 + 1);
-            let arg = 2.0 * ln_q * (p as f64 + 3.0) * LN_2 / (PI * PI) * (1.0 + 1e-12);
+            // M = AGM(a1, b1), which stops on its own gap.
             let mm = &mut a[..g];
-            agm(&s[..g], b1, arg.log2().ceil().max(0.0) as usize, mm);
+            agm(&s[..g], b1, mm);
             // T = π / (4M), its integer part on top.
             let pb = &mut b[..f + 2];
             pi(pb);
@@ -1971,8 +2198,8 @@ pub fn ln_agm_static_at<const N: usize, const T: usize>(
         out,
         bufs.each_mut().map(|b| &mut b[..k]),
         |x, s, a, b| theta_static::<N, T>(x, s, a, b).expect("ln_agm checks N"),
-        (hi_mul_static::<N>, |a, b, n, o| {
-            agm_static::<N>(a, b, n, o).expect("ln_agm checks N")
+        (hi_mul_static::<N>, |a, b, o| {
+            agm_static::<N>(a, b, o).expect("ln_agm checks N")
         }),
         (
             |o| pi_static::<N>(o).expect("ln_agm checks N"),

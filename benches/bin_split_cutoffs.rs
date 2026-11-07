@@ -2,25 +2,32 @@
 //
 //   cargo bench --bench bin_split_cutoffs -- <family> [--limbs 8,16,max] [--terms 1,4]
 //       [--par 256,max] [--cands 0/31/max,64/1/max] [--rounds 9] [--sizes 256,1024]
-//       [--a 0,0.5,1] [--j 0,16,24]
+//       [--a 0,0.5,1] [--j 0,16,24] [--tail 0,1,3,7,15]
 //
 // Families: bbp, engel, hyper, sbbp, sengel, shyper (leaf sweeps, serial), par (parallel
 // cutoff, all threads, default leaves), e2e (old term cutoffs against the defaults), ln
 // (ln_dyn end to end against its square-root scale A, all threads) and exp (exp_dyn end to
-// end against its square count j, with ln_dyn on the same X for scale, all threads).
+// end against its square count j, with ln_dyn on the same X for scale, all threads) and agm
+// (agm_dyn_at and agm_static_at on ln_agm's inputs against the tail's term cap, with the roots
+// each cap took and ln_agm_dyn_at::<3> on the same X for scale).
 // Each candidate times a tree build only: finalize doesn't depend on the tree's shape.
 // Candidates alternate within each round and each one reports its median over rounds,
 // relative to the workload's best; the summary is the geometric mean over workloads.
 
 use big_bits::utils::{
+    mul::{mul_dyn, sqr_dyn},
     series::{
         bin_split_tree_at, BBPSeries, DynHyperCtx, DynNodeBBP, DynNodeEngel, DynNodeHyper, Engel,
         HyperSeries, Node, Series, Shift, SplitCutoffs, StaticHyperCtx, StaticNodeBBP,
         StaticNodeEngel, StaticNodeHyper,
     },
-    trans::{exp_dyn_at, exp_dyn_entry, ln_dyn, ln_dyn_at, Exp},
+    trans::{
+        agm_dyn_at, agm_static_at, exp_dyn_at, exp_dyn_entry, ln_agm_dyn_at, ln_dyn, ln_dyn_at,
+        theta_dyn, Exp,
+    },
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
+use std::cell::RefCell;
 use std::{env, hint::black_box, time::Instant};
 
 // e^y - 1's term count for y <= 2^-s at w limbs, at least one.
@@ -325,6 +332,8 @@ struct Args {
     a: Option<Vec<f64>>,
     // exp's square counts.
     j: Option<Vec<u64>>,
+    // The AGM tail's term caps.
+    tail: Option<Vec<u64>>,
 }
 
 // "limbs/terms/par" candidates, comma separated.
@@ -362,6 +371,7 @@ fn args() -> Args {
         sizes: None,
         a: None,
         j: None,
+        tail: None,
     };
     while let Some(flag) = it.next() {
         let val = it.next().expect("flag value");
@@ -374,6 +384,7 @@ fn args() -> Args {
             "--sizes" => a.sizes = Some(parse_list(&val).iter().map(|&s| s as usize).collect()),
             "--a" => a.a = Some(val.split(',').map(|t| t.parse().expect("numbers")).collect()),
             "--j" => a.j = Some(parse_list(&val)),
+            "--tail" => a.tail = Some(parse_list(&val)),
             f => panic!("unknown flag {f}"),
         }
     }
@@ -592,6 +603,148 @@ fn scale_e2e<C: Copy + std::fmt::Display>(
     println!("{:<22} {:>10}{pad}  {}", "geomean", "", cells.join(" "));
 }
 
+// a b exactly.
+fn full_mul(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let mut out = vec![0; a.len() + b.len() - 1];
+    let top = mul_dyn(a, b, &mut out);
+    out.push(top);
+    out
+}
+
+// x's limbs from lo, n of them, zero past its end.
+fn limbs_from(x: &[u64], lo: usize, n: usize) -> Vec<u64> {
+    (0..n).map(|i| x.get(lo + i).copied().unwrap_or(0)).collect()
+}
+
+// ln_agm_dyn_at::<3>'s AGM inputs at o output limbs for an X of 64 (o + 1) random bits (no
+// cancellation), with agm_frame's f, l and g: θ from theta_dyn::<3> at q = x 2^-(bits(x) + l),
+// b1 = θ2 θ3 and a1 = (θ2 + θ3)² / 2 - b1, from exact products floored to g fraction limbs
+// (ln_agm_core's high products can differ in the last limbs).
+fn agm_inputs(x: &[u64], o: usize) -> (Vec<u64>, Vec<u64>) {
+    let f = o as u64 + 1;
+    let l = (64 * (f + 1) + 3).div_ceil(64).max(2);
+    let g = (f + 2 + l.div_ceil(64)) as usize;
+    let z = ((l - 2) / 64) as usize;
+    let (mut th2, mut th3) = (vec![0; g - z], vec![0; g + 1]);
+    theta_dyn::<3>(x, 64 * x.len() as u64 + l, &mut th2, &mut th3);
+    let th2 = &th2[..th2.iter().rposition(|&v| v != 0).unwrap() + 1];
+    let b1 = limbs_from(&full_mul(th2, &th3), g, g);
+    let mut sum = th3.clone();
+    let mut c = 0u128;
+    for (i, s) in sum.iter_mut().enumerate() {
+        c += *s as u128 + th2.get(i).copied().unwrap_or(0) as u128;
+        *s = c as u64;
+        c >>= 64;
+    }
+    let mut sq = vec![0; 2 * sum.len() - 1];
+    let top = sqr_dyn(&sum, &mut sq);
+    sq.push(top);
+    let mut a1 = limbs_from(&sq, g, g + 1);
+    // a1 = sq / 2 - b1, in g limbs.
+    for i in 0..g {
+        a1[i] = a1[i] >> 1 | a1[i + 1] << 63;
+    }
+    a1.truncate(g);
+    let mut borrow = 0i128;
+    for (v, &w) in a1.iter_mut().zip(&b1) {
+        let d = *v as i128 - w as i128 - borrow;
+        *v = d as u64;
+        borrow = (d < 0) as i128;
+    }
+    assert_eq!(borrow, 0);
+    (a1, b1)
+}
+
+// agm_dyn_at against its tail's term cap at each size, relative to the best, each cap's
+// roots/terms, j = cap 0's roots - its own, then agm_static_at at a few N sized to the frame.
+fn agm_family(args: &Args) {
+    let caps: Vec<usize> = args
+        .tail
+        .as_deref()
+        .unwrap_or(&[0, 1, 2, 3, 5, 7, 10, 15, 19])
+        .iter()
+        .map(|&c| c as usize)
+        .collect();
+    let header: Vec<String> = caps.iter().map(|c| format!("I<={c}")).collect();
+    let w = header.iter().map(|h| h.len()).max().unwrap().max(7);
+    println!(
+        "{:<22} {:>10} {:>10}  {}",
+        "workload",
+        "best ms",
+        "ln ms",
+        header.iter().map(|h| format!("{h:>w$}")).collect::<Vec<_>>().join(" ")
+    );
+    let mut rng = StdRng::seed_from_u64(29);
+    let report = |name: String, t: &[f64], steps: &[(usize, usize)], ln: Option<f64>| {
+        let best = t.iter().cloned().fold(f64::MAX, f64::min);
+        let cells: Vec<String> = t.iter().map(|&x| format!("{:>w$.3}", x / best)).collect();
+        let ln = ln.map_or(String::new(), |v| format!("{:.3}", v * 1e3));
+        println!("{name:<22} {:>10.3} {ln:>10}  {}", best * 1e3, cells.join(" "));
+        let r0 = steps[0].0;
+        let cells: Vec<String> = steps
+            .iter()
+            .map(|&(r, i)| format!("{:>w$}", format!("{r}/{i} j{}", r0 - r)))
+            .collect();
+        println!("{:<22} {:>10} {:>10}  {}", "  roots/terms", "", "", cells.join(" "));
+    };
+    for o in sizes_or(args, &[64, 256, 1024, 4096, 16384]) {
+        let x = rand_x(64 * (o as u64 + 1), &mut rng);
+        let (a1, b1) = agm_inputs(&x, o);
+        let out = RefCell::new(vec![0; a1.len()]);
+        let steps: Vec<_> = caps
+            .iter()
+            .map(|&c| agm_dyn_at(&a1, &b1, c, &mut out.borrow_mut()))
+            .collect();
+        let run = |c: usize| {
+            black_box(agm_dyn_at(&a1, &b1, c, &mut out.borrow_mut()));
+        };
+        let t = measure(&run, &caps, args.rounds);
+        let lo = RefCell::new(vec![0; o]);
+        let ln = measure(
+            &|_: ()| {
+                black_box(ln_agm_dyn_at::<3>(&x, 0, &mut lo.borrow_mut()).unwrap());
+            },
+            &[()],
+            args.rounds,
+        );
+        report(format!("agm_dyn {o} (g={})", a1.len()), &t, &steps, Some(ln[0]));
+    }
+
+    // Static, with N two limbs past the frame g.
+    fn static_row<const N: usize>(o: usize, caps: &[usize], rounds: usize) -> (String, Vec<f64>, Vec<(usize, usize)>) {
+        let mut rng = StdRng::seed_from_u64(31);
+        let (a1, b1) = agm_inputs(&rand_x(64 * (o as u64 + 1), &mut rng), o);
+        assert!(a1.len() + 2 <= N);
+        let out = RefCell::new(vec![0; a1.len()]);
+        let steps: Vec<_> = caps
+            .iter()
+            .map(|&c| agm_static_at::<N>(&a1, &b1, c, &mut out.borrow_mut()).unwrap())
+            .collect();
+        let run = |c: usize| {
+            black_box(agm_static_at::<N>(&a1, &b1, c, &mut out.borrow_mut()).unwrap());
+        };
+        (format!("agm_static N={N}"), measure(&run, caps, rounds), steps)
+    }
+    let (caps2, rounds) = (caps.clone(), args.rounds);
+    let rows = std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || {
+            prefer_fast_cores();
+            [
+                static_row::<72>(64, &caps2, rounds),
+                static_row::<272>(256, &caps2, rounds),
+                static_row::<1048>(1024, &caps2, rounds),
+                static_row::<4168>(4096, &caps2, rounds),
+            ]
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    for (name, t, steps) in rows {
+        report(name, &t, &steps, None);
+    }
+}
+
 // Asks macOS to keep this thread on a performance core.
 fn prefer_fast_cores() {
     #[cfg(target_os = "macos")]
@@ -653,6 +806,7 @@ fn main() {
                 black_box(ln_dyn(x, 0, out).unwrap());
             })),
         ),
+        "agm" => agm_family(&a),
         f @ ("sbbp" | "sengel" | "shyper") => {
             // Static trees need far more stack than the main thread has.
             let f = f.to_string();
