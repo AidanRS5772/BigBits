@@ -141,7 +141,8 @@ division, whose cost relative to M grows with size.
 last step costs, by this machine's kernels (R ≈ 1.6 M, D ≈ 2.1 M at 4164 limbs), an estimated
 2.4 M per root, against the 2.1 M Zimmermann measures. That agrees with the earlier NR sqrt
 experiment. It would only win with FFT transform reuse (Bernstein's counts), which means exposing
-the transforms from the multiplication layer.
+the transforms from the multiplication layer. `docs/nr_transform_sharing.md` works out how much of
+that fits 16-bit digits in a double: about 5% of the AGM.
 
 **The approximate top level already skips what it can** (the low square, the remainder, the final
 correction). Its quotient-only division is one half-precision reciprocal and one Karp–Markstein
