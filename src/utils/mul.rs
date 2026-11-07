@@ -1493,130 +1493,25 @@ pub fn karatsuba_entry_static<const N: usize>(long: &[u64], short: &[u64], out: 
 }
 
 //FFT MULTIPLICATION
-// Low tier complexity overhead is very high, High tier algorithm. It handles unbalanced inputs
-// through a chunking and non-chunking version. The chunking version is recursive. The chunking
-// boundary happens at F_0 s^2 = l , F_0 > 4 , the smaller the overhead of chunking the closer F_0
-// is too 4.
-// Time:
-// FFT: O((l+s)log(l+s))
-// Chunking FFT: O(2l*log(2s))
+// Low tier complexity overhead is very high, High tier algorithm. An unbalanced product takes one
+// transform of l + s digits. Chunking l into pieces of s only pays from about l = F_0 s^2, F_0 > 4
+// (2l log(2s) against l log(l)), and nearly every such shape passes the NTT cutoff first, so there
+// is no chunking version.
+// Time: O((l+s)log(l+s))
 // Space:
-// FFT:
 //  Complex Space: O(l+s)
-// Chunking FFT:
-//  Complex Space: O(2s)
-//  Real Space: O(2s)
 
-pub struct FTTTwidleTower {
-    table: Vec<Complex<f64>>,
-    veiw: Vec<Complex<f64>>,
-    res: usize,
-    gen: u8,
-    base: usize,
-}
-
-impl FTTTwidleTower {
-    const MAX_GEN: u8 = 3;
-
-    pub fn build(n: usize) -> Self {
-        let len = n / 4 + 1;
-        let th = 2.0 * PI / (n as f64);
-        let mut table = Vec::<Complex<f64>>::with_capacity(len);
-        table.push(Complex::new(1.0, 0.0));
-        for k in 1..len {
-            table.push(Complex::cis(th * k as f64));
-        }
-
-        FTTTwidleTower {
-            table,
-            veiw: Vec::new(),
-            res: n,
-            gen: 0,
-            base: 1,
-        }
-    }
-
-    pub fn refine(&mut self, new_res: usize) {
-        debug_assert!(new_res > self.res);
-        debug_assert!(new_res % self.res == 0);
-
-        let new_len = new_res / 4 + 1;
-        let mut new_table = Vec::<Complex<f64>>::with_capacity(new_len);
-
-        let growth = new_res / self.res;
-        let mut steps = Vec::<Complex<f64>>::with_capacity(growth - 1);
-        let th = 2.0 * PI / (new_res as f64);
-        for i in 1..growth {
-            steps.push(Complex::cis(th * i as f64));
-        }
-
-        for &v in &self.table[..self.table.len() - 1] {
-            new_table.push(v);
-            for &s in steps.iter() {
-                new_table.push(v * s);
-            }
-        }
-        new_table.push(self.table[self.table.len() - 1]);
-
-        self.table = new_table;
-        self.res = new_res;
-        self.gen += 1;
-        self.base *= growth;
-    }
-
-    pub fn rebuild(&mut self, new_res: usize) {
-        debug_assert!(new_res > self.res);
-        debug_assert!(new_res % self.res == 0);
-
-        let new_len = new_res / 4 + 1;
-        let growth = new_res / self.res;
-        let new_base = self.base * growth;
-        let mut new_table = Vec::<Complex<f64>>::with_capacity(new_len);
-        new_table.push(Complex { re: 1.0, im: 0.0 });
-        let th = 2.0 * PI / (new_res as f64);
-        for i in 1..new_len {
-            if i % new_base != 0 {
-                new_table.push(Complex::cis(th * i as f64));
-            } else {
-                new_table.push(self.table[i / growth]);
-            }
-        }
-
-        self.table = new_table;
-        self.res = new_res;
-        self.gen = 0;
-        self.base = 1;
-    }
-
-    pub fn get(&mut self, res: usize) -> &[Complex<f64>] {
-        return match res.cmp(&self.res) {
-            std::cmp::Ordering::Equal => &self.table,
-            std::cmp::Ordering::Greater => {
-                debug_assert!(res % self.res == 0);
-                if self.gen >= Self::MAX_GEN {
-                    self.rebuild(res);
-                } else {
-                    self.refine(res);
-                }
-                &self.table
-            }
-            std::cmp::Ordering::Less => {
-                debug_assert!(self.res % res == 0);
-                let len = res / 4 + 1;
-                let stride = self.res / res;
-                self.veiw.clear();
-                for i in 0..len {
-                    self.veiw.push(self.table[i * stride]);
-                }
-                &self.veiw
-            }
-        };
-    }
+// recombine's and sqr_recombine's twiddles: e^(2 pi i k / n) for k in 0..=n/4.
+pub(crate) fn fft_twidles(n: usize) -> Box<[Complex<f64>]> {
+    let th = 2.0 * PI / n as f64;
+    (0..=n / 4).map(|k| Complex::cis(th * k as f64)).collect()
 }
 
 struct FFTCache {
     planner: FftPlanner<f64>,
-    twidles: HashMap<usize, FTTTwidleTower>,
+    // One exact table per transform size n, so a size's table doesn't depend on the sizes the
+    // thread saw before it, and a call reads it straight.
+    twidles: HashMap<usize, Box<[Complex<f64>]>>,
 }
 
 impl FFTCache {
@@ -1633,11 +1528,7 @@ impl FFTCache {
     ) -> (Arc<dyn Fft<f64>>, Arc<dyn Fft<f64>>, &[Complex<f64>], usize) {
         let fwd = self.planner.plan_fft_forward(n);
         let bwd = self.planner.plan_fft_inverse(n / 2);
-        let tw = self
-            .twidles
-            .entry(n >> n.trailing_zeros())
-            .or_insert_with(|| FTTTwidleTower::build(n))
-            .get(n);
+        let tw = self.twidles.entry(n).or_insert_with(|| fft_twidles(n));
         let scratch_sz = n + fwd
             .get_inplace_scratch_len()
             .max(bwd.get_inplace_scratch_len());
@@ -1652,9 +1543,8 @@ impl FFTCache {
         let bwd = self.planner.plan_fft_inverse(m);
         let tw = self
             .twidles
-            .entry(m >> m.trailing_zeros())
-            .or_insert_with(|| FTTTwidleTower::build(2 * m))
-            .get(2 * m);
+            .entry(2 * m)
+            .or_insert_with(|| fft_twidles(2 * m));
         let scratch_sz = m + fwd
             .get_inplace_scratch_len()
             .max(bwd.get_inplace_scratch_len());
@@ -1666,177 +1556,153 @@ thread_local! {
     static FFT_CACHE: RefCell<FFTCache> = RefCell::new(FFTCache::new());
 }
 
-const FFT_RADIX: [usize; 3] = [3, 5, 7];
+// Transform sizes are 4 * o * 2^a for these odd parts. rustfft sends only 2^k and 3 * 2^k through
+// its radix-4 kernel, and anything else through a mixed-radix split with two transposes, so a size
+// costs more per point the more odd factors it has: about 1.2x for 5, 7, 9 and 15, 1.3-1.5x for
+// 21, 25, 27, 35, 45, 49 and 63, and up to 1.9x past that (NEON). Those sizes lose to a slightly
+// longer cheap one; these five average within 1% of the fastest size at or above each length. The
+// measurements are in docs/fft_precision.md. AVX plans its factors differently: remeasure on x86.
+const FFT_ODD_PARTS: [usize; 5] = [1, 3, 5, 7, 9];
 
-const fn fft_log_prim_search(
-    init: usize,
-    target: usize,
-    mut idx: usize,
-    primes: &[usize],
-) -> usize {
-    if init >= target {
-        return init;
-    }
-    if idx == 0 {
-        let sh = target.ilog2().saturating_sub(init.ilog2());
-        let mut result = init << sh;
-        if result < target {
-            result <<= 1;
-        }
-        return result;
-    }
-    idx -= 1;
-    let p = primes[idx];
-    let mut val = init;
-    let mut best = fft_log_prim_search(val, target, idx, primes);
-    if best == target {
-        return best;
-    }
-    val *= p;
-    while val < best {
-        let cur = fft_log_prim_search(val, target, idx, primes);
-        if cur < best {
-            best = cur;
-            if best == target {
-                return best;
-            }
-        }
-        val *= p;
-    }
-    return best;
-}
-
+/// The smallest transform size at or above `n` digits: 4 * o * 2^a with o in {1, 3, 5, 7, 9}.
 pub const fn find_fft_size(n: usize) -> usize {
-    return fft_log_prim_search(4, n, FFT_RADIX.len(), &FFT_RADIX);
+    let mut best = usize::MAX;
+    let mut i = 0;
+    while i < FFT_ODD_PARTS.len() {
+        let mut size = 4 * FFT_ODD_PARTS[i];
+        while size < n {
+            size *= 2;
+        }
+        if size < best {
+            best = size;
+        }
+        i += 1;
+    }
+    best
 }
 
 /// One FFT call's rounding: `err` is the largest distance from a scaled coefficient to the integer
-/// it rounded to, and `peak` the largest rounded coefficient's magnitude. The checked entries keep
-/// a result only while [`FftRounding::trips`] is false; the raw ones return it for the probe and
-/// the tests.
+/// it rounded to, and `fold_failed` whether the fold check ran and failed. The checked entries keep
+/// a result only while `fold_failed` is false; the raw ones return it for the probe and the tests.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FftRounding {
     pub err: f64,
-    pub peak: f64,
-}
-
-impl FftRounding {
-    /// Whether a checked entry redoes the call on the NTT: its error passes `FFT_ROUNDOFF_LIMIT`
-    /// or its peak reaches `FFT_COEFF_LIMIT`, where the error can no longer be read finely enough.
-    /// NaN trips, though finite inputs never make one.
-    pub fn trips(self) -> bool {
-        !(self.err <= FFT_ROUNDOFF_LIMIT && self.peak < FFT_COEFF_LIMIT)
-    }
-
-    fn max(self, o: Self) -> Self {
-        FftRounding {
-            err: self.err.max(o.err),
-            peak: self.peak.max(o.peak),
-        }
-    }
+    pub fold_failed: bool,
 }
 
 // Each scale_and_round divides the inverse transform's coefficients by its length, rounds them to
-// the nearest integer and returns the call's FftRounding: the largest distance it rounded across
-// and the largest rounded magnitude. Coefficients are finite (bounded integers plus rounding
-// error), so the maxima need no NaN handling.
+// the nearest integer and returns the largest distance it rounded across.
+// Coefficients are finite (bounded integers plus rounding error), so the maximum needs no NaN
+// handling. A power-of-two length (POW2) multiplies by 1 / scale
+// instead: that reciprocal is exact, so the result is bit-identical to the division's. Any other
+// length divides, as an inexact reciprocal would move the distance the fold check's trigger reads.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn scale_and_round_x86(x: &mut [Complex<f64>], scale: f64) -> FftRounding {
+unsafe fn scale_and_round_x86<const POW2: bool>(x: &mut [Complex<f64>], scale: f64) -> f64 {
     let coefs = std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut f64, x.len() * 2);
-    let divisor = _mm256_set1_pd(scale);
+    let factor = _mm256_set1_pd(if POW2 { 1.0 / scale } else { scale });
     let sign = _mm256_set1_pd(-0.0);
-    // Two accumulators each, so the maxima's loop-carried chains don't hold up the loop.
+    // Two accumulators, so the maximum's loop-carried chain doesn't hold up the loop.
     let (mut err0, mut err1) = (_mm256_setzero_pd(), _mm256_setzero_pd());
-    let (mut peak0, mut peak1) = (_mm256_setzero_pd(), _mm256_setzero_pd());
     const ROUND: i32 = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
     let chunks = coefs.len() / 8;
     let ptr = coefs.as_mut_ptr();
     for i in 0..chunks {
         let offset = i * 8;
-        // Load 8 f64s, divide by scale and round
-        let s0 = _mm256_div_pd(_mm256_loadu_pd(ptr.add(offset)), divisor);
-        let s1 = _mm256_div_pd(_mm256_loadu_pd(ptr.add(offset + 4)), divisor);
+        // Load 8 f64s, scale and round
+        let (v0, v1) = (
+            _mm256_loadu_pd(ptr.add(offset)),
+            _mm256_loadu_pd(ptr.add(offset + 4)),
+        );
+        let (s0, s1) = if POW2 {
+            (_mm256_mul_pd(v0, factor), _mm256_mul_pd(v1, factor))
+        } else {
+            (_mm256_div_pd(v0, factor), _mm256_div_pd(v1, factor))
+        };
         let r0 = _mm256_round_pd::<ROUND>(s0);
         let r1 = _mm256_round_pd::<ROUND>(s1);
-        // |scaled - rounded| and |rounded|: clear the sign bits
+        // |scaled - rounded|: clear the sign bits
         err0 = _mm256_max_pd(err0, _mm256_andnot_pd(sign, _mm256_sub_pd(s0, r0)));
         err1 = _mm256_max_pd(err1, _mm256_andnot_pd(sign, _mm256_sub_pd(s1, r1)));
-        peak0 = _mm256_max_pd(peak0, _mm256_andnot_pd(sign, r0));
-        peak1 = _mm256_max_pd(peak1, _mm256_andnot_pd(sign, r1));
         _mm256_storeu_pd(ptr.add(offset), r0);
         _mm256_storeu_pd(ptr.add(offset + 4), r1);
     }
-    let (mut errs, mut peaks) = ([0.0f64; 4], [0.0f64; 4]);
+    let mut errs = [0.0f64; 4];
     _mm256_storeu_pd(errs.as_mut_ptr(), _mm256_max_pd(err0, err1));
-    _mm256_storeu_pd(peaks.as_mut_ptr(), _mm256_max_pd(peak0, peak1));
     let tail = scale_and_round_slice(&mut coefs[chunks * 8..], scale);
-    errs.iter()
-        .zip(&peaks)
-        .fold(tail, |m, (&err, &peak)| m.max(FftRounding { err, peak }))
+    errs.iter().fold(tail, |m, &err| m.max(err))
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn scale_and_round_aarch(x: &mut [Complex<f64>], scale: f64) -> FftRounding {
+unsafe fn scale_and_round_aarch<const POW2: bool>(x: &mut [Complex<f64>], scale: f64) -> f64 {
     let coefs = std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut f64, x.len() * 2);
-    let divisor = vdupq_n_f64(scale);
-    // Two accumulators each, so the maxima's loop-carried chains don't hold up the loop.
+    let factor = vdupq_n_f64(if POW2 { 1.0 / scale } else { scale });
+    // Two accumulators, so the maximum's loop-carried chain doesn't hold up the loop.
     let (mut err0, mut err1) = (vdupq_n_f64(0.0), vdupq_n_f64(0.0));
-    let (mut peak0, mut peak1) = (vdupq_n_f64(0.0), vdupq_n_f64(0.0));
     let chunks = coefs.len() / 4;
     let ptr = coefs.as_mut_ptr();
     for i in 0..chunks {
         let offset = i * 4;
-        // Load 4 f64s, divide by scale and round
-        let s0 = vdivq_f64(vld1q_f64(ptr.add(offset)), divisor);
-        let s1 = vdivq_f64(vld1q_f64(ptr.add(offset + 2)), divisor);
+        // Load 4 f64s, scale and round
+        let (v0, v1) = (vld1q_f64(ptr.add(offset)), vld1q_f64(ptr.add(offset + 2)));
+        let (s0, s1) = if POW2 {
+            (vmulq_f64(v0, factor), vmulq_f64(v1, factor))
+        } else {
+            (vdivq_f64(v0, factor), vdivq_f64(v1, factor))
+        };
         let r0 = vrndnq_f64(s0);
         let r1 = vrndnq_f64(s1);
-        // |scaled - rounded| and |rounded|
+        // |scaled - rounded|
         err0 = vmaxq_f64(err0, vabdq_f64(s0, r0));
         err1 = vmaxq_f64(err1, vabdq_f64(s1, r1));
-        peak0 = vmaxq_f64(peak0, vabsq_f64(r0));
-        peak1 = vmaxq_f64(peak1, vabsq_f64(r1));
         vst1q_f64(ptr.add(offset), r0);
         vst1q_f64(ptr.add(offset + 2), r1);
     }
     let tail = scale_and_round_slice(&mut coefs[chunks * 4..], scale);
-    tail.max(FftRounding {
-        err: vmaxvq_f64(vmaxq_f64(err0, err1)),
-        peak: vmaxvq_f64(vmaxq_f64(peak0, peak1)),
-    })
+    tail.max(vmaxvq_f64(vmaxq_f64(err0, err1)))
 }
 
-fn scale_and_round_slice(coefs: &mut [f64], scale: f64) -> FftRounding {
-    let mut r = FftRounding::default();
+fn scale_and_round_slice(coefs: &mut [f64], scale: f64) -> f64 {
+    let mut err = 0f64;
     for c in coefs {
         let scaled = *c / scale;
         *c = scaled.round_ties_even();
-        r.err = r.err.max((scaled - *c).abs());
-        r.peak = r.peak.max(c.abs());
+        err = err.max((scaled - *c).abs());
     }
-    r
+    err
 }
 
-pub fn scale_and_round_standard(x: &mut [Complex<f64>], scale: f64) -> FftRounding {
+pub fn scale_and_round_standard(x: &mut [Complex<f64>], scale: f64) -> f64 {
     let coefs = unsafe { std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut f64, x.len() * 2) };
     scale_and_round_slice(coefs, scale)
 }
 
-fn scale_and_round(x: &mut [Complex<f64>], scale: f64) -> FftRounding {
+pub(crate) fn scale_and_round(x: &mut [Complex<f64>], scale: f64) -> f64 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            return unsafe { scale_and_round_x86(x, scale) };
+            return unsafe {
+                if (scale as usize).is_power_of_two() {
+                    scale_and_round_x86::<true>(x, scale)
+                } else {
+                    scale_and_round_x86::<false>(x, scale)
+                }
+            };
         }
         return scale_and_round_standard(x, scale);
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        return unsafe { scale_and_round_aarch(x, scale) };
+        return unsafe {
+            if (scale as usize).is_power_of_two() {
+                scale_and_round_aarch::<true>(x, scale)
+            } else {
+                scale_and_round_aarch::<false>(x, scale)
+            }
+        };
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -1854,11 +1720,10 @@ fn separate_mul(x: Complex<f64>, y: Complex<f64>) -> Complex<f64> {
     Complex::new(ar * br - ai * bi, ar * bi + ai * br)
 }
 
-fn recombine(x: &mut [Complex<f64>], m: usize, n: usize, tw: &[Complex<f64>]) {
-    let pk = x[0].re * x[0].im;
-    let pj = x[m].re * x[m].im;
-    x[0] = Complex::new(pk + pj, pk - pj);
-    for k in 1..m / 2 {
+// The pairs k..m/2 of recombine, one at a time.
+#[inline]
+fn recombine_pairs(x: &mut [Complex<f64>], m: usize, n: usize, tw: &[Complex<f64>], from: usize) {
+    for k in from..m / 2 {
         let pk = separate_mul(x[k], x[n - k]);
         let pj = separate_mul(x[m + k], x[m - k]);
         let s = pk + pj;
@@ -1867,8 +1732,116 @@ fn recombine(x: &mut [Complex<f64>], m: usize, n: usize, tw: &[Complex<f64>]) {
         x[k] = Complex::new(s.re - dw.im, s.im + dw.re).scale(0.25);
         x[m - k] = Complex::new(s.re + dw.im, dw.re - s.im).scale(0.25);
     }
+}
+
+// Two consecutive complex values at p, split into a real and an imaginary register, and back. The
+// _rev forms take p and p - 1, for the descending half of a conjugate pair.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn load_complex2(p: *const f64) -> (float64x2_t, float64x2_t) {
+    let (a, b) = (vld1q_f64(p), vld1q_f64(p.add(2)));
+    (vtrn1q_f64(a, b), vtrn2q_f64(a, b))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn load_complex2_rev(p: *const f64) -> (float64x2_t, float64x2_t) {
+    let (a, b) = (vld1q_f64(p), vld1q_f64(p.sub(2)));
+    (vtrn1q_f64(a, b), vtrn2q_f64(a, b))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn store_complex2(p: *mut f64, re: float64x2_t, im: float64x2_t) {
+    vst1q_f64(p, vtrn1q_f64(re, im));
+    vst1q_f64(p.add(2), vtrn2q_f64(re, im));
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn store_complex2_rev(p: *mut f64, re: float64x2_t, im: float64x2_t) {
+    vst1q_f64(p, vtrn1q_f64(re, im));
+    vst1q_f64(p.sub(2), vtrn2q_f64(re, im));
+}
+
+// recombine_pairs two pairs at a time, returning the first k it left. Fused products, so its
+// rounding differs slightly from the scalar loop's.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn recombine_pairs_aarch(
+    x: &mut [Complex<f64>],
+    m: usize,
+    n: usize,
+    tw: &[Complex<f64>],
+) -> usize {
+    debug_assert!(tw.len() >= m / 2 && x.len() >= n);
+    let p = x.as_mut_ptr() as *mut f64;
+    let t = tw.as_ptr() as *const f64;
+    let quarter = vdupq_n_f64(0.25);
+    let mut k = 1;
+    while k + 1 < m / 2 {
+        let (xr, xi) = load_complex2(p.add(2 * k));
+        let (yr, yi) = load_complex2_rev(p.add(2 * (n - k)));
+        let (ur, ui) = load_complex2(p.add(2 * (m + k)));
+        let (vr, vi) = load_complex2_rev(p.add(2 * (m - k)));
+        let (wr, wi) = load_complex2(t.add(2 * k));
+        // separate_mul(x[k], x[n - k])
+        let (ar, ai) = (vaddq_f64(xr, yr), vsubq_f64(xi, yi));
+        let (br, bi) = (vaddq_f64(xi, yi), vsubq_f64(yr, xr));
+        let pkr = vfmsq_f64(vmulq_f64(ar, br), ai, bi);
+        let pki = vfmaq_f64(vmulq_f64(ar, bi), ai, br);
+        // separate_mul(x[m + k], x[m - k])
+        let (ar, ai) = (vaddq_f64(ur, vr), vsubq_f64(ui, vi));
+        let (br, bi) = (vaddq_f64(ui, vi), vsubq_f64(vr, ur));
+        let pjr = vfmsq_f64(vmulq_f64(ar, br), ai, bi);
+        let pji = vfmaq_f64(vmulq_f64(ar, bi), ai, br);
+        let (sr, si) = (vaddq_f64(pkr, pjr), vaddq_f64(pki, pji));
+        let (dr, di) = (vsubq_f64(pkr, pjr), vsubq_f64(pki, pji));
+        let dwr = vfmsq_f64(vmulq_f64(dr, wr), di, wi);
+        let dwi = vfmaq_f64(vmulq_f64(dr, wi), di, wr);
+        store_complex2(
+            p.add(2 * k),
+            vmulq_f64(vsubq_f64(sr, dwi), quarter),
+            vmulq_f64(vaddq_f64(si, dwr), quarter),
+        );
+        store_complex2_rev(
+            p.add(2 * (m - k)),
+            vmulq_f64(vaddq_f64(sr, dwi), quarter),
+            vmulq_f64(vsubq_f64(dwr, si), quarter),
+        );
+        k += 2;
+    }
+    k
+}
+
+// The two terms with no conjugate pair: no pair reads or writes them.
+#[inline(always)]
+fn recombine_ends(x: &mut [Complex<f64>], m: usize, n: usize) {
+    let pk = x[0].re * x[0].im;
+    let pj = x[m].re * x[m].im;
+    x[0] = Complex::new(pk + pj, pk - pj);
     let k = m / 2;
     x[k] = separate_mul(x[k], x[n - k]).conj().scale(0.5);
+}
+
+pub(crate) fn recombine(x: &mut [Complex<f64>], m: usize, n: usize, tw: &[Complex<f64>]) {
+    recombine_ends(x, m, n);
+    #[cfg(target_arch = "aarch64")]
+    let from = unsafe { recombine_pairs_aarch(x, m, n, tw) };
+    #[cfg(not(target_arch = "aarch64"))]
+    let from = 1;
+    recombine_pairs(x, m, n, tw, from);
+}
+
+// recombine without NEON, for the tests.
+#[cfg(test)]
+pub(crate) fn recombine_standard(x: &mut [Complex<f64>], m: usize, n: usize, tw: &[Complex<f64>]) {
+    recombine_ends(x, m, n);
+    recombine_pairs(x, m, n, tw, 1);
 }
 
 fn fft_core(
@@ -1877,7 +1850,7 @@ fn fft_core(
     bwd: &dyn Fft<f64>,
     tw: &[Complex<f64>],
     fft_scratch: &mut [Complex<f64>],
-) -> FftRounding {
+) -> f64 {
     let n = x.len();
     fwd.process_with_scratch(x, fft_scratch);
     recombine(x, n / 2, n, tw);
@@ -1887,20 +1860,21 @@ fn fft_core(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn decompose_16_x86(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
+unsafe fn decompose_16_x86(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) -> (u64, u64) {
     let out = x.as_mut_ptr() as *mut f64;
     let mut idx = 0usize;
+    let (mut c_l, mut c_s) = (0, 0);
 
     for (&l, &s) in long.iter().zip(short) {
         // Broadcast into both 64-bit lanes of a 128-bit register
-        // [u16_0, u16_1, u16_2, u16_3] → [u32_0, u32_1, u32_2, u32_3]
-        // [u32_0, u32_1, u32_2, u32_3] → [f64_0, f64_1, f64_2, f64_3]
-        let l_broadcast = _mm_set1_epi64x(l as i64);
-        let l_as_u32s = _mm_cvtepu16_epi32(l_broadcast);
-        let l_f64s = _mm256_cvtepi32_pd(l_as_u32s);
-        let s_broadcast = _mm_set1_epi64x(s as i64);
-        let s_as_u32s = _mm_cvtepu16_epi32(s_broadcast);
-        let s_f64s = _mm256_cvtepi32_pd(s_as_u32s);
+        // [i16_0, i16_1, i16_2, i16_3] → [i32_0, i32_1, i32_2, i32_3]
+        // [i32_0, i32_1, i32_2, i32_3] → [f64_0, f64_1, f64_2, f64_3]
+        let l_broadcast = _mm_set1_epi64x(balance_limb(l, &mut c_l) as i64);
+        let l_as_i32s = _mm_cvtepi16_epi32(l_broadcast);
+        let l_f64s = _mm256_cvtepi32_pd(l_as_i32s);
+        let s_broadcast = _mm_set1_epi64x(balance_limb(s, &mut c_s) as i64);
+        let s_as_i32s = _mm_cvtepi16_epi32(s_broadcast);
+        let s_f64s = _mm256_cvtepi32_pd(s_as_i32s);
         // result: [l0, s0, l2, s2]
         let lo = _mm256_unpacklo_pd(l_f64s, s_f64s);
         // result: [l1, s1, l3, s3]
@@ -1916,9 +1890,9 @@ unsafe fn decompose_16_x86(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) 
     }
     let zero = _mm256_setzero_pd();
     for &l in &long[short.len()..] {
-        let l_broadcast = _mm_set1_epi64x(l as i64);
-        let l_as_u32s = _mm_cvtepu16_epi32(l_broadcast);
-        let l_f64s = _mm256_cvtepi32_pd(l_as_u32s);
+        let l_broadcast = _mm_set1_epi64x(balance_limb(l, &mut c_l) as i64);
+        let l_as_i32s = _mm_cvtepi16_epi32(l_broadcast);
+        let l_f64s = _mm256_cvtepi32_pd(l_as_i32s);
         // Interleave with zeros: same logic but s_f64s is replaced by zero
         let lo = _mm256_unpacklo_pd(l_f64s, zero);
         let hi = _mm256_unpackhi_pd(l_f64s, zero);
@@ -1934,38 +1908,82 @@ unsafe fn decompose_16_x86(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) 
     if idx < total {
         std::ptr::write_bytes(out.add(idx), 0, total - idx);
     }
+    (c_l, c_s)
 }
 
-//converts u64 to f64 in 16 bit chunks
+// Balanced digits: a limb's four 16-bit digits as signed values in [-2^15, 2^15), and the carry
+// into the next limb. x + bias + carry, with each digit's top bit then flipped, is y_i - 2^15 digit
+// by digit, so the digits sum to x with no carry between the lanes. Mixed signs make a coefficient's
+// digit products cancel, and an unsigned operand's huge zero-frequency term goes away with them.
+const FFT_DIGIT_BIAS: u64 = 0x8000_8000_8000_8000;
+
+#[inline(always)]
+fn balance_limb(x: u64, carry: &mut u64) -> u64 {
+    let (y, c1) = x.overflowing_add(FFT_DIGIT_BIAS);
+    let (y, c2) = y.overflowing_add(*carry);
+    *carry = (c1 | c2) as u64;
+    y ^ FFT_DIGIT_BIAS
+}
+
+// An operand's top digit stays unsigned, so balancing adds no digit and no transform grows: a carry
+// out of it (out of the top limb, or into the zero digit above it) goes back in as +2^16, leaving
+// that digit at most 2^16. limbs may carry zero top limbs, as a middle product's operands can.
+// `coefs` holds the operand's digits at offset + stride * index.
+fn fft_absorb_top_carry(
+    coefs: &mut [f64],
+    offset: usize,
+    stride: usize,
+    limbs: &[u64],
+    carry: u64,
+) {
+    let len16 = bit16_length(limbs.len(), limbs[limbs.len() - 1].max(1));
+    let carried = if len16 == 4 * limbs.len() {
+        carry != 0
+    } else {
+        std::mem::take(&mut coefs[offset + stride * len16]) != 0.0
+    };
+    if carried {
+        coefs[offset + stride * (len16 - 1)] += 65536.0;
+    }
+}
+
+// Digit i of a balanced limb.
+#[inline(always)]
+fn balanced_digit(limb: u64, i: usize) -> f64 {
+    (limb >> (16 * i)) as u16 as i16 as f64
+}
+
+//converts a balanced limb to f64 in signed 16 bit chunks
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn u64_into_2x2f64s_aarch(x: u64) -> (float64x2_t, float64x2_t) {
     // Load into a 64-bit NEON register
     let x_raw = vdup_n_u64(x);
-    // Reinterpret the same 64 bits as 4 × u16
-    let x_u16x4 = vreinterpret_u16_u64(x_raw);
-    // Zero Extend: 4 x u16 -> 4 x u32
-    let x_u32x4 = vmovl_u16(x_u16x4);
-    // Split: 4 x u32 -> 2 x u32 + 2 x u32
-    let (x_u32_lo, x_u32_hi) = (vget_low_u32(x_u32x4), vget_high_u32(x_u32x4));
-    // Zero Extend: 2 x u32 -> 2 x u64
-    let x_u64_lo = vmovl_u32(x_u32_lo);
-    let x_u64_hi = vmovl_u32(x_u32_hi);
-    // Float Cast: 2 x u64 -> 2 x f64
-    let x_f0 = vcvtq_f64_u64(x_u64_lo);
-    let x_f1 = vcvtq_f64_u64(x_u64_hi);
+    // Reinterpret the same 64 bits as 4 × i16
+    let x_i16x4 = vreinterpret_s16_u64(x_raw);
+    // Sign Extend: 4 x i16 -> 4 x i32
+    let x_i32x4 = vmovl_s16(x_i16x4);
+    // Split: 4 x i32 -> 2 x i32 + 2 x i32
+    let (x_i32_lo, x_i32_hi) = (vget_low_s32(x_i32x4), vget_high_s32(x_i32x4));
+    // Sign Extend: 2 x i32 -> 2 x i64
+    let x_i64_lo = vmovl_s32(x_i32_lo);
+    let x_i64_hi = vmovl_s32(x_i32_hi);
+    // Float Cast: 2 x i64 -> 2 x f64
+    let x_f0 = vcvtq_f64_s64(x_i64_lo);
+    let x_f1 = vcvtq_f64_s64(x_i64_hi);
     (x_f0, x_f1)
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn decompose_16_aarch(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
+unsafe fn decompose_16_aarch(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) -> (u64, u64) {
     let out = x.as_mut_ptr() as *mut f64;
     let mut idx = 0usize;
+    let (mut c_l, mut c_s) = (0, 0);
 
     for (&l, &s) in long.iter().zip(short) {
-        let (l_f0, l_f1) = u64_into_2x2f64s_aarch(l);
-        let (s_f0, s_f1) = u64_into_2x2f64s_aarch(s);
+        let (l_f0, l_f1) = u64_into_2x2f64s_aarch(balance_limb(l, &mut c_l));
+        let (s_f0, s_f1) = u64_into_2x2f64s_aarch(balance_limb(s, &mut c_s));
         // [l0, l1] × [s0, s1] → [l0, s0]
         let pair0 = vzip1q_f64(l_f0, s_f0);
         // [l0, l1] × [s0, s1] → [l1, s1]
@@ -1984,7 +2002,7 @@ unsafe fn decompose_16_aarch(long: &[u64], short: &[u64], x: &mut [Complex<f64>]
 
     let zero = vdupq_n_f64(0.0);
     for &l in &long[short.len()..] {
-        let (l_f0, l_f1) = u64_into_2x2f64s_aarch(l);
+        let (l_f0, l_f1) = u64_into_2x2f64s_aarch(balance_limb(l, &mut c_l));
         // zip with zero register for im = 0.0
         vst1q_f64(out.add(idx), vzip1q_f64(l_f0, zero));
         vst1q_f64(out.add(idx + 2), vzip2q_f64(l_f0, zero));
@@ -1997,82 +2015,87 @@ unsafe fn decompose_16_aarch(long: &[u64], short: &[u64], x: &mut [Complex<f64>]
     if idx < total {
         std::ptr::write_bytes(out.add(idx), 0, total - idx);
     }
+    (c_l, c_s)
 }
 
-pub fn decompose_16_standard(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
-    const MASK: u64 = u16::MAX as u64;
+pub fn decompose_16_standard(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) -> (u64, u64) {
     let mut idx = 0;
+    let (mut c_l, mut c_s) = (0, 0);
     for (&l, &s) in long.iter().zip(short) {
-        x[idx].re = (l & MASK) as f64;
-        x[idx].im = (s & MASK) as f64;
-        x[idx + 1].re = (l >> 16 & MASK) as f64;
-        x[idx + 1].im = (s >> 16 & MASK) as f64;
-        x[idx + 2].re = (l >> 32 & MASK) as f64;
-        x[idx + 2].im = (s >> 32 & MASK) as f64;
-        x[idx + 3].re = (l >> 48) as f64;
-        x[idx + 3].im = (s >> 48) as f64;
+        let (l, s) = (balance_limb(l, &mut c_l), balance_limb(s, &mut c_s));
+        for i in 0..4 {
+            x[idx + i] = Complex::new(balanced_digit(l, i), balanced_digit(s, i));
+        }
         idx += 4;
     }
     for &l in &long[short.len()..] {
-        x[idx].re = (l & MASK) as f64;
-        x[idx].im = 0.0;
-        x[idx + 1].re = (l >> 16 & MASK) as f64;
-        x[idx + 1].im = 0.0;
-        x[idx + 2].re = (l >> 32 & MASK) as f64;
-        x[idx + 2].im = 0.0;
-        x[idx + 3].re = (l >> 48) as f64;
-        x[idx + 3].im = 0.0;
+        let l = balance_limb(l, &mut c_l);
+        for i in 0..4 {
+            x[idx + i] = Complex::new(balanced_digit(l, i), 0.0);
+        }
         idx += 4;
     }
     if idx < x.len() {
         x[idx..].fill(Complex::zero());
     }
+    (c_l, c_s)
 }
 
-fn decompose(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
+// long + i short in balanced digits, with each operand's top digit unsigned.
+pub(crate) fn decompose(long: &[u64], short: &[u64], x: &mut [Complex<f64>]) {
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
-        unsafe {
-            decompose_16_x86(long, short, x);
-        }
+    let (c_l, c_s) = if is_x86_feature_detected!("avx2") {
+        unsafe { decompose_16_x86(long, short, x) }
     } else {
-        decompose_16_standard(long, short, x);
-    }
+        decompose_16_standard(long, short, x)
+    };
 
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        decompose_16_aarch(long, short, x);
-    }
+    let (c_l, c_s) = unsafe { decompose_16_aarch(long, short, x) };
+
+    let coefs = unsafe { std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut f64, x.len() * 2) };
+    fft_absorb_top_carry(coefs, 0, 2, long, c_l);
+    fft_absorb_top_carry(coefs, 1, 2, short, c_s);
 }
 
-#[inline]
-fn fft_chunk_value(chunk: &[f64]) -> u128 {
-    let mut val = 0u128;
-    for (i, c) in chunk.iter().enumerate() {
-        val += (*c as u64 as u128) << (i * 16);
-    }
-    val
+// One limb's four 16-bit coefficients, which are signed integers of magnitude below 2^53:
+// c0 + c1 2^16 + c2 2^32 + c3 2^48, added in two halves rather than shifted digit by digit.
+#[inline(always)]
+fn fft_limb_value(c: &[f64]) -> i128 {
+    let [c0, c1, c2, c3] = *c else {
+        unreachable!("chunks_exact(4)")
+    };
+    let lo = c0 as i64 as i128 + ((c1 as i64 as i128) << 16);
+    let hi = c2 as i64 as i128 + ((c3 as i64 as i128) << 16);
+    lo + (hi << 32)
 }
 
-#[inline]
-fn fft_accumulate_limb(chunks: &mut std::slice::Chunks<'_, f64>, carry: &mut u128) -> u64 {
-    let total = *carry + fft_chunk_value(chunks.next().unwrap());
+#[inline(always)]
+fn fft_accumulate_limb(chunks: &mut std::slice::ChunksExact<'_, f64>, carry: &mut i128) -> u64 {
+    let total = *carry + fft_limb_value(chunks.next().unwrap());
     *carry = total >> 64;
     total as u64
 }
 
-fn fft_accumulate(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
+// Writes out and returns the signed value above it. Every coefficient past that value's four is
+// zero, as a product has at most 4 digits per limb, so the padding is left unread.
+pub(crate) fn fft_accumulate_signed(x: &[Complex<f64>], out: &mut [u64]) -> i128 {
     let coefs = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const f64, x.len() * 2) };
-    let mut chunks = coefs.chunks(4);
-    let mut carry = 0u128;
+    let mut chunks = coefs.chunks_exact(4);
+    let mut carry = 0i128;
 
     for elem in out.iter_mut() {
         *elem = fft_accumulate_limb(&mut chunks, &mut carry);
     }
-    for chunk in chunks {
-        carry += fft_chunk_value(chunk);
+    if let Some(chunk) = chunks.next() {
+        carry += fft_limb_value(chunk);
     }
-    carry as u64
+    carry
+}
+
+// A product's limbs and the limb above them, which a nonnegative product can't make negative.
+pub(crate) fn fft_accumulate(x: &[Complex<f64>], out: &mut [u64]) -> u64 {
+    fft_accumulate_signed(x, out) as u64
 }
 
 #[inline(always)]
@@ -2080,23 +2103,24 @@ fn bit16_length(sz: usize, last: u64) -> usize {
     (sz - 1) * 4 + (last.ilog2() as usize) / 16 + 1
 }
 
-// THE ROUND-OFF CHECK
+// THE FOLD CHECK AND ITS TRIGGER
 //
 // Every 16-bit FFT entry measures its call's rounding (scale_and_round) before it reads the
-// coefficients: the largest distance between a coefficient and the integer it rounds to, and the
-// largest coefficient. A wrong limb needs some coefficient off by more than 0.5, which reads at
-// least 0.4 unless it is off by 0.6 or more, and rounding errors spread over many coefficients, so
-// a wrong call shows a distance past FFT_ROUNDOFF_LIMIT. That holds only while the distance can be
-// read finely: a coefficient's error comes in steps of up to c·2^-52, so from FFT_COEFF_LIMIT
-// (2^48) the call trips whatever it reads. A tripped call's transform is discarded and the call is
-// redone on the NTT, which is exact. FFT products and squares then check their result by its
-// residues mod the NTT primes (always in debug builds, in release with FFT_RESIDUE_CHECK) and redo
-// a mismatch too. The dispatch limits (FFT_16BIT_CUTOFF and its siblings) only keep reroutes rare
-// for random operands. The *_raw entries skip every check, for the precision probe and the tests,
-// and return the call's FftRounding beside the result.
+// coefficients: the largest distance between a coefficient and the integer it rounds to. One that
+// reads above FFT_FOLD_TRIGGER runs the fold check (fft_fold_agrees), which tests the result itself,
+// and is redone on the NTT only if that fails. A wrong limb needs some coefficient off by more than
+// 0.5, which reads 1 - e, so a wrong result can only skip the check with one off by at least 0.75
+// while every other reads within 0.25. Balanced digits keep the largest possible coefficient below
+// 2^48 at every dispatch limit (asserted in mod.rs), so a coefficient's error is read in steps of at
+// most 1/16; those limits are therefore soundness bounds as well as speed choices. FFT products and
+// squares then check their result by its residues mod the NTT primes (always in debug builds, in
+// release with FFT_RESIDUE_CHECK) and redo a mismatch too. The *_raw entries redo nothing, for the
+// precision probe and the tests, and return the call's FftRounding beside the result.
 
 static FFT_REROUTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FFT_RESIDUE_REROUTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FFT_FOLD_CHECKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FFT_FOLD_REROUTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // Whether fft_entry and fft_sqr_entry check their results by residues.
 const FFT_RESIDUES: bool = cfg!(debug_assertions) || FFT_RESIDUE_CHECK;
@@ -2108,17 +2132,238 @@ pub fn fft_reroutes() -> u64 {
     FFT_REROUTES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// How many of [`fft_reroutes`] passed the round-off check and failed only the residue check: wrong
-/// results the round-off check missed. It should stay 0.
+/// How many of [`fft_reroutes`] passed the fold check or never ran it and failed only the residue
+/// check: wrong results the fold check and its trigger missed. It should stay 0.
 #[doc(hidden)]
 pub fn fft_residue_reroutes() -> u64 {
     FFT_RESIDUE_REROUTES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-// Whether a call with this rounding must be redone: never for the raw entries.
+/// How many fold checks the checked entries have run in this process (a diagnostic).
+#[doc(hidden)]
+pub fn fft_fold_checks() -> u64 {
+    FFT_FOLD_CHECKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many of [`fft_fold_checks`] failed, each redone on the NTT.
+#[doc(hidden)]
+pub fn fft_fold_reroutes() -> u64 {
+    FFT_FOLD_REROUTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// The largest transform each dispatcher reaches. A checked entry can only vouch for sizes up to these
+// (see the limits in mod.rs), so past one it goes straight to the NTT.
+const FFT_MUL_MAX_SIZE: usize = find_fft_size(4 * (FFT_16BIT_CUTOFF + 1));
+const FFT_SQR_MAX_SIZE: usize = find_fft_size(8 * FFT_SQR_16BIT_CUTOFF);
+const FFT_MID_MAX_SIZE: usize = find_fft_size(8 * FFT_MID_16BIT_CUTOFF + 4);
+const FFT_BNM1_MAX_SIZE: usize = 4 * FFT_BNM1_16BIT_CUTOFF;
+
+// THE FOLD CHECK
+//
+// The transform computes V = a b mod 2^(16 N) - 1, whatever its digits are, where V sums the N
+// rounded coefficients at their digit positions. So V = a b must also hold mod any p dividing
+// 2^(16 N) - 1, which is what lets a middle product and a cyclic square check themselves: neither
+// keeps a whole product. A wrong V passes only if its coefficient errors, weighted by 2^(16 j) mod p,
+// sum to zero. docs/fft_precision.md has how these primes were chosen.
+//
+// One prime per wrapped transform size, from an exhaustive search, each at least 40 bits with the
+// longest repeat of those weights up to N/16 digits. Not longer: a smooth rounding wave leaves wrong
+// coefficients at its evenly spaced crests, and copies s apart sum to x^t (x^N - 1) / (x^s - 1) = 0
+// unless the repeat divides s, so primes repeating at N, N/2 or N/4 pass 9-28% of real wrong results.
+// Sizes outside this table have no prime (see fft_fold_prime).
+pub(crate) const FFT_FOLD_WRAPPED: &[(usize, u64)] = &[
+    (65536, 2327042503868417),
+    (73728, 2327042503868417),
+    (81920, 2327042503868417),
+    (98304, 2327042503868417),
+    (114688, 2327042503868417),
+    (131072, 2327042503868417),
+    (147456, 1094462078977),
+    (163840, 2327042503868417),
+    (196608, 2327042503868417),
+    (229376, 2327042503868417),
+    (262144, 31065037602817),
+    (294912, 31065037602817),
+    (327680, 1753340313601),
+    (393216, 31065037602817),
+    (458752, 31065037602817),
+    (524288, 31065037602817),
+];
+
+// Products and squares don't wrap, so any prime holds for them. This is the largest safe prime below
+// the kernel's bound, so 2 has order (p - 1) / 2: no weights repeat or negate inside any transform.
+pub(crate) const FFT_FOLD_PLAIN: u64 = 3689348814741904247;
+
+// a mod p, four limbs a step. Only the accumulator chains between steps, so the products can run
+// in parallel: 0.76 ns a limb on the M1 against div_prim's 3.27. p below 2^64 / 5 keeps the sum of
+// five products and a limb inside 128 bits.
+struct FftFold {
+    p: u64,
+    b: [u64; 6],
+}
+
+impl FftFold {
+    fn new(p: u64) -> Self {
+        debug_assert!((p as u128) * 5 < 1u128 << 64);
+        let limb = ((1u128 << 64) % p as u128) as u64;
+        let mut b = [1u64; 6];
+        for k in 1..6 {
+            b[k] = fold_mul(b[k - 1], limb, p);
+        }
+        FftFold { p, b }
+    }
+
+    fn rem(&self, x: &[u64]) -> u64 {
+        let b = &self.b;
+        let wide = |a: u64, c: u64| a as u128 * c as u128;
+        let chunks = x.chunks_exact(4);
+        let top = chunks.remainder().iter().zip(b);
+        let mut acc: u128 = top.map(|(&l, &w)| wide(l, w)).sum();
+        for c in chunks.rev() {
+            acc = c[0] as u128
+                + wide(c[1], b[1])
+                + wide(c[2], b[2])
+                + wide(c[3], b[3])
+                + wide(acc as u64, b[4])
+                + wide((acc >> 64) as u64, b[5]);
+        }
+        (acc % self.p as u128) as u64
+    }
+}
+
+#[inline]
+fn fold_mul(a: u64, b: u64, p: u64) -> u64 {
+    (a as u128 * b as u128 % p as u128) as u64
+}
+
+fn fold_pow(mut a: u64, mut e: u64, p: u64) -> u64 {
+    let mut r = 1 % p;
+    while e > 0 {
+        if e & 1 == 1 {
+            r = fold_mul(r, a, p);
+        }
+        a = fold_mul(a, a, p);
+        e >>= 1;
+    }
+    r
+}
+
+// The prime for a transform of n digits. A wrapped size may have none: those are too small for a
+// reading to reach the trigger on any operand measured, and fall back to the NTT if one does.
+fn fft_fold_prime(n: usize, wrapped: bool) -> Option<u64> {
+    if !wrapped {
+        return Some(FFT_FOLD_PLAIN);
+    }
+    FFT_FOLD_WRAPPED
+        .iter()
+        .find(|&&(size, _)| size == n)
+        .map(|&(_, p)| p)
+}
+
+// Whether the rounded coefficients x (all n of them) agree with a b mod the prime for this
+// transform, or false when a wrapped size has no prime. The operands are the unbalanced limbs: the
+// digits only change the coefficients, not the value V has.
+pub(crate) fn fft_fold_agrees(x: &[Complex<f64>], a: &[u64], b: &[u64], wrapped: bool) -> bool {
+    let n = x.len() * 2;
+    let Some(p) = fft_fold_prime(n, wrapped) else {
+        return false;
+    };
+    let fold = FftFold::new(p);
+    let mut guard = ScratchGuard::acquire();
+    let v = guard.get(n / 4);
+    let top = fft_accumulate_signed(x, v);
+    // What lies above n / 4 limbs weighs 2^(16 n), which is 1 for a wrapped prime.
+    let weight = fold_pow(fold.b[1], (n / 4) as u64, p);
+    let top = top.rem_euclid(p as i128) as u64;
+    let got = add_mod(fold.rem(v), fold_mul(top, weight, p), p);
+    let ra = fold.rem(a);
+    let rb = if std::ptr::eq(a, b) { ra } else { fold.rem(b) };
+    fold_mul(ra, rb, p) == got
+}
+
+// The call's rounding, running the fold check if it read above the trigger, in a raw entry too, so
+// the probe and the tests can see its verdict. NaN runs it as well, though finite inputs never make
+// one.
 #[inline(always)]
-fn fft_trips(rounding: FftRounding, checked: bool) -> bool {
-    checked && rounding.trips()
+fn fft_fold_judge(
+    err: f64,
+    checked: bool,
+    x: &[Complex<f64>],
+    a: &[u64],
+    b: &[u64],
+    wrapped: bool,
+) -> FftRounding {
+    let mut rounding = FftRounding {
+        err,
+        fold_failed: false,
+    };
+    if !(err <= FFT_FOLD_TRIGGER) {
+        rounding.fold_failed = !fft_fold_agrees(x, a, b, wrapped);
+        if checked {
+            FFT_FOLD_CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if rounding.fold_failed {
+                FFT_FOLD_REROUTES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    rounding
+}
+
+// long x short mod 2^(16 n) - 1, and `read`'s view of its n rounded coefficients. A checked call that
+// fails the fold check doesn't reach `read`, so out stays untouched and the caller redoes it.
+#[inline(always)]
+fn fft_mul_coefs<R>(
+    long: &[u64],
+    short: &[u64],
+    n: usize,
+    wrapped: bool,
+    checked: bool,
+    read: impl FnOnce(&[Complex<f64>]) -> R,
+) -> (Option<R>, FftRounding) {
+    FFT_CACHE.with(|cell| {
+        let fft_cache = &mut *cell.borrow_mut();
+        let (fwd, bwd, tw, scratch_sz) = fft_cache.prep_mul(n);
+        let mut scratch_gaurd = ScratchGuard::acquire();
+        let complex_scratch: &mut [Complex<f64>] =
+            unsafe { std::mem::transmute(scratch_gaurd.get(scratch_sz)) };
+        let (x, fft_scratch) = complex_scratch.split_at_mut(n);
+
+        decompose(long, short, x);
+        let err = fft_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
+        let x = &x[..n / 2];
+        let rounding = fft_fold_judge(err, checked, x, long, short, wrapped);
+        if checked && rounding.fold_failed {
+            return (None, rounding);
+        }
+        (Some(read(x)), rounding)
+    })
+}
+
+// a^2 mod 2^(16 n) - 1, with n = 2 m, as fft_mul_coefs.
+#[inline(always)]
+fn fft_sqr_coefs<R>(
+    a: &[u64],
+    m: usize,
+    wrapped: bool,
+    checked: bool,
+    read: impl FnOnce(&[Complex<f64>]) -> R,
+) -> (Option<R>, FftRounding) {
+    FFT_CACHE.with(|cell| {
+        let fft_cache = &mut *cell.borrow_mut();
+        let (fwd, bwd, tw, scratch_sz) = fft_cache.prep_sqr(m);
+        let mut scratch_gaurd = ScratchGuard::acquire();
+        let complex_scratch: &mut [Complex<f64>] =
+            unsafe { std::mem::transmute(scratch_gaurd.get(scratch_sz)) };
+        let (x, fft_scratch) = complex_scratch.split_at_mut(m);
+
+        sqr_decompose(a, x);
+        let err = fft_sqr_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
+        let rounding = fft_fold_judge(err, checked, x, a, a, wrapped);
+        if checked && rounding.fold_failed {
+            return (None, rounding);
+        }
+        (Some(read(x)), rounding)
+    })
 }
 
 #[inline]
@@ -2132,20 +2377,20 @@ fn note_residue_reroute() {
 }
 
 /// long × short into `out` by the 16-bit FFT. The call is redone on the NTT ([`ntt_entry_dyn`])
-/// when its rounding trips the round-off check ([`FftRounding::trips`]), and, in debug builds or
+/// when its rounding fails the fold check, and, in debug builds or
 /// with `FFT_RESIDUE_CHECK`, when its result fails the residue check ([`crate::utils::verify`]).
 pub fn fft_entry(long: &[u64], short: &[u64], out: &mut [u64]) -> u64 {
     fft_entry_checked(long, short, out, true)
 }
 
-// fft_entry with the round-off check optional: the tests turn it off to reach the residue check.
+// fft_entry with the fold check optional: the tests turn it off to reach the residue check.
 pub(crate) fn fft_entry_checked(
     long: &[u64],
     short: &[u64],
     out: &mut [u64],
-    roundoff: bool,
+    fold: bool,
 ) -> u64 {
-    if let Some(overflow) = fft_entry_impl(long, short, out, roundoff).0 {
+    if let Some(overflow) = fft_entry_impl(long, short, out, fold).0 {
         if !FFT_RESIDUES
             || Residues::of_with_top(out, overflow) == Residues::of(long).mul(Residues::of(short))
         {
@@ -2197,21 +2442,11 @@ fn fft_entry_impl(
         bit16_length(short.len(), short[short.len() - 1]),
     );
     let n = find_fft_size(l_len16 + s_len16 - 1);
-    let (overflow, rounding) = FFT_CACHE.with(|cell| {
-        let fft_cache = &mut *cell.borrow_mut();
-        let (fwd, bwd, tw, scratch_sz) = fft_cache.prep_mul(n);
-        let mut scratch_gaurd = ScratchGuard::acquire();
-        let complex_scratch: &mut [Complex<f64>] =
-            unsafe { std::mem::transmute(scratch_gaurd.get(scratch_sz)) };
-        let (x, fft_scratch) = complex_scratch.split_at_mut(n);
-
-        decompose(long, short, x);
-        let rounding = fft_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
-        if fft_trips(rounding, checked) {
-            return (None, rounding);
-        }
-        (Some(fft_accumulate(&mut x[..n / 2], out_core)), rounding)
-    });
+    if checked && n > FFT_MUL_MAX_SIZE {
+        return (None, FftRounding::default());
+    }
+    let (overflow, rounding) =
+        fft_mul_coefs(long, short, n, false, checked, |x| fft_accumulate(x, out_core));
     (
         overflow.map(|overflow| absorb_overflow(out_tail, overflow)),
         rounding,
@@ -4397,10 +4632,10 @@ fn seperate(x: Complex<f64>, y: Complex<f64>) -> (Complex<f64>, Complex<f64>) {
     (Complex::new(a, b), Complex::new(c, -d))
 }
 
-fn sqr_recombine(x: &mut [Complex<f64>], m: usize, tw: &[Complex<f64>]) {
-    let Complex::<f64> { re, im } = x[0];
-    x[0] = Complex::new(re * re + im * im, 2.0 * re * im);
-    for k in 1..m / 2 {
+// The pairs k..m/2 of sqr_recombine, one at a time.
+#[inline]
+fn sqr_recombine_pairs(x: &mut [Complex<f64>], m: usize, tw: &[Complex<f64>], from: usize) {
+    for k in from..m / 2 {
         let (e, o) = seperate(x[k], x[m - k]);
         let (a, b) = seperate(e, tw[k] * o.conj());
         let s = (a + b) * (a - b);
@@ -4408,10 +4643,83 @@ fn sqr_recombine(x: &mut [Complex<f64>], m: usize, tw: &[Complex<f64>]) {
         x[k] = Complex::new(s.re - t.im, s.im + t.re).scale(2.0);
         x[m - k] = Complex::new(s.re + t.im, t.re - s.im).scale(2.0);
     }
+}
+
+// sqr_recombine_pairs two pairs at a time, as recombine_pairs_aarch.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn sqr_recombine_pairs_aarch(
+    x: &mut [Complex<f64>],
+    m: usize,
+    tw: &[Complex<f64>],
+) -> usize {
+    debug_assert!(tw.len() >= m / 2 && x.len() >= m);
+    let p = x.as_mut_ptr() as *mut f64;
+    let t = tw.as_ptr() as *const f64;
+    // The scalar loop's halvings are left out, and the powers of two they would have taken come off
+    // s and t at the end: scaling by them is exact, so the rounding doesn't change.
+    let eighth = vdupq_n_f64(0.125);
+    let half = vdupq_n_f64(0.5);
+    let mut k = 1;
+    while k + 1 < m / 2 {
+        let (xr, xi) = load_complex2(p.add(2 * k));
+        let (yr, yi) = load_complex2_rev(p.add(2 * (m - k)));
+        let (wr, wi) = load_complex2(t.add(2 * k));
+        // (e, o) = seperate(x[k], x[m - k]), both doubled
+        let er = vaddq_f64(xr, yr);
+        let ei = vsubq_f64(xi, yi);
+        let or = vaddq_f64(xi, yi);
+        let oi = vsubq_f64(yr, xr);
+        // v = tw[k] * o.conj(), doubled
+        let vr = vfmaq_f64(vmulq_f64(wr, or), wi, oi);
+        let vi = vfmsq_f64(vmulq_f64(wi, or), wr, oi);
+        // (a, b) = seperate(e, v), times 4
+        let ar = vaddq_f64(er, vr);
+        let ai = vsubq_f64(ei, vi);
+        let br = vaddq_f64(ei, vi);
+        let bi = vsubq_f64(vr, er);
+        // s = (a + b) * (a - b), times 16, and t = e * o, times 4
+        let (pr, pi) = (vaddq_f64(ar, br), vaddq_f64(ai, bi));
+        let (qr, qi) = (vsubq_f64(ar, br), vsubq_f64(ai, bi));
+        let sr = vfmsq_f64(vmulq_f64(pr, qr), pi, qi);
+        let si = vfmaq_f64(vmulq_f64(pr, qi), pi, qr);
+        let tr = vfmsq_f64(vmulq_f64(er, or), ei, oi);
+        let ti = vfmaq_f64(vmulq_f64(er, oi), ei, or);
+        // The output is 2 (s + i t) and its conjugate pair's.
+        let (sr, si) = (vmulq_f64(sr, eighth), vmulq_f64(si, eighth));
+        let (tr, ti) = (vmulq_f64(tr, half), vmulq_f64(ti, half));
+        store_complex2(p.add(2 * k), vsubq_f64(sr, ti), vaddq_f64(si, tr));
+        store_complex2_rev(p.add(2 * (m - k)), vaddq_f64(sr, ti), vsubq_f64(tr, si));
+        k += 2;
+    }
+    k
+}
+
+// The two terms with no conjugate pair: no pair reads or writes them.
+#[inline(always)]
+fn sqr_recombine_ends(x: &mut [Complex<f64>], m: usize) {
+    let Complex::<f64> { re, im } = x[0];
+    x[0] = Complex::new(re * re + im * im, 2.0 * re * im);
     x[m / 2] = Complex::new(
         (x[m / 2].re + x[m / 2].im) * (x[m / 2].re - x[m / 2].im),
         2.0 * x[m / 2].re * x[m / 2].im,
     );
+}
+
+pub(crate) fn sqr_recombine(x: &mut [Complex<f64>], m: usize, tw: &[Complex<f64>]) {
+    sqr_recombine_ends(x, m);
+    #[cfg(target_arch = "aarch64")]
+    let from = unsafe { sqr_recombine_pairs_aarch(x, m, tw) };
+    #[cfg(not(target_arch = "aarch64"))]
+    let from = 1;
+    sqr_recombine_pairs(x, m, tw, from);
+}
+
+// sqr_recombine without NEON, for the tests.
+#[cfg(test)]
+pub(crate) fn sqr_recombine_standard(x: &mut [Complex<f64>], m: usize, tw: &[Complex<f64>]) {
+    sqr_recombine_ends(x, m);
+    sqr_recombine_pairs(x, m, tw, 1);
 }
 
 fn fft_sqr_core(
@@ -4420,7 +4728,7 @@ fn fft_sqr_core(
     bwd: &dyn Fft<f64>,
     tw: &[Complex<f64>],
     fft_scratch: &mut [Complex<f64>],
-) -> FftRounding {
+) -> f64 {
     let m = x.len();
     fwd.process_with_scratch(x, fft_scratch);
     sqr_recombine(x, m, tw);
@@ -4430,16 +4738,17 @@ fn fft_sqr_core(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn sqr_decompose_16_x86(buf: &[u64], x: &mut [Complex<f64>]) {
+unsafe fn sqr_decompose_16_x86(buf: &[u64], x: &mut [Complex<f64>]) -> u64 {
     let out = x.as_mut_ptr() as *mut f64;
     let mut idx = 0usize;
+    let mut carry = 0;
     for &b in buf {
         // loadl loads 64 bits into the low half of a 128-bit register
-        let v = _mm_set1_epi64x(b as i64);
-        // pmovzxwd: zero-extend 4 u16s → 4 u32s
-        let u32s = _mm_cvtepu16_epi32(v);
+        let v = _mm_set1_epi64x(balance_limb(b, &mut carry) as i64);
+        // pmovsxwd: sign-extend 4 i16s → 4 i32s
+        let i32s = _mm_cvtepi16_epi32(v);
         // cvtepi32_pd: 4 i32 → 4 f64
-        let f = _mm256_cvtepi32_pd(u32s);
+        let f = _mm256_cvtepi32_pd(i32s);
         _mm256_storeu_pd(out.add(idx), f);
         idx += 4;
     }
@@ -4447,15 +4756,17 @@ unsafe fn sqr_decompose_16_x86(buf: &[u64], x: &mut [Complex<f64>]) {
     if written < x.len() * 2 {
         std::ptr::write_bytes(out.add(written), 0, x.len() * 2 - written);
     }
+    carry
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn sqr_decompose_16_aarch64(buf: &[u64], x: &mut [Complex<f64>]) {
+unsafe fn sqr_decompose_16_aarch64(buf: &[u64], x: &mut [Complex<f64>]) -> u64 {
     let out = x.as_mut_ptr() as *mut f64;
     let mut idx = 0usize;
+    let mut carry = 0;
     for &b in buf {
-        let (f0, f1) = u64_into_2x2f64s_aarch(b);
+        let (f0, f1) = u64_into_2x2f64s_aarch(balance_limb(b, &mut carry));
         vst1q_f64(out.add(idx), f0);
         vst1q_f64(out.add(idx + 2), f1);
         idx += 4;
@@ -4464,47 +4775,51 @@ unsafe fn sqr_decompose_16_aarch64(buf: &[u64], x: &mut [Complex<f64>]) {
     if written < x.len() * 2 {
         std::ptr::write_bytes(out.add(written), 0, x.len() * 2 - written);
     }
+    carry
 }
 
-pub fn sqr_decompose_16_standard(buf: &[u64], x: &mut [Complex<f64>]) {
+pub fn sqr_decompose_16_standard(buf: &[u64], x: &mut [Complex<f64>]) -> u64 {
     let coefs = unsafe { std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut f64, x.len() * 2) };
-    const MASK: u64 = u16::MAX as u64;
     let mut idx = 0;
+    let mut carry = 0;
     for &b in buf {
-        coefs[idx] = (b & MASK) as f64;
-        coefs[idx + 1] = (b >> 16 & MASK) as f64;
-        coefs[idx + 2] = (b >> 32 & MASK) as f64;
-        coefs[idx + 3] = (b >> 48) as f64;
+        let b = balance_limb(b, &mut carry);
+        for i in 0..4 {
+            coefs[idx + i] = balanced_digit(b, i);
+        }
         idx += 4;
     }
     if idx < coefs.len() {
         coefs[idx..].fill(0.0);
     }
+    carry
 }
 
-fn sqr_decompose(buf: &[u64], x: &mut [Complex<f64>]) {
+// buf in balanced digits, with its top digit unsigned.
+pub(crate) fn sqr_decompose(buf: &[u64], x: &mut [Complex<f64>]) {
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
+    let carry = if is_x86_feature_detected!("avx2") {
         unsafe { sqr_decompose_16_x86(buf, x) }
     } else {
-        sqr_decompose_16_standard(buf, x);
-    }
+        sqr_decompose_16_standard(buf, x)
+    };
 
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        sqr_decompose_16_aarch64(buf, x);
-    }
+    let carry = unsafe { sqr_decompose_16_aarch64(buf, x) };
+
+    let coefs = unsafe { std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut f64, x.len() * 2) };
+    fft_absorb_top_carry(coefs, 0, 1, buf, carry);
 }
 
-/// buf² into `out` by the 16-bit FFT, redone on the NTT ([`ntt_sqr_entry_dyn`]) when the round-off
-/// check trips or the result fails the residue check, as [`fft_entry`] does.
+/// buf² into `out` by the 16-bit FFT, redone on the NTT ([`ntt_sqr_entry_dyn`]) when the fold check
+/// trips or the result fails the residue check, as [`fft_entry`] does.
 pub fn fft_sqr_entry(buf: &[u64], out: &mut [u64]) -> u64 {
     fft_sqr_entry_checked(buf, out, true)
 }
 
-// fft_sqr_entry with the round-off check optional, as fft_entry_checked.
-pub(crate) fn fft_sqr_entry_checked(buf: &[u64], out: &mut [u64], roundoff: bool) -> u64 {
-    if let Some(overflow) = fft_sqr_entry_impl(buf, out, roundoff).0 {
+// fft_sqr_entry with the fold check optional, as fft_entry_checked.
+pub(crate) fn fft_sqr_entry_checked(buf: &[u64], out: &mut [u64], fold: bool) -> u64 {
+    if let Some(overflow) = fft_sqr_entry_impl(buf, out, fold).0 {
         if !FFT_RESIDUES || {
             let r = Residues::of(buf);
             Residues::of_with_top(out, overflow) == r.mul(r)
@@ -4541,22 +4856,12 @@ fn fft_sqr_entry_impl(buf: &[u64], out: &mut [u64], checked: bool) -> (Option<u6
     let (out_core, out_tail) = out.split_at_mut(out_len);
     let bit_len = bit16_length(buf.len(), buf.last().copied().unwrap());
     let n = find_fft_size(2 * bit_len - 1);
+    if checked && n > FFT_SQR_MAX_SIZE {
+        return (None, FftRounding::default());
+    }
     let m = n / 2;
-    let (overflow, rounding) = FFT_CACHE.with(|cell| {
-        let fft_cache = &mut *cell.borrow_mut();
-        let (fwd, bwd, tw, scratch_sz) = fft_cache.prep_sqr(m);
-        let mut scratch_gaurd = ScratchGuard::acquire();
-        let complex_scratch: &mut [Complex<f64>] =
-            unsafe { std::mem::transmute(scratch_gaurd.get(scratch_sz)) };
-        let (x, fft_scratch) = complex_scratch.split_at_mut(m);
-
-        sqr_decompose(buf, x);
-        let rounding = fft_sqr_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
-        if fft_trips(rounding, checked) {
-            return (None, rounding);
-        }
-        (Some(fft_accumulate(x, out_core)), rounding)
-    });
+    let (overflow, rounding) =
+        fft_sqr_coefs(buf, m, false, checked, |x| fft_accumulate(x, out_core));
     (
         overflow.map(|overflow| absorb_overflow(out_tail, overflow)),
         rounding,
@@ -4566,7 +4871,7 @@ fn fft_sqr_entry_impl(buf: &[u64], out: &mut [u64], checked: bool) -> (Option<u6
 // WRAPPED SQUARE (mod B^m - 1)
 
 /// The smallest m >= `min` whose cyclic square mod B^m - 1 runs on an FFT of exactly 4m 16-bit
-/// digits: m = 2^a 3^b 5^c 7^d, since every FFT size is 4 times one (GMP's
+/// digits: m = o * 2^a with o in {1, 3, 5, 7, 9}, since every FFT size is 4 times one (GMP's
 /// mpn_mulmod_bnm1_next_size). Any m >= min serves a caller that only needs the modulus to pass
 /// a bound, so rounding up to this size lets the transform wrap at exactly B^m.
 pub fn bnm1_size(min: usize) -> usize {
@@ -4582,7 +4887,7 @@ pub fn bnm1_fft(a_len: usize, m: usize) -> bool {
 
 // a^2 mod B^m - 1, canonical, m = out.len(), for nonzero a with a.len() <= m and 4m an FFT size.
 // It is fft_sqr_entry without the zero padding: a length-4m cyclic convolution of 16-bit digits is
-// the square mod 2^(64m) - 1. When the round-off check trips it is redone as the NTT's full square,
+// the square mod 2^(64m) - 1. When the fold check trips it is redone as the NTT's full square,
 // folded (not through sqr_dyn, whose FFT square would round about as badly). There is no residue
 // check: the primes don't divide B^m − 1. Public (hidden) for benches/probes/fft_precision.rs.
 #[doc(hidden)]
@@ -4598,7 +4903,7 @@ pub fn fft_sqr_mod_bnm1(a: &[u64], out: &mut [u64]) {
     fold_mod_bnm1(full, out);
 }
 
-/// [`fft_sqr_mod_bnm1`] without the round-off check, returning the call's rounding. For the
+/// [`fft_sqr_mod_bnm1`] without the fold check's redo, returning the call's rounding. For the
 /// precision probe and the tests.
 #[doc(hidden)]
 pub fn fft_sqr_mod_bnm1_raw(a: &[u64], out: &mut [u64]) -> FftRounding {
@@ -4611,30 +4916,24 @@ fn fft_sqr_mod_bnm1_impl(a: &[u64], out: &mut [u64], checked: bool) -> (bool, Ff
     let n = 4 * out.len();
     debug_assert_eq!(find_fft_size(n), n, "4m must be an FFT size");
     debug_assert!(!a.is_empty() && a.len() <= out.len());
+    if checked && n > FFT_BNM1_MAX_SIZE {
+        return (false, FftRounding::default());
+    }
     let half = n / 2;
-    let (carry, rounding) = FFT_CACHE.with(|cell| {
-        let fft_cache = &mut *cell.borrow_mut();
-        let (fwd, bwd, tw, scratch_sz) = fft_cache.prep_sqr(half);
-        let mut scratch_gaurd = ScratchGuard::acquire();
-        let complex_scratch: &mut [Complex<f64>] =
-            unsafe { std::mem::transmute(scratch_gaurd.get(scratch_sz)) };
-        let (x, fft_scratch) = complex_scratch.split_at_mut(half);
-
-        sqr_decompose(a, x);
-        let rounding = fft_sqr_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
-        if fft_trips(rounding, checked) {
-            return (None, rounding);
-        }
-        // All n coefficients land in exactly m limbs; the carry out of the top (below 2^35, as
-        // each coefficient is below 2^50) counts multiples of B^m, which is 1.
-        (Some(fft_accumulate(x, out)), rounding)
-    });
+    // All n coefficients land in exactly m limbs; the signed carry out of the top (below 2^35 in
+    // magnitude, as each coefficient is below 2^50) counts multiples of B^m, which is 1.
+    let (carry, rounding) =
+        fft_sqr_coefs(a, half, true, checked, |x| fft_accumulate_signed(x, out));
     let Some(carry) = carry else {
         return (false, rounding);
     };
-    // out + carry - B^m + 1 is far below B^m, so the wrap can't carry again.
-    if add_prim(out, carry) {
-        inc_buf(out);
+    // The carry is far below B^m, so its wrap can't carry again.
+    if carry >= 0 {
+        if add_prim(out, carry as u64) {
+            inc_buf(out);
+        }
+    } else if sub_prim(out, carry.unsigned_abs() as u64) {
+        dec_buf(out);
     }
     canon_mod_bnm1(out);
     (true, rounding)
@@ -5422,8 +5721,8 @@ fn fft_accumulate_mid(
     next_next_col_lo: u64,
 ) -> (u64, u64) {
     let coefs = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const f64, x.len() * 2) };
-    let mut chunks = coefs.chunks(4);
-    let mut carry: u128 = 0;
+    let mut chunks = coefs.chunks_exact(4);
+    let mut carry: i128 = 0;
 
     for elem in out.iter_mut() {
         *elem = fft_accumulate_limb(&mut chunks, &mut carry);
@@ -5441,9 +5740,11 @@ fn fft_accumulate_mid(
 }
 
 /// The middle product long[2n-1] × short[n] → out[n] by the 16-bit FFT, redone on the NTT
-/// ([`ntt_mid_mul_dyn`], within the same documented error) when the round-off check trips. The check
+/// ([`ntt_mid_mul_dyn`], within the same documented error) when the fold check fails. The check
 /// covers every coefficient of the transform, not only the band it reads. There is no residue
-/// check, as the band omits an unknown part of the product.
+/// check, as the band omits an unknown part of the product. The band holds the product's value to
+/// about 2^34 units of its lowest limb in either sign, which can flip every limb of a run of zeros
+/// or all ones, so compare two middle products by value.
 pub fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
     match fft_mid_mul_impl(long, short, out, true).0 {
         Some(of) => of,
@@ -5454,7 +5755,7 @@ pub fn fft_mid_mul(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
     }
 }
 
-/// [`fft_mid_mul`] without the round-off check, returning the call's rounding beside the FFT's own
+/// [`fft_mid_mul`] without the fold check's redo, returning the call's rounding beside the FFT's own
 /// result. For the precision probe and the tests.
 #[doc(hidden)]
 pub fn fft_mid_mul_raw(long: &[u64], short: &[u64], out: &mut [u64]) -> ((u64, u64), FftRounding) {
@@ -5480,37 +5781,22 @@ fn fft_mid_mul_impl(
     let start_coef = (sz - 1) * w;
     let end_coef = (2 * sz + 1) * w;
     let n = find_fft_size((l_len + s_len - start_coef - 1).max(end_coef));
+    if checked && n > FFT_MID_MAX_SIZE {
+        return (None, FftRounding::default());
+    }
     let (next_col_lo, next_col_hi, _) = mul_column_parts(long, short, 2 * sz - 1);
     let (next_next_col_lo, _, _) = mul_column_parts(long, short, 2 * sz);
     let next_col = (next_col_lo, next_col_hi);
-    let (of, rounding) = FFT_CACHE.with(|cell| {
-        let fft_cache = &mut *cell.borrow_mut();
-        let (fwd, bwd, tw, scratch_sz) = fft_cache.prep_mul(n);
-        let mut scratch_gaurd = ScratchGuard::acquire();
-        let complex_scratch: &mut [Complex<f64>] =
-            unsafe { std::mem::transmute(scratch_gaurd.get(scratch_sz)) };
-        let (x, fft_scratch) = complex_scratch.split_at_mut(n);
-
-        decompose(long, short, x);
-        let rounding = fft_core(x, fwd.as_ref(), bwd.as_ref(), tw, fft_scratch);
-        if fft_trips(rounding, checked) {
-            return (None, rounding);
-        }
-        let of = fft_accumulate_mid(
+    // Balanced coefficients below the band sum to under about 2^34 units of its lowest limb, in
+    // either sign, so the band already holds the product's value and no column needs adding back.
+    fft_mul_coefs(long, short, n, true, checked, |x| {
+        fft_accumulate_mid(
             &x[start_coef / 2..end_coef / 2],
             out,
             next_col,
             next_next_col_lo,
-        );
-        (Some(of), rounding)
-    });
-    let Some(mut of) = of else {
-        return (None, rounding);
-    };
-    let (c0, c1) = middle_correction(long, short);
-    add_mid_overflow(&mut of, add_prim(out, c0));
-    add_mid_overflow(&mut of, add_prim(&mut out[1..], c1));
-    (Some(of), rounding)
+        )
+    })
 }
 
 // out[0] is coefficient lo of the convolution: s - 1 for a canonical middle

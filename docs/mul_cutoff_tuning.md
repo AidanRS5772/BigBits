@@ -28,9 +28,14 @@ and the results.
 | `mid` | `FFT_MID_CUTOFF` | `mid_mul_buf` → `fft_mid_mul` |
 | `midntt` | `NTT_MID_CUTOFF` | `mid_mul_buf` → `ntt_mid_mul_static` |
 
+The FFT crossovers here were measured with `find_fft_size`'s old sizes, the smallest 7-smooth one.
+It has since moved to 4·o·2^a with o in {1, 3, 5, 7, 9} (`docs/fft_precision.md`), which makes the FFT
+faster at most lengths and its steps larger, and they have not been retuned, so the sawtooth details
+below describe the old sizes.
+
 Not tuned here: `FFT_16BIT_CUTOFF`, `FFT_SQR_16BIT_CUTOFF` and
-`FFT_MID_16BIT_CUTOFF` are where random operands trip the 16-bit FFT's round-off
-check more than 2^-10 of the time (measured with the precision probe; see
+`FFT_MID_16BIT_CUTOFF` are where random operands tripped the 16-bit FFT's old round-off
+check more than 2^-10 of the time, and they now also keep coefficients under 2^48 (see
 `docs/fft_precision.md`); the `NTT_PAR_*` cutoffs decide threading, which the
 schoolbook rewrite doesn't affect and a single core can't measure;
 `HI_MUL_GUARD_LIMBS` is an accuracy setting.

@@ -107,46 +107,57 @@ pub const KARATSUBA_CUTOFF: f64 = 52.0;
 // time steps up with its transform size, so the boundary is a sawtooth: squares are
 // faster with the FFT from about 250 limbs except just past a step (307x307 is 11%
 // slower), and 1.96 switches them from about 230. Mean time lost over the measured
-// shapes: 0.19% (regular) and 0.33% (chunking).
+// shapes: 0.19% (regular) and 0.33% (chunking). Measured with find_fft_size's old
+// sizes, whose steps were smaller, and not retuned since, like the FFT crossovers below.
 pub const FFT_CHUNKING_KARATSUBA_CUTOFF: f64 = 1.88;
 pub const FFT_KARATSUBA_CUTOFF: f64 = 1.96;
-// The 16-bit FFT entries' round-off check. A call is redone on the NTT when its largest rounding
-// distance (|x − round(x)| over every coefficient) passes FFT_ROUNDOFF_LIMIT, or when its largest
-// coefficient reaches FFT_COEFF_LIMIT. A wrong limb needs a coefficient off by more than 0.5, which
-// reads 1 − e: one off by less than 0.6 passes 0.4 by itself (Prime95's convention).
-pub const FFT_ROUNDOFF_LIMIT: f64 = 0.4;
-// The distance can only be read as finely as the coefficients are stored. Before the 1/N scaling,
-// an output near N·c is a multiple of ulp(N·c), so a coefficient's error is a multiple of
-// ulp(N·c)/N ≤ c·2^-52: under 1/16 below 2^48. Past it the steps coarsen until no reading can pass
-// 0.4. At N = 2^15·7 and c ≈ 2^49.7 the only readings are 0, 1/8, 1/4 and 3/8, and wrong cyclic
-// squares and middle products read 0.375 (docs/fft_precision.md). Random operands stay below 2^48
-// up to the dispatch limits; operands with digits near 2^16 reach it from about 18000 limbs.
-pub const FFT_COEFF_LIMIT: f64 = (1u64 << 48) as f64;
+// When the 16-bit FFT entries check a result. A call whose largest rounding distance
+// (|x − round(x)| over every coefficient) passes this runs the fold check (mul.rs's fft_fold_agrees),
+// keeps its result if that passes, and is redone on the NTT if it fails. A wrong limb needs a
+// coefficient off by more than 0.5, which reads 1 − e, so a wrong result that reads at or below this
+// needs a coefficient off by at least 0.75 and every other one within 0.25. A high reading alone
+// proves nothing: it shows noise, and most such results are right.
+pub const FFT_FOLD_TRIGGER: f64 = 0.25;
 // Whether fft_entry and fft_sqr_entry also check every result by its residues mod the NTT primes
 // (utils::verify) in release builds, redoing a mismatch on the NTT. Debug builds always do. It
 // catches any wrong product whose error fits in 188 bits, whatever the rounding read, and costs a
 // pass over the operands and the result: see docs/fft_precision.md for its share of the FFT's
 // time. Middle products and squares mod B^m − 1 have no such check.
 pub const FFT_RESIDUE_CHECK: bool = false;
-// The 16-bit FFT entries' dispatch limits, past which the dynamic dispatchers take the NTT. They
-// are speed choices, not accuracy bounds: the round-off check redoes any call that could be wrong.
-// Each is the largest size below the first transform size where uniformly random operands trip the
-// check (FFT_ROUNDOFF_LIMIT or FFT_COEFF_LIMIT) more than 1 in 2^10 times (over 16 trips in 2^14
-// operands), so random-like operands rarely pay for both transforms. Operands with digits near
-// 2^16 (all ones, say) reach FFT_COEFF_LIMIT from about 18000 limbs and cost the FFT plus the NTT
-// above that. Measured on the M1 (rustfft's NEON paths); remeasure on x86. See
-// docs/fft_precision.md.
+// The 16-bit FFT entries' dispatch limits, past which the dynamic dispatchers take the NTT. Each
+// was the largest size below the first transform size where uniformly random operands, in unsigned
+// digits, tripped the old check (a reading of 0.4 or a 2^48 coefficient gate) more than 1 in 2^10 times. Balanced
+// digits read far below that, so as speed choices they are now conservative; they haven't been
+// remeasured. They are also what keeps the removed gate unnecessary, as asserted below. Measured on
+// the M1 (rustfft's NEON paths); remeasure on x86. See docs/fft_precision.md.
+// These were measured before find_fft_size moved to its stricter set of sizes: the transforms named
+// here are the ones they were measured at, and each limit now lands on the transform given after
+// "now".
 // Products: output limbs l + s − 1 (transform 423360: 0 trips in 2^14, largest coefficient
-// 2^47.71; 17 in 12727 at 428652, all past 0.4).
+// 2^47.71; 17 in 12727 at 428652, all past 0.4). Now 458752.
 pub const FFT_16BIT_CUTOFF: usize = 105839;
 // Squares: operand limbs (transform 442368: 0 trips in 2^14, 2^47.77; 17 in 11323 at 444528).
+// Now 458752.
 pub const FFT_SQR_16BIT_CUTOFF: usize = 55296;
 // Middle products: short limbs n (transform 518616: 0 trips in 2^14, 2^47.998; 17 in 10875 at
-// 524288).
+// 524288). Now 524288.
 pub const FFT_MID_16BIT_CUTOFF: usize = 64826;
-// Squares mod B^m − 1: modulus limbs m, a bnm1_size (transform 259200: 11 trips in 2^14, all at
-// FFT_COEFF_LIMIT; 17 in 8845 at 259308, from the same gate).
-pub const FFT_BNM1_16BIT_CUTOFF: usize = 64800;
+// Squares mod B^m − 1: modulus limbs m, a bnm1_size. Measured at 64800 (transform 259200: 11 trips
+// in 2^14, all at the old gate; 17 in 8845 at 259308, from the same gate), which is no longer a
+// bnm1_size; this is the largest one below it, so the dispatch is the same as it would be at 64800.
+pub const FFT_BNM1_16BIT_CUTOFF: usize = 57344;
+// Why no coefficient gate is needed: a balanced coefficient sums at most 4 min(l, s) digit products
+// of magnitude at most 2^30, plus a little for the operands' unsigned top digits, which is under
+// 2^48 at every limit. Below 2^48 a coefficient's error is a multiple of at most 1/16, so readings
+// stay fine enough for the fold check's trigger to mean something. Raising a limit past this needs a new
+// answer to that, not only a new measurement.
+const _: () = {
+    let room = 1u64 << 18;
+    assert!(4 * ((FFT_16BIT_CUTOFF as u64 + 1) / 2) + 8 < room);
+    assert!(4 * FFT_SQR_16BIT_CUTOFF as u64 + 8 < room);
+    assert!(4 * FFT_MID_16BIT_CUTOFF as u64 + 8 < room);
+    assert!(4 * FFT_BNM1_16BIT_CUTOFF as u64 + 8 < room);
+};
 
 // is_karatsuba's cost ratios, karatsuba_entry_static against ntt_entry_static with
 // the NTT's three convolutions on rayon: squares switch from about 2500 limbs. On one

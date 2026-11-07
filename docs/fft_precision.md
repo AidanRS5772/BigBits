@@ -1,23 +1,139 @@
-# 16-bit FFT precision: the round-off check, the residue check and the dispatch limits
+# 16-bit FFT precision: balanced digits, the fold check, the residue check and the dispatch limits
 
 The dynamic multiplication layer computes products, squares, middle products and squares mod
 B^m − 1 on a floating-point FFT of 16-bit digits (`fft_entry`, `fft_sqr_entry`, `fft_mid_mul`,
 `fft_sqr_mod_bnm1`). Each is exact only while every output coefficient's rounding error stays
-below 0.5. Every entry now measures its own rounding and redoes a call on the NTT when the call
-could be wrong. Products and squares can also check their results by residues, always in debug
-builds. The four dispatch limits in `src/utils/mod.rs` only decide how often a redo happens. This note records the checks,
-the evidence that they catch wrong results, how the limits were set, and how to remeasure them.
-Measured 2026-11-02/04 on the Apple M1 (rustfft's NEON paths).
+below 0.5. Operands go in as balanced digits, so errors stay small. A call that reads above 0.25 runs
+the fold check and is redone on the NTT if that fails. Products and squares can also check their
+results by residues, always in debug builds. The four dispatch limits in `src/utils/mod.rs` bound both
+speed and soundness. This note records the checks, the evidence behind them, how the limits were set,
+and how to remeasure them. Measured on the Apple M1 (rustfft's NEON paths) unless noted.
 
-## The round-off check
+**What's current.** The balanced digits, fold check, soundness and cost sections below were measured
+2026-11-06 at the current sizes. The dispatch limits were measured 2026-11-02/04 on unsigned digits at
+the old sizes and haven't been remeasured; they are conservative for random operands now.
 
-`scale_and_round` scales and rounds the inverse transform's coefficients and returns the call's
-`FftRounding`: `err`, the largest rounding distance max |x − round(x)|, and `peak`, the largest
-rounded magnitude (NEON: `vabdq_f64`, `vabsq_f64` and `vmaxq_f64`; AVX: masked subtractions and
-`_mm256_max_pd`; scalar for tails and the standard path). Before it reads a coefficient, each entry
-trips when `err` passes `FFT_ROUNDOFF_LIMIT` (0.4, Prime95's convention) or `peak` reaches
-`FFT_COEFF_LIMIT` (2^48). A tripped call's transform is discarded, `out` is left untouched and the
-call is redone on the NTT:
+## Transform sizes
+
+`find_fft_size(n)` is the smallest 4·o·2^a at or above n with o in {1, 3, 5, 7, 9}, and `bnm1_size`
+follows it (m = o·2^a). rustfft's NEON planner sends only 2^k and 3·2^k through its radix-4 kernel, and
+everything else through a mixed-radix split with two transposes and a full twiddle pass, so per-point
+cost falls in tiers. ns/(n log2 n) against a power of two in the same octave, median over 2^11–2^19 for
+products and squares (all 651 7-smooth sizes from 2048 to 540000, warm, minimum of three shuffled
+passes, one thread, M1):
+
+| Odd part | Cost (products / squares) | Odd part | Cost (products / squares) |
+|---:|---:|---:|---:|
+| 1 | 1.00 / 1.00 | 27 | 1.49 / 1.46 |
+| 3 | 1.00 / 0.99 | 35 | 1.35 / 1.35 |
+| 5 | 1.21 / 1.19 | 45 | 1.33 / 1.30 |
+| 7 | 1.18 / 1.18 | 49 | 1.42 / 1.40 |
+| 9 | 1.21 / 1.20 | 63 | 1.36 / 1.28 |
+| 15 | 1.22 / 1.18 | 125 | 1.79 / 1.73 |
+| 21 | 1.36 / 1.34 | 243 | 1.72 / 1.67 |
+| 25 | 1.50 / 1.49 | 729 | 1.93 / 1.80 |
+
+A costly size just below a cheap one loses to it: 423360 (2^6·3^3·5·7^2) took 9.27 ms for a product,
+and the 24% longer 2^19 took 6.94 ms. Time against the old rule, over log-uniform lengths from 2048 to
+430000 digits:
+
+| Set of odd parts | Products | Squares | Worst single length (products / squares) |
+|---|---:|---:|---:|
+| `{1}` | 0.862 | 0.884 | 1.69 / 1.67 |
+| `{1,3}` | 0.707 | 0.730 | 1.19 / 1.22 |
+| `{1,3,5,15}` | 0.725 | 0.742 | 1.16 / 1.15 |
+| `{1,3,9}` | 0.690 | 0.711 | 1.09 / 1.14 |
+| `{1,3,5,9}` | 0.688 | 0.708 | 1.03 / 1.07 |
+| `{1,3,5,7,9}` | 0.689 | 0.708 | 1.00 / 1.03 |
+| `{1,3,5,9,15,45}` | 0.740 | 0.754 | 1.15 / 1.14 |
+
+The old rule's time was 1.46× (products) and 1.42× (squares) that of the fastest size at or above each
+length; this set's is 1.006×. 15 is out because 15·2^k sits only 6.7% below 2^(k+4) at 1.2× the cost. 7
+adds nothing on average, but it holds the worst length at today's time. Other entries' times follow:
+0.735× over 12 operations from `mul_dyn` to `ln_dyn` and 0.80× for `exp_dyn`, with identical outputs.
+
+Rounding depends on the class too: at the same operands 3·2^k reads about 1.5× its neighbours (mean
+0.24 at 3·2^17 against 0.14–0.17 for 9·2^15, 5·2^16, 7·2^16 and 2^19, squares of 36000 random limbs, on
+unsigned digits). That was already true of those sizes under the old rule, and the cause isn't known.
+
+AVX plans its factors differently, as radix steps of one chain, so these tiers may not hold on x86;
+`benches/probes/fft_sizes.rs` (`sizes` mode) measures rustfft's per-point cost by class on any machine.
+
+## The stages around the transforms
+
+Share of a call's time at n = 2^19 (products / squares): transforms 84% / 74%, recombine 6.6% / 13%,
+accumulate 5.1% / 7.7%, rounding 2.4% / 3.8%, decomposing 1.5% / 0.9%, and setting up a warm call under
+0.2%. At n = 4096 recombine is 12% / 21% and accumulate 9% / 12%. Three edits:
+
+- `recombine` and `sqr_recombine` take two conjugate pairs per NEON step, with fused products. Their
+  rounding differs slightly from the scalar loops', with no change in what the check reads. x86 keeps
+  the scalar loops.
+- `scale_and_round` multiplies by 1/n at power-of-two lengths (0.85× of that stage on the M1). That
+  reciprocal is exact, so the result is bit-identical. Other lengths still divide, as an inexact
+  reciprocal would move the distance the fold check's trigger reads.
+- `fft_accumulate` adds each limb's four digits in two halves and reads only the one limb past `out`,
+  rather than shifting digit by digit and scanning the padding (0.62× of that stage). Balanced digits
+  made its coefficients signed since.
+
+Together, these give 0.958× alone. With the sizes and tables, release A/B against the tree before them
+(M1, one thread, minimum of three alternating runs, outputs identical at all 208 points from 400 limbs
+to the limits): 0.667× geomean over 13 operations, from 0.585× (`mul_dyn`, 3:2 shape) to 0.79× (`ln_dyn`),
+and at most 1.001× at any point. Below the FFT tiers nothing moves.
+
+## Twiddle tables
+
+`recombine` and `sqr_recombine` read e^(2πik/n) for k up to n/4 from a table per transform size, built
+once per thread by `fft_twidles` with `cis`. Their cost is linear and a small part of a first call,
+whose setup is about 85% rustfft's plans (5.3 ms of plans and 1.1 ms of table at n = 2^19). They replace
+`FTTTwidleTower`, which kept one table per odd part at the finest size seen, made coarser sizes copy a
+strided view on every call (4–6.6% of a product below the top size), and built finer ones by repeated
+multiplication (worst error 4.5×2^-53 after three steps, with no change in the rounding read).
+
+## Balanced digits
+
+`decompose` and `sqr_decompose` write each operand as digits in [−2^15, 2^15): a digit of 2^15 or more
+has 2^16 subtracted and carries 1 into the next one (`balance_limb` does a limb at once: x + bias +
+carry, with each digit's top bit then flipped). The value is unchanged, and a coefficient's digit
+products now mostly cancel instead of all adding up, which takes away the huge zero-frequency term that
+every rounding error scaled with. An operand's top digit stays unsigned (`fft_absorb_top_carry`), at
+most 2^16, so balancing adds no digit and no transform grows. `fft_accumulate_signed` carries the signed
+coefficients, and a cyclic square folds a negative top carry back in. Middle products no longer add
+`middle_correction`: coefficients below the band sum to under about 2^34 units of its lowest limb, in
+either sign, so the band already holds the product's value. That can flip every limb of a run of zeros
+or ones, so compare middle products by value.
+
+The largest reading, unsigned against balanced, on the same operands:
+
+| Operands | Shape | Unsigned | Balanced |
+|---|---|---:|---:|
+| Random | Products at the limit (52920 × 52920) | 0.219 | 0.0007 |
+| Random | Products, 49152 × 49152 (3·2^17) | 0.312 | 0.0016 |
+| Random | Middle products at the limit | 0.188 | 0.0010 |
+| Random | Cyclic squares at the limit | 0.188 | 0.0010 |
+| Digits at least 0xC000 | Products, 52920 × 52920 | 0.5 | 0.0137 |
+| Digits near −2^15, one sign | Products, 52920 × 52920 | 0.219 | 0.219 |
+| Period 12, full size | Middle products at the limit | 0.188 | 0.438 |
+
+Random and high-digit operands read about 35–300× lower. The rows that don't improve are what balancing can't
+help: digits of one sign at full size don't cancel, and repeating patterns concentrate into a few
+frequencies. Their coefficients are at most 1/4 of the unsigned worst case's.
+
+**Why there's no coefficient gate.** A coefficient's error is read in steps of up to c·2^-52, so past
+2^48 the reading stops meaning much. The old check tripped there. A balanced coefficient sums at most
+4·min(l, s) digit products of size at most 2^30, plus a little for the unsigned top digits, which stays
+under 2^48 at every dispatch limit. A compile-time assert in `mod.rs` holds the limits to that, so the
+limits now bound soundness as well as speed, and raising one past it needs a new answer to this. Past
+each dispatcher's largest transform a checked entry goes straight to the NTT, without running a
+transform: at N = 3145728 middle products read under 0.25 and came out wrong.
+
+## The fold check
+
+`scale_and_round` returns the call's `FftRounding`, whose `err` is the largest rounding distance
+max |x − round(x)|. A call with `err` above `FFT_FOLD_TRIGGER` (0.25) runs `fft_fold_agrees`, which tests
+the result itself; if that passes the result stands, however high it read, and if it fails the call is
+redone on the NTT. A high reading only shows noise, and on the M1 most such results are right. A wrong
+limb needs a coefficient off by more than 0.5, reading 1 − e, so a wrong result that skips the check
+needs one off by at least 0.75 with every other within 0.25.
 
 | Checked entry | Redone by |
 |---|---|
@@ -26,59 +142,104 @@ call is redone on the NTT:
 | `fft_mid_mul` | `ntt_mid_mul_dyn` (the same contract: within the documented low-limb error) |
 | `fft_sqr_mod_bnm1` | `ntt_sqr_entry_dyn` into pooled scratch, then `fold_mod_bnm1` (not `sqr_dyn`, whose FFT square would round about as badly) |
 
-The redo runs outside the `FFT_CACHE` borrow. `fft_reroutes()` (doc-hidden) counts redone calls
-in the process, and the doc-hidden `fft_entry_raw`, `fft_sqr_entry_raw`, `fft_mid_mul_raw` and
-`fft_sqr_mod_bnm1_raw` skip every check and return the `FftRounding` beside the FFT's own result,
-for the probe and the tests. The middle product's check covers every coefficient of its transform,
-not only the band it reads, so it trips more often than its band needs.
+The redo runs outside the `FFT_CACHE` borrow. `fft_reroutes()` counts redone calls, and `fft_fold_checks()`
+and `fft_fold_reroutes()` the fold check's runs and failures. The doc-hidden `fft_entry_raw`,
+`fft_sqr_entry_raw`, `fft_mid_mul_raw` and `fft_sqr_mod_bnm1_raw` redo nothing and return the
+`FftRounding`, fold verdict included, beside the FFT's own result, for the probe and the tests.
 
-**Why 0.4 catches wrong results.** A wrong limb needs some coefficient off by e > 0.5, and that
-coefficient then rounds to the wrong integer and measures 1 − e. One off by less than 0.6 measures
-more than 0.4 and trips the check by itself. A wrong call escapes only if some coefficient is off by
-0.6 or more while every other one stays under 0.4. Rounding errors are sums of many small errors
-spread over the coefficients, so a distribution whose tail reaches 0.6 has coefficients between 0.4
-and 0.5, provided the distance can be read that finely.
+**The identity.** The transform computes V = a·b mod 2^(16N) − 1, whatever its digits are, where V sums
+the N rounded coefficients at their digit positions. So V = a·b also holds mod any p dividing
+2^(16N) − 1, which is what lets a middle product and a cyclic square check themselves: neither keeps a
+whole product, so the residue check can't reach them. `FftFold::rem` takes four limbs a step with
+precomputed B^k mod p, so only the accumulator chains: 0.76 ns a limb against `div_prim`'s 3.27.
 
-**Why the size gate.** It can't always be read that finely. Before the 1/N scaling, an inverse
-transform output near N·c is a double, a multiple of ulp(N·c), so after scaling a coefficient's
-error is a multiple of g = ulp(N·c)/N ≤ c·2^-52, then rounded to the doubles near c. For
-c < 2^48, g is under 1/16, and readings fill [0, 0.5] in steps of at most 1/16. Past 2^48 the steps
-coarsen. At N = 2^15·7 and c ≈ 2^49.7 (cyclic squares of m = 57344 limbs with digits at least
-0xF000), g = 2^15/N = 1/7 and the doubles near c are 1/8 apart. The only readings are then 0, 1/8,
-1/4 and 3/8: a coefficient off by 3/7 rounds right, one off by 4/7 rounds wrong, and both read
-0.375. Without the gate, the first soundness run (below) found 264 such calls, wrong and untripped:
-middle products at n = 57343 (N = 2^16·7) and cyclic squares at m = 57344, 81920 and 98304
-(N = 2^15·7, 2^16·5, 2^17·3), all with digits at least 0xC000. Two of those shapes were inside
-the dispatch limits then in force. The model g = ulp(N·c)/N, rounded to the doubles near c,
-predicts every one of them, and every tripped call at the same sizes. Squares and products had no
-misses: their coefficients rise from small at the ends to c at the middle, so the small ones, read
-finely, still trip. Middle products and cyclic squares have coefficients of one size throughout.
+**Products and squares** don't wrap, so any prime holds for them. `FFT_FOLD_PLAIN` is 3689348814741904247,
+the largest safe prime below the kernel's bound of 2^64 / 5, so 2 has order (p − 1) / 2. Over 2^20 digits
+no two positions share a weight or its negative, and no three unit errors cancel.
 
-Random operands stay below 2^48 up to the dispatch limits. Their largest coefficients there are
-2^47.71 for products, 2^47.77 for squares and 2^47.998 for middle products. The gate sets the
-cyclic limit (below), as every coefficient of a cyclic square sums the same 4m digit products.
-Operands with digits near 2^16 reach 2^48 from about 18000 limbs, about where the old worst-case
-limits were, and pay the FFT and then the NTT above that.
+**Middle products and cyclic squares** need p to divide 2^(16N) − 1, so the weights 2^(16j) mod p repeat
+at some length dividing N digits, and halfway through that length the weight is −1. The NTT primes can't
+do this: 2 has order about 2^60 mod each, so they divide it at none of the sizes. Literature: Keller's
+table of Fermat factors gives primes of order 2^(k+1), and shows none known for F20 or F22, so 2^21 and
+2^23 can't be had that way; Prime95's SUMINP/SUMOUT is the same identity at x = 1. Nothing found publishes
+a choice for this use, so the choice was made by search.
+
+The search took every order d = o·2^t, o in {1, 3, 5, 7, 9}, t from 17 to 23, and every p = k·d + 1 with
+k up to 2^35 below the kernel's bound: candidates sieved by primes below 2^13, tested by Montgomery
+squarings, survivors checked by a deterministic Miller–Rabin. It rediscovered every known factor of F15–F19
+and F21 in that range, and found none of order exactly 2^21 or 2^23, matching the table. 41 candidates of at
+least 30 bits were then run against real wrong results, compared with the NTT: 446 at these sizes, nearly all
+on unsigned digits, as balanced ones only went wrong past the limits, and 327 balanced ones up to N = 2097152.
+The longer a prime's repeat, the worse it did:
+
+| Weights repeat every | Wrong results tested | Passed by the prime |
+|---:|---:|---:|
+| N | 306 | 24.5% |
+| N/2 | 345 | 9.3% |
+| N/4 | 344 | 27.9% |
+| N/8 | 555 | 0.5% |
+| N/16 and shorter | 5991 | 1 (0.02%) |
+
+Those errors are evenly spaced copies, such as limbs 1600, 11840, 22080 and 32320 at N = 163840, exactly N/4
+apart: a smooth rounding wave goes wrong at each crest. If x^N = 1 and x^s ≠ 1, copies s apart sum to
+x^t·(x^N − 1)/(x^s − 1) = 0, so a prime passes them unless its repeat divides s. A shorter repeat has its own
+blind spot, opposite errors a repeat apart and equal ones half a repeat apart, but random pairs land there
+only about 1 time in the repeat length. So each size takes the longest repeat up to N/16 digits, then the
+most bits, from primes of at least 40 bits:
+
+| Transform N | p | Bits | Weights repeat every, digits |
+|---:|---:|---:|---:|
+| 65536 | 2327042503868417 | 52 | 4096 (N/16) |
+| 73728 | 2327042503868417 | 52 | 4096 (N/18) |
+| 81920 | 2327042503868417 | 52 | 4096 (N/20) |
+| 98304 | 2327042503868417 | 52 | 4096 (N/24) |
+| 114688 | 2327042503868417 | 52 | 4096 (N/28) |
+| 131072 | 2327042503868417 | 52 | 4096 (N/32) |
+| 147456 | 1094462078977 | 40 | 9216 (N/16) |
+| 163840 | 2327042503868417 | 52 | 4096 (N/40) |
+| 196608 | 2327042503868417 | 52 | 4096 (N/48) |
+| 229376 | 2327042503868417 | 52 | 4096 (N/56) |
+| 262144 | 31065037602817 | 45 | 16384 (N/16) |
+| 294912 | 31065037602817 | 45 | 16384 (N/18) |
+| 327680 | 1753340313601 | 41 | 20480 (N/16) |
+| 393216 | 31065037602817 | 45 | 16384 (N/24) |
+| 458752 | 31065037602817 | 45 | 16384 (N/28) |
+| 524288 | 31065037602817 | 45 | 16384 (N/32) |
+
+On the wrong results at these sizes this table passed 0 of 446; the table of longest repeats passed 94. Sizes
+outside it have no prime, and a call that fires goes to the NTT. No operand measured reads near 0.25 below
+65536 (at most 0.078 there).
+
+**Known limits.** Errors that repeat around the transform at a period no repeat length divides, such as
+period 3, pass every wrap-compatible prime: `x^N = 1` makes them cancel. They came up past the limits with
+period-3 and period-12 digits, where all candidates passed them, and not inside the limits. Sparse errors at
+exactly the spacings above pass too, and anything else at a chance of 1/p, from 2^-40 to 2^-52 here.
 
 ## The residue check
 
 FFT products and squares (`fft_entry`, `fft_sqr_entry`) then check the result they would return by
 its residues mod the NTT primes (`src/utils/verify.rs`, below): `Residues::of_with_top(out, top)`
 against the operands' residues multiplied. A mismatch is redone on the NTT and counted in
-`fft_residue_reroutes()` as well as `fft_reroutes()`; it means the round-off check let a wrong
-result through, and it should stay 0. Debug builds always run it. Release builds run it when
-`FFT_RESIDUE_CHECK` in `mod.rs` is set (`false` by default). It catches any wrong result whose
-error fits in 188 bits, whatever the rounding read. Middle products and cyclic squares have no
-such check, since their results omit an unknown part of the full product, and rely on the
-round-off check alone.
+`fft_residue_reroutes()` as well as `fft_reroutes()`; it means the fold check and its trigger let a
+wrong result through, and it should stay 0. Debug builds always run it, which also means tests of the
+checked entries can't see most FFT bugs: `test_fft_raw_entries_are_exact_at_every_odd_part` tests the raw
+ones. Release builds run it when `FFT_RESIDUE_CHECK` in `mod.rs` is set (`false` by default). It catches
+any wrong result whose error fits in 188 bits, whatever the rounding read. Middle products and cyclic
+squares have no such check, since their results omit an unknown part of the full product.
 
 ## Cost
 
-Release A/B on the M1, one thread, minimum of four alternating rounds of nine, against the same
-tree without the check. Squares and products are within noise (−1.3% to +0.5%) from 1024 limbs to
-the limits, and about 2% (0.25 µs) slower at 256 limbs. Tracking the peak costs nothing beside the
-error. The first version cost 2–3% everywhere: each max accumulator was a loop-carried chain, which
-two accumulators per quantity remove. A tripped call costs the FFT and then the NTT (below).
+Balanced digits, the fold check and removing the coefficient tracking together, release A/B against the
+tree before them (M1, one thread, minimum of three alternating runs, 13 operations at 208 points from 400
+limbs to the limits): 0.995× geomean, with every operation from 0.979× (squares, whose NEON recombine lost
+some redundant scaling) to 1.001× and a worst point of 1.018×.
+Outputs matched at every point but one `rcp_dyn` (19324 limbs), whose new value is the exact floor where the
+old one's low limb differed, which the contract allows. Against the commit before this branch's FFT work the
+whole tree is about 0.69×.
+
+A fired fold check, on top of the FFT at the limits (three runs): 4–7% on a product, 8–10% on a middle
+product and 9–10% on a cyclic square. On one thread a redo costs about 2–3× the FFT on top of it, or up to 6×
+for a cyclic square (the old-size timings below).
 
 The residue check reads the operands and the result, 4n limbs for an n × n product, at 2.55 ns per
 limb (`Residues::of`, below):
@@ -94,6 +255,55 @@ limb (`Residues::of`, below):
 That is why `FFT_RESIDUE_CHECK` is off by default.
 
 ## Soundness
+
+**Same operands, old check and new.** Nineteen operand kinds (unsigned worst cases, random limbs, chirps,
+and balanced worst cases: one sign at full size, random signs, periods 3 and 12) at every transform size
+in the upper tiers, FILLS 1, 0.5 and 0.01, ratios from 1 to 16 for products, only shapes a dispatcher can
+reach, 8 operands each. The residue verifier judged products and squares, the NTT middle products and
+cyclic squares.
+
+| | Calls | Wrong | Redone on the NTT | Of those, right anyway | Fold checks run | Missed |
+|---|---:|---:|---:|---:|---:|---:|
+| Unsigned, 0.4 and the gate | 35112 | 2527 | 6727 | 4200 | – | 0 |
+| Balanced, fold check | 35112 | 0 | 0 | – | 412 | 0 |
+
+All 412 fold checks were on right results, and every fired kind was a balanced worst case: periods 3 and 12
+(272) and one-sign digits (140). Random limbs never fired: at most 0.0026 over 51978 calls at the sizes from
+16384 limbs to the limits.
+
+**On x86 under Rosetta (SSE, not AVX2)** readings run higher. A narrower sweep (2352 calls) found 2 wrong middle products inside the limits,
+reading 0.47 and 0.5 with digits of period 12, and the fold check caught both, with no miss. So "no wrong results inside the limits" is a NEON result, and AVX2 is unmeasured.
+
+**Estimated misses.** A miss now needs a coefficient off by at least 0.75 with every other within 0.25, or a
+wrong result the fold check passes. From each shape's largest-reading tail, per call, as an exponential fit (the
+cautious one), counting only the size of the error and not the second condition:
+
+| Operands | Old, error ≥ 0.6 under the gate | New, error ≥ 0.75 |
+|---|---:|---:|
+| Random, products or squares at the limits | 10^-8 to 10^-13 | below 10^-1000 |
+| Random, middle or cyclic at the limits | too coarse to fit | below 10^-1000 |
+| Random, 32768-limb operands | 10^-22 | below 10^-1000 |
+| One-sign digits, 52920 × 52920 | 10^-11 | 10^-15 |
+| One-sign digits, 55296-limb squares | 10^-10 | 10^-10 |
+
+These extrapolate far past the data, and readings near 2^48 sit on a grid too coarse to fit many
+structured shapes, so treat them as orders of magnitude at best. A rate says nothing about operands built to
+defeat the check; only the residue check and the fold check speak to those.
+
+## History: the unsigned-digit check
+
+Until 2026-11-06 digits were unsigned, and a call was redone when its reading passed 0.4 (Prime95's
+convention) or its largest coefficient reached 2^48. The evidence below is why the gate existed, and what the
+dispatch limits were measured against.
+
+**Why 0.4.** A coefficient off by e > 0.5 reads 1 − e, so one off by less than 0.6 trips by itself, and a
+wrong call escapes only with one off by 0.6 or more while every other stays under 0.4.
+
+**Why the gate.** Before the 1/N scaling, an output near N·c is a multiple of ulp(N·c), so a coefficient's
+error is a multiple of g = ulp(N·c)/N ≤ c·2^-52, then rounded to the doubles near c. Below 2^48, g is under
+1/16. At N = 2^15·7 and c ≈ 2^49.7 (cyclic squares of 57344 limbs with digits at least 0xF000), g = 1/7 and
+the doubles near c are 1/8 apart, so the only readings are 0, 1/8, 1/4 and 3/8: a coefficient off by 3/7
+rounds right, one off by 4/7 rounds wrong, and both read 0.375.
 
 Two runs fed the raw entries operands whose results go wrong and counted the calls that came out
 wrong without tripping (missed). The residue verifier judged products and squares, the NTT middle
@@ -136,17 +346,16 @@ the gate in about 1.25M calls: the limit passes below, plus run 2's random group
 results in the coarse pass, with coefficients just past 2^48, all tripped by distance alone, the
 smallest reading 0.4375.
 
-So the check rests on evidence, not proof. No wrong result below 2^48 has read under 0.4, but
-nothing rules one out. For random operands at the largest sizes inside the limits, the data
-bounds a miss to under about 1 in 10^10 per call: under 2.4e-6 wrong and under 6e-5 of those
-missed. Extending the measured error tail puts it nearer 1 in 10^11 or below. The residue check
-closes the gap for products and squares. Middle products and cyclic squares have no such backstop.
+"Rare" only held for those widest shapes. A later sweep at the current sizes found unbalanced products wrong
+well below 2^48 (1985 of 2247 wrong in 27648 calls, mostly at 3·2^k with ratios from 2 to 8); all tripped.
 
 ## The dispatch limits
 
-With the check in place, the limits in `mod.rs` only decide how often a call pays for the FFT and
-then the NTT. Each is the largest size below the first transform size where uniformly random
-operands trip the check, either the distance or the gate, more than 1 in 2^10 times. The operands have every limb uniform and a
+The limits in `mod.rs` were set when digits were unsigned, by how often a call paid for the FFT and then
+the NTT. Each is the largest size below the first transform size where uniformly random operands
+tripped the old check, either the distance or the gate, more than 1 in 2^10 times. Balanced random
+operands now read about 0.001 at them, so as speed choices they're conservative, but they also keep
+coefficients under 2^48, which the check now relies on. The operands have every limb uniform and a
 nonzero top limb, at the transform size's widest shape: balanced products, full-length squares,
 `long[2n − 1] × short[n]` and m-limb cyclic operands. The probe ran in `rate` mode in two passes,
 one thread per process:
@@ -172,9 +381,15 @@ Only the cyclic limit moved, from 65536 to 64800 modulus limbs.
 | Products (output limbs l + s − 1) | 105839 | 423360 | 0 in 2^14 | 428652: 17 in 12727 | 36863 |
 | Squares (operand limbs) | 55296 | 442368 | 0 in 2^14 | 444528: 17 in 11323 | 18000 |
 | Middle products (short limbs n) | 64826 | 518616 | 0 in 2^14 | 524288: 17 in 10875 | 16799 |
-| Cyclic squares (modulus limbs m) | 64800 | 259200 | 11 in 2^14, all at the gate | 259308: 17 in 8845, the same | 23040 |
+| Cyclic squares (modulus limbs m) | 64800 (now 57344) | 259200 | 11 in 2^14, all at the gate | 259308: 17 in 8845, the same | 23040 |
 
-The new limits are 2.8–3.9× the old ones. Trip rates are not monotone in the size, so a size below
+These limits were measured at the old transform sizes and have not been remeasured. They now land on
+458752 (products and squares) and 524288 (middle products). 64800 is no longer a `bnm1_size`, so the
+cyclic limit is the largest one below it, 57344 (7·2^13), which dispatches the same: the next one up,
+65536, is past 64800 either way. A stage whose `bnm1_size(k + 1)` is 65536 (k from 57344 to 65535) now
+stays classic, where k up to 64799 used to wrap.
+
+The new limits were 2.8–3.9× the old ones. Trip rates are not monotone in the size, so a size below
 a limit can trip more than the limit itself. The most trips at or below each limit were:
 
 | Entry | Trips in 2^14 | Transform N |
@@ -206,12 +421,9 @@ and middle products at the old limits. It is about 30% faster at the new product
 middle-product limits. Only the cyclic square keeps a clear FFT lead (2.4×). A dispatch that
 weighed the pool's size would switch earlier on many threads; that is not done.
 
-Worst-case operands (digits near 2^16) trip well below the limits: they reach the size gate from
-about 18000 limbs, and their errors passed 0.4 from about a quarter to a third of the limits in the
-old search. Above that they pay the FFT and then the NTT, about 1.2–1.5× the NTT alone on one
-thread. Their coefficients could be bounded before the transform: a cyclic square's mean
-coefficient is (Σ digits)²/4m exactly. Such a bound could send them straight to the NTT; that is not
-done.
+On unsigned digits, operands with digits near 2^16 reached the gate from about 18000 limbs and paid the FFT
+and then the NTT above that. With balanced digits those operands read about 0.01 at the limits and don't
+pay it.
 
 ## Why the FFT fails: precision, not arithmetic
 
@@ -236,17 +448,16 @@ squares):
 The library loses up to about a bit against the plain FFT at mixed-radix sizes (factors 3, 5, 7)
 and matches it at powers of two; the random-operand trip rates show the same pattern, with
 radix-3 and radix-7 sizes tripping where neighbouring powers of two don't. Recomputing every twiddle
-of `FTTTwidleTower` exactly with `cis` changed nothing, so the tables are not the cause; the
+of the tables then in use exactly with `cis` changed nothing, so the tables are not the cause; the
 half-length real-FFT packing and its recombination are the likely place, not yet confirmed.
-Balanced digits in [−2^15, 2^15) remove the zero-frequency term and cut the worst case about 4×.
+Balanced digits remove the zero-frequency term, which is why the entries use them now.
 
 ## History: the worst-case limits
 
 `FFT_16BIT_CUTOFF` was 2^16 output limbs for products and middle products, and `dyn_sqr_dispatch`
 compared it with the square's operand length, letting squares reach twice the product's size. Its
 only accuracy tests used random operands. Against the exact NTT, worst-case operands
-(`fft_worst_operand` in `src/tests/mod.rs`: all ones, a step, random digits all at least
-0xF000, 0xFF00 or 0xE000) gave wrong results well inside those limits: all-ones squares from 23814
+(all ones, a step, random digits all at least 0xF000, 0xFF00 or 0xE000) gave wrong results well inside those limits: all-ones squares from 23814
 operand limbs and all-ones products from 26460 × 26460.
 
 Before the check, the fix was a limit per entry just below the first transform size where 10000
@@ -267,7 +478,7 @@ A size's maximum error over n operands grows roughly like the maximum of Gaussia
 √(2 ln n). Middle products had the heaviest tail: their first failure moved from short length
 n ≈ 22.6k (300 operands per size) to 16806 (10000), and their failures were sporadic. That search
 could only ever give a limit that a larger search might break, and it sent random operands to the
-NTT 2–3× earlier than they need. The check removes both problems.
+NTT 2–3× earlier than they need. Per-call checks removed both problems.
 
 ## The residue verifier
 
@@ -288,28 +499,29 @@ is the four compare-and-select steps per limb per prime (reduce the limb below p
 final subtraction): 24 flag operations per limb, against the M1's three or so per cycle.
 
 It can't check a middle product's band or a square mod B^m − 1, whose results omit an unknown part
-of the full product, so the probe and the tests still compare those with the NTT. Besides the FFT
+of the full product, so those rely on the fold check, and the probe and the tests compare them with the NTT. Besides the FFT
 entries' residue check, `mul_dyn` and `sqr_dyn` assert every NTT result with it in debug builds.
 
 ## Remeasuring
 
 `benches/probes/fft_precision.rs` runs operands through the raw entries at every transform size in
 a range and reports, per size:
-- the trips, either part, and `over`, the calls at the size gate;
-- the errors' tail: calls past 0.30 and 0.35;
-- the wrong results, and `under`, those below the gate;
-- the missed ones (wrong and untripped, which must stay 0);
-- the largest error, log2 of the largest coefficient (`peak`), and the smallest error among the
-  wrong calls below the gate. Its header has the build command. `rate` mode takes uniformly
-random limbs (the limits), and `worst` mode the worst-case kinds (`KIND=k` forces one; 6 and 7 are
-random digits at least 0x8000 and 0xC000). `STOP=k` ends a size after k + 1 trips. Products and
-squares are judged by the residue verifier, middle and cyclic squares by the NTT (`no-oracle`
-skips it, for trip rates only).
+- `fires`, the calls that run the fold check, `needless`, those whose result was right, and `trips`, those
+  it failed;
+- the errors' tail: calls past 0.30 and 0.375;
+- the wrong results, split into `by_fold` (caught), `blind` (it ran and passed them) and `quiet` (read too low
+  for it to run), and `missed`, the last two together, which must stay 0;
+- the largest error and the smallest among the wrong calls. Its header has the build command. `rate` mode
+takes uniformly random limbs, `worst` mode the unsigned worst cases (`KIND=k` forces any kind in its
+`operand`), and `sweep` the soundness run above, over `FILLS`, `RATIOS` and `KINDS`, with `REACHABLE=1`
+leaving out shapes past the limits. `STOP=k` ends a size after k + 1 trips. Products and squares are
+judged by the residue verifier, middle and cyclic squares by the NTT (`no-oracle` skips it).
 
-A transform size's limbs follow from its entry's sizing: a square of n limbs takes
+`FILL=f` and `RATIO=r` set the shape, as operands can fill as little as 5/6 of a size and wide ratios read
+differently. A transform size's limbs follow from its entry's sizing: a square of n limbs takes
 `find_fft_size(8n − 1)`, a product of O output limbs `find_fft_size(4O + 3)`, a middle product of
 short length n `find_fft_size(8n + 4)`, and a cyclic square exactly 4m. The cyclic limit must be a
 `bnm1_size`, since `bnm1_fft` only runs the cyclic FFT at such an m.
 
-Rounding depends on rustfft's SIMD paths. On x86 (AVX) the trip rates, and so the best limits,
-will differ; the check itself keeps the results exact either way.
+Rounding depends on rustfft's SIMD paths, so run all of this on each machine: readings under Rosetta already
+differ enough to give wrong results inside the limits. A new wrapped transform size needs its own prime.

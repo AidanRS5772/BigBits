@@ -51,27 +51,47 @@ pub(super) fn rand_nonzero_vec(len: usize, seed: u64) -> Vec<u64> {
     v
 }
 
-// Operand kinds that round worst in the 16-bit FFT (unsigned digits near their maximum put most of
-// the spectrum in one huge zero-frequency term, which every rounding error scales with): all ones,
-// a step, and random digits all at least 0xF000, 0xFF00 or 0xE000. Measured against the exact NTT,
-// these round worse than random operands by 3-4x, and the middle product's worst is not all ones.
+// Operand kinds that round worst in the 16-bit FFT. Balanced digits cancel in a coefficient's sum
+// unless they keep one sign or a pattern, so these are written in balanced digits at full size: all
+// -2^15, all 2^15 - 1, random signs, and periods 3 and 12. Raw 0x7FFF or 0x8000 limbs wouldn't do,
+// as a carry that persists through them balances them to one sign whatever their digits.
 pub(super) const FFT_WORST_KINDS: usize = 5;
 
 pub(super) fn fft_worst_operand(kind: usize, len: usize, rng: &mut StdRng) -> Vec<u64> {
-    let mut v: Vec<u64> = match kind % FFT_WORST_KINDS {
-        0 => vec![u64::MAX; len],
-        1 => (0..len)
-            .map(|i| if i >= len / 2 { u64::MAX } else { 0 })
-            .collect(),
-        k => {
-            let digits = [
-                0xF000_F000_F000_F000u64,
-                0xFF00_FF00_FF00_FF00,
-                0xE000_E000_E000_E000,
-            ];
-            (0..len).map(|_| rng.gen::<u64>() | digits[k - 2]).collect()
+    const HI: i64 = (1 << 15) - 1;
+    const LO: i64 = -(1 << 15);
+    let digit = |k: usize, rng: &mut StdRng| match kind % FFT_WORST_KINDS {
+        0 => LO,
+        1 => HI,
+        2 => {
+            if rng.gen::<bool>() {
+                HI
+            } else {
+                LO
+            }
+        }
+        3 => {
+            if k % 3 == 2 {
+                LO
+            } else {
+                HI
+            }
+        }
+        _ => {
+            if k % 12 < 6 {
+                HI
+            } else {
+                LO
+            }
         }
     };
+    let mut v = vec![0u64; len];
+    let mut carry = 0i64;
+    for k in 0..4 * len {
+        let t = digit(k, rng) + carry;
+        v[k / 4] |= (t.rem_euclid(1 << 16) as u64) << (16 * (k % 4));
+        carry = t.div_euclid(1 << 16);
+    }
     v[len - 1] |= 1 << 63;
     v
 }

@@ -172,7 +172,7 @@ the cyclic FFT's dispatch limit:
 |---|---:|---|
 | `DYN_SQRT_WRAPPED_REM_CUTOFF` | 341 | Root limbs from which a dynamic stage (and `sqrt_dyn`'s top stage) takes the wrapped remainder |
 | `DYN_SQR_BNM1_FFT_CUTOFF` | 340 | Operand limbs above which `sqr_mod_bnm1_dyn` runs the cyclic FFT rather than `sqr_dyn` and a fold |
-| `FFT_BNM1_16BIT_CUTOFF` | 64800 | The cyclic FFT's dispatch limit in modulus limbs: the largest `bnm1_size` below where random operands trip its round-off check (here its 2^48 size gate) more than 1 in 2^10 times, not timed against the stages (`docs/fft_precision.md`). Stages whose `bnm1_size(k + 1)` passes it stay classic |
+| `FFT_BNM1_16BIT_CUTOFF` | 57344 | The cyclic FFT's dispatch limit in modulus limbs: the largest `bnm1_size` below where random operands tripped its old check (a 2^48 size gate, since removed) more than 1 in 2^10 times, not timed against the stages (`docs/fft_precision.md`). That was measured as 64800 at the old transform sizes and not remeasured; 57344 is the largest `bnm1_size` below it now. Stages whose `bnm1_size(k + 1)` passes it stay classic |
 
 The placeholders follow `FFT_SQR_CUTOFF`: every stage whose wrapped square is on the FFT takes it.
 That isn't measured, and it costs time at the small end. Release A/B against the classic stages
@@ -278,9 +278,11 @@ The sweep points the other way: at the placeholder, NR starts too low. Whole-roo
 `sqrt_approx_dyn` stays within noise at the AGM's sizes (0.999 at g = 524, 0.988 at 1044, 0.999 at 2084, 1.000
 at 4164, 1.005 at 8324, 0.990 at 16644). A cutoff of 1366 costs up to 14% (`sqrt_approx_dyn` at g = 2084),
 and no wrapping up to 21%. The cutoff is left at the placeholder, as a tuning pass should also look at
-`bnm1_size`: it takes the smallest 7-smooth transform, and a root of exactly 2^k limbs needs m ≥ 2^k + 1, so
-its transform is mixed-radix (m = 525 for k = 512). rustfft on NEON has cost up to twice as much per point at
-such sizes, which may be part of the mid-size losses, but it wasn't timed separately here.
+`bnm1_size`: it took the smallest 7-smooth transform, and a root of exactly 2^k limbs needs m ≥ 2^k + 1, so
+its transform was mixed-radix (m = 525 for k = 512). rustfft on NEON has cost up to twice as much per point at
+such sizes, which may be part of the mid-size losses, but it wasn't timed separately here. These tables were
+measured at those sizes. `bnm1_size` now follows `find_fft_size`'s stricter set (m = 576 for k = 512), and the
+wrapped remainder's cutoffs haven't been remeasured with it.
 
 The balanced row above also shows `div_rem_dyn` taking NR too early on the M1: dispatch switches from BZ at
 d = 778, where NR takes 1.34× at 1024 limbs, 1.17× at 1536 and 1.14× at 2048. Its constants were measured
