@@ -1,5 +1,15 @@
 # Series evaluation dispatch tuning
 
+> **2026-11-10: this document describes the model the static nodes still use.** Dynamic nodes
+> (`series_eval_dyn`) now compare fitted runtime equations, one an algorithm, built on mul's
+> and division's fitted equations (`SeriesEq` over `Parts` in `series.rs`; fitted by `cargo
+> tune tune series`, reported by `cargo tune series`). On exp's and ln's own series their
+> picks lose 0.1-0.2% of measured time where the shared prices described here lost 3.8-4.3%.
+> See CLAUDE.md's `series.rs` entry and the log entry "The series' dynamic dispatch rebuilt on
+> fitted equations" in `docs/tuning_implementation.md`. The harness and script named below
+> were deleted when the constants became knobs (they are at commit `faa9971`), and
+> `SERIES_NS_ALLOC` is gone, as no static algorithm allocates.
+
 The series evaluators (`series_eval_dyn`, `series_eval_static` and the node-level
 `series_eval_range` under them) pick among reverse Horner, rectangular splitting (rect) and
 binary splitting by predicting each eligible algorithm's time and taking the fastest. The prediction is a
@@ -286,3 +296,56 @@ follows.
 - `cargo bench-series --check` (and with `--blocks`) agrees with the exact sum within one
   ulp for every algorithm, block length and shape.
 - Changed Rust files pass `rustfmt --check --edition 2021`; `git diff --check` passes.
+
+## Values before the tuner (2026-11-08)
+
+The cost model's coefficients and the Horner shortcut's limits moved from `src/utils/mod.rs` into
+the tuning schema (section `series` of `src/tuning/schema.rs`, Phase 1 of
+`docs/tuning_system.md`) with their values unchanged: `SERIES_NS_<X>` is `series.ns_<x>`, and
+`SERIES_HORNER_LIMBS`/`TERMS` are `series.horner_limbs`/`horner_terms`. The model reads them once
+per decision as a `SeriesModel` (`Work::ns_with`). The harness this document describes
+(`benches/series_cutoffs.rs`, `cargo bench-series`, `scripts/python/tune_series_cutoffs.py`) was
+deleted then; it still runs at commit `faa9971`, and Phase 2's tuner replaces it.
+
+Their notes in `mod.rs`:
+
+```text
+// series_eval predicts each eligible algorithm's time from its kernels' operation counts
+// (series.rs's Work: Big-O in the call's terms, precision, shifts, x and N, with structural
+// pass, product and array counts) and takes the fastest. These are the ns per unit of each
+// count, shared by every series kind and both allocation modes, fitted by non-negative
+// least squares on relative error over serial timings on an Apple M1 (aarch64). See
+// docs/series_cutoff_tuning.md.
+// A limb of a div_prim or div_prim2 pass, or a Knuth quotient limb.
+pub const SERIES_NS_DIV: f64 = 3.574;
+// A limb times scalar limb of a linear pass: a product or multiply-add by a scalar, an
+// addition, a negation, a clear or a copy.
+pub const SERIES_NS_SCALAR: f64 = 0.1574;
+// A schoolbook limb product of a multi-limb product (mul::mul_work).
+pub const SERIES_NS_PRODUCT: f64 = 0.3847;
+// A Horner or rect term's group and weight bookkeeping.
+pub const SERIES_NS_TERM: f64 = 9.334;
+// A kernel call: a pass, product or division.
+pub const SERIES_NS_CALL: f64 = 0.9307;
+// A heap allocation or scratch acquisition.
+pub const SERIES_NS_ALLOC: f64 = 9.377;
+// A limb of a static [u64; N] array zero-filled or moved.
+pub const SERIES_NS_FILL: f64 = 0.09114;
+// Up to this many output limbs, small ranges go to Horner without the cost model, which
+// there costs about as much as the sum (200-330 ns a call at 1-4 limbs). For a Hyper series
+// with a one-limb x that is every range: logging the model's picks over exp_dyn, ln_dyn and
+// their static twins (116k calls, 1-400 limbs, every m) found it picking Horner for all of
+// them up to 28 limbs, and the first other pick at 29.
+pub const SERIES_HORNER_LIMBS: usize = 28;
+// For BBP and Engel, a range of at most this many terms. Horner alone beat the model plus
+// its pick on every Engel<Exp> and Bbp<ATanh> range of up to 12 terms at 1-28 limbs, dynamic
+// and static (Engel by 1.2-3.7x, as the model picks bin_split for even one term; BBP by
+// 1.06-2.5x). From about 15 terms BBP's bin_split wins even with the model's cost.
+pub const SERIES_HORNER_TERMS: u64 = 12;
+```
+
+The random-knob test found one bug: with every coefficient at `f64::MAX`, each of rect's candidate
+block lengths predicted an infinite time, none beat the initial infinity, and `rect_best` returned
+block length 0, which `rect` rejects. It now keeps its first candidate, which changes nothing for
+finite predictions.
+

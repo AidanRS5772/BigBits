@@ -90,6 +90,10 @@ remove this sensitivity.
 
 ## Reproduction
 
+The probe and scripts below were deleted on 2026-11-08, when the sqrt constants became knobs
+(see [Values before the tuner](#values-before-the-tuner-2026-11-08)). They still run at commit
+`faa9971`, in a worktree (`git worktree add --detach <dir> faa9971`).
+
 ```bash
 cargo bench-cutoffs --no-run
 python3 scripts/python/tune_sqrt_cutoffs.py --rlib target/release/deps/libbig_bits-HASH.rlib \
@@ -287,4 +291,25 @@ wrapped remainder's cutoffs haven't been remeasured with it.
 The balanced row above also shows `div_rem_dyn` taking NR too early on the M1: dispatch switches from BZ at
 d = 778, where NR takes 1.34× at 1024 limbs, 1.17× at 1536 and 1.14× at 2048. Its constants were measured
 on an i7-8750H.
+
+## Values before the tuner (2026-11-08)
+
+The sqrt cutoffs moved from `src/utils/mod.rs` into the tuning schema (section `sqrt` of
+`src/tuning/schema.rs`, Phase 1 of `docs/tuning_system.md`) with their values unchanged; code reads
+them as `k::sqrt::<knob>()`.
+
+| Knob | Was | Value | Notes from `mod.rs` |
+|---|---|---|---|
+| `sqrt.leaf` | `ZIMMERMAN_SQRT_LEAF_CUTOFF` | 11 | the recursive leaf, shared by dyn and static |
+| `sqrt.dyn_rem`, `sqrt.static_rem` | `DYN_`/`STATIC_SQRT_REM_ZIMMERMAN_CUTOFF` | 16 | top level, root and remainder |
+| `sqrt.dyn_only`, `sqrt.static_only` | `DYN_`/`STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF` | 11 | top level, root only |
+| `sqrt.dyn_approx`, `sqrt.static_approx` | `DYN_`/`STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF` | 11 | top level, approximate root |
+| `sqrt.dyn_wrapped_rem` | `DYN_SQRT_WRAPPED_REM_CUTOFF` | 341 | "Dynamic Zimmermann levels (and sqrt_dyn's top level) with at least this many root limbs form their remainder X - s^2 from one square mod B^m - 1 and divide quotient-only, rather than take the division's remainder and subtract the low root's square. GUESS: every level whose wrapped square is on the FFT." It was `DYN_SQR_BNM1_FFT_CUTOFF + 1`, and is a `Follows` of mul's cutoff once mul is declared |
+| `sqrt.dyn_rcp_carry` | `DYN_SQRT_RCP_CARRY_CUTOFF` | 256 | "Not a crossover: a reciprocal needs two NR stages to be read (about 680 root limbs at the cutoffs above), so smaller roots just skip its scratch acquisition." |
+
+The random-knob test (`cargo test --lib --features tune`) found that every cutoff, the six top
+levels as well as the leaf, must be at least 3: Zimmermann's split takes `lo = (s.len() - 1) / 2`
+low root limbs from a full x, which is none for roots of 1 or 2 limbs, and `s_lo[lo - 1]` then
+underflows (a stage of 2 limbs would also recurse on itself). Those are the knobs' valid minimums;
+every larger value, up to `usize::MAX`, gives correct roots.
 

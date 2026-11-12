@@ -218,8 +218,8 @@ fn test_theta_dyn_sparse_and_all_ones() {
     }
 }
 
-// Past DYN_PARTIAL_MUL_CUTOFF and STATIC_PARTIAL_SQR_CUTOFF, so the guarded high products and
-// the transforms run, and past DYN_THETA_PAR_LIMBS, so Auto takes the threaded parallel plan: l
+// Past `mul.dyn_partial_mul` and `mul.static_partial_sqr`, so the guarded high products and
+// the transforms run, and past theta.dyn_par_limbs, so Auto takes the threaded parallel plan: l
 // for N = 3 (p / (4 (N + 1)²)), and a small l capped by the frame.
 #[test]
 fn test_theta_dyn_large() {

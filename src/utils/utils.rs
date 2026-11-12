@@ -1,5 +1,6 @@
 #![allow(dead_code)]
-use crate::utils::{rows_dispatch, Rows, MUL_LIMB_ADX_CUTOFF};
+use crate::tuning::k;
+use crate::utils::{rows_dispatch, Rows};
 use std::arch::asm;
 
 #[inline(always)]
@@ -486,13 +487,13 @@ pub fn sub_mul_limb(x: &mut [u64], s: &[u64], d: u64) -> u64 {
 }
 
 // The rows behind add_mul_limb and sub_mul_limb, checked first: the ADX row runs from
-// MUL_LIMB_ADX_CUTOFF limbs, below which its bmi2/adx call costs more than it saves.
+// base.limb_adx limbs, below which its bmi2/adx call costs more than it saves.
 rows_dispatch!(#[inline(always)]
     fn add_mul_row(x: &mut [u64], s: &[u64], d: u64) -> u64 = add_mul_rows
-    if s.len() >= MUL_LIMB_ADX_CUTOFF);
+    if s.len() >= k::base::limb_adx());
 rows_dispatch!(#[inline(always)]
     fn sub_mul_row(x: &mut [u64], s: &[u64], d: u64) -> u64 = sub_mul_rows
-    if s.len() >= MUL_LIMB_ADX_CUTOFF);
+    if s.len() >= k::base::limb_adx());
 
 #[inline(always)]
 fn add_mul_rows<K: Rows>(x: &mut [u64], s: &[u64], d: u64) -> u64 {

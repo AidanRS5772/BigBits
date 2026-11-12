@@ -6,12 +6,9 @@ use crate::utils::sqrt::{
     zimmerman_sqrt_only_static, zimmerman_sqrt_static,
 };
 use crate::utils::utils::{add_buf, cmp_buf, dec_buf, eq_buf, inc_buf, sub_buf};
-use crate::utils::{
-    DYN_SQRT_APPROX_ZIMMERMAN_CUTOFF, DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF, DYN_SQRT_RCP_CARRY_CUTOFF,
-    DYN_SQRT_REM_ZIMMERMAN_CUTOFF, DYN_SQRT_WRAPPED_REM_CUTOFF,
-    STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF, STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF,
-    STATIC_SQRT_REM_ZIMMERMAN_CUTOFF, ZIMMERMAN_SQRT_LEAF_CUTOFF,
-};
+use crate::tuning::{k, resolved};
+#[cfg(feature = "tune")]
+use rand::{rngs::StdRng, Rng};
 
 /// Verify both outputs for
 /// `shifted_x = x * B^(2 * root.len() - x.len()) = root^2 + remainder`.
@@ -392,17 +389,18 @@ fn assert_sqrt_only_contract<const N: usize>(x: &[u64], root_len: usize) {
 
 #[test]
 fn test_sqrt_only_all_shapes_and_normalization_around_cutoff() {
-    let leaf = ZIMMERMAN_SQRT_LEAF_CUTOFF;
+    let leaf = k::sqrt::leaf();
     let mut root_lens = vec![1, 2, 3, 2 * leaf - 1, 2 * leaf + 1];
     for cutoff in [
         leaf,
-        DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF,
-        DYN_SQRT_APPROX_ZIMMERMAN_CUTOFF,
-        STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF,
-        STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF,
+        k::sqrt::dyn_only(),
+        k::sqrt::dyn_approx(),
+        k::sqrt::static_only(),
+        k::sqrt::static_approx(),
     ] {
-        root_lens.extend([cutoff - 1, cutoff, cutoff + 1]);
+        root_lens.extend([cutoff.saturating_sub(1), cutoff, cutoff + 1]);
     }
+    root_lens.retain(|&r| (1..=64).contains(&r));
     root_lens.sort_unstable();
     root_lens.dedup();
     for root_len in root_lens {
@@ -546,15 +544,12 @@ fn test_sqrt_static_exact_capacity() {
 
 #[test]
 fn test_sqrt_dispatch_root_remainder_all_shapes_around_cutoff() {
-    const N: usize = 2 * (DYN_SQRT_REM_ZIMMERMAN_CUTOFF + STATIC_SQRT_REM_ZIMMERMAN_CUTOFF);
+    const N: usize = 2 * (resolved::sqrt::DYN_REM + resolved::sqrt::STATIC_REM) + 2;
     let mut root_lens = vec![1, 2];
-    for cutoff in [
-        ZIMMERMAN_SQRT_LEAF_CUTOFF,
-        DYN_SQRT_REM_ZIMMERMAN_CUTOFF,
-        STATIC_SQRT_REM_ZIMMERMAN_CUTOFF,
-    ] {
-        root_lens.extend([cutoff - 1, cutoff, cutoff + 1]);
+    for cutoff in [k::sqrt::leaf(), k::sqrt::dyn_rem(), k::sqrt::static_rem()] {
+        root_lens.extend([cutoff.saturating_sub(1), cutoff, cutoff + 1]);
     }
+    root_lens.retain(|&r| r >= 1 && 2 * r <= N);
     root_lens.sort_unstable();
     root_lens.dedup();
     for root_len in root_lens {
@@ -572,16 +567,16 @@ fn test_sqrt_dispatch_root_remainder_all_shapes_around_cutoff() {
 #[test]
 #[cfg(debug_assertions)]
 fn test_sqrt_dispatch_static_capacity_applies_to_both_algorithms() {
-    const N: usize = STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF;
+    // With N = 4 every root of 3 or more limbs exceeds capacity, so roots on both sides of each
+    // entry's cutoff (whatever its value) must be rejected.
+    const N: usize = 4;
     let entries: [(fn(&mut [u64], &mut [u64]), usize); 3] = [
-        (sqrt_static::<N>, STATIC_SQRT_REM_ZIMMERMAN_CUTOFF),
-        (sqrt_only_static::<N>, STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF),
-        (sqrt_approx_static::<N>, STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF),
+        (sqrt_static::<N>, k::sqrt::static_rem()),
+        (sqrt_only_static::<N>, k::sqrt::static_only()),
+        (sqrt_approx_static::<N>, k::sqrt::static_approx()),
     ];
     for (entry, cutoff) in entries {
-        // Root widths on each side of the cutoff must both exceed capacity.
-        assert!(2 * (cutoff - 1) > N);
-        for root_len in [cutoff - 1, cutoff] {
+        for root_len in [3, cutoff.saturating_sub(1).max(3), cutoff.max(3)] {
             let result = std::panic::catch_unwind(|| {
                 entry(&mut vec![u64::MAX; 2 * root_len], &mut vec![0; root_len]);
             });
@@ -657,7 +652,7 @@ fn test_sqrt_rem_rejects_one_limb() {
 
 // Every dynamic stage from the recursive leaf up forms its remainder from a wrapped square.
 fn sqrt_dyn_wrapped_all(x: &mut [u64], s: &mut [u64]) {
-    sqrt_dyn_at(x, s, ZIMMERMAN_SQRT_LEAF_CUTOFF);
+    sqrt_dyn_at(x, s, k::sqrt::leaf());
 }
 
 // The wrapped stages change how a remainder is formed, not the root or remainder, so every output
@@ -666,9 +661,9 @@ fn sqrt_dyn_wrapped_all(x: &mut [u64], s: &mut [u64]) {
 fn assert_wrapped_matches_classic(x: &[u64], root_len: usize) {
     type At = fn(&mut [u64], &mut [u64], usize);
     let mut cutoffs = vec![
-        ZIMMERMAN_SQRT_LEAF_CUTOFF,
-        (root_len / 2).max(ZIMMERMAN_SQRT_LEAF_CUTOFF),
-        DYN_SQRT_WRAPPED_REM_CUTOFF,
+        k::sqrt::leaf(),
+        (root_len / 2).max(k::sqrt::leaf()),
+        k::sqrt::dyn_wrapped_rem(),
     ];
     cutoffs.dedup();
     let modes: [(&str, At, bool); 3] = [
@@ -696,7 +691,7 @@ fn assert_wrapped_matches_classic(x: &[u64], root_len: usize) {
 
 // Random inputs of every top-level shape (full, one short, three quarters, and the most padded),
 // with and without a normalization shift, at sizes whose stages run the folded fallback (small)
-// and the cyclic FFT (from DYN_SQR_BNM1_FFT_CUTOFF limbs).
+// and the cyclic FFT (from `mul.sqr_bnm1_fft` limbs).
 #[test]
 fn test_sqrt_wrapped_remainder_matches_classic() {
     for root_len in [24usize, 50, 101, 400, 700, 1500] {
@@ -794,7 +789,7 @@ fn test_sqrt_wrapped_remainder_edges() {
 
 // ─── carried reciprocals ────────────────────────────────────────────────────
 
-// From DYN_SQRT_RCP_CARRY_CUTOFF root limbs each NR stage resumes from the last one's reciprocal,
+// From `sqrt.dyn_rcp_carry` root limbs each NR stage resumes from the last one's reciprocal,
 // which changes how a quotient is reached, not its value. Every output mode against schoolbook.
 fn assert_carried_roots(x: &[u64], root_len: usize) {
     assert_sqrt_contract_with(x, root_len, sqrt_dyn);
@@ -825,8 +820,8 @@ fn assert_carried_roots(x: &[u64], root_len: usize) {
 #[test]
 fn test_sqrt_carried_reciprocal_all_shapes() {
     for root_len in [
-        DYN_SQRT_RCP_CARRY_CUTOFF - 1,
-        DYN_SQRT_RCP_CARRY_CUTOFF,
+        k::sqrt::dyn_rcp_carry().max(2) - 1,
+        k::sqrt::dyn_rcp_carry().max(1),
         680,
         1044,
         2084,
@@ -884,6 +879,36 @@ fn test_sqrt_carried_reciprocal_structured_roots() {
         }
         for x in cases {
             assert_carried_roots(&x, k);
+        }
+    }
+}
+
+// The sqrt section's random-knob check (test_tuning.rs): every output mode, dyn and static, at
+// roots from 1 to about 300 limbs and every top-level shape, against the schoolbook contracts.
+// The sizes reach the leaf, the top-level cutoffs, the wrapped remainder and the carried
+// reciprocal at the values the random vectors draw (up to the caps in test_tuning.rs).
+#[cfg(feature = "tune")]
+pub(super) fn random_knob_check(rng: &mut StdRng) {
+    for root_len in [1usize, 2, 3, 4, 5, 7, 11, 16, 23, 40, 64, 130, 300] {
+        let mut x_lens = vec![2 * root_len, root_len + 1, (3 * root_len).div_ceil(2) + 1];
+        x_lens.retain(|&l| l > root_len && l <= 2 * root_len);
+        x_lens.dedup();
+        for x_len in x_lens {
+            let mut x = rand_vec(x_len, rng.gen());
+            x[x_len - 1] = match rng.gen_range(0..4) {
+                0 => 1,
+                1 => u64::MAX,
+                2 => (x[x_len - 1] >> rng.gen_range(0..64)).max(1),
+                _ => x[x_len - 1] | 1,
+            };
+            if rng.gen_range(0..8) == 0 {
+                x.fill(u64::MAX); // every stage saturates
+            }
+            if root_len > 1 || x_len > 1 {
+                assert_sqrt_contract_with(&x, root_len, sqrt_dyn);
+                assert_sqrt_contract_with(&x, root_len, sqrt_static::<600>);
+            }
+            assert_sqrt_only_contract::<600>(&x, root_len);
         }
     }
 }

@@ -7,7 +7,7 @@
 //!   benches/probes/zimmermann_stages.rs \
 //!   --extern big_bits=target/prof/deps/libbig_bits-HASH.rlib \
 //!   -L dependency=target/prof/deps -o target/zimmermann_sqrt_profiles/stages_probe
-pub use big_bits::utils;
+pub use big_bits::{tuning, utils};
 use std::{
     hint::black_box,
     time::{Duration, Instant},
@@ -43,7 +43,7 @@ mod measured {
             2 => SqrtOutput::ApproxRoot,
             _ => unreachable!(),
         };
-        assert!(s.len() >= output.dyn_cutoff());
+        assert!(s.len() >= SqrtKnobs::dyn_read(output, usize::MAX).top);
         let x_len = x.len();
         let sh = x[x_len - 1].leading_zeros() as u8 & !1_u8;
         shl_buf(x, sh);
@@ -58,7 +58,7 @@ mod measured {
             } else {
                 BACKEND
             };
-            let result = if backend == 0 || backend == 4 || d.len() <= crate::utils::BZ_CUTOFF {
+            let result = if backend == 0 || backend == 4 || d.len() <= crate::tuning::k::div::bz() {
                 if remainder {
                     div_rem_dyn(n, d, q)
                 } else {
@@ -116,7 +116,7 @@ mod measured {
                 finish(guard.get(square_len));
             },
             // Classic stages throughout, so the stage timers keep their meaning.
-            None,
+            SqrtKnobs::dyn_read(output, usize::MAX),
         );
         if output == SqrtOutput::RootRem {
             if !SKIP_NOOP || sh != 0 {

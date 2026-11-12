@@ -5,11 +5,10 @@ edition = "2021"
 
 [dev-dependencies]
 criterion = "0.5.1"
+rand = "0.8.5"
 
 [dependencies]
-criterion = "0.5.1"
-itertools = "0.12.1"
-rand = "0.8.5"
+nalgebra = { version = "0.34", optional = true }
 rayon = "1.12.0"
 rustfft = "6.4.1"
 
@@ -32,16 +31,15 @@ lto = "thin"
 codegen-units = 1
 
 [features]
+# Live knob values for the tuner and the random-knob test (docs/tuning_system.md). For tuning
+# builds only: it makes every knob read an atomic instead of a constant, and pulls in the fitting
+# library (nalgebra, whose SVD solves every fit), which normal builds never compile.
+tune = ["dep:nalgebra"]
 _bench_internals = []
 _fft_cutoffs = []
 
 [[bench]]
 name = "utils_bench"
-harness = false
-required-features = ["_bench_internals"]
-
-[[bench]]
-name = "cutoffs_bench"
 harness = false
 required-features = ["_bench_internals"]
 
@@ -58,13 +56,10 @@ name = "bin_split_profile"
 harness = false
 
 [[bench]]
-name = "bin_split_cutoffs"
+name = "tuning_bias"
 harness = false
 
-[[bench]]
-name = "mul_cutoffs"
-harness = false
-
-[[bench]]
-name = "series_cutoffs"
-harness = false
+# The tuner: `cargo tune ...` (an alias in .cargo/config.toml). Release profile, as that is what ships.
+[[example]]
+name = "tune"
+required-features = ["tune"]

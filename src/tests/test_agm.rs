@@ -4,7 +4,7 @@ use crate::utils::sqrt::sqrt_only_dyn;
 use crate::utils::trans::{agm_dyn, agm_dyn_at, agm_static, agm_static_at, theta_dyn, AGM_TAIL};
 use crate::utils::utils::{add_buf, buf_len, cmp_buf, inc_buf, shr_buf, sub_buf};
 use crate::utils::CapacityError;
-use crate::utils::DYN_AGM_TAIL_TERMS;
+use crate::tuning::k;
 use std::cmp::Ordering;
 use std::f64::consts::LN_2;
 
@@ -187,7 +187,7 @@ fn test_agm_random_against_oracle() {
             let mut got = vec![0; l];
             agm_dyn(&a, &b, &mut got);
             let mut at = vec![0; l];
-            agm_dyn_at(&a, &b, DYN_AGM_TAIL_TERMS, &mut at);
+            agm_dyn_at(&a, &b, k::agm::dyn_tail_terms(), &mut at);
             assert_eq!(got, at, "l={l}");
             // Past a few limbs the tail replaces roots.
             if l >= 40 {

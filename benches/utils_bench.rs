@@ -4,7 +4,7 @@ use big_bits::utils::sqrt::{
     binom_sqrt, sqrt_approx_dyn, sqrt_approx_static, sqrt_dyn, sqrt_only_dyn, sqrt_only_static,
     sqrt_static, zimmerman_sqrt_dyn, zimmerman_sqrt_static,
 };
-use big_bits::utils::DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF;
+use big_bits::tuning::resolved::sqrt::DYN_ONLY as DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF;
 use big_bits::{utils::div::*, *};
 use criterion::{
     black_box, criterion_group, criterion_main, measurement::WallTime, BatchSize, BenchmarkGroup,

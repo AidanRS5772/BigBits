@@ -1,6 +1,8 @@
 [alias]
+tune = "run --release --features tune --example tune --"
 bench-utils = "bench --features _bench_internals --bench utils_bench"
-bench-cutoffs = "bench --features _bench_internals --bench cutoffs_bench"
-bench-bin-split = "bench --bench bin_split_cutoffs --"
-bench-mul-cutoffs = "bench --profile release --bench mul_cutoffs --"
-bench-series = "bench --profile release --bench series_cutoffs --"
+
+[env]
+# This machine's own tuning file: `cargo tune tune` writes it, build.rs layers it over the target's
+# preset, and git ignores it. Delete the file to build with the preset again.
+BIGBITS_TUNING = { value = "presets/local.toml", relative = true }

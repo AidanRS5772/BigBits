@@ -1,3 +1,4 @@
+use crate::tuning::k;
 use crate::utils::{
     div::{
         div_carry_dyn, div_dyn, div_rem_carry_dyn, div_rem_dyn, div_rem_static, div_static,
@@ -8,10 +9,7 @@ use crate::utils::{
         add_buf, add_mul, buf_len, cmp_buf, combine_u64, dec_buf, fold_mod_bnm1, shl_buf, shr_buf,
         sub_buf, sub_mod_bnm1,
     },
-    ScratchGuard, DYN_SQRT_APPROX_ZIMMERMAN_CUTOFF, DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF,
-    DYN_SQRT_RCP_CARRY_CUTOFF, DYN_SQRT_REM_ZIMMERMAN_CUTOFF, DYN_SQRT_WRAPPED_REM_CUTOFF,
-    FFT_BNM1_16BIT_CUTOFF, STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF, STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF,
-    STATIC_SQRT_REM_ZIMMERMAN_CUTOFF, ZIMMERMAN_SQRT_LEAF_CUTOFF,
+    ScratchGuard, FFT_BNM1_16BIT_CUTOFF,
 };
 
 // x -= q_sqr; if that went negative, moves the remainder from s to s - 1 (rem + 2s - 1) and returns
@@ -153,22 +151,54 @@ enum SqrtOutput {
     Stage,
 }
 
-impl SqrtOutput {
-    // Root widths from which each top-level entry prefers Zimmermann.
-    fn dyn_cutoff(self) -> usize {
-        match self {
-            Self::RootRem | Self::Stage => DYN_SQRT_REM_ZIMMERMAN_CUTOFF,
-            Self::Root => DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF,
-            Self::ApproxRoot => DYN_SQRT_APPROX_ZIMMERMAN_CUTOFF,
-        }
+// The sqrt knobs one call reads (docs/tuning_system.md, invariants 6 and 7): read once at the top
+// level and passed down the recursion, so every stage of a call sees the same values.
+#[derive(Clone, Copy, Debug)]
+struct SqrtKnobs {
+    // Root width from which the top level runs Zimmermann rather than the binomial root.
+    top: usize,
+    // Root width below which a recursive stage is the binomial root (the recursion's leaf).
+    leaf: usize,
+    // Root width from which a dynamic stage takes the wrapped remainder; None for static roots.
+    wrapped: Option<usize>,
+    // Root width from which a dynamic root carries one reciprocal up its stages.
+    rcp_carry: usize,
+}
+
+impl SqrtKnobs {
+    fn dyn_read(output: SqrtOutput, wrapped: usize) -> Self {
+        let top = match output {
+            SqrtOutput::RootRem | SqrtOutput::Stage => k::sqrt::dyn_rem(),
+            SqrtOutput::Root => k::sqrt::dyn_only(),
+            SqrtOutput::ApproxRoot => k::sqrt::dyn_approx(),
+        };
+        Self { top, leaf: k::sqrt::leaf(), wrapped: Some(wrapped), rcp_carry: k::sqrt::dyn_rcp_carry() }
     }
 
-    fn static_cutoff(self) -> usize {
-        match self {
-            Self::RootRem | Self::Stage => STATIC_SQRT_REM_ZIMMERMAN_CUTOFF,
-            Self::Root => STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF,
-            Self::ApproxRoot => STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF,
-        }
+    fn static_read(output: SqrtOutput) -> Self {
+        let top = match output {
+            SqrtOutput::RootRem | SqrtOutput::Stage => k::sqrt::static_rem(),
+            SqrtOutput::Root => k::sqrt::static_only(),
+            SqrtOutput::ApproxRoot => k::sqrt::static_approx(),
+        };
+        Self { top, leaf: k::sqrt::leaf(), wrapped: None, rcp_carry: usize::MAX }
+    }
+}
+
+/// The algorithm for a root of `root_len` limbs: the binomial root below `cutoff`, Zimmermann from
+/// it. At the top level `cutoff` is the entry's knob (`sqrt.dyn_rem`, …), in a recursive stage the
+/// leaf (`sqrt.leaf`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SqrtAlg {
+    Binomial,
+    Zimmermann,
+}
+
+pub(crate) fn sqrt_alg(root_len: usize, cutoff: usize) -> SqrtAlg {
+    if root_len < cutoff {
+        SqrtAlg::Binomial
+    } else {
+        SqrtAlg::Zimmermann
     }
 }
 
@@ -194,10 +224,10 @@ fn zimmermann_sqrt_core(
     s: &mut [u64],
     div_alg: &mut dyn FnMut(&mut [u64], &[u64], &mut [u64], bool) -> u64,
     sqr_alg: &mut dyn FnMut(&[u64], &mut [u64]) -> u64,
-    wrapped: Option<usize>,
+    knobs: SqrtKnobs,
 ) {
     debug_assert_eq!(x.len(), 2 * s.len());
-    if s.len() < ZIMMERMAN_SQRT_LEAF_CUTOFF {
+    if sqrt_alg(s.len(), knobs.leaf) == SqrtAlg::Binomial {
         binom_sqrt_core(x, s);
         return;
     }
@@ -208,14 +238,14 @@ fn zimmermann_sqrt_core(
         div_alg,
         sqr_alg,
         &mut |_, _| unreachable!(),
-        wrapped,
+        knobs,
     );
 }
 
 // The sole entry into the recursive stack. One stage: s_hi from the child, then s_lo from dividing by
 // 2 s_hi. Only the outer stage may skip remainder work, accept an approximate root or read a padded
 // x (X = x B^p); it gets its square buffer for a padded x from with_square_scratch, lazily.
-// wrapped is the root width from which a stage takes the wrapped remainder.
+// knobs.wrapped is the root width from which a stage takes the wrapped remainder.
 fn zimmerman_sqrt_entry(
     x: &mut [u64],
     s: &mut [u64],
@@ -223,7 +253,7 @@ fn zimmerman_sqrt_entry(
     div_alg: &mut dyn FnMut(&mut [u64], &[u64], &mut [u64], bool) -> u64,
     sqr_alg: &mut dyn FnMut(&[u64], &mut [u64]) -> u64,
     with_square_scratch: &mut dyn FnMut(usize, &mut dyn FnMut(&mut [u64])),
-    wrapped: Option<usize>,
+    knobs: SqrtKnobs,
 ) {
     let (x_len, s_len) = (x.len(), s.len());
     let padded = x_len < 2 * s_len;
@@ -238,7 +268,8 @@ fn zimmerman_sqrt_entry(
     // R = X - s^2 lies in [-(2s - 1), 2s], narrower than B^m - 1 for m > s_len, so the wrapped
     // remainder reads it from one square mod B^m - 1 and the division can skip its own. X is folded
     // first, as the child overwrites it, and multiplying by B^p rotates it.
-    let modulus = wrapped
+    let modulus = knobs
+        .wrapped
         .filter(|&cutoff| {
             matches!(output, SqrtOutput::RootRem | SqrtOutput::Stage) && s_len >= cutoff
         })
@@ -256,7 +287,7 @@ fn zimmerman_sqrt_entry(
     };
 
     let (s_lo, s_hi) = s.split_at_mut(lo);
-    zimmermann_sqrt_core(&mut x[x_lo..], s_hi, div_alg, sqr_alg, wrapped);
+    zimmermann_sqrt_core(&mut x[x_lo..], s_hi, div_alg, sqr_alg, knobs);
     let (reduced, saturated) = reduce_sqrt_rem(&mut x[x_lo..x_lo + hi + 1], s_hi);
 
     // A padded x materializes its virtual low zeros, which a full x keeps below this window.
@@ -364,7 +395,8 @@ fn normalized(
 }
 
 fn sqrt_dyn_output(x: &mut [u64], s: &mut [u64], output: SqrtOutput, wrapped_cutoff: usize) {
-    if s.len() < output.dyn_cutoff() {
+    let knobs = SqrtKnobs::dyn_read(output, wrapped_cutoff);
+    if sqrt_alg(s.len(), knobs.top) == SqrtAlg::Binomial {
         normalized(x, s, output, binom_sqrt_core);
         return;
     }
@@ -372,7 +404,7 @@ fn sqrt_dyn_output(x: &mut [u64], s: &mut [u64], output: SqrtOutput, wrapped_cut
     // the recursion. The widest worth keeping is the top stage's child's, about 1/8 of the root.
     let (mut carry_scratch, mut carry, mut carried);
     let div: &mut dyn FnMut(&mut [u64], &[u64], &mut [u64], bool) -> u64 =
-        if s.len() < DYN_SQRT_RCP_CARRY_CUTOFF {
+        if s.len() < knobs.rcp_carry {
             &mut dyn_div
         } else {
             carry_scratch = ScratchGuard::acquire();
@@ -397,7 +429,7 @@ fn sqrt_dyn_output(x: &mut [u64], s: &mut [u64], output: SqrtOutput, wrapped_cut
                 let mut guard = ScratchGuard::acquire();
                 finish(guard.get(square_len));
             },
-            Some(wrapped_cutoff),
+            knobs,
         );
     });
 }
@@ -407,7 +439,8 @@ fn sqrt_static_output<const N: usize>(x: &mut [u64], s: &mut [u64], output: Sqrt
         x.len() <= N && s.len() <= N,
         "Zimmermann sqrt operands exceed static capacity"
     );
-    if s.len() < output.static_cutoff() {
+    let knobs = SqrtKnobs::static_read(output);
+    if sqrt_alg(s.len(), knobs.top) == SqrtAlg::Binomial {
         normalized(x, s, output, binom_sqrt_core);
         return;
     }
@@ -422,7 +455,7 @@ fn sqrt_static_output<const N: usize>(x: &mut [u64], s: &mut [u64], output: Sqrt
                 let mut s_lo_sqr = [0_u64; N];
                 finish(&mut s_lo_sqr[..square_len]);
             },
-            None,
+            knobs,
         );
     });
 }
@@ -431,7 +464,7 @@ fn sqrt_static_output<const N: usize>(x: &mut [u64], s: &mut [u64], output: Sqrt
 /// `floor(sqrt(X))` in `s`, the remainder in `x`. Requires trimmed nonzero `x` and
 /// `s.len() < x.len() <= 2 * s.len()`.
 pub fn sqrt_dyn(x: &mut [u64], s: &mut [u64]) {
-    sqrt_dyn_output(x, s, SqrtOutput::RootRem, DYN_SQRT_WRAPPED_REM_CUTOFF);
+    sqrt_dyn_output(x, s, SqrtOutput::RootRem, k::sqrt::dyn_wrapped_rem());
 }
 
 /// [`sqrt_dyn`] with the wrapped remainder from `wrapped_cutoff` root limbs (`usize::MAX`: none), for
@@ -444,7 +477,7 @@ pub fn sqrt_dyn_at(x: &mut [u64], s: &mut [u64], wrapped_cutoff: usize) {
 /// [`sqrt_dyn`]'s root only, with `x` left unspecified. Also takes `x.len() == s.len() == 1`
 /// (`X = x * B`).
 pub fn sqrt_only_dyn(x: &mut [u64], s: &mut [u64]) {
-    sqrt_dyn_output(x, s, SqrtOutput::Root, DYN_SQRT_WRAPPED_REM_CUTOFF);
+    sqrt_dyn_output(x, s, SqrtOutput::Root, k::sqrt::dyn_wrapped_rem());
 }
 
 /// [`sqrt_only_dyn`] with an explicit wrapped-remainder cutoff, as [`sqrt_dyn_at`].
@@ -456,7 +489,7 @@ pub fn sqrt_only_dyn_at(x: &mut [u64], s: &mut [u64], wrapped_cutoff: usize) {
 /// [`sqrt_only_dyn`], except that `s` is `floor(sqrt(X))` or `floor(sqrt(X)) + 1`. A numeric error
 /// bound, not a guarantee of identical high limbs.
 pub fn sqrt_approx_dyn(x: &mut [u64], s: &mut [u64]) {
-    sqrt_dyn_output(x, s, SqrtOutput::ApproxRoot, DYN_SQRT_WRAPPED_REM_CUTOFF);
+    sqrt_dyn_output(x, s, SqrtOutput::ApproxRoot, k::sqrt::dyn_wrapped_rem());
 }
 
 /// [`sqrt_approx_dyn`] with an explicit wrapped-remainder cutoff, as [`sqrt_dyn_at`].

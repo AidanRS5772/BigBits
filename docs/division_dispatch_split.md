@@ -321,3 +321,54 @@ DIV_TUNE_STATIC_SIZED=1 DIV_TUNE_REGIME=runtime DIV_TUNE_FAMILY=static_rem \
   taskset -c 2 $B --bench --noplot division_tuning
 ```
 
+## Values before the tuner (2026-11-08)
+
+The division constants moved from `src/utils/mod.rs` into the tuning schema (section `div` of
+`src/tuning/schema.rs`, Phase 1 of `docs/tuning_system.md`) with their values unchanged. Each knob
+is its old name lowercased without `_CUTOFF`: `DIV_KNUTH_CUTOFF` is `div.knuth`, `BZ_CUTOFF` is
+`div.bz`, `DYN_DIV_KARATSUBA_FFT_NR_BZ_CUTOFF` is `div.dyn_div_karatsuba_fft_nr_bz`, and so on;
+`bz_2_1_cost`'s two fitted scales, which Phase 0 had moved into `mod.rs`, are
+`div.bz_2_1_school_to_karatsuba` and `div.bz_2_1_karatsuba_to_fft`. The four `const DivCutoffs`
+became constructors (`DivCutoffs::dyn_div()`, …) that read the knobs once per call, and carry the
+Knuth and BZ-leaf widths too, so `div_alg_dispatch` reads no globals. The harness this document
+uses (`benches/cutoffs_bench.rs`, `DIV_TUNE_*`, `scripts/python/analyze_div_cutoffs.py`) was deleted
+then; it still runs at commit `faa9971`.
+
+The random-knob test (`cargo test --lib --features tune`) found that `div.bz` must be at least 3:
+BZ's 2/1 step halves the divisor, and its Knuth leaf (`div_buf_body`) needs at least two divisor
+limbs, so a leaf of 1 or 2 indexed past a one-limb divisor and a leaf of 0 recursed forever. Every
+other division knob is valid at any value.
+
+The constants as they were in `mod.rs`:
+
+```text
+pub const DIV_KNUTH_CUTOFF: usize = 68;
+pub const BZ_CUTOFF: usize = 140;
+pub const BZ_TOP_PADDED_COST_SCALE: f64 = 1.80;
+// bz_2_1_cost's fitted scales: a 2/1 block's cost relative to d^2 (schoolbook products), as
+// d^log2(3) for Karatsuba products and as d log2^2 d for transform products. They were constants
+// inside bz_2_1_cost until 2026-11-08.
+pub const BZ_2_1_SCHOOL_TO_KARATSUBA: f64 = 3.394147384;
+pub const BZ_2_1_KARATSUBA_TO_FFT: f64 = 2.733850808;
+
+pub const DYN_DIV_KARATSUBA_FFT_NR_BZ_CUTOFF: usize = 112;
+pub const DYN_DIV_KARATSUBA_NR_BZ_CUTOFF: f64 = 1.5;
+pub const DYN_DIV_FFT_NR_BZ_CUTOFF: f64 = 6.98;
+
+pub const DYN_DIV_REM_KARATSUBA_FFT_NR_BZ_CUTOFF: usize = 778;
+pub const DYN_DIV_REM_KARATSUBA_NR_BZ_CUTOFF: f64 = 4.4;
+pub const DYN_DIV_REM_FFT_NR_BZ_CUTOFF: f64 = 7.15;
+
+pub const DYN_RCP_KNUTH_NR_CUTOFF: usize = 36;
+
+pub const STATIC_DIV_KARATSUBA_NTT_NR_BZ_CUTOFF: usize = 842;
+pub const STATIC_DIV_KARATSUBA_NR_BZ_CUTOFF: f64 = 0.75;
+pub const STATIC_DIV_NTT_NR_BZ_CUTOFF: f64 = 11.66;
+
+pub const STATIC_DIV_REM_KARATSUBA_NTT_NR_BZ_CUTOFF: usize = 112;
+pub const STATIC_DIV_REM_KARATSUBA_NR_BZ_CUTOFF: f64 = 4.4;
+pub const STATIC_DIV_REM_NTT_NR_BZ_CUTOFF: f64 = 11.66;
+
+pub const STATIC_RCP_KNUTH_NR_CUTOFF: usize = 36;
+```
+

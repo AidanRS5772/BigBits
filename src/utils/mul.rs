@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use crate::utils::verify::Residues;
+use crate::tuning::k;
 use crate::utils::{utils::*, *};
 use core::task;
 use rayon::*;
@@ -178,7 +179,7 @@ pub fn mul_prim(buf: &mut [u64], prim: u64) -> u64 {
 #[inline]
 pub fn mul_add_prim(buf: &mut [u64], prim: u64, add: u64) -> u64 {
     #[cfg(target_arch = "x86_64")]
-    if buf.len() >= MUL_PRIM_ADX_CUTOFF && adx_available() {
+    if buf.len() >= k::base::prim_adx() && adx_available() {
         return unsafe { mul_add_prim_adx(buf, prim, add) };
     }
     unsafe { mul_add_prim_base(buf, prim, add) }
@@ -1355,21 +1356,35 @@ enum KDispatch {
     Recurse,
 }
 
-// is_school's boundary for any cutoffs, which benchmarks sweep.
+// is_school's boundary for any cutoffs. For s > half it is the parabola
+// s <= 1.125 c - (l - 1.5 c)^2 / (2 c), computed as its exact expansion 1.5 l - l^2 / (2 c): the
+// old form cancelled two terms of size c, which read a large c (1e30 and up) as "never schoolbook"
+// instead of 1.5 l, "always" (the random-knob test found it recursing forever). Both give the same
+// boundary at every l below 2^21 for c from 3 to 100. c >= 3 keeps 3 x 3 on schoolbook, where a
+// Karatsuba level's cross product is 3 x 3 again.
 #[inline(always)]
 pub fn is_school_at(l: usize, s: usize, chunk: usize, c: f64) -> bool {
     let half = (l + 1) / 2;
     if s <= half {
         s <= chunk
     } else {
-        let val = l as f64 - 1.5 * c;
-        let boundary = (1.125 * c - val * val / (2.0 * c)).ceil() as usize;
+        let l = l as f64;
+        let boundary = (1.5 * l - l * l / (2.0 * c)).ceil() as usize;
         s <= boundary
     }
 }
 
+// Schoolbook or Karatsuba for l x s (l >= s) by the table `mul.kara` (read once per call or
+// recursion level): Karatsuba's sub-products, its scratch sizing and the product dispatchers'
+// schoolbook tier all ask this, so they agree. Its default is is_school_at(l, s, 63, 52.0).
 pub fn is_school(l: usize, s: usize) -> bool {
-    is_school_at(l, s, CHUNKING_KARATSUBA_CUTOFF, KARATSUBA_CUTOFF)
+    school_at(k::mul::kara(), l, s)
+}
+
+// is_school at an explicit table (invariant 6).
+#[inline(always)]
+pub fn school_at(kara: &crate::tuning::table::Table2, l: usize, s: usize) -> bool {
+    kara.pick(s, l) == 0
 }
 
 fn kdispatch(l: usize, s: usize) -> KDispatch {
@@ -1426,14 +1441,31 @@ fn karatsuba_mul(a: &[u64], b: &[u64], out: &mut [u64], scratch: &mut [u64]) -> 
         KDispatch::School => {
             return mul_buf(long, short, out);
         }
-        KDispatch::Chunking => return chunking_karatsuba(long, short, out, scratch),
+        KDispatch::Chunking => {
+            // Its buffers: a chunk's value and cross term, then the last chunk's product.
+            let (l, s) = (long.len(), short.len());
+            let last = l - (l - s + 1) / s * s;
+            if scratch.len() < (2 * s + 2 * ((s + 1) / 2) + 1).max(last + s - 1) {
+                return mul_buf(long, short, out);
+            }
+            return chunking_karatsuba(long, short, out, scratch);
+        }
         KDispatch::Recurse => {}
     }
     let half = (long.len() + 1) / 2;
+    if scratch.len() < 2 * half + 1 {
+        // See find_karatsuba_scratch: only a non-monotone `mul.kara` table gets here.
+        return mul_buf(long, short, out);
+    }
     let (cross, rest) = scratch.split_at_mut(2 * half + 1);
     karatsuba_core(long, short, half, out, cross, rest)
 }
 
+// Scratch karatsuba_mul needs for l x s, by one largest stand-in per level (the cross product at
+// half + 1 square). That holds for the boundaries dispatch has used, but not for every `mul.kara`
+// table: one that makes a smaller sub-product Karatsuba and a larger one schoolbook can need more.
+// karatsuba_mul therefore falls back to schoolbook wherever its scratch is too short, so any table
+// is correct and such a table is only slower.
 pub fn find_karatsuba_scratch(l_in: usize, s_in: usize) -> usize {
     let (l, s) = if l_in >= s_in {
         (l_in, s_in)
@@ -1563,6 +1595,39 @@ thread_local! {
 // longer cheap one; these five average within 1% of the fastest size at or above each length. The
 // measurements are in docs/fft_precision.md. AVX plans its factors differently: remeasure on x86.
 const FFT_ODD_PARTS: [usize; 5] = [1, 3, 5, 7, 9];
+
+/// The FFT's per-point cost for each odd part of FFT_ODD_PARTS, relative to a power of two: a
+/// fixed constant per architecture, not a knob (docs/tuning_system.md, "Fixed constants"). AArch64:
+/// the NEON medians of docs/fft_precision.md. x86-64 is unmeasured (rustfft's AVX planner chains
+/// its radix steps differently), and other targets have no measurement: 1.0 throughout.
+#[cfg(target_arch = "aarch64")]
+pub const FFT_ODD_COST: [f64; 5] = [1.00, 1.00, 1.21, 1.18, 1.21];
+#[cfg(not(target_arch = "aarch64"))]
+pub const FFT_ODD_COST: [f64; 5] = [1.0; 5];
+
+/// One real transform's work at size n (an FFT size): rho(o) n log2 n, for n's odd part o. The
+/// FFT entries' work functions count it at the size they really use.
+pub fn fft_transform_work(n: usize) -> f64 {
+    let odd = n >> n.trailing_zeros();
+    let rho = match FFT_ODD_PARTS.iter().position(|&o| o == odd) {
+        Some(i) => FFT_ODD_COST[i],
+        None => 1.0,
+    };
+    rho * n as f64 * (n as f64).log2()
+}
+
+/// fft_entry's transform size for an l x s product, and fft_sqr_entry's for an n-limb square.
+pub fn fft_mul_size(l: usize, s: usize) -> usize {
+    find_fft_size(4 * l + 4 * s - 1)
+}
+pub fn fft_sqr_size(n: usize) -> usize {
+    find_fft_size(8 * n - 1)
+}
+/// fft_mid_mul's transform size for a middle product whose short operand has n limbs (operands
+/// with full top limbs): 2n + 1 limbs of digits, so nothing wraps onto the band it reads.
+pub fn fft_mid_size(n: usize) -> usize {
+    find_fft_size(4 * (2 * n + 1))
+}
 
 /// The smallest transform size at or above `n` digits: 4 * o * 2^a with o in {1, 3, 5, 7, 9}.
 pub const fn find_fft_size(n: usize) -> usize {
@@ -3435,9 +3500,9 @@ fn ntt_scratch_len(n: usize) -> usize {
     }
 
     if n % 5 == 0 {
-        ntt_radix_scratch_len(n, 5, NTT_PAR_CUTOFF_NTT_5)
+        ntt_radix_scratch_len(n, 5, k::mul::ntt_par_radix5())
     } else if n % 3 == 0 {
-        ntt_radix_scratch_len(n, 3, NTT_PAR_CUTOFF_NTT_3)
+        ntt_radix_scratch_len(n, 3, k::mul::ntt_par_radix3())
     } else {
         0
     }
@@ -3457,7 +3522,7 @@ fn ntt_radix_scratch_len(n: usize, radix: usize, par_cutoff: usize) -> usize {
 
 fn ntt_convolution_scratch_len(n: usize) -> usize {
     let ntt_scratch = ntt_scratch_len(n);
-    if n > NTT_PAR_CUTOFF_NTT {
+    if n > k::mul::ntt_par() {
         2 * ntt_scratch
     } else {
         ntt_scratch
@@ -3551,7 +3616,7 @@ fn ntt_3<P: NTTPrime, D: NTTDir>(
     {
         let [b0, b1, b2] = split(buf);
         let child_scratch_len = ntt_scratch_len(m);
-        if n > NTT_PAR_CUTOFF_NTT_3 {
+        if n > k::mul::ntt_par_radix3() {
             let (s0, rest) = scratch.split_at_mut(child_scratch_len);
             let (s1, rest) = rest.split_at_mut(child_scratch_len);
             let (s2, _) = rest.split_at_mut(child_scratch_len);
@@ -3602,7 +3667,7 @@ fn ntt_5<P: NTTPrime, D: NTTDir>(
     {
         let [b0, b1, b2, b3, b4] = split(buf);
         let child_scratch_len = ntt_scratch_len(m);
-        if n > NTT_PAR_CUTOFF_NTT_5 {
+        if n > k::mul::ntt_par_radix5() {
             let (s0, rest) = scratch.split_at_mut(child_scratch_len);
             let (s1, rest) = rest.split_at_mut(child_scratch_len);
             let (s2, rest) = rest.split_at_mut(child_scratch_len);
@@ -3716,7 +3781,7 @@ fn ntt_convolution<P: NTTPrime>(
             mont_b
         };
 
-        if n > NTT_PAR_CUTOFF_NTT && ntt_scratch.len() >= 2 * ntt_scratch_len {
+        if n > k::mul::ntt_par() && ntt_scratch.len() >= 2 * ntt_scratch_len {
             let (a_ntt_scratch, b_ntt_scratch) = ntt_scratch.split_at_mut(ntt_scratch_len);
             let (mont_a, mont_b) = rayon::join(ntt_a, ntt_b);
             let mont_a_scratch: &mut [Montgomery<P>] =
@@ -3959,7 +4024,7 @@ pub fn ntt_entry_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
         a,
         Some(b),
         [&mut *res1, &mut *res2, &mut *res3],
-        out_len > NTT_PAR_CUTOFF_NTT_CONV,
+        out_len > k::mul::ntt_par_conv(),
     );
 
     let (out_core, out_tail) = out.split_at_mut(out_len);
@@ -4101,7 +4166,7 @@ pub fn ntt_entry_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [
     let n2 = find_ntt_size::<P2>(out_len);
     let n3 = find_ntt_size::<P3>(out_len);
 
-    if out_len > NTT_PAR_CUTOFF_NTT_CONV {
+    if out_len > k::mul::ntt_par_conv() {
         let conv1 = || {
             let mut buf_scratch = [0; N];
             let mut ntt_scratch = [0; N];
@@ -4214,42 +4279,33 @@ pub fn is_karatsuba(l: usize, s: usize, chunk: f64, reg: f64) -> bool {
     }
 }
 
-// The work of an l x s product in schoolbook limb products, following mul_dyn's tiers
-// (stat: mul_static's, with the NTT for the FFT), for cost models. Each tier's scale comes
+// The work of an l x s product in schoolbook limb products, following mul_static's tiers, for
+// the static series nodes' cost model (dynamic nodes price products by `MulEq`). Each tier's scale comes
 // from the crossover that selects it, where both sides cost the same: Karatsuba's cost is
 // scaled to l s at the school boundary (c^(2 - log2 3) for is_school's cutoff c), and the
 // transform's is is_karatsuba's ratio times fft_cost. A two-limb short side counts four
 // limb products a limb, as mul_prim2's 128-bit carries cost about four mul_prim passes.
 // Only Karatsuba and above call libm.
-pub fn mul_work(l: usize, s: usize, stat: bool) -> f64 {
+pub fn mul_work(l: usize, s: usize) -> f64 {
     let (l, s) = if l >= s { (l, s) } else { (s, l) };
     if s <= 2 {
         return (l * s * s) as f64;
     }
-    if is_school(l, s) {
+    // Its own boundary, the formula its tiers are scaled at, not `mul.kara`: with the table's
+    // boundary elsewhere the scaling below would jump. mul_ns replaces all of this.
+    if is_school_at(l, s, k::mul::chunking_karatsuba(), k::mul::karatsuba()) {
         return l as f64 * s as f64;
     }
     const SCALE: f64 = 2.0 - 1.584962501;
     let (kara, cut, ratio) = if s <= (l + 1) / 2 {
-        let ratio = if stat {
-            NTT_CHUNKING_KARATSUBA_CUTOFF
-        } else {
-            FFT_CHUNKING_KARATSUBA_CUTOFF
-        };
-        let cut = CHUNKING_KARATSUBA_CUTOFF as f64;
-        (chunking_karatsuba_cost(l, s), cut, ratio)
+        (chunking_karatsuba_cost(l, s), k::mul::chunking_karatsuba() as f64, k::mul::ntt_chunking_karatsuba())
     } else {
-        let ratio = if stat {
-            NTT_KARATSUBA_CUTOFF
-        } else {
-            FFT_KARATSUBA_CUTOFF
-        };
-        (karatsuba_cost(l, s), KARATSUBA_CUTOFF, ratio)
+        (karatsuba_cost(l, s), k::mul::karatsuba(), k::mul::ntt_karatsuba())
     };
     cut.powf(SCALE) * kara.min(ratio * fft_cost(l, s))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MulDynDispatch {
     Prim,
     Prim2,
@@ -4259,14 +4315,139 @@ pub enum MulDynDispatch {
     NTT,
 }
 
+// The static product dispatch's knobs (invariants 6 and 7): the schoolbook boundary and
+// is_karatsuba's ratios against the NTT, read once per call. (Dynamic products compare fitted
+// equations instead: MulEq.)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MulKnobs {
+    // mul.kara: the schoolbook tier.
+    pub kara: &'static crate::tuning::table::Table2,
+    pub chunk_ratio: f64,
+    pub kara_ratio: f64,
+}
+
+impl MulKnobs {
+    pub fn static_read() -> Self {
+        MulKnobs {
+            kara: k::mul::kara(),
+            chunk_ratio: k::mul::ntt_chunking_karatsuba(),
+            kara_ratio: k::mul::ntt_karatsuba(),
+        }
+    }
+}
+
+/// The fitted runtime equations of the dynamic product entries (docs/tuning_system.md, decision
+/// 8): each algorithm's time in ns, in its theoretical form with constants fitted to its own
+/// timings by `cargo tune` (knobs `mul.kara_rec_*`, `mul.chunk_rec_*`, `mul.fft_*`). Read once
+/// per call.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MulEq {
+    /// mul_buf: scale l s + shift, as [scale, shift].
+    pub school: [f64; 2],
+    /// karatsuba_entry_dyn with s above half of l: scale karatsuba_cost(l, s) + school l s, as
+    /// [scale, school]. The first term is Karatsuba's theoretical work, l^e - (l - s)^e at
+    /// e = log2 3, and the second schoolbook's, which the recursion's leaves still do: its weight
+    /// stands where a fitted exponent stood until 2026-11-11, so the equation is linear in its
+    /// constants like every other.
+    pub kara: [f64; 2],
+    /// karatsuba_entry_dyn with s at most half of l (chunking): scale chunking_karatsuba_cost(l, s)
+    /// + school l s, the first term l s^(e - 1) at e = log2 3.
+    pub chunk: [f64; 2],
+    /// fft_entry: ns per unit of rho(o) N log2 N at its transform size N.
+    pub fft: f64,
+}
+
+// The forms above are what the timings need (the form analysis of 2026-11-11, `cargo tune tune
+// --analyze`, on the M1): schoolbook's term a row, recursive Karatsuba's terms a limb and their
+// shifts, and the FFT's term a point and its shift either solved negative or didn't lower the
+// error on shapes held out, so the equations no longer carry them.
+
+impl MulEq {
+    pub fn read() -> Self {
+        MulEq {
+            school: [k::mul::school_scale(), k::mul::school_shift()],
+            kara: [k::mul::kara_rec_scale(), k::mul::kara_rec_school()],
+            chunk: [k::mul::chunk_rec_scale(), k::mul::chunk_rec_school()],
+            fft: k::mul::fft_scale(),
+        }
+    }
+
+    /// Schoolbook's predicted ns for l x s, l >= s.
+    pub fn school_ns(&self, l: usize, s: usize) -> f64 {
+        let [a, c] = self.school;
+        a * l as f64 * s as f64 + c
+    }
+
+    /// mul_dyn's predicted ns for an l x s product, either order: the schoolbook equation where
+    /// `kara` (mul.kara's table) keeps schoolbook, else the cheaper of Karatsuba's and the FFT's,
+    /// as its dispatch chooses. Other algorithms' equations are built on it (division's).
+    pub fn mul_ns(&self, l: usize, s: usize, kara: &crate::tuning::table::Table2) -> f64 {
+        let (l, s) = if l >= s { (l, s) } else { (s, l) };
+        if s == 0 {
+            0.0
+        } else if s <= 2 || school_at(kara, l, s) {
+            self.school_ns(l, s)
+        } else {
+            self.kara_ns(l, s).min(self.fft_ns(l, s))
+        }
+    }
+
+    /// Recursive Karatsuba's predicted ns for l x s, l >= s.
+    pub fn kara_ns(&self, l: usize, s: usize) -> f64 {
+        let (lf, sf) = (l as f64, s as f64);
+        let ([a, q], work) = if s > (l + 1) / 2 { (self.kara, karatsuba_cost(l, s)) } else { (self.chunk, chunking_karatsuba_cost(l, s)) };
+        a * work + q * lf * sf
+    }
+
+    /// The FFT's predicted ns for l x s, at the transform size it really uses.
+    pub fn fft_ns(&self, l: usize, s: usize) -> f64 {
+        self.fft_ns_at(fft_mul_size(l, s))
+    }
+
+    /// The FFT's predicted ns at transform size n: a product's, or a middle product's
+    /// (`fft_mid_size`), which runs the same three transforms.
+    pub fn fft_ns_at(&self, n: usize) -> f64 {
+        self.fft * fft_transform_work(n)
+    }
+}
+
+// mul_dyn's choice for l >= s. The table decides small products before the equations are read
+// (constants in a normal build, eleven live values in a tune build).
 pub fn dyn_dispatch(l: usize, s: usize) -> MulDynDispatch {
+    match dyn_small_dispatch(l, s, k::mul::kara()) {
+        Some(alg) => alg,
+        None => dyn_large_dispatch(l, s, &MulEq::read()),
+    }
+}
+
+// mul_dyn's choice at explicit knobs (invariant 6): `kara` is mul.kara's table.
+pub fn dyn_dispatch_at(l: usize, s: usize, kara: &crate::tuning::table::Table2, eq: &MulEq) -> MulDynDispatch {
+    dyn_small_dispatch(l, s, kara).unwrap_or_else(|| dyn_large_dispatch(l, s, eq))
+}
+
+// The single-limb, two-limb and schoolbook tiers, or None past the table's schoolbook boundary.
+fn dyn_small_dispatch(l: usize, s: usize, kara: &crate::tuning::table::Table2) -> Option<MulDynDispatch> {
     if s == 1 {
-        MulDynDispatch::Prim
+        Some(MulDynDispatch::Prim)
     } else if s == 2 {
-        MulDynDispatch::Prim2
-    } else if is_school(l, s) {
-        MulDynDispatch::School
-    } else if is_karatsuba(l, s, FFT_CHUNKING_KARATSUBA_CUTOFF, FFT_KARATSUBA_CUTOFF) {
+        Some(MulDynDispatch::Prim2)
+    } else if school_at(kara, l, s) {
+        Some(MulDynDispatch::School)
+    } else {
+        None
+    }
+}
+
+// Past the schoolbook boundary: recursive Karatsuba or the transform, whichever fitted equation
+// predicts less time (the user's rule for a decision with two inputs: fitted runtime equations
+// compared per call). The FFT's equation is evaluated at the transform size it really uses, so
+// the choice follows its size steps, which one ratio over (l, s) could not: on the M1 the
+// equations lose 0.0-0.2% of measured time against the ratios' 0.2-0.7%, and 0-7% at worst
+// against 8-18%. Past the FFT's limit the NTT takes the transform's place, decided by the same
+// comparison (the FFT's equation at the size it would use: there is no fitted NTT equation), as
+// a very unbalanced product still belongs to chunking Karatsuba there.
+fn dyn_large_dispatch(l: usize, s: usize, eq: &MulEq) -> MulDynDispatch {
+    if eq.kara_ns(l, s) < eq.fft_ns(l, s) {
         MulDynDispatch::Karatsuba
     } else if (l + s - 1) <= FFT_16BIT_CUTOFF {
         MulDynDispatch::FFT
@@ -4341,13 +4522,18 @@ enum StaticDispatch {
 }
 
 fn static_dispatch(l: usize, s: usize) -> StaticDispatch {
+    static_dispatch_at(l, s, &MulKnobs::static_read())
+}
+
+// mul_static's choice for l >= s at explicit knobs (invariant 6).
+fn static_dispatch_at(l: usize, s: usize, kn: &MulKnobs) -> StaticDispatch {
     if s == 1 {
         StaticDispatch::Prim
     } else if s == 2 {
         StaticDispatch::Prim2
-    } else if is_school(l, s) {
+    } else if school_at(kn.kara, l, s) {
         StaticDispatch::School
-    } else if is_karatsuba(l, s, NTT_CHUNKING_KARATSUBA_CUTOFF, NTT_KARATSUBA_CUTOFF) {
+    } else if is_karatsuba(l, s, kn.chunk_ratio, kn.kara_ratio) {
         StaticDispatch::Karatsuba
     } else {
         StaticDispatch::NTT
@@ -4545,7 +4731,8 @@ rows_dispatch!(pub fn sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 = sqr_buf_row
 
 //KARATSUBA SQUARE
 
-fn karatsuba_sqr_core(
+// pub(crate) so the tuner can time one level (a forced entry, docs/tuning_system.md).
+pub(crate) fn karatsuba_sqr_core(
     buf: &[u64],
     half: usize,
     out: &mut [u64],
@@ -4582,7 +4769,7 @@ fn karatsuba_sqr_core(
 }
 
 fn karatsuba_sqr_mul(buf: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
-    if buf.len() <= KARATSUBA_SQR_CUTOFF {
+    if buf.len() <= k::mul::karatsuba_sqr() {
         return sqr_buf(buf, out);
     }
     let half = (buf.len() + 1) / 2;
@@ -4591,7 +4778,7 @@ fn karatsuba_sqr_mul(buf: &[u64], out: &mut [u64], scratch: &mut [u64]) -> u64 {
 }
 
 pub fn find_karatsuba_sqr_scratch_sz(n: usize) -> usize {
-    if n <= KARATSUBA_SQR_CUTOFF {
+    if n <= k::mul::karatsuba_sqr() {
         return 0;
     }
     let half = (n + 1) / 2;
@@ -4879,10 +5066,15 @@ pub fn bnm1_size(min: usize) -> usize {
 }
 
 /// Whether [`sqr_mod_bnm1_dyn`] squares an `a_len`-limb operand mod B^m − 1 by the cyclic FFT
-/// (above `DYN_SQR_BNM1_FFT_CUTOFF` limbs, with 4m an FFT size of at most its dispatch limit,
+/// (above `mul.sqr_bnm1_fft` limbs, with 4m an FFT size of at most its dispatch limit,
 /// `FFT_BNM1_16BIT_CUTOFF` modulus limbs), rather than by `sqr_dyn` and a fold.
 pub fn bnm1_fft(a_len: usize, m: usize) -> bool {
-    a_len > DYN_SQR_BNM1_FFT_CUTOFF && m <= FFT_BNM1_16BIT_CUTOFF && find_fft_size(4 * m) == 4 * m
+    bnm1_fft_at(a_len, m, k::mul::sqr_bnm1_fft())
+}
+
+// bnm1_fft at an explicit `mul.sqr_bnm1_fft` (invariant 6).
+pub fn bnm1_fft_at(a_len: usize, m: usize, cutoff: usize) -> bool {
+    a_len > cutoff && m <= FFT_BNM1_16BIT_CUTOFF && find_fft_size(4 * m) == 4 * m
 }
 
 // a^2 mod B^m - 1, canonical, m = out.len(), for nonzero a with a.len() <= m and 4m an FFT size.
@@ -4941,7 +5133,7 @@ fn fft_sqr_mod_bnm1_impl(a: &[u64], out: &mut [u64], checked: bool) -> (bool, Ff
 
 /// Computes a² mod (B^m − 1), m = `out.len()`, `B = 2^64`, as the canonical residue in
 /// [0, B^m − 1). Requires a's trimmed length to be at most m. When [`bnm1_fft`] allows (m from
-/// [`bnm1_size`], at most `FFT_BNM1_16BIT_CUTOFF`, and a above `DYN_SQR_BNM1_FFT_CUTOFF` limbs)
+/// [`bnm1_size`], at most `FFT_BNM1_16BIT_CUTOFF`, and a above `mul.sqr_bnm1_fft` limbs)
 /// it is one cyclic FFT square, half the transform of a full square of a; otherwise it squares a
 /// with `sqr_dyn` and folds the product.
 pub fn sqr_mod_bnm1_dyn(a: &[u64], out: &mut [u64]) {
@@ -5006,7 +5198,7 @@ pub fn ntt_sqr_entry_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
         buf,
         None,
         [&mut *res1, &mut *res2, &mut *res3],
-        out_len > NTT_PAR_CUTOFF_NTT_CONV,
+        out_len > k::mul::ntt_par_conv(),
     );
     let (out_core, out_tail) = out.split_at_mut(out_len);
     let overflow = ntt_accumulate(res1, res2, res3, out_core, out_len, n1, n2, n3);
@@ -5049,7 +5241,7 @@ pub fn ntt_sqr_entry_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64
     let n2 = find_ntt_size::<P2>(out_len);
     let n3 = find_ntt_size::<P3>(out_len);
 
-    if out_len > NTT_PAR_CUTOFF_NTT_CONV {
+    if out_len > k::mul::ntt_par_conv() {
         let conv1 = || {
             let mut buf_scratch = [0; N];
             let mut ntt_scratch = [0; N];
@@ -5118,9 +5310,14 @@ enum DynSqrDispatch {
 }
 
 fn dyn_sqr_dispatch(n: usize) -> DynSqrDispatch {
-    if n <= KARATSUBA_SQR_CUTOFF {
+    dyn_sqr_dispatch_at(n, k::mul::karatsuba_sqr(), k::mul::fft_sqr())
+}
+
+// sqr_dyn's choice at explicit `mul.karatsuba_sqr` and `mul.fft_sqr` (invariant 6).
+fn dyn_sqr_dispatch_at(n: usize, kara: usize, fft: usize) -> DynSqrDispatch {
+    if n <= kara {
         DynSqrDispatch::School
-    } else if n <= FFT_SQR_CUTOFF {
+    } else if n <= fft {
         DynSqrDispatch::Karatsuba
     } else if n <= FFT_SQR_16BIT_CUTOFF {
         DynSqrDispatch::FFT
@@ -5177,9 +5374,14 @@ enum StaticSqrDispatch {
 }
 
 fn static_sqr_dispatch(n: usize) -> StaticSqrDispatch {
-    if n <= KARATSUBA_SQR_CUTOFF {
+    static_sqr_dispatch_at(n, k::mul::karatsuba_sqr(), k::mul::static_ntt_sqr())
+}
+
+// sqr_static's choice at explicit `mul.karatsuba_sqr` and `mul.static_ntt_sqr` (invariant 6).
+fn static_sqr_dispatch_at(n: usize, kara: usize, ntt: usize) -> StaticSqrDispatch {
+    if n <= kara {
         StaticSqrDispatch::School
-    } else if n <= STATIC_NTT_SQR_CUTOFF {
+    } else if n <= ntt {
         StaticSqrDispatch::Karatsubaa
     } else {
         StaticSqrDispatch::NTT
@@ -5331,7 +5533,7 @@ pub fn hi_mul_buf_cols(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
 
 pub fn hi_mul_buf(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     // Narrow windows give short rows, whose per-row cost loses to columns.
-    if out.len() <= HI_MUL_ROW_CUTOFF {
+    if out.len() <= k::mul::hi_mul_row() {
         return hi_mul_buf_cols(a, b, out);
     }
     hi_mul_buf_by_rows(a, b, out)
@@ -5342,17 +5544,35 @@ rows_dispatch!(
     pub fn hi_mul_buf_by_rows(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 = hi_mul_buf_rows
 );
 
+// A high product's algorithm (invariant 6): the whole product when it fits out, else hi_*_buf
+// for windows of up to `cutoff` limbs (`mul.<dyn|static>_partial_<mul|sqr>`) and the guarded
+// product of the operands' top limbs above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HiAlg {
+    Full,
+    School,
+    Guarded,
+}
+
+pub fn hi_alg(full_len: usize, out_len: usize, cutoff: usize) -> HiAlg {
+    if full_len <= out_len {
+        HiAlg::Full
+    } else if out_len <= cutoff {
+        HiAlg::School
+    } else {
+        HiAlg::Guarded
+    }
+}
+
 pub fn hi_mul_dyn(a: &[u64], b: &[u64], out: &mut [u64]) -> u64 {
     if a.is_empty() || b.is_empty() {
         return 0;
     }
-    if a.len() + b.len() - 1 <= out.len() {
-        return mul_dyn(a, b, out);
+    match hi_alg(a.len() + b.len() - 1, out.len(), k::mul::dyn_partial_mul()) {
+        HiAlg::Full => mul_dyn(a, b, out),
+        HiAlg::School => hi_mul_buf(a, b, out),
+        HiAlg::Guarded => hi_mul_guarded_dyn(a, b, out),
     }
-    if out.len() <= DYN_PARTIAL_MUL_CUTOFF {
-        return hi_mul_buf(a, b, out);
-    }
-    hi_mul_guarded_dyn(a, b, out)
 }
 
 // hi_mul_dyn's window from the product of the operands' guarded top limbs, for a
@@ -5379,14 +5599,11 @@ pub fn hi_mul_static<const N: usize>(a: &[u64], b: &[u64], out: &mut [u64]) -> u
         out.len() <= N,
         "out is to large for static parameter N: {N}"
     );
-    let out_len = out.len();
-    if a.len() + b.len() - 1 <= out.len() {
-        return mul_static::<N>(a, b, out);
+    match hi_alg(a.len() + b.len() - 1, out.len(), k::mul::static_partial_mul()) {
+        HiAlg::Full => mul_static::<N>(a, b, out),
+        HiAlg::School => hi_mul_buf(a, b, out),
+        HiAlg::Guarded => hi_mul_guarded_static::<N>(a, b, out),
     }
-    if out_len <= STATIC_PARTIAL_MUL_CUTOFF {
-        return hi_mul_buf(a, b, out);
-    }
-    hi_mul_guarded_static::<N>(a, b, out)
 }
 
 // hi_mul_static's counterpart of hi_mul_guarded_dyn.
@@ -5536,7 +5753,7 @@ pub fn hi_sqr_buf_cols(buf: &[u64], out: &mut [u64]) -> u64 {
 
 pub fn hi_sqr_buf(buf: &[u64], out: &mut [u64]) -> u64 {
     // Narrow windows give short rows, whose per-row cost loses to columns.
-    if out.len() <= HI_SQR_ROW_CUTOFF {
+    if out.len() <= k::mul::hi_sqr_row() {
         return hi_sqr_buf_cols(buf, out);
     }
     hi_sqr_buf_by_rows(buf, out)
@@ -5551,13 +5768,11 @@ pub fn hi_sqr_dyn(buf: &[u64], out: &mut [u64]) -> u64 {
     if buf.is_empty() {
         return 0;
     }
-    if 2 * buf.len() - 1 <= out.len() {
-        return sqr_dyn(buf, out);
+    match hi_alg(2 * buf.len() - 1, out.len(), k::mul::dyn_partial_sqr()) {
+        HiAlg::Full => sqr_dyn(buf, out),
+        HiAlg::School => hi_sqr_buf(buf, out),
+        HiAlg::Guarded => hi_sqr_guarded_dyn(buf, out),
     }
-    if out.len() <= DYN_PARTIAL_SQR_CUTOFF {
-        return hi_sqr_buf(buf, out);
-    }
-    hi_sqr_guarded_dyn(buf, out)
 }
 
 // hi_sqr_dyn's counterpart of hi_mul_guarded_dyn.
@@ -5579,14 +5794,11 @@ pub fn hi_sqr_static<const N: usize>(buf: &[u64], out: &mut [u64]) -> u64 {
         out.len() <= N,
         "out is to large for static parameter N: {N}"
     );
-    let out_len = out.len();
-    if 2 * buf.len() - 1 <= out.len() {
-        return sqr_static::<N>(buf, out);
+    match hi_alg(2 * buf.len() - 1, out.len(), k::mul::static_partial_sqr()) {
+        HiAlg::Full => sqr_static::<N>(buf, out),
+        HiAlg::School => hi_sqr_buf(buf, out),
+        HiAlg::Guarded => hi_sqr_guarded_static::<N>(buf, out),
     }
-    if out_len <= STATIC_PARTIAL_SQR_CUTOFF {
-        return hi_sqr_buf(buf, out);
-    }
-    hi_sqr_guarded_static::<N>(buf, out)
 }
 
 // hi_sqr_static's counterpart of hi_mul_guarded_dyn.
@@ -5921,7 +6133,7 @@ pub fn ntt_mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u6
     let mut scratch_gaurd = ScratchGuard::acquire();
     let [res1, res2, res3] = scratch_gaurd.get_splits([n1, n2, n3]);
 
-    let par = 2 * sz - 1 > NTT_PAR_CUTOFF_NTT_CONV;
+    let par = 2 * sz - 1 > k::mul::ntt_par_conv();
     dyn_convolutions(long, Some(short), [&mut *res1, &mut *res2, &mut *res3], par);
     let mut of = ntt_mid_accumulate_scaled(res1, res2, res3, out, sz - 1, n1, n2, n3);
     let (c0, c1) = middle_correction(long, short);
@@ -5960,7 +6172,7 @@ pub fn ntt_mid_mul_static<const N: usize>(
     let mut res2 = [0; N];
     let mut res3 = [0; N];
 
-    if 2 * sz - 1 > NTT_PAR_CUTOFF_NTT_CONV {
+    if 2 * sz - 1 > k::mul::ntt_par_conv() {
         let conv1 = || {
             let mut buf_scratch = [0; N];
             let mut ntt_scratch = [0; N];
@@ -6049,14 +6261,19 @@ pub fn ntt_mid_mul_static<const N: usize>(
     return of;
 }
 
-enum DynMidDispatch {
+pub(crate) enum DynMidDispatch {
     School,
     FFT,
     NTT,
 }
 
 fn dyn_mid_dispatch(n: usize) -> DynMidDispatch {
-    return if n < FFT_MID_CUTOFF {
+    dyn_mid_dispatch_at(n, k::mul::fft_mid())
+}
+
+// mid_mul_dyn's choice for a short operand of n limbs at an explicit `mul.fft_mid` (invariant 6).
+pub(crate) fn dyn_mid_dispatch_at(n: usize, fft_mid: usize) -> DynMidDispatch {
+    return if n < fft_mid {
         DynMidDispatch::School
     } else if n <= FFT_MID_16BIT_CUTOFF {
         DynMidDispatch::FFT
@@ -6076,11 +6293,17 @@ pub fn mid_mul_dyn(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
 
 pub fn mid_mul_static<const N: usize>(long: &[u64], short: &[u64], out: &mut [u64]) -> (u64, u64) {
     debug_assert_mid_mul_shape(long, short, out);
-    if short.len() < NTT_MID_CUTOFF {
-        mid_mul_buf(long, short, out)
-    } else {
+    if static_mid_ntt(short.len(), k::mul::ntt_mid()) {
         ntt_mid_mul_static::<N>(long, short, out)
+    } else {
+        mid_mul_buf(long, short, out)
     }
+}
+
+// Whether mid_mul_static takes the NTT for a short operand of n limbs at an explicit `mul.ntt_mid`
+// (invariant 6).
+pub fn static_mid_ntt(n: usize, ntt_mid: usize) -> bool {
+    n >= ntt_mid
 }
 
 //FAST EXPONENTIATION

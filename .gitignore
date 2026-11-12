@@ -5,3 +5,5 @@ coverage.lcov
 profile.json.gz
 coverage_out/
 .DS_Store
+# a machine's own tuning file (cargo tune tune)
+presets/local.toml

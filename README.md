@@ -80,6 +80,28 @@ cargo bench-utils
 cargo bench-cutoffs
 ```
 
+## Tuning this machine
+
+The crossovers between algorithms (schoolbook, Karatsuba, FFT, NTT; Knuth, Burnikel-Ziegler,
+Newton-Raphson; and so on) depend on the CPU. A build uses, in order: defaults, the preset
+checked in for its target if there is one (`presets/<arch>-<os>.toml`), and this machine's own
+measurements if it has taken them. To take them:
+
+```bash
+cargo tune tune                    # about 6 minutes on an M1 at the default level; --level thorough takes about 30
+cargo build --release              # now built with this machine's values
+cargo tune status                  # which file supplies each section
+```
+
+The tuner writes `presets/local.toml`, which git ignores and the build picks up by itself;
+delete it to go back to the preset. Run it on mains power with nothing else busy: it ends with
+a "samples" line that says when its timings could not be trusted. Every section finishes with
+an end-to-end check against the values the build had before, and a section whose workloads
+come out slower on average (by more than 2% at the default level, 1% at thorough) is dropped,
+so a tune can't leave the library noticeably slower than it found it.
+`cargo tune check` repeats that comparison at any time. The tuner needs a checkout of this
+repository; `docs/tuning_system.md` describes the design.
+
 ## Trying it out
 
 BigBits isn't on crates.io yet. To experiment with it, add it as a git dependency:

@@ -239,3 +239,5 @@ Measured on the M1 (4 performance and 4 efficiency cores) on generic X at T = 5,
   - On one thread the same limit costs the AGM its lead at 65536 limbs (1.08), which the model doesn't see either.
 - **Accuracy:** both methods returned bit-identical results at every size measured.
 - **Static:** only measured on 8 CPUs, since macOS can't limit `available_parallelism`. There the series won by 2.3–2.5× from 1024 to 4096 limbs.
+
+> **2026-11-11:** `ln_series_speedup` and the `ln.*_series_par_fraction` knobs named here were replaced by a serial/parallel pair of measured bounds (`ln.<dyn|static>_agm_limbs` on one thread, `ln.<dyn|static>_agm_par_until` on a pool); see `docs/tuning_implementation.md`.

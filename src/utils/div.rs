@@ -1,15 +1,7 @@
 use std::arch::asm;
 
-use crate::utils::{
-    mul::*, rows_dispatch, utils::*, Rows, ScratchGuard, BZ_CUTOFF, BZ_TOP_PADDED_COST_SCALE,
-    DIV_KNUTH_CUTOFF, DYN_DIV_FFT_NR_BZ_CUTOFF, DYN_DIV_KARATSUBA_FFT_NR_BZ_CUTOFF,
-    DYN_DIV_KARATSUBA_NR_BZ_CUTOFF, DYN_DIV_REM_FFT_NR_BZ_CUTOFF,
-    DYN_DIV_REM_KARATSUBA_FFT_NR_BZ_CUTOFF, DYN_DIV_REM_KARATSUBA_NR_BZ_CUTOFF,
-    DYN_RCP_KNUTH_NR_CUTOFF, STATIC_DIV_KARATSUBA_NR_BZ_CUTOFF,
-    STATIC_DIV_KARATSUBA_NTT_NR_BZ_CUTOFF, STATIC_DIV_NTT_NR_BZ_CUTOFF,
-    STATIC_DIV_REM_KARATSUBA_NR_BZ_CUTOFF, STATIC_DIV_REM_KARATSUBA_NTT_NR_BZ_CUTOFF,
-    STATIC_DIV_REM_NTT_NR_BZ_CUTOFF, STATIC_RCP_KNUTH_NR_CUTOFF,
-};
+use crate::tuning::k;
+use crate::utils::{mul::*, rows_dispatch, utils::*, Rows, ScratchGuard};
 
 /// Algorithm selected by dispatch or supplied to a prepared division driver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,38 +18,44 @@ pub enum RcpAlg {
     NR,
 }
 
-#[derive(Clone, Copy)]
-struct DivCutoffs {
-    karatsuba_transform: usize,
-    karatsuba_bz_nr: f64,
-    transform_bz_nr: f64,
+// A static division entry's knobs (section `div`), read once per call and passed to its pure
+// predicate (invariants 6 and 7): the mandatory Knuth width, BZ's leaf, and the BZ-vs-NR cutoff
+// rule, whose three values differ between div_static and div_rem_static. (The dynamic entries
+// compare fitted equations instead: DivEq and dyn_div_alg.)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DivCutoffs {
+    pub(crate) knuth: usize,
+    pub(crate) bz_leaf: usize,
+    pub(crate) karatsuba_transform: usize,
+    pub(crate) karatsuba_bz_nr: f64,
+    pub(crate) transform_bz_nr: f64,
 }
 
-const DYN_DIV: DivCutoffs = DivCutoffs {
-    karatsuba_transform: DYN_DIV_KARATSUBA_FFT_NR_BZ_CUTOFF,
-    karatsuba_bz_nr: DYN_DIV_KARATSUBA_NR_BZ_CUTOFF,
-    transform_bz_nr: DYN_DIV_FFT_NR_BZ_CUTOFF,
-};
-const DYN_DIV_REM: DivCutoffs = DivCutoffs {
-    karatsuba_transform: DYN_DIV_REM_KARATSUBA_FFT_NR_BZ_CUTOFF,
-    karatsuba_bz_nr: DYN_DIV_REM_KARATSUBA_NR_BZ_CUTOFF,
-    transform_bz_nr: DYN_DIV_REM_FFT_NR_BZ_CUTOFF,
-};
-const STATIC_DIV: DivCutoffs = DivCutoffs {
-    karatsuba_transform: STATIC_DIV_KARATSUBA_NTT_NR_BZ_CUTOFF,
-    karatsuba_bz_nr: STATIC_DIV_KARATSUBA_NR_BZ_CUTOFF,
-    transform_bz_nr: STATIC_DIV_NTT_NR_BZ_CUTOFF,
-};
-const STATIC_DIV_REM: DivCutoffs = DivCutoffs {
-    karatsuba_transform: STATIC_DIV_REM_KARATSUBA_NTT_NR_BZ_CUTOFF,
-    karatsuba_bz_nr: STATIC_DIV_REM_KARATSUBA_NR_BZ_CUTOFF,
-    transform_bz_nr: STATIC_DIV_REM_NTT_NR_BZ_CUTOFF,
-};
+impl DivCutoffs {
+    pub(crate) fn static_div() -> Self {
+        DivCutoffs {
+            knuth: k::div::knuth(),
+            bz_leaf: k::div::bz(),
+            karatsuba_transform: k::div::static_div_karatsuba_ntt_nr_bz(),
+            karatsuba_bz_nr: k::div::static_div_karatsuba_nr_bz(),
+            transform_bz_nr: k::div::static_div_ntt_nr_bz(),
+        }
+    }
+    pub(crate) fn static_div_rem() -> Self {
+        DivCutoffs {
+            knuth: k::div::knuth(),
+            bz_leaf: k::div::bz(),
+            karatsuba_transform: k::div::static_div_rem_karatsuba_ntt_nr_bz(),
+            karatsuba_bz_nr: k::div::static_div_rem_karatsuba_nr_bz(),
+            transform_bz_nr: k::div::static_div_rem_ntt_nr_bz(),
+        }
+    }
+}
 
 // By the logical quotient width q_len + 1 and the effective divisor width.
-fn div_alg_dispatch(r: &DivisionRequest, c: DivCutoffs) -> DivAlg {
+pub(crate) fn div_alg_dispatch(r: &DivisionRequest, c: DivCutoffs) -> DivAlg {
     let (q, d) = (r.q_len + 1, r.d_len);
-    if q == 1 || d <= DIV_KNUTH_CUTOFF {
+    if q == 1 || d <= c.knuth {
         return DivAlg::Knuth;
     }
     let bz = if q.max(d) < c.karatsuba_transform {
@@ -68,12 +66,288 @@ fn div_alg_dispatch(r: &DivisionRequest, c: DivCutoffs) -> DivAlg {
     };
     if !bz && nr_split(d + q - 1, q).is_some() {
         DivAlg::NR
-    } else if d <= BZ_CUTOFF {
+    } else if d <= c.bz_leaf {
         // BZ would only run Knuth leaves at these widths.
         DivAlg::Knuth
     } else {
         DivAlg::BZ
     }
+}
+
+/// The fitted runtime equations of the dynamic division algorithms (docs/tuning_system.md,
+/// decision 8): each algorithm's ns over q, the quotient body and its structural limb, and d, the
+/// effective divisor width, in its own structure with constants fitted to its own timings (knobs
+/// `div.*_ns_*`). They are built on mul's equations (`MulEq::mul_ns`) and, for BZ, on Knuth's.
+/// Read once per call, and only by a shape that some algorithm other than Knuth can take.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DivEq {
+    /// Knuth, with or without the remainder (it forms it either way): [q d, q, d, 1].
+    pub(crate) knuth: [f64; 4],
+    /// NR, quotient only: [school middle products, FFT middle products, school high products,
+    /// guarded high products, q]. The first four multiply `nr_parts`, NR's own products priced
+    /// by tier; its time doesn't depend on d, as it reads the divisor's top window.
+    pub(crate) nr: [f64; 5],
+    /// NR with the remainder: the same four, then [Mul(d, min(q - 1, d + 1)), q, d]; that
+    /// product is nr_rem_finish's, of d by the quotient's low limbs.
+    pub(crate) nr_rem: [f64; 7],
+    /// BZ: [the 2/1 blocks' recursion, a Knuth top block]. See `bz_plan`.
+    /// (NR's term in d and both NR equations' shifts, and BZ's term in q, solved negative on the
+    /// M1's timings and were taken out of the forms on 2026-11-11.)
+    pub(crate) bz: [f64; 2],
+    /// div.bz: at or below it a 2/1 block is Knuth, so BZ has nothing of its own to offer.
+    pub(crate) bz_leaf: usize,
+    /// mul.fft_mid and mul.dyn_partial_mul: where NR's middle and high products change tier.
+    pub(crate) fft_mid: usize,
+    pub(crate) partial_mul: usize,
+}
+
+impl DivEq {
+    pub(crate) fn read() -> Self {
+        DivEq {
+            knuth: [k::div::knuth_ns_qd(), k::div::knuth_ns_q(), k::div::knuth_ns_d(), k::div::knuth_ns_shift()],
+            nr: [
+                k::div::nr_ns_mid_school(),
+                k::div::nr_ns_mid_fft(),
+                k::div::nr_ns_hi_school(),
+                k::div::nr_ns_hi_guarded(),
+                k::div::nr_ns_q(),
+            ],
+            nr_rem: [
+                k::div::nr_rem_ns_mid_school(),
+                k::div::nr_rem_ns_mid_fft(),
+                k::div::nr_rem_ns_hi_school(),
+                k::div::nr_rem_ns_hi_guarded(),
+                k::div::nr_rem_ns_prod(),
+                k::div::nr_rem_ns_q(),
+                k::div::nr_rem_ns_d(),
+            ],
+            bz: [k::div::bz_ns_block(), k::div::bz_ns_top()],
+            bz_leaf: k::div::bz(),
+            fft_mid: k::mul::fft_mid(),
+            partial_mul: k::mul::dyn_partial_mul(),
+        }
+    }
+
+    pub(crate) fn knuth_ns(&self, q: usize, d: usize) -> f64 {
+        let [a, b, c, e] = self.knuth;
+        let (q, d) = (q as f64, d as f64);
+        a * q * d + b * q + c * d + e
+    }
+
+    /// NR's terms outside its products: a lower bound on its time, which is cheap to form.
+    pub(crate) fn nr_base_ns(&self, q: usize, d: usize, rem: bool) -> f64 {
+        if rem { self.nr_rem[5] * q as f64 + self.nr_rem[6] * d as f64 } else { self.nr[4] * q as f64 }
+    }
+
+    pub(crate) fn nr_ns(&self, q: usize, d: usize, rem: bool, mul: &MulEq, kara: &crate::tuning::table::Table2) -> f64 {
+        let parts = self.nr_parts(q, mul, kara);
+        let tiers = if rem { &self.nr_rem[..4] } else { &self.nr[..4] };
+        let mut products: f64 = parts.iter().zip(tiers).map(|(ns, multiple)| ns * multiple).sum();
+        if rem {
+            products += self.nr_rem[4] * mul.mul_ns(d, (q - 1).min(d + 1), kara);
+        }
+        products + self.nr_base_ns(q, d, rem)
+    }
+
+    /// NR's own products for a q-limb quotient, priced by mul's equations and summed by tier:
+    /// [school middle products, FFT middle products, school high products, guarded high
+    /// products], in ns. They are the ones `nr_quo_est_dyn` runs. The reciprocal chain to h + 2
+    /// limbs (`nr_rcp_schedule`; h = q / 2 + 1) takes, from each precision p, a middle product
+    /// with a (p + 1)-limb short side and a high product of two (p + 1)-limb operands into p
+    /// limbs. `nr_refine_quo` then takes the numerator's top by the reciprocal into h + 2 limbs,
+    /// the error band (a middle product, short side h + 1) and the correction into l + 2 limbs
+    /// (l = q - h). Each product's tier is the dispatchers' own choice (`dyn_mid_dispatch_at`,
+    /// `hi_alg`), so this follows the code: a middle product is schoolbook's n by n time below
+    /// `mul.fft_mid` and the FFT's at `fft_mid_size(n)` from it (there is no Karatsuba middle
+    /// product, which is why M(h, h), a full product's price, missed by up to 7% either way
+    /// between 90 and 720 quotient limbs); a high product is half a schoolbook product of its
+    /// window up to `mul.dyn_partial_mul` and the full product of its operands' tops above. Past
+    /// the FFT middle product's limit the NTT runs; no tuned shape reaches it, and it is priced
+    /// as the FFT. The school tiers are closed forms, so a small division's dispatch reads no
+    /// product equation. Since 2026-11-10; the four multiples are fitted to NR's own timings.
+    pub(crate) fn nr_parts(&self, q: usize, mul: &MulEq, kara: &crate::tuning::table::Table2) -> [f64; 4] {
+        use crate::utils::mul::{dyn_mid_dispatch_at, fft_mid_size, hi_alg, DynMidDispatch, HiAlg};
+        let h = q / 2 + 1;
+        let l = q - h;
+        // The school tiers are quadratics in a product's size, so they are summed as integers
+        // (sizes squared and a count) and priced once: a small division's dispatch runs this
+        // on every call, and the first version (a closure a product, the schedule in an array)
+        // cost it about 25 ns, 5-9% of a 350-480 ns division.
+        let (mut mid_school, mut hi_school) = ([0usize; 2], [0usize; 2]);
+        let (mut mid_fft, mut hi_guarded) = (0.0f64, 0.0f64);
+        let mut mid = |n: usize| match dyn_mid_dispatch_at(n, self.fft_mid) {
+            DynMidDispatch::School => mid_school = [mid_school[0] + n * n, mid_school[1] + 1],
+            _ => mid_fft += mul.fft_ns_at(fft_mid_size(n)),
+        };
+        let mut hi = |a: usize, b: usize, out: usize| match hi_alg(a + b - 1, out, self.partial_mul) {
+            HiAlg::Full => hi_guarded += mul.mul_ns(a, b, kara),
+            HiAlg::School => hi_school = [hi_school[0] + out * out, hi_school[1] + 1],
+            HiAlg::Guarded => hi_guarded += mul.mul_ns(a.min(out), b.min(out), kara),
+        };
+        // The chain's precisions: nr_rcp_schedule's sizes below its target h + 2, which are the
+        // target halved (rounding up) again and again, down to the one-limb seed.
+        let mut p = h + 2;
+        while p > 1 {
+            p = (p + 1) / 2;
+            mid(p + 1);
+            hi(p + 1, p + 1, p);
+        }
+        mid(h + 1);
+        // The numerator's top by the reciprocal: the numerator has at least 2h + 1 limbs
+        // (nr_split), and a high product reads only its operands' tops.
+        hi(2 * h + 1, h + 3, h + 2);
+        hi(h + 3, h + 1, l + 2);
+        let [scale, shift] = mul.school;
+        [scale * mid_school[0] as f64 + shift * mid_school[1] as f64, mid_fft, 0.5 * scale * hi_school[0] as f64 + shift * hi_school[1] as f64, hi_guarded]
+    }
+
+    /// One 2/1 block of d limbs as div_2_1 runs it, as (products, leaves): each level halves the
+    /// divisor and makes two products of that half, 2^k M(d / 2^k) at level k, down to 2^L Knuth
+    /// leaves once the width is at most the leaf.
+    pub(crate) fn bz_block_parts(&self, d: usize, mul: &MulEq, kara: &crate::tuning::table::Table2) -> (f64, f64) {
+        let (mut n, mut count, mut products) = (d, 1.0, 0.0);
+        while n > self.bz_leaf.max(2) {
+            n = (n + 1) / 2;
+            count *= 2.0;
+            products += count * mul.mul_ns(n, n, kara);
+        }
+        (products, count * self.knuth_ns(n, n))
+    }
+
+    /// The block's Knuth leaves alone: cheap (no product is predicted), and a lower bound on
+    /// what any block costs.
+    pub(crate) fn bz_leaves_ns(&self, d: usize) -> f64 {
+        let (mut n, mut count) = (d, 1.0);
+        while n > self.bz_leaf.max(2) {
+            n = (n + 1) / 2;
+            count *= 2.0;
+        }
+        count * self.knuth_ns(n, n)
+    }
+
+    /// A top block of `top` quotient limbs run as a 2/1 block on a padded numerator. Its
+    /// quotient's upper d - top limbs are zero, and div_3_2 multiplies each quotient piece at its
+    /// significant width: at the level with pieces of n limbs, the top / n pieces under `top`
+    /// cost a whole n x n product, the one `top` falls in a product of n by top mod n, and the
+    /// pieces above it nothing. The Knuth leaves run in full whatever the quotient.
+    pub(crate) fn bz_padded_top_ns(&self, top: usize, d: usize, mul: &MulEq, kara: &crate::tuning::table::Table2) -> f64 {
+        let (mut n, mut count, mut products) = (d, 1usize, 0.0);
+        while n > self.bz_leaf.max(2) {
+            n = (n + 1) / 2;
+            count *= 2;
+            let whole = (top / n).min(count);
+            let part = if whole < count { top % n } else { 0 };
+            products += whole as f64 * mul.mul_ns(n, n, kara) + if part > 0 { mul.mul_ns(n, part, kara) } else { 0.0 };
+        }
+        products + count as f64 * self.knuth_ns(n, n)
+    }
+
+    /// Whether BZ runs a top block of `top` quotient limbs padded (else Knuth): the cheaper of
+    /// the two predictions, which is also what bz_div_core_dyn does. Never at or under the leaf.
+    pub(crate) fn bz_top_padded(&self, d: usize, top: usize, mul: &MulEq, kara: &crate::tuning::table::Table2) -> bool {
+        self.bz_top(d, top, mul, kara).0
+    }
+
+    // (padded?, the top block's predicted ns with its multiple). The leaves alone, a lower bound
+    // on the padded block, settle most shapes with a short top without predicting a product.
+    fn bz_top(&self, d: usize, top: usize, mul: &MulEq, kara: &crate::tuning::table::Table2) -> (bool, f64) {
+        let knuth = self.bz[1] * self.knuth_ns(top, d);
+        if d <= self.bz_leaf || self.bz[0] * self.bz_leaves_ns(d) >= knuth {
+            return (false, knuth);
+        }
+        let padded = self.bz[0] * self.bz_padded_top_ns(top, d, mul, kara);
+        if padded < knuth { (true, padded) } else { (false, knuth) }
+    }
+
+    /// BZ's predicted ns for (q, d), or None where it has no 2/1 block of its own and so is
+    /// Knuth: the quotient body's (q - 1) / d whole blocks, each the block's products and leaves,
+    /// and its top block of (q - 1) % d + 1 quotient limbs, padded or Knuth as `bz_top_padded`.
+    pub(crate) fn bz_plan(&self, q: usize, d: usize, mul: &MulEq, kara: &crate::tuning::table::Table2) -> Option<f64> {
+        if d <= self.bz_leaf {
+            return None;
+        }
+        let (blocks, top) = ((q - 1) / d, (q - 1) % d + 1);
+        let (padded, top_ns) = self.bz_top(d, top, mul, kara);
+        if blocks == 0 && !padded {
+            return None;
+        }
+        let whole = if blocks == 0 {
+            0.0
+        } else {
+            let (products, leaves) = self.bz_block_parts(d, mul, kara);
+            blocks as f64 * (products + leaves)
+        };
+        Some(self.bz[0] * whole + top_ns)
+    }
+}
+
+/// Tune builds: forces bz_div_core_dyn's top block, for the tuner to time each mode whatever the
+/// rule would choose (0: the rule, 1: padded where the divisor is past the leaf, 2: Knuth). Like
+/// a knob, never changed while a division runs.
+#[cfg(feature = "tune")]
+pub(crate) static BZ_TOP_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+// bz_div_core_dyn's top block of `top` quotient limbs: padded where the fitted equations predict
+// it cheaper than Knuth (the choice has two inputs, d and top).
+fn dyn_bz_top_padded(dlen: usize, top: usize) -> bool {
+    if dlen <= k::div::bz() {
+        return false;
+    }
+    #[cfg(feature = "tune")]
+    match BZ_TOP_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    DivEq::read().bz_top_padded(dlen, top, &MulEq::read(), k::mul::kara())
+}
+
+// div_dyn's and div_rem_dyn's choice for a request (`rem`: with the remainder), by the logical
+// quotient width q_len + 1 and the effective divisor width.
+pub(crate) fn dyn_div_alg(r: &DivisionRequest, rem: bool) -> DivAlg {
+    let (q, d) = (r.q_len + 1, r.d_len);
+    // Knuth without reading an equation: at a divisor so narrow that the equations pick Knuth
+    // for every quotient (the guard the tuner computes from them, as mul.kara's table spares
+    // small products the comparison), and where nothing else can run.
+    let guard = if rem { k::div::dyn_rem_knuth_d() } else { k::div::dyn_knuth_d() };
+    if d <= guard || !dyn_div_contested(q, d, k::div::bz()) {
+        return DivAlg::Knuth;
+    }
+    dyn_div_alg_at(q, d, rem, &DivEq::read(), &MulEq::read(), k::mul::kara())
+}
+
+// Whether NR or BZ can take the shape at all, without reading an equation: NR needs nr_split's
+// room (a quotient of 8 limbs or more), and BZ a divisor past its leaf.
+fn dyn_div_contested(q: usize, d: usize, bz_leaf: usize) -> bool {
+    q > 1 && (nr_split(d + q - 1, q).is_some() || d > bz_leaf)
+}
+
+// The choice at explicit equations (invariant 6): the least predicted time among the algorithms
+// that can take the shape (the user's rule for a decision with two inputs). Knuth always can;
+// NR needs nr_split's room; BZ a 2/1 block of its own (`bz_plan`).
+pub(crate) fn dyn_div_alg_at(q: usize, d: usize, rem: bool, eq: &DivEq, mul: &MulEq, kara: &crate::tuning::table::Table2) -> DivAlg {
+    dyn_div_best(q, d, rem, eq, mul, kara).0
+}
+
+// dyn_div_alg_at's choice with its predicted ns, which other algorithms' equations are built on
+// (a series' finalize).
+#[inline(always)]
+pub(crate) fn dyn_div_best(q: usize, d: usize, rem: bool, eq: &DivEq, mul: &MulEq, kara: &crate::tuning::table::Table2) -> (DivAlg, f64) {
+    if !dyn_div_contested(q, d, eq.bz_leaf) {
+        return (DivAlg::Knuth, eq.knuth_ns(q, d));
+    }
+    let mut best = (DivAlg::Knuth, eq.knuth_ns(q, d));
+    // NR's products are predicted only if its other terms don't already pass the best.
+    if nr_split(d + q - 1, q).is_some() && eq.nr_base_ns(q, d, rem) < best.1 {
+        let t = eq.nr_ns(q, d, rem, mul, kara);
+        if t < best.1 {
+            best = (DivAlg::NR, t);
+        }
+    }
+    if let Some(t) = eq.bz_plan(q, d, mul, kara).filter(|&t| t < best.1) {
+        best = (DivAlg::BZ, t);
+    }
+    best
 }
 
 pub(crate) fn rcp_alg_dispatch(precision: usize, knuth_nr_cutoff: usize) -> RcpAlg {
@@ -93,7 +367,7 @@ pub fn div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
     let Some(r) = division_preflight(n, d, q) else {
         return 0;
     };
-    div_prepared_dyn(n, d, q, r, div_alg_dispatch(&r, DYN_DIV))
+    div_prepared_dyn(n, d, q, r, dyn_div_alg(&r, false))
 }
 
 /// Dynamic division with the same quotient contract as [`div_dyn`], leaving
@@ -102,7 +376,7 @@ pub fn div_rem_dyn(n: &mut [u64], d: &[u64], q: &mut [u64]) -> u64 {
     let Some(r) = division_preflight(n, d, q) else {
         return 0;
     };
-    div_rem_prepared_dyn(n, d, q, r, div_alg_dispatch(&r, DYN_DIV_REM))
+    div_rem_prepared_dyn(n, d, q, r, dyn_div_alg(&r, true))
 }
 
 /// Static-scratch division with the same quotient contract as [`div_dyn`].
@@ -110,7 +384,7 @@ pub fn div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
     let Some(r) = division_preflight(n, d, q) else {
         return 0;
     };
-    div_prepared_static::<N>(n, d, q, r, div_alg_dispatch(&r, STATIC_DIV))
+    div_prepared_static::<N>(n, d, q, r, div_alg_dispatch(&r, DivCutoffs::static_div()))
 }
 
 /// Static-scratch division with the same quotient and remainder contract as
@@ -119,7 +393,7 @@ pub fn div_rem_static<const N: usize>(n: &mut [u64], d: &[u64], q: &mut [u64]) -
     let Some(r) = division_preflight(n, d, q) else {
         return 0;
     };
-    div_rem_prepared_static::<N>(n, d, q, r, div_alg_dispatch(&r, STATIC_DIV_REM))
+    div_rem_prepared_static::<N>(n, d, q, r, div_alg_dispatch(&r, DivCutoffs::static_div_rem()))
 }
 
 /// Computes the highest `q.len()` limbs of the quotient body and returns the
@@ -130,7 +404,7 @@ pub fn hi_div_dyn(n: &[u64], d: &[u64], q: &mut [u64]) -> u64 {
     let Some(r) = division_request(n, d, q, Some(requested)) else {
         return 0;
     };
-    div_prepared_dyn(n, d, q, r, div_alg_dispatch(&r, DYN_DIV))
+    div_prepared_dyn(n, d, q, r, dyn_div_alg(&r, false))
 }
 
 /// Static-scratch counterpart of [`hi_div_dyn`].
@@ -139,21 +413,21 @@ pub fn hi_div_static<const N: usize>(n: &[u64], d: &[u64], q: &mut [u64]) -> u64
     let Some(r) = division_request(n, d, q, Some(requested)) else {
         return 0;
     };
-    div_prepared_static::<N>(n, d, q, r, div_alg_dispatch(&r, STATIC_DIV))
+    div_prepared_static::<N>(n, d, q, r, div_alg_dispatch(&r, DivCutoffs::static_div()))
 }
 
 pub fn rcp_dyn(d: &[u64], rcp: &mut [u64]) {
     if !reciprocal_preflight(d, rcp) {
         return;
     }
-    let algorithm = rcp_alg_dispatch(rcp.len(), DYN_RCP_KNUTH_NR_CUTOFF);
+    let algorithm = rcp_alg_dispatch(rcp.len(), k::div::dyn_rcp_knuth_nr());
     rcp_prepared_dyn(d, rcp, algorithm);
 }
 pub fn rcp_static<const N: usize>(d: &[u64], rcp: &mut [u64]) {
     if !reciprocal_preflight(d, rcp) {
         return;
     }
-    let algorithm = rcp_alg_dispatch(rcp.len(), STATIC_RCP_KNUTH_NR_CUTOFF);
+    let algorithm = rcp_alg_dispatch(rcp.len(), k::div::static_rcp_knuth_nr());
     rcp_prepared_static::<N>(d, rcp, algorithm);
 }
 /// The reciprocal a dynamic NR division leaves for the next division by a longer prefix of the same
@@ -188,7 +462,7 @@ pub fn div_carry_dyn(n: &[u64], d: &[u64], q: &mut [u64], carry: &mut RcpCarry) 
     let Some(r) = division_preflight(n, d, q) else {
         return 0;
     };
-    div_prepared_carry_dyn(n, d, q, r, div_alg_dispatch(&r, DYN_DIV), Some(carry))
+    div_prepared_carry_dyn(n, d, q, r, dyn_div_alg(&r, false), Some(carry))
 }
 
 /// [`div_rem_dyn`], reading and leaving `carry`.
@@ -197,7 +471,7 @@ pub fn div_rem_carry_dyn(n: &mut [u64], d: &[u64], q: &mut [u64], carry: &mut Rc
     let Some(r) = division_preflight(n, d, q) else {
         return 0;
     };
-    div_rem_prepared_carry_dyn(n, d, q, r, div_alg_dispatch(&r, DYN_DIV_REM), Some(carry))
+    div_rem_prepared_carry_dyn(n, d, q, r, dyn_div_alg(&r, true), Some(carry))
 }
 
 /// Minimum quotient-buffer width for trimmed little-endian operands.
@@ -1005,9 +1279,18 @@ pub fn div_3_2(
         add_buf(&mut n[d_lo_len..], d_hi);
     }
 
-    let m = &mut scratch[..q_len + d_lo_len];
+    // The product takes the quotient piece at its significant width. A block on a padded
+    // numerator has a quotient with zero top limbs, and of the product algorithms only the FFT
+    // trims its operands itself: schoolbook and Karatsuba would multiply the zeros through. A
+    // zero piece has no product to subtract at all.
+    let q_sig = buf_len(q);
+    debug_assert!(q_sig <= q_len);
+    if q_sig == 0 {
+        return;
+    }
+    let m = &mut scratch[..q_sig + d_lo_len];
     *m.last_mut().unwrap() = 0;
-    mul_alg(q, d_lo, m);
+    mul_alg(&mut q[..q_sig], d_lo, m);
     if sub_buf(n, m) {
         dec_buf(q);
         if !add_buf(n, d) {
@@ -1024,7 +1307,7 @@ pub fn div_2_1(
     mul_alg: &mut dyn FnMut(&mut [u64], &[u64], &mut [u64]),
 ) {
     let dlen = d.len();
-    if dlen <= BZ_CUTOFF {
+    if dlen <= k::div::bz() {
         // The 2/1 invariant already proves the structural top quotient limb is
         // zero, so do not pay for estimating it in every recursive base case.
         debug_assert!(cmp_buf(&n[dlen..], d).is_lt());
@@ -1043,27 +1326,22 @@ pub fn bz_top_block_knuth_work(dlen: usize, qlen: usize) -> f64 {
     (dlen as f64) * (qlen as f64)
 }
 pub fn bz_2_1_cost(d: usize) -> f64 {
-    const SCHOOL_TO_KARATSUBA: f64 = 3.394147384;
-    const KARATSUBA_TO_FFT: f64 = 2.733850808;
     match dyn_dispatch(d, d) {
         MulDynDispatch::Prim | MulDynDispatch::Prim2 | MulDynDispatch::School => {
             d as f64 * d as f64
         }
-        MulDynDispatch::Karatsuba => SCHOOL_TO_KARATSUBA * (d as f64).powf(1.5849625007),
+        MulDynDispatch::Karatsuba => k::div::bz_2_1_school_to_karatsuba() * (d as f64).powf(1.5849625007),
         MulDynDispatch::FFT | MulDynDispatch::NTT => {
-            KARATSUBA_TO_FFT * (d as f64) * (d as f64).log2() * (d as f64).log2()
+            k::div::bz_2_1_karatsuba_to_fft() * (d as f64) * (d as f64).log2() * (d as f64).log2()
         }
     }
 }
 pub fn use_bz_for_top_block(dlen: usize, qlen: usize) -> bool {
-    if dlen <= BZ_CUTOFF {
-        return false;
-    }
-    if qlen == 0 {
-        return false;
-    }
-
-    BZ_TOP_PADDED_COST_SCALE * bz_2_1_cost(dlen) <= bz_top_block_knuth_work(dlen, qlen)
+    use_bz_for_top_block_at(dlen, qlen, k::div::bz(), k::div::bz_top_padded_cost_scale())
+}
+// The rule at an explicit leaf and scale (invariant 6).
+pub fn use_bz_for_top_block_at(dlen: usize, qlen: usize, leaf: usize, scale: f64) -> bool {
+    dlen > leaf && qlen != 0 && scale * bz_2_1_cost(dlen) <= bz_top_block_knuth_work(dlen, qlen)
 }
 // Burnikel-Ziegler on a normalized-divisor request: the top block (Knuth, or with top_n of
 // 2 d.len() limbs, BZ's 2/1 on the block padded to full size), then the 2/1 blocks below.
@@ -1125,7 +1403,7 @@ fn bz_div_core_dyn(
     mode: RemainderMode,
 ) -> u64 {
     let dlen = d.len();
-    let top = use_bz_for_top_block(dlen, (n.len() - dlen) % dlen + 1);
+    let top = dyn_bz_top_padded(dlen, (n.len() - dlen) % dlen + 1);
     let mut scratch = ScratchGuard::acquire();
     let [top_n, s] = scratch.get_splits([if top { 2 * dlen } else { 0 }, 2 * dlen]);
     let mul = |a: &mut [u64], b: &[u64], o: &mut [u64]| {

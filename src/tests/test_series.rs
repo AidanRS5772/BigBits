@@ -1143,9 +1143,12 @@ fn test_rect_zero_limb_powers() {
 fn test_mul_work_continuous() {
     // Each tier's scale comes from the crossover that selects it, so the work never jumps
     // where the multiplier switches algorithms: neighbors differ by about their sizes.
-    for stat in [false, true] {
+    // mul_work follows mul_static's tiers alone since 2026-11-11 (dynamic nodes price their
+    // products by MulEq).
+    {
+        let stat = true;
         let near = |a: (usize, usize), b: (usize, usize), grow: f64| {
-            let r = mul_work(b.0, b.1, stat) / mul_work(a.0, a.1, stat);
+            let r = mul_work(b.0, b.1) / mul_work(a.0, a.1);
             assert!(
                 (0.85..=grow * 1.1).contains(&r),
                 "mul_work {a:?} -> {b:?} (static {stat}): {r}"
@@ -1165,14 +1168,8 @@ fn test_mul_work_continuous() {
 }
 
 fn check_costs(costs: Costs, ok: Eligible, max_m: u64, what: &str) {
-    let works = [costs.horner, costs.rect.map(|r| r.1), Some(costs.bin_split)];
-    for w in works.into_iter().flatten() {
-        let units = [w.div, w.scalar, w.product, w.term, w.call, w.alloc, w.fill];
-        assert!(
-            units.iter().all(|u| u.is_finite() && *u >= 0.0),
-            "{what}: {w:?}"
-        );
-        assert!(w.ns().is_finite() && w.ns() > 0.0, "{what}: {w:?}");
+    for ns in ALGS.iter().filter_map(|&alg| costs.of(alg)) {
+        assert!(ns.is_finite() && ns > 0.0, "{what}: {costs:?}");
     }
     assert_eq!(costs.horner.is_some(), ok.horner, "{what}");
     assert_eq!(costs.rect.is_some(), ok.rect, "{what}");
@@ -1197,7 +1194,27 @@ fn check_node_costs<N: SeriesNode>(ctx: &N::Ctx, max_m: u64, what: &str) {
                 // horner_first skips the model, only for ranges Horner can sum.
                 let first = N::horner_first(ctx, a, b, len, zeros);
                 assert!(!first || ok.horner, "{what}");
-                let want = if first { SeriesAlg::Horner } else { costs.pick() };
+                // Past horner_first the guards settle what they can, and the least prediction
+                // decides among what they leave.
+                let g = N::guards(ctx, a, b, len, zeros);
+                let (alg, m) = N::decide(ctx, a, b, len, zeros);
+                assert!(ok.allows(alg), "{what}: decided {alg:?}");
+                assert!(alg != SeriesAlg::Rect || m.is_some_and(|m| m >= 1 && m as u64 <= b - a), "{what}: rect at {m:?}");
+                if g.rect_first {
+                    assert_eq!(alg, SeriesAlg::Rect, "{what}");
+                } else if g.no_bin_split {
+                    let rest = Costs { bin_split: f64::INFINITY, ..costs };
+                    assert!(alg == rest.pick() && alg != SeriesAlg::BinSplit, "{what}: {alg:?}");
+                } else {
+                    assert_eq!(alg, costs.pick(), "{what}");
+                }
+                assert!(!g.rect_first || ok.rect, "{what}");
+                assert!(!g.no_bin_split || ok.horner || ok.rect, "{what}");
+                // The small-series table is read ahead of both, and only ever names an
+                // algorithm that can sum the range.
+                let small = N::small(ctx, a, b, len, zeros);
+                assert!(small.map_or(true, |(alg, m)| ok.allows(alg) && (alg == SeriesAlg::Rect) == m.is_some()), "{what}: {small:?}");
+                let want = small.map_or(if first { SeriesAlg::Horner } else { alg }, |s| s.0);
                 assert_eq!(N::dispatch(ctx, a, b, len, zeros), want, "{what}");
                 if ok.rect {
                     for m in [1, max_m.min(b - a)] {
@@ -1205,6 +1222,175 @@ fn check_node_costs<N: SeriesNode>(ctx: &N::Ctx, max_m: u64, what: &str) {
                         assert_eq!(at.rect.unwrap().0, m as usize, "{what}");
                         check_costs(at, ok, max_m.min(b - a), &what);
                     }
+                }
+            }
+        }
+    }
+}
+
+// The small-series table's layout: a frame's bucket and the frames it holds, a range's class,
+// and a lookup at an explicit table (a pick, the equations past the extent or the buckets, and
+// nothing for a class the table's last row doesn't reach).
+#[test]
+fn test_small_series_table_layout() {
+    use crate::tuning::table::{row_index, Table2};
+    // Buckets by octaves to 65535 limbs: every frame is in exactly the bucket whose span holds
+    // it, and a class's `SMALL_ROWS` keys hold them all.
+    assert_eq!(small_frame(0), None);
+    assert_eq!(small_frame(65536), None);
+    let mut last = 0;
+    for len in 1..65536 {
+        let b = small_frame(len).unwrap();
+        let (lo, hi) = small_frame_span(b);
+        assert!(lo <= len && len <= hi && b < SMALL_ROWS && (b == last || b == last + 1), "frame {len}: bucket {b} holds {lo}-{hi}");
+        last = b;
+    }
+    assert_eq!((small_frame(1), small_frame(3), small_frame(5), small_frame(6), small_frame(11), small_frame(12), small_frame(255)), (Some(0), Some(1), Some(2), Some(2), Some(3), Some(3), Some(7)));
+    assert_eq!((small_frame(256), small_frame(511), small_frame(512), small_frame(65535)), (Some(8), Some(8), Some(9), Some(SMALL_ROWS - 1)));
+    assert_eq!((small_frame_span(5), small_frame_span(8), small_frame_span(15)), ((32, 63), (256, 511), (32768, 65535)));
+    // Classes: the kind and x's width, q's bucket, and whether r is past 1; none past 64 bits.
+    assert_eq!(small_class(0, 1, 0), Some(0));
+    assert_eq!(small_class(0, 8, 0), small_class(0, 3, 0));
+    assert_ne!(small_class(0, 9, 0), small_class(0, 8, 0));
+    assert_ne!(small_class(0, 17, 0), small_class(0, 16, 0));
+    assert_eq!(small_class(0, 17, 0), small_class(0, 32, 0));
+    assert_eq!(small_class(0, 33, 0), small_class(0, 64, 0));
+    assert_ne!(small_class(2, 8, 1), small_class(2, 8, 5), "r of 1 and r past 1");
+    assert_eq!(small_class(1, 65, 0), None);
+    assert_eq!(small_class(2, 8, 70), None);
+    let kinds: Vec<usize> = [0u64, 2, 16, 17, 64, 65, 128, 129, 256, 257, 512, 513, 1024, 1025, 2048, 2049].iter().map(|&b| small_kind_hyper(b)).collect();
+    // An x of 3 to 8 limbs is one kind.
+    assert_eq!(kinds, [2, 3, 3, 4, 4, 5, 5, 6, 6, 6, 6, 7, 7, 8, 8, 9]);
+    assert!(SMALL_CLASSES == SMALL_KINDS * SMALL_Q_BITS.len() * 2 && small_class(SMALL_KINDS - 1, 64, 64) == Some(SMALL_CLASSES - 1));
+    // Every class but BBP's and Engel's with an r has a shape, which Horner can sum and rect
+    // only with an x of two limbs or more.
+    for class in 0..SMALL_CLASSES {
+        let kind = class / 2 / SMALL_Q_BITS.len();
+        match Shape::of_class(class, 20, 30) {
+            None => assert!(kind < 2 && class % 2 == 1, "class {class}"),
+            Some((shape, ok)) => {
+                assert!(ok.horner && ok.rect == (shape.x_limbs() >= 2) && (kind >= 5) == ok.rect, "class {class}");
+                let c = shape.predictions(ok);
+                assert!(ALGS.iter().filter_map(|&a| c.of(a)).all(|ns| ns.is_finite() && ns > 0.0), "class {class}: {c:?}");
+                assert!(ok.allows(shape.decide_at(ok, Guarded::default()).0));
+            }
+        }
+    }
+    // A table by hand: class 3 at frames of 4-7 limbs runs Horner to 9 terms, binary splitting
+    // from 10 and leaves 200 and more to the equations; at 8 limbs and up, rect from 3 terms.
+    let key = |class: usize, frame: usize| (class * SMALL_ROWS + small_frame(frame).unwrap()) as u32;
+    let t: &'static [u32] = Box::leak(Box::new([key(3, 4), 1, 0, key(3, 4), 10, 2, key(3, 4), 200, 3, key(3, 8), 1, 3, key(3, 8), 3, 1]));
+    let table = Table2 { t, rows: Box::leak(row_index(t).into_boxed_slice()) };
+    assert_eq!(small_pick(&table, 3, 4, 1), Some(SeriesAlg::Horner));
+    assert_eq!(small_pick(&table, 3, 5, 9), Some(SeriesAlg::Horner));
+    assert_eq!(small_pick(&table, 3, 5, 10), Some(SeriesAlg::BinSplit));
+    assert_eq!(small_pick(&table, 3, 4, 199), Some(SeriesAlg::BinSplit));
+    assert_eq!(small_pick(&table, 3, 7, 200), None, "past the extent");
+    assert_eq!(small_pick(&table, 3, 8, 2), None);
+    assert_eq!(small_pick(&table, 3, 15, 1 << 40), Some(SeriesAlg::Rect));
+    assert_eq!(small_pick(&table, 3, 200, 5), Some(SeriesAlg::Rect), "a frame past the last row reads it");
+    assert_eq!(small_pick(&table, 3, 65536, 5), None, "a frame past the buckets");
+    assert_eq!(small_pick(&table, 2, 4, 5), Some(SeriesAlg::Horner), "below the first row: its first pick");
+    // The default table hands everything to the equations.
+    let none = Table2 { t: &[0, 0, 3], rows: &[0] };
+    assert!((0..SMALL_CLASSES).all(|c| [1, 30, 255, 4000].iter().all(|&f| small_pick(&none, c, f, 7).is_none())));
+    // The live table through a node: its class, and a pick the range's own eligibility allows.
+    type N = DynNodeHyper<Exp>;
+    let ctx = DynHyperCtx::new(&[0x1234_5678], 80);
+    assert_eq!(N::small_class(&ctx, 1, 20), small_class(small_kind_hyper(29), 4, 1));
+    assert_eq!(<DynNodeBBP<ATanh> as SeriesNode>::small_class(&Shift(9), 1, 20), small_class(0, 5, 0));
+    assert_eq!(<StaticNodeHyper<16, Exp> as SeriesNode>::small_class(&StaticHyperCtx::<16>::new(&[5], 80), 1, 20), None);
+    if let Some((alg, m)) = N::small(&ctx, 1, 20, 3, 0) {
+        assert!(N::eligible(&ctx, 1, 20, 3, 0).allows(alg) && (alg == SeriesAlg::Rect) == m.is_some());
+        assert_eq!(N::dispatch(&ctx, 1, 20, 3, 0), alg);
+    }
+}
+
+// The dispatch's guards at explicit knobs: rect outright from a rho and an x width, binary
+// splitting left out past a beta while another algorithm can sum the range; what `decide` then
+// runs; and that rect at the guard's block length (the balance, unpredicted) sums the range.
+#[test]
+fn test_guards_settle_ranges_by_their_ratios() {
+    type N = DynNodeHyper<Exp>;
+    // An x of 40 limbs a bit below its shift, 300 terms into a 50-limb frame: an argument
+    // nothing has reduced.
+    let mut x = super::rand_vec(40, 0x5e71e5);
+    x[39] |= 1 << 63;
+    x[0] |= 1;
+    let ctx = DynHyperCtx::new(&x, 64 * 40 + 1);
+    let (a, b, len) = (1, 301, 50);
+    let ok = N::eligible(&ctx, a, b, len, 0);
+    assert!(ok.horner && ok.rect);
+    let s = N::shape(&ctx, a, b, len, 0);
+    // rho: x's 2560 bits over the frame's 3200 a term of 300. beta: the tree's P, 300 terms of
+    // the shift's 2561 bits and q's, over the frame.
+    assert!((s.rho() - 240.0).abs() < 1e-9 && s.x_limbs() == 40, "{}", s.rho());
+    assert!((240.0..250.0).contains(&s.beta()), "{}", s.beta());
+    let at = |beta: f64, rho: f64, x: usize| SeriesGuards { bin_split_beta: beta, rect_rho: rho, rect_x: x };
+    assert_eq!(s.guards(ok, &at(8.0, 8.0, 16)), Guarded { rect_first: true, no_bin_split: true });
+    assert_eq!(s.guards(ok, &at(1e9, 1e9, 0)), Guarded::default(), "both off");
+    assert!(s.guards(ok, &at(1e9, 240.0, 40)).rect_first, "at its rho and its x");
+    assert!(!s.guards(ok, &at(1e9, 240.5, 40)).rect_first && !s.guards(ok, &at(1e9, 240.0, 41)).rect_first);
+    assert!(!s.guards(ok, &at(s.beta(), 1e9, 0)).no_bin_split && s.guards(ok, &at(s.beta() - 0.5, 1e9, 0)).no_bin_split);
+    // Binary splitting stays where nothing else can sum the range, and rect's guard needs rect.
+    let (none, horner) = (Eligible { horner: false, rect: false }, Eligible { horner: true, rect: false });
+    assert_eq!(s.guards(none, &at(0.0, 0.0, 0)), Guarded::default());
+    assert_eq!(s.guards(horner, &at(0.0, 0.0, 0)), Guarded { rect_first: false, no_bin_split: true });
+    // An x of one limb has no rho to speak of, and a narrow tree no beta.
+    let narrow = N::shape(&DynHyperCtx::new(&[5], 3000), 1, 4, 200, 0);
+    assert!(narrow.rho() < 0.01 && narrow.beta() < 1.0, "{} {}", narrow.rho(), narrow.beta());
+
+    // decide: rect at a block length within the range under its guard; under the beta guard
+    // alone the better of Horner and rect by their predictions; with neither, any of the three.
+    let costs = N::costs(&ctx, a, b, len, 0, None);
+    let (alg, m) = s.decide_at(ok, Guarded { rect_first: true, no_bin_split: true });
+    let m = m.expect("rect's block length");
+    assert!(alg == SeriesAlg::Rect && (1..=300).contains(&m), "{alg:?} {m}");
+    let (alg, _) = s.decide_at(ok, Guarded { rect_first: false, no_bin_split: true });
+    let want = if costs.rect.unwrap().1 <= costs.horner.unwrap() { SeriesAlg::Rect } else { SeriesAlg::Horner };
+    assert_eq!(alg, want);
+    assert_eq!(s.decide_at(ok, Guarded::default()).0, costs.pick());
+    assert_eq!(s.decide_at(none, Guarded::default()).0, SeriesAlg::BinSplit);
+    // The live dispatch is `decide_at` under the live knobs' verdict.
+    let live = N::guards(&ctx, a, b, len, 0);
+    assert_eq!(live, s.guards(ok, &SeriesGuards::read()));
+    assert_eq!(N::decide(&ctx, a, b, len, 0), s.decide_at(ok, live));
+    assert_eq!(N::dispatch(&ctx, a, b, len, 0), s.decide_at(ok, live).0);
+    // Static nodes have no guards.
+    let sctx = StaticHyperCtx::<64>::new(&x, 64 * 40 + 1);
+    assert_eq!(<StaticNodeHyper<64, Exp> as SeriesNode>::guards(&sctx, a, b, len, 0), Guarded::default());
+
+    // Rect at the guard's block length against binary splitting, within a unit of the last limb.
+    let (mut by_rect, mut by_tree) = (vec![0u64; len], vec![0u64; len]);
+    N::rect(&ctx, a, b, 0, &mut by_rect, Some(m));
+    series_eval_at::<N>(&ctx, a, b, 0, &mut by_tree, SeriesAlg::BinSplit);
+    let (hi, lo) = if cmp_buf(&by_rect, &by_tree) == Ordering::Less { (&by_tree, &by_rect) } else { (&by_rect, &by_tree) };
+    let mut d = hi.clone();
+    sub_buf(&mut d, lo);
+    assert!(buf_len(&d) <= 1 && d[0] <= 1, "rect at m = {m} is {} units off", d[0]);
+}
+
+// A dynamic node's equations over the same edge shapes: every part finite and non-negative, an
+// algorithm's parts there exactly when it can sum the range, and the predictions the dispatch
+// compares are those parts under the live prices (rect's at an explicit block length; with
+// none it may read as Horner plus its fixed cost, where it can't win).
+fn check_node_parts<N: SeriesNode>(ctx: &N::Ctx, what: &str) {
+    let (env, eq) = (SeriesEnv::read(), SeriesEq::read());
+    for (a, b) in [(0, 1), (1, 2), (1, 17), (3, 300), (5, 3000)] {
+        for len in [1, 2, 5, 64, 1000] {
+            for zeros in [0, 3, 50] {
+                let what = format!("{what} [{a}, {b}) len {len} zeros {zeros}");
+                let ok = N::eligible(ctx, a, b, len, zeros);
+                let m = ok.rect.then_some(((b - a) as usize).min(3));
+                let parts = N::parts(ctx, a, b, len, zeros, m, &env);
+                let costs = N::costs(ctx, a, b, len, zeros, m);
+                for (i, alg) in ALGS.into_iter().enumerate() {
+                    assert_eq!(parts[i].is_some(), ok.allows(alg), "{what}: {alg:?}");
+                    let Some(p) = parts[i] else { continue };
+                    assert!(p.features().iter().all(|v| v.is_finite() && *v >= 0.0), "{what}: {alg:?} {p:?}");
+                    let prices = [&eq.horner, &eq.rect, &eq.bin_split][i];
+                    let (want, got) = (p.ns_with(prices, eq.wake), costs.of(alg).unwrap());
+                    assert!((want - got).abs() <= 1e-9 * want, "{what}: {alg:?} {want} != {got}");
                 }
             }
         }
@@ -1232,16 +1418,24 @@ fn test_series_costs_edges() {
         check_node_costs::<DynNodeBBP<SgBbp>>(&Shift(k), u64::MAX, "signed bbp");
         check_node_costs::<DynNodeBBP<WideQ>>(&Shift(k), u64::MAX, "wide bbp");
         check_node_costs::<DynNodeEngel<Exp>>(&Shift(k), u64::MAX, "engel");
+        check_node_parts::<DynNodeBBP<BbpLin>>(&Shift(k), "bbp");
+        check_node_parts::<DynNodeBBP<SgBbp>>(&Shift(k), "signed bbp");
+        check_node_parts::<DynNodeBBP<WideQ>>(&Shift(k), "wide bbp");
+        check_node_parts::<DynNodeEngel<Exp>>(&Shift(k), "engel");
         let ctx = DynHyperCtx::new_shift(k);
         check_node_costs::<DynNodeHyper<Hyp>>(&ctx, u64::MAX, "hyper x = 1");
         check_node_costs::<DynNodeHyper<RBig>>(&ctx, u64::MAX, "hyper r > q");
         check_node_costs::<DynNodeHyper<WideTerms<true>>>(&ctx, u64::MAX, "wide hyper");
+        check_node_parts::<DynNodeHyper<Hyp>>(&ctx, "hyper x = 1");
+        check_node_parts::<DynNodeHyper<RBig>>(&ctx, "hyper r > q");
+        check_node_parts::<DynNodeHyper<WideTerms<true>>>(&ctx, "wide hyper");
     }
     for xl in [1, 2, 3, 256] {
         let x = rand_x(64 * xl as u64, &mut rng);
         for k in [64 * xl as u64, 64 * xl as u64 + 7, 64 * xl as u64 + 4000] {
             let ctx = DynHyperCtx::new(&x, k);
             check_node_costs::<DynNodeHyper<Exp>>(&ctx, u64::MAX, "hyper x");
+            check_node_parts::<DynNodeHyper<Exp>>(&ctx, "hyper x");
         }
         // k below bits(x): bin_split only.
         let ctx = DynHyperCtx::new(&x, 64 * xl as u64 - 1);
@@ -1256,26 +1450,175 @@ fn test_series_costs_edges() {
 
 #[test]
 fn test_horner_cost_grows_with_terms() {
-    // More terms never make Horner cheaper: they add frame limbs, divisions and steps.
+    // Horner's predicted time grows with its terms, which add frame limbs, divisions and steps:
+    // twice the terms always cost more. One more term can take a little off, as the groups
+    // realign and a first term left alone with q = 1 divides by nothing, but never much.
     let mut rng = StdRng::seed_from_u64(92);
     let x = rand_x(192, &mut rng);
     let (shift, hyper_x) = (Shift(3), DynHyperCtx::new(&x, 200));
     for len in [1, 8, 100] {
-        let mut last = [0.0; 4];
-        for b in 2..600 {
-            let ns = [
+        let at = |b: u64| {
+            [
                 DynNodeBBP::<BbpQuad>::costs(&shift, 1, b, len, 0, None).horner,
                 DynNodeEngel::<Exp>::costs(&shift, 1, b, len, 0, None).horner,
                 DynNodeHyper::<Hyp>::costs(&DynHyperCtx::new_shift(3), 1, b, len, 0, None).horner,
                 DynNodeHyper::<Exp>::costs(&hyper_x, 1, b, len, 0, None).horner,
             ]
-            .map(|w| w.unwrap().ns());
-            for (i, (&now, before)) in ns.iter().zip(&mut last).enumerate() {
-                assert!(now >= *before, "kind {i} len {len} b {b}: {now} < {before}");
-                *before = now;
+            .map(|ns| ns.unwrap())
+        };
+        let mut last = at(2);
+        for b in 3..600 {
+            let (ns, half) = (at(b), at(1 + (b - 1) / 2));
+            for i in 0..4 {
+                assert!(ns[i] >= 0.8 * last[i], "kind {i} len {len} b {b}: {} after {}", ns[i], last[i]);
+                assert!(ns[i] > half[i], "kind {i} len {len} b {b}: {} is not past {} at half the terms", ns[i], half[i]);
+            }
+            last = ns;
+        }
+    }
+}
+
+// The leaves and merges of the tree bin_split_tree_at builds over [a, b).
+fn tree_nodes<N: Node>(ctx: &N::Ctx, a: u64, b: u64) -> (u64, u64) {
+    if b - a <= N::leaf_terms().max(1) || N::limbs(ctx, a, b) < N::leaf_limbs() {
+        return (1, 0);
+    }
+    let m = (a + b) / 2;
+    let (l, r) = (tree_nodes::<N>(ctx, a, m), tree_nodes::<N>(ctx, m, b));
+    (l.0 + r.0, l.1 + r.1 + 1)
+}
+
+#[test]
+fn test_bin_split_parts_count_the_tree() {
+    // Binary splitting's equation walks the tree the code builds: its allocations are the
+    // tree's leaves and merges (two buffers a leaf; a merge's P and Q, and BBP's cross product;
+    // finalize's scratch). The walk takes q's size at the range's midpoint for every node of a
+    // level, where the tree's own estimate is smaller at its left nodes than at its right ones,
+    // so with a level right at the leaf cutoff the two can differ by a node or two.
+    let env = SeriesEnv::read();
+    let allocs = |leaves: u64, merges: u64, per_merge: u64| (2 * leaves + per_merge * merges + 1) as f64;
+    for shift in [1u64, 7, 64, 200, 4096] {
+        for t in [1u64, 2, 3, 5, 8, 13, 100, 257, 1000] {
+            // Trees narrow enough to stay on the caller's thread, where the counts are whole.
+            if t * (shift + 12) / 64 >= crate::tuning::k::bin_split::dyn_par().min(1 << 14) {
+                continue;
+            }
+            let ctx = Shift(shift);
+            let (leaves, merges) = tree_nodes::<DynNodeEngel<Exp>>(&ctx, 1, 1 + t);
+            let got = DynNodeEngel::<Exp>::parts(&ctx, 1, 1 + t, 8, 0, None, &env)[2].unwrap().alloc;
+            let want = allocs(leaves, merges, 2);
+            assert!((got - want).abs() <= 0.2 * want, "engel shift {shift} t {t}: {got} allocations, the tree makes {want}");
+            let (leaves, merges) = tree_nodes::<DynNodeBBP<BbpLin>>(&ctx, 1, 1 + t);
+            let got = DynNodeBBP::<BbpLin>::parts(&ctx, 1, 1 + t, 8, 0, None, &env)[2].unwrap().alloc;
+            let want = allocs(leaves, merges, 3);
+            assert!((got - want).abs() <= 0.2 * want, "bbp shift {shift} t {t}: {got} allocations, the tree makes {want}");
+            // A tree of one leaf, and one of one term a leaf, are counted exactly.
+            if leaves == 1 || leaves == t {
+                assert_eq!(got, want, "bbp shift {shift} t {t}");
             }
         }
     }
+}
+
+#[test]
+fn test_horner_products_closed_form() {
+    // Horner's products by a multi-limb x in hi_mul_buf's tier are summed in closed form over the
+    // frames' four stretches (the whole accumulator, holding x whole, shorter than x, one limb).
+    // Against the same sum taken term by term: a frame of L limbs by x of xl costs schoolbook's
+    // a (L m - m (m - 1) / 2) + c for m = min(xl, L).
+    let mut rng = StdRng::seed_from_u64(94);
+    let env = SeriesEnv::read();
+    let [a, c] = crate::utils::mul::MulEq::read().school;
+    let partial = crate::tuning::k::mul::dyn_partial_mul();
+    for xl in [2usize, 3, 7, 40] {
+        let x = rand_x(64 * xl as u64, &mut rng);
+        for extra in [0u64, 1, 9, 64, 200, 3000] {
+            let shift = 64 * xl as u64 + extra;
+            let ctx = DynHyperCtx::new(&x, shift);
+            for (len, zeros, t) in [(1usize, 0usize, 1u64), (5, 0, 2), (5, 3, 40), (30, 0, 7), (64, 1, 300), (200, 0, 1000)] {
+                let acc = len + 4;
+                if acc > partial {
+                    continue;
+                }
+                let (top, k) = ((len + zeros + 2) as f64, extra as f64);
+                let want: f64 = (1..=t)
+                    .map(|i| {
+                        let l = (top - k * i as f64 / 64.0).clamp(1.0, acc as f64);
+                        let m = (xl as f64).min(l);
+                        a * (l * m - m * (m - 1.0) / 2.0) + c
+                    })
+                    .sum();
+                let got = DynNodeHyper::<Exp>::parts(&ctx, 1, 1 + t, len, zeros, None, &env)[0].unwrap().product;
+                assert!((got - want).abs() <= 1e-9 * want, "xl {xl} shift {shift} len {len} zeros {zeros} t {t}: {got} != {want}");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_series_equations_share_horners_kernel_prices() {
+    // Rect runs Horner's kernels, so its equation takes Horner's prices for their passes (the
+    // two-limb divisions, the passes by one- and two-limb multipliers, the fills and copies)
+    // and has its own for its products, calls and fixed cost, and for the one-limb divisions,
+    // which its groups make in every range and Horner's long series hardly make at all. The
+    // same for both sets of prices, the long series' and the short ones'.
+    assert_eq!(SeriesEq::RECT, [0, 2, 9, 11]);
+    for eq in [SeriesEq::read(), SeriesEq::read_short()] {
+        for c in 0..12 {
+            if SeriesEq::RECT.contains(&c) || c == 8 {
+                continue;
+            }
+            assert_eq!(eq.rect[c], eq.horner[c], "column {}", Parts::NAMES[c]);
+        }
+        // No price for work an algorithm doesn't do.
+        for (name, cols, prices) in [("horner", &SeriesEq::HORNER[..], &eq.horner), ("bin_split", &SeriesEq::BIN_SPLIT[..], &eq.bin_split)] {
+            for c in (0..12).filter(|c| !cols.contains(c)) {
+                assert_eq!(prices[c], 0.0, "{name}: column {}", Parts::NAMES[c]);
+            }
+        }
+    }
+}
+
+// Horner's groups are counted whole for a q of constant size: 32 bits fill a 128-bit group with
+// exactly four terms, so a range of eight makes two divisions, at the frames of its first and
+// its fifth term (an average of 3.63 terms a group counted three, and read 39% high on such a
+// range).
+struct Q32;
+impl EngelSeries for Q32 {
+    const START: u64 = 1;
+    fn tail_bits(_: u64, _: i64) -> u64 {
+        0
+    }
+    fn p(_: u64) -> u64 {
+        1
+    }
+    fn q(n: u64) -> u64 {
+        (1 << 31) + 2 * n + 1
+    }
+}
+
+#[test]
+fn test_horner_groups_are_whole() {
+    type N = DynNodeEngel<Q32>;
+    let env = SeriesEnv::read();
+    // 64 limbs a term from the shift, in a frame of 454 limbs below 64 zero limbs: term i's
+    // frame is 454 + 64 + 2 - 64 i limbs.
+    let (len, zeros) = (454, 64);
+    let frame = |i: usize| len + zeros + 2 - 64 * i;
+    let h = N::parts(&Shift(4096), 1, 9, len, zeros, None, &env)[0].unwrap();
+    assert_eq!((h.div2, h.div1, h.term), ((frame(1) + frame(5)) as f64, 0.0, 8.0), "{h:?}");
+    // Nine terms: the shallowest group holds the one left over.
+    let h = N::parts(&Shift(4096), 1, 10, len + 64, zeros, None, &env)[0].unwrap();
+    assert_eq!(h.div2 + h.div1, (3 * 64 + frame(1) + frame(2) + frame(6)) as f64, "{h:?}");
+    // A q that grows fills groups of several sizes: the budget over its mean bits, less half a
+    // term. q(n) = n over 1000 terms has 7.7 and 9.6 bits at its Gauss points, 8.7 on average.
+    let e = <DynNodeEngel<Exp> as SeriesNode>::parts(&Shift(64), 1, 1001, 100, 1, None, &env)[0].unwrap();
+    let groups = e.call - e.term;
+    assert!((groups - (1000.0f64 / (128.0 / 8.67 - 0.5)).ceil()).abs() <= 1.0, "{groups} groups of 1000 terms");
+    // And 32 terms of it, 118 bits in all, are one group: one division, over the first term's
+    // frame.
+    let e = <DynNodeEngel<Exp> as SeriesNode>::parts(&Shift(1152), 1, 33, 564, 18, None, &env)[0].unwrap();
+    assert_eq!((e.call - e.term, e.div1 + e.div2), (1.0, (564 + 18 + 2 - 18) as f64), "{e:?}");
 }
 
 // Typed contexts: term counts and zeros from each series' tail bound.
@@ -1573,4 +1916,33 @@ fn test_typed_static_capacity() {
         series_eval_static::<4, _>(&Engel::<Exp>::new(130), &mut []),
         Ok((false, 2))
     );
+}
+
+// The series section's random-knob check (test_tuning.rs): series_eval_range's own pick under the
+// live cost model and Horner cutoffs, and every forced algorithm, against the exact sum, for BBP,
+// Engel and Hyper ranges (x of 1 to 256 bits), dynamic and static.
+#[cfg(feature = "tune")]
+pub(super) fn random_knob_check(rng: &mut StdRng) {
+    for _ in 0..4 {
+        let k = [1u64, 3, 8, 63, 65, 130][rng.gen_range(0..6)];
+        let (len, t) = (rng.gen_range(1..=40), rng.gen_range(1..=300));
+        let z = ((k - 1) / 64) as usize;
+        let what = format!("random-knob k {k} len {len} t {t}");
+        let want = want_bbp::<BbpQuad>(k, 1, 1 + t, z, len);
+        check_algs::<DynNodeBBP<BbpQuad>>(&Shift(k), (1, 1 + t), z, &want, &what);
+        let want = want_engel::<Exp>(k, 1, 1 + t, z, len);
+        check_algs::<DynNodeEngel<Exp>>(&Shift(k), (1, 1 + t), z, &want, &what);
+        let bits = [1u64, 40, 64, 130, 256][rng.gen_range(0..5)];
+        let x = rand_x(bits, rng);
+        let ctx = DynHyperCtx::new(&x, bits + k);
+        let want = want_hyper::<Exp>(&ctx, 1, 1 + t, 0, len);
+        check_algs::<DynNodeHyper<Exp>>(&ctx, (1, 1 + t), 0, &want, &format!("{what} x {bits}"));
+        if len + 4 <= 64 {
+            let want = want_bbp::<BbpQuad>(k, 1, 1 + t, z, len);
+            check_algs::<StaticNodeBBP<64, BbpQuad>>(&Shift(k), (1, 1 + t), z, &want, &what);
+            let sctx = StaticHyperCtx::<64>::new(&x, bits + k);
+            let want = want_hyper::<Exp>(&ctx, 1, 1 + t, 0, len);
+            check_algs::<StaticNodeHyper<64, Exp>>(&sctx, (1, 1 + t), 0, &want, &what);
+        }
+    }
 }

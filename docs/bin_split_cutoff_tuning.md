@@ -1,7 +1,7 @@
 # Binary-splitting cutoff tuning
 
 Machine: Apple M1 (4 performance + 4 efficiency cores), macOS, `bench` profile.
-Harness: `benches/bin_split_cutoffs.rs` (`cargo bench-bin-split <family>`). Each
+Harness: `benches/bin_split_cutoffs.rs` (`cargo bench-bin-split <family>`), deleted 2026-11-09 when these constants became tuning knobs; it still runs at commit `faa9971`. Each
 candidate builds the tree with `bin_split_tree_at` (finalize is excluded because it
 doesn't depend on the tree's shape). Each sample repeats a build to about 20 ms.
 Candidates alternate within each round, in forward and reversed rotations, and each
@@ -575,3 +575,220 @@ root's cost with the series: 4.94 at 24, 2.20 at 64, 1.36 at 128, 1.06–1.16 at
 at 384, 0.98 at 512 and 0.93 at 1000. That gives 480. Below `pi.bin`'s 1024 limbs it
 copies the table, so past it the series always gets its own thread, with a stack sized
 for N.
+
+## Values before the tuner (2026-11-08)
+
+The leaf and parallel cutoffs moved from `src/utils/mod.rs` into the tuning schema (section
+`bin_split` of `src/tuning/schema.rs`, Phase 1 of `docs/tuning_system.md`) with their values
+unchanged. `Node::LEAF_LIMBS`/`LEAF_TERMS` became the trait methods `leaf_limbs()`/`leaf_terms()`,
+which return the node kind's knob, and `SplitCutoffs::of` is no longer a `const fn`.
+
+| Knob | Was | Value |
+|---|---|---|
+| `bin_split.dyn_bbp_leaf_limbs`, `static_bbp_leaf_limbs` | `DYN_`/`STATIC_BBP_LEAF_LIMBS` | 64, 512 |
+| `bin_split.dyn_engel_leaf_limbs`, `static_engel_leaf_limbs` | `DYN_`/`STATIC_ENGEL_LEAF_LIMBS` | 96, 128 |
+| `bin_split.dyn_hyper_leaf_limbs`, `static_hyper_leaf_limbs` | `DYN_`/`STATIC_HYPER_LEAF_LIMBS` | 48, 64 |
+| `bin_split.dyn_hyper_leaf_terms`, `static_hyper_leaf_terms` | `DYN_`/`STATIC_HYPER_LEAF_TERMS` | 8, 8 |
+| `bin_split.dyn_par` | `DYN_BIN_SPLIT_PAR_CUTOFF` | 256 |
+| `bin_split.dyn_merge_par` | `DYN_BIN_SPLIT_MERGE_PAR_CUTOFF` | 256 |
+
+Their notes in `mod.rs`:
+
+```text
+// Binary splitting builds a range as one leaf once its node's estimated size
+// (Node::limbs) drops below LEAF_LIMBS, or it has at most LEAF_TERMS terms.
+// Hyper's terms can each multiply by a wide x, which makes its leaves cost
+// more per limb, so it also keeps a few terms per leaf. See
+// docs/bin_split_cutoff_tuning.md.
+pub const DYN_BBP_LEAF_LIMBS: u64 = 64;
+pub const STATIC_BBP_LEAF_LIMBS: u64 = 512;
+pub const DYN_ENGEL_LEAF_LIMBS: u64 = 96;
+pub const STATIC_ENGEL_LEAF_LIMBS: u64 = 128;
+pub const DYN_HYPER_LEAF_LIMBS: u64 = 48;
+pub const DYN_HYPER_LEAF_TERMS: u64 = 8;
+pub const STATIC_HYPER_LEAF_LIMBS: u64 = 64;
+pub const STATIC_HYPER_LEAF_TERMS: u64 = 8;
+
+// Dynamic binary splitting builds a split's two halves in parallel from this
+// many estimated limbs, and a merge's independent products once its Q reaches
+// this many limbs.
+pub const DYN_BIN_SPLIT_PAR_CUTOFF: u64 = 256;
+pub const DYN_BIN_SPLIT_MERGE_PAR_CUTOFF: usize = 256;
+```
+
+The random-knob test (`cargo test --lib --features tune`) found every value of these knobs valid,
+from 0 to `u64::MAX`: a dynamic tree under any cutoffs equals one leaf, and a static one finalizes
+within one unit of it. `cargo bench-bin-split` (`benches/bin_split_cutoffs.rs`) was deleted on
+2026-11-09, when exp's and ln's constants became knobs too; it still runs at commit `faa9971`.
+
+### The constant caches' gates (2026-11-08)
+
+The six parallel gates of the constant caches moved the same way, into section `consts`:
+`DYN_LN2_PAR_CUTOFF`/`_HALF` are `consts.dyn_ln2_par`/`consts.dyn_ln2_par_half`,
+`DYN_PI_PAR_CUTOFF`/`_HALF` are `consts.dyn_pi_par`/`consts.dyn_pi_par_half`, and
+`STATIC_LN2_PAR_CUTOFF`/`STATIC_PI_PAR_CUTOFF` are `consts.static_ln2_par`/`consts.static_pi_par`.
+`cache_par` now saturates its products, as `half * half` overflowed for large knob values; the
+values it compares are unchanged wherever they don't overflow. The random-knob test also found
+debug builds' scoped threads overflowing their `static_split_stack(N)` stacks on π's static tree
+with one-term Hyper leaves (`bin_split.static_hyper_leaf_limbs` and `_terms` at 0): the release
+build of the same call fits, as the stack was sized for optimized frames, so debug builds now
+reserve four times as much. Their notes in `mod.rs`:
+
+```text
+// The dynamic constant caches (ln2_dyn, pi_dyn) copy requests of up to their tables' 1024
+// limbs from them, and past that build in parallel (rayon) when
+// new * (cached^2 + HALF^2) >= CUTOFF * HALF^2, in output limbs: from CUTOFF new limbs on
+// a cold cache, with the threshold halving at HALF cached limbs and falling with its
+// square past that. Extending a cache also merges into the cached nodes and finalizes at
+// the full length, which both cost more the larger the cache is, so a few new limbs on a
+// large cache are worth parallelizing. Waking rayon's workers from outside the pool
+// costs about 15-20 us. ln2 runs its four series' shares in parallel (measured on the
+// earlier base-16 series): ties cold at ~31 limbs, warm at new ~ 20, 14, 6 and 1 for 16,
+// 32, 64 and 128 cached. pi spawns its one series into the pool, where its own top
+// merges can run in parallel, while the caller builds the root: ties cold at 96-128
+// limbs, warm at new ~ 45, 8 and 1 for 256, 1024 and 4096 cached. Each thread keeps its
+// own FFT plans and scratch, so the first request after a switch between the serial and
+// parallel paths pays a few us once (ln2 32 -> 42 and 128 -> 129 after a parallel cold
+// build, about 1.05x). Past the tables every ln2 build is parallel, and pi's from about 7
+// new limbs; the smaller ties matter only if a table shrinks. See
+// docs/bin_split_cutoff_tuning.md.
+pub const DYN_LN2_PAR_CUTOFF: u64 = 32;
+pub const DYN_LN2_PAR_HALF: u64 = 30;
+pub const DYN_PI_PAR_CUTOFF: u64 = 104;
+pub const DYN_PI_PAR_HALF: u64 = 256;
+
+// ln2_static sums and finalizes each of its four series on its own scoped thread from
+// this many limbs (out.len() plus its guard; measured on the earlier base-16 series).
+// Four threads cost about 60 us to start: they lost at 32 limbs (1.34x) and won from 40
+// (0.95x, 0.56x at 64). Below ln2.bin's 1024 limbs it copies the table instead, so this
+// only matters if the table shrinks.
+pub const STATIC_LN2_PAR_CUTOFF: usize = 40;
+
+// pi_static builds its series and its root on two scoped threads from this many limbs
+// below pi's integer limb (out.len() - 1 plus its guard), which only overlaps the root's
+// cost with the series: they lost at 384 (1.05x) and won from 512 (0.98x, 0.93x at
+// 1000). Below pi.bin's 1024 limbs it copies the table instead, so past it the series
+// always gets a thread, and its stack sized for N.
+pub const STATIC_PI_PAR_CUTOFF: usize = 480;
+```
+
+### exp, ln, the AGM and theta (2026-11-09)
+
+Their 22 constants moved into sections `exp`, `ln`, `agm` and `theta`, with their values unchanged:
+`DYN_EXP_SQR_BITS` is `exp.dyn_sqr_bits`, `STATIC_LN_SQRT_A` is `ln.static_sqrt_a`,
+`DYN_LN_AGM_TERMS` is `ln.dyn_agm_terms`, `DYN_AGM_TAIL_TERMS` is `agm.dyn_tail_terms`,
+`DYN_THETA_PAR_LIMBS` is `theta.dyn_par_limbs`, and so on (`THETA_STATIC_SLOTS`, a capacity, stays a
+constant). Ranges that bound work rather than correctness are capped: `exp.*_sqr_bits` at 256
+squares, `ln.*_sqrt_a` at 3 (the largest scale the tests cover), the Amdahl fractions at [0, 1], and
+the theta term counts at their compiled plans (0..=16 dynamic, 0..=9 static). The random-knob test
+found no other limits. Their notes in `mod.rs`:
+
+```text
+// exp_dyn_entry evaluates its chunk series in parallel once it has at least two chunks
+// and chunks * working limbs reaches this, on a pool of two or more threads. Chunks
+// cost about the same at a given precision, so this is one decision for the whole
+// loop. exp_dyn takes no squares when its core would go parallel, so this also trades
+// them away: on 12 threads, exp_dyn on X in [1, 2) ran serially with its squares 1.05-1.45x
+// faster than in parallel without them up to 112 limbs (work 1130), tied at 128 (1290-1419)
+// and lost from 144 (1595) on, by 1.4-1.8x. 512 sent 64-128 limbs parallel, up to 1.5x
+// slower. See docs/bin_split_cutoff_tuning.md.
+pub const DYN_EXP_CHUNK_PAR_WORK: usize = 1280;
+
+// exp_dyn_entry's first chunk after x's top bit spans at least this many bits; later chunks
+// each span [s, ~2s). Narrower chunks near the top all sum about as many terms, so each
+// costs about as much as a wide one. See docs/bin_split_cutoff_tuning.md.
+pub const DYN_EXP_CHUNK_MIN_BITS: u64 = 16;
+
+// exp_static_entry's counterparts: it gives each chunk series its own scoped thread once
+// it has at least two chunks and chunks * working limbs reaches this. A thread
+// costs about 10 us to start, far more than a rayon task: threads tied at 585 and
+// won from 774 (0.67x) to 13325 (0.34x).
+pub const STATIC_EXP_CHUNK_PAR_WORK: usize = 768;
+pub const STATIC_EXP_CHUNK_MIN_BITS: u64 = 16;
+
+// exp_dyn runs its core on r 2^-j, j = this less the bits by which r already sits below 1,
+// and squares the result back j times, unless the core would sum its chunks in parallel.
+// 0 disables them. `cargo bench-bin-split exp` (1 to 4096 limbs, serial) put 24 within 1.05x
+// of each size's best fixed j, 1.01x on the geometric mean; a log2(precision) scale fit
+// worse (1.07x, 1.26x at 1 to 4 limbs), as the best j hardly moves with precision.
+// Re-swept with the trees' rayon split gated on two or more threads: 24 was still best,
+// 1.013x on the geometric mean and within 1.07x of each size's best (worst at 512).
+pub const DYN_EXP_SQR_BITS: u64 = 24;
+// GUESS: the dynamic value. exp_static only takes the squares when N has room for them.
+pub const STATIC_EXP_SQR_BITS: u64 = 24;
+
+// ln_dyn takes floor(A log2(64 out.len())) square roots before its series, less the bits
+// by which its argument already sits near 1, so the series' argument starts that far down.
+// 0 disables them. `cargo bench-bin-split ln` (2 to 2048 limbs) tied 0.25 and 0.5 within
+// noise, 1.06x and 1.08x of each size's best; 0 was 1.29x and 1 was 1.27x.
+pub const DYN_LN_SQRT_A: f64 = 0.25;
+// GUESS: the dynamic value. ln_static only takes the square roots when N has room for them.
+pub const STATIC_LN_SQRT_A: f64 = 0.25;
+
+// ln_dyn_entry's first chunk after its top bit spans at least this many bits. Unlike exp's,
+// an atanh chunk's term count depends only on its offset, so this starts at plain
+// doubling. GUESS
+pub const DYN_LN_CHUNK_MIN_BITS: u64 = 2;
+pub const STATIC_LN_CHUNK_MIN_BITS: u64 = 2;
+
+// ln_dyn_entry and ln_static_entry go parallel as exp's entries do. GUESS
+pub const DYN_LN_CHUNK_PAR_WORK: usize = 512;
+pub const STATIC_LN_CHUNK_PAR_WORK: usize = 768;
+
+// ln_dyn takes the theta-AGM logarithm from this many output limbs for a generic X on one thread,
+// where ln(1 + δ)'s series and the AGM tie. Past it, trans.rs's agm_wins weighs the series' cost,
+// about log2(P / δ's lead)² per M(P), against the AGM's, about log2 P (widened by the lead when
+// e ln 2 and ln u cancel), so X near 1 or near a power of 2 stays on the series longer. On one
+// thread (M1, T = 5) the AGM won from 1024 to 32768 limbs (0.60-0.88 of the series' time) and lost
+// at 65536 (1.08), where its full-width products pass the 16-bit FFT's limit. GUESS
+pub const DYN_LN_AGM_LIMBS: usize = 1024;
+// GUESS: the dynamic value. ln_static also needs N to have room for the AGM's frame.
+pub const STATIC_LN_AGM_LIMBS: usize = 1024;
+
+// The share of the series logarithm's work that runs in parallel, for its speedup on k threads,
+// 1 / ((1 - p) + p / k), by which agm_wins divides the series' cost. The thread count flips the
+// dispatch: the series' chunks and their trees split across the threads, while the AGM's steps are
+// one serial chain (its own gain on 8 threads was 1.03 below the 16-bit FFT's limit, and 1.4-1.8
+// at 65536 limbs, where its products run on the parallel NTT). On the M1 the series ran 1.5-1.9x
+// faster on 2 threads, 2.2-2.9x on 4 and 2.4-3.7x on 8 (4 performance and 4 efficiency cores),
+// which p = 0.85 fits (1.74, 2.76, 3.90). With it the AGM keeps one thread from the cutoff, needs
+// 1M-2M limbs on 2 and 2^29 on 3, and from 4 threads (2^35 limbs) on effectively never wins. Measured, the series won at every size on
+// 2 threads (to 131072 limbs, by 1.02-1.52x) and on 8 (to 262144, by 1.06-3.6x), and the two
+// approach each other at the top, so the AGM may win past the measured range. Static's threads
+// come from available_parallelism, which macOS can't limit, so only its 8-CPU case was measured
+// (the series won 2.3-2.5x from 1024 to 4096 limbs). GUESS for static.
+pub const DYN_LN_SERIES_PAR_FRACTION: f64 = 0.85;
+pub const STATIC_LN_SERIES_PAR_FRACTION: f64 = 0.85;
+
+// The theta-AGM logarithm's theta terms N (θ3 over k = 1..N, θ2 over k = 0..N). Each doubling
+// of N + 1 saves two AGM steps and costs theta terms, so the best N is about 2 / (R ln 2) for R
+// = a term's cost over a step's, independent of precision (docs/agm-ln-theta.md).
+// `cargo bench-bin-split lnagm` (M1, 256 to 32768 limbs): on one thread the dynamic entry is best
+// at 5 (3 to 5 within 0.7% from 1024 limbs). On the 8-thread pool it is best at 10 to 12 and 5
+// loses 2.4-5.5%, as theta's terms run in parallel and the AGM's steps don't, but there the
+// series beats the AGM about 2x at every size measured. Static is best at 6 on both (1024 and
+// 4096 limbs), the most whose parallel plan fits THETA_STATIC_SLOTS.
+pub const DYN_LN_AGM_TERMS: usize = 5;
+pub const STATIC_LN_AGM_TERMS: usize = 6;
+
+// agm_dyn and agm_static run means until the closed-form series of the AGM's limit needs at most
+// this many terms, then sum it (trans.rs's agm_tail, docs/agm_profile.md). The gap a - b doubles
+// each step, so the series j steps before the means alone would finish needs about 2^(j-1) to
+// 2^j - 1 terms; from 64 to 16384 limbs replacing j = 1, 2, 3, 4 roots took 1, 3, 6-7 and 12-14
+// on ln_agm's inputs at 3 theta terms, and 1, 2, 5 and 11 at 5 (where the caps rechecked within
+// 0.6% of the best).
+// `cargo bench-bin-split agm` (M1): dyn's best is j = 3 at every size (0.95-0.96 of no tail;
+// 6-7 terms won, 12-14 lost by up to 3%), static's j = 2 (3 terms won, 6-7 lost by up to 1.5%,
+// as its quotient is a reciprocal and a product), so each cap sits between the two. At most
+// AGM_TAIL's 19.
+pub const DYN_AGM_TAIL_TERMS: usize = 10;
+pub const STATIC_AGM_TAIL_TERMS: usize = 4;
+
+// theta runs its parallel plan (the shortest dependency path) on frames of this many limbs,
+// threaded when it has two or more workers, and its least-work plan below. The plan depends only
+// on the size, so threads never change the result. GUESS
+pub const DYN_THETA_PAR_LIMBS: usize = 256;
+// GUESS: a scoped thread costs about 10 us to start, against rayon's few.
+pub const STATIC_THETA_PAR_LIMBS: usize = 1024;
+```
+

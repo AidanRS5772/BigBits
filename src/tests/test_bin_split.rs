@@ -16,6 +16,7 @@ const C: SplitCutoffs = SplitCutoffs {
     leaf_limbs: 2,
     leaf_terms: 1,
     par_limbs: 64,
+    par_work: 0,
 };
 
 // Serial cutoffs with leaves of at most leaf_terms terms, or below leaf_limbs.
@@ -24,6 +25,7 @@ fn leaves(leaf_limbs: u64, leaf_terms: u64) -> SplitCutoffs {
         leaf_limbs,
         leaf_terms,
         par_limbs: u64::MAX,
+        par_work: 0,
     }
 }
 
@@ -94,6 +96,23 @@ fn test_bbp_tree_matches_single_leaf() {
     }
     check_bbp::<BbpQuad>(4, 1, 6000);
     check_bbp::<BbpLin>(70, 5, 3000);
+}
+
+// A tree started off the pool, as a test thread starts it, splits in parallel only with
+// `par_work` of limbs times terms at the node (the split has to wake the pool); on a pool worker
+// the limb gate alone decides. Either way the gate changes when halves are built, never what
+// they are: every setting gives the single leaf's fraction, started here and from a worker.
+#[test]
+fn test_split_work_gate_keeps_trees_exact() {
+    let ctx = Shift(4);
+    let want = DynNodeBBP::<BbpLin>::leaf(&ctx, 1, 3000, true);
+    for par_work in [0, 1, 1 << 12, 1 << 20, u64::MAX] {
+        let cut = SplitCutoffs { par_work, ..C };
+        let got = bin_split_tree_at::<DynNodeBBP<BbpLin>>(&ctx, 1, 3000, true, cut);
+        assert!(got.p == want.p && got.q == want.q, "off the pool, par_work {par_work}");
+        let (l, _) = rayon::join(|| bin_split_tree_at::<DynNodeBBP<BbpLin>>(&ctx, 1, 3000, true, cut), || ());
+        assert!(l.p == want.p && l.q == want.q, "on a worker, par_work {par_work}");
+    }
 }
 
 #[test]
@@ -302,7 +321,7 @@ fn test_pi_static_table() {
 
 // The static series at every length up to the N - 3 bound match pi_dyn (here pi.bin)
 // exactly: the guard limb absorbs the static nodes' truncation and the finish's rounding.
-// These all run serially (below STATIC_PI_PAR_CUTOFF); test_pi_static_past_table runs the
+// These all run serially (below `consts.static_pi_par`); test_pi_static_past_table runs the
 // threads against the dynamic series.
 #[test]
 fn test_pi_static_sum_matches_dyn() {
@@ -1532,4 +1551,70 @@ fn test_const_series_match_tables() {
         pi_build(&mut pi_node, &mut buf, l + 1);
         assert_eq!(&buf[1..], &want[..], "pi dyn series at {l} limbs");
     }
+}
+
+// The bin_split section's random-knob check (test_tuning.rs): trees under the live cutoffs
+// (leaves, parallel splits and merges on the global pool). Dynamic nodes are exact fractions, so
+// any tree equals one leaf bit for bit; static trees finalize within one unit of the dynamic one.
+#[cfg(feature = "tune")]
+pub(super) fn random_knob_check(rng: &mut rand::rngs::StdRng) {
+    use rand::Rng;
+    let (b, b2, b3) = (rng.gen_range(2..2500), rng.gen_range(3..2500), rng.gen_range(2..1500));
+    let ctx = Shift(4);
+    let want = DynNodeBBP::<BbpLin>::leaf(&ctx, 1, b, true);
+    let got = bin_split::<DynNodeBBP<BbpLin>>(&ctx, 1, b);
+    assert!(got.p == want.p && got.q == want.q, "BBP [1, {b}) differs");
+    let ctx1 = Shift(1);
+    let want = DynNodeEngel::<EngelFact>::leaf(&ctx1, 2, b2, true);
+    let got = bin_split::<DynNodeEngel<EngelFact>>(&ctx1, 2, b2);
+    assert!(got.p == want.p && got.q == want.q, "Engel [2, {b2}) differs");
+    let x = [0x9e37_79b9_7f4a_7c15, 0xff_ffff_ffff];
+    let hctx = DynHyperCtx::new(&x, 112);
+    for last in [true, false] {
+        let want = DynNodeHyper::<Hyp>::leaf(&hctx, 0, b3, last);
+        let got = bin_split_tree::<DynNodeHyper<Hyp>>(&hctx, 0, b3, last);
+        assert!(got.p == want.p && got.q == want.q && got.r == want.r, "Hyper [0, {b3}) differs");
+    }
+    check_static_at::<DynNodeBBP<BbpLin>, StaticNodeBBP<16, BbpLin>>(
+        &ctx, &ctx, 1, b, 13, true, SplitCutoffs::of::<StaticNodeBBP<16, BbpLin>>(),
+    );
+    check_static_at::<DynNodeEngel<EngelFact>, StaticNodeEngel<64, EngelFact>>(
+        &ctx1, &ctx1, 2, b2, 40, true, SplitCutoffs::of::<StaticNodeEngel<64, EngelFact>>(),
+    );
+    let s64 = StaticHyperCtx::<64>::new(&x, 112);
+    check_static_at::<DynNodeHyper<Hyp>, StaticNodeHyper<64, Hyp>>(
+        &hctx, &s64, 0, b3, 40, true, SplitCutoffs::of::<StaticNodeHyper<64, Hyp>>(),
+    );
+}
+
+// The consts section's random-knob check (test_tuning.rs): ln 2 and pi built from scratch and by
+// extending a cached node under the live parallel gates, dyn and static, against the 1024-limb
+// tables (which ln2_dyn and pi_dyn copy below them).
+#[cfg(feature = "tune")]
+pub(super) fn consts_random_knob_check(rng: &mut rand::rngs::StdRng) {
+    use rand::Rng;
+    let top = LN2_LIMBS.min(PI_LIMBS) - 1;
+    let (l1, l2) = (rng.gen_range(1..=top / 2), rng.gen_range(top / 2..=top));
+    let mut want = vec![0; l2];
+    ln2_dyn(&mut want);
+    let mut nodes = (None, None, None, None);
+    let mut buf = Vec::new();
+    ln2_build(&mut nodes, &mut buf, l1 + 1);
+    assert_eq!(&buf[1..], &want[l2 - l1..], "ln2 series at {l1} limbs");
+    buf.clear(); // ln2_build adds its shares into buf
+    ln2_build(&mut nodes, &mut buf, l2 + 1);
+    assert_eq!(&buf[1..], &want[..], "ln2 series extended from {l1} to {l2} limbs");
+    let mut out = vec![0; l2];
+    ln2_static_sum::<1030>(&mut out, 1).unwrap();
+    assert_eq!(out, want, "ln2 static series at {l2} limbs");
+    pi_dyn(&mut want);
+    let mut node = None;
+    buf.clear();
+    pi_build(&mut node, &mut buf, l1 + 1);
+    assert_eq!(&buf[1..], &want[l2 - l1..], "pi series at {l1} limbs");
+    buf.clear();
+    pi_build(&mut node, &mut buf, l2 + 1);
+    assert_eq!(&buf[1..], &want[..], "pi series extended from {l1} to {l2} limbs");
+    pi_static_sum::<1030>(&mut out).unwrap();
+    assert_eq!(out, want, "pi static series at {l2} limbs");
 }

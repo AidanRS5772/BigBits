@@ -6,10 +6,10 @@ use big_bits::utils::sqrt::{
     binom_sqrt, binom_sqrt_core, sqrt_approx_dyn, sqrt_approx_static, sqrt_dyn, sqrt_only_dyn,
     sqrt_only_static, sqrt_static,
 };
-use big_bits::utils::{
-    DYN_SQRT_APPROX_ZIMMERMAN_CUTOFF, DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF,
-    DYN_SQRT_REM_ZIMMERMAN_CUTOFF, STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF,
-    STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF, STATIC_SQRT_REM_ZIMMERMAN_CUTOFF,
+use big_bits::tuning::resolved::sqrt::{
+    DYN_APPROX as DYN_SQRT_APPROX_ZIMMERMAN_CUTOFF, DYN_ONLY as DYN_SQRT_ONLY_ZIMMERMAN_CUTOFF,
+    DYN_REM as DYN_SQRT_REM_ZIMMERMAN_CUTOFF, STATIC_APPROX as STATIC_SQRT_APPROX_ZIMMERMAN_CUTOFF,
+    STATIC_ONLY as STATIC_SQRT_ONLY_ZIMMERMAN_CUTOFF, STATIC_REM as STATIC_SQRT_REM_ZIMMERMAN_CUTOFF,
 };
 use std::{
     env,

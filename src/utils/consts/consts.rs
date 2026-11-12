@@ -14,12 +14,17 @@ use crate::utils::{
     mul::{hi_mul_static, mul_dyn, mul_prim},
     sqrt::{sqrt_approx_dyn, sqrt_approx_static},
     utils::{add_buf, add_mul, buf_len, shl_buf, shr_buf, sub_buf},
-    CapacityError, ScratchGuard, DYN_LN2_PAR_CUTOFF, DYN_LN2_PAR_HALF, DYN_PI_PAR_CUTOFF,
-    DYN_PI_PAR_HALF, STATIC_LN2_PAR_CUTOFF, STATIC_PI_PAR_CUTOFF,
+    CapacityError, ScratchGuard,
 };
+use crate::tuning::k;
 
+// Whether a cache extension builds in parallel: new * (cached^2 + half^2) >= cutoff * half^2, in
+// output limbs (`consts.dyn_<ln2|pi>_par` and `_par_half`). Saturating, so every knob value is
+// valid (invariant 1); the same as the plain products wherever those don't overflow.
 fn cache_par(new: u64, cached: u64, cutoff: u64, half: u64) -> bool {
-    new.saturating_mul(cached.saturating_mul(cached) + half * half) >= cutoff * half * half
+    let half_sq = half.saturating_mul(half);
+    new.saturating_mul(cached.saturating_mul(cached).saturating_add(half_sq))
+        >= cutoff.saturating_mul(half_sq)
 }
 
 pub fn bin_split_extend<'a, N>(ctx: &N::Ctx, node: &'a mut Option<N>, start: u64, end: u64) -> &'a N
@@ -205,8 +210,8 @@ pub(crate) fn ln2_build(nodes: &mut Ln2Nodes, buf: &mut Vec<u64>, len: usize) {
     let par = cache_par(
         limbs(n - have),
         limbs(have),
-        DYN_LN2_PAR_CUTOFF,
-        DYN_LN2_PAR_HALF,
+        k::consts::dyn_ln2_par(),
+        k::consts::dyn_ln2_par_half(),
     );
     let mut scratch = ScratchGuard::acquire();
     let [t1, t2, t3, t4] = scratch.get_splits([len; 4]);
@@ -280,7 +285,7 @@ pub(crate) fn ln2_static_sum<const N: usize>(
         &|| ln2_share_static::<N, Ln2S<1, 1>>(n, w4, len),
     ];
     let mut buf = [0; N];
-    static_jobs::<N, 4, _, _, _>(len >= STATIC_LN2_PAR_CUTOFF, shares, |shares| {
+    static_jobs::<N, 4, _, _, _>(len >= k::consts::static_ln2_par(), shares, |shares| {
         for t in shares {
             let carry = add_buf(&mut buf[..len], &t[..len]);
             debug_assert!(!carry, "ln(2) < 1");
@@ -400,8 +405,8 @@ pub(crate) fn pi_build(node: &mut Option<DynNodeHyper<Pi>>, buf: &mut Vec<u64>, 
     let par = cache_par(
         limbs(n - have),
         limbs(have - 1),
-        DYN_PI_PAR_CUTOFF,
-        DYN_PI_PAR_HALF,
+        k::consts::dyn_pi_par(),
+        k::consts::dyn_pi_par_half(),
     );
     let mut scratch = ScratchGuard::acquire();
     let [qt, pt, t, x, root, num] = scratch.get_splits([len, len, len + 1, len + 1, len, 2 * len]);
@@ -476,7 +481,7 @@ pub(crate) fn pi_static_sum<const N: usize>(out: &mut [u64]) -> Result<(), Capac
         root
     };
     let jobs: [&(dyn Fn() -> [u64; N] + Sync); 2] = [&|| pi_ratio_static::<N>(f), &sqrt];
-    let (v, root) = static_jobs::<N, 2, _, _, _>(f >= STATIC_PI_PAR_CUTOFF, jobs, |r| {
+    let (v, root) = static_jobs::<N, 2, _, _, _>(f >= k::consts::static_pi_par(), jobs, |r| {
         (r.next().unwrap(), r.next().unwrap())
     });
 
