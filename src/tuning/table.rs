@@ -1,6 +1,6 @@
-//! Dispatchers' small-input tables (docs/tuning_system.md, "Dispatch"): change points derived from
-//! the predictions, read below each dispatcher's extent. Lookups are linear scans, as a table holds
-//! a few change points (one input) or a few per row (two inputs).
+//! Dispatchers' small-input tables: change points measured by the tuner (`tuner/tables.rs`), read
+//! where a dispatcher's equations would cost more than the rule's share of the call. Lookups are
+//! linear scans: a table holds a few change points (one input) or a few per row (two).
 
 /// A one-input table `[size, alg, size, alg, …]`: the algorithm of the last change point at or
 /// below `n` (the first one's for smaller n).
@@ -60,28 +60,4 @@ impl Table2 {
         }
         t[i + 2] as usize
     }
-}
-
-/// `Table2::pick` without the index (a binary search for the row), for tables in hand.
-#[inline]
-pub fn pick2(t: &[u32], s: u64, l: u64) -> usize {
-    debug_assert!(t.len() >= 3 && t.len() % 3 == 0);
-    let (mut lo, mut hi) = (0, t.len() / 3);
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if t[3 * mid] as u64 <= s {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    if hi == 0 {
-        return t[2] as usize;
-    }
-    let mut i = hi - 1;
-    let row = t[3 * i];
-    while t[3 * i + 1] as u64 > l && i > 0 && t[3 * (i - 1)] == row {
-        i -= 1;
-    }
-    t[3 * i + 2] as usize
 }

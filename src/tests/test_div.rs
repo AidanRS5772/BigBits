@@ -2483,18 +2483,61 @@ fn test_dyn_div_alg_compares_equations() {
     assert_ne!(dyn_div_alg_at(3000, 90, false, &free_bz, &mul, kara), DivAlg::BZ);
 }
 
-// The live dispatcher: Knuth at divisors up to the tuner's guards whatever the quotient, and the
-// public entries exact on both sides of them and wherever the equations send a shape.
+// A small division reads a measured table in place of the equations (`div.dyn_small`,
+// `div.dyn_rem_small`, change points over (d, q)): a lookup at a table made by hand, a pick that
+// can't take the shape handed on to the equations, and the default tables, which keep Knuth at
+// narrow divisors as the guards before them did.
 #[test]
-fn test_dyn_div_guards_and_entries() {
-    for (rem, guard) in [(false, k::div::dyn_knuth_d()), (true, k::div::dyn_rem_knuth_d())] {
-        for d_len in [1usize, 2, guard.max(1), guard + 1, guard + 9] {
+fn test_dyn_div_small_table() {
+    use crate::tuning::table::{row_index, Table2};
+    // Divisors of 8 to 39 limbs: Knuth for quotients to 19 limbs, NR to 99, the equations from
+    // 100. From 40: BZ, which a divisor under the leaf can't take. From 60: the equations.
+    let t: &'static [u32] = Box::leak(Box::new([8, 2, 0, 8, 20, 2, 8, 100, 3, 40, 2, 1, 60, 1, 3]));
+    let table = Table2 { t, rows: Box::leak(row_index(t).into_boxed_slice()) };
+    let leaf = 99;
+    assert_eq!(dyn_div_small(&table, 5, 8, leaf), Some(DivAlg::Knuth));
+    assert_eq!(dyn_div_small(&table, 19, 39, leaf), Some(DivAlg::Knuth));
+    assert_eq!(dyn_div_small(&table, 20, 8, leaf), Some(DivAlg::NR));
+    assert_eq!(dyn_div_small(&table, 99, 30, leaf), Some(DivAlg::NR));
+    assert_eq!(dyn_div_small(&table, 100, 8, leaf), None, "past the row's extent");
+    assert_eq!(dyn_div_small(&table, 30, 45, leaf), None, "BZ under its leaf is handed on");
+    assert_eq!(dyn_div_small(&table, 30, 45, 40), Some(DivAlg::BZ));
+    assert_eq!(dyn_div_small(&table, 30, 70, leaf), None);
+    assert_eq!(dyn_div_small(&table, 30, 5000, leaf), None, "a divisor past the last row reads it");
+    assert_eq!(dyn_div_small(&table, 9, 3, leaf), Some(DivAlg::Knuth), "below the first row: its first pick");
+    // What can take a shape: NR from a quotient of 8 limbs, BZ past its leaf, Knuth always.
+    assert!(dyn_div_can(DivAlg::Knuth, 1, 1, leaf) && !dyn_div_can(DivAlg::NR, 7, 50, leaf) && dyn_div_can(DivAlg::NR, 8, 50, leaf));
+    assert!(!dyn_div_can(DivAlg::BZ, 50, 99, leaf) && dyn_div_can(DivAlg::BZ, 50, 100, leaf) && !dyn_div_can(DivAlg::BZ, 1, 100, leaf));
+    assert!(!dyn_div_has_choice(7, 99, leaf) && dyn_div_has_choice(8, 4, leaf) && dyn_div_has_choice(2, 100, leaf) && !dyn_div_has_choice(1, 5000, leaf));
+    // The defaults: Knuth at divisors to 32 limbs (64 with the remainder), the equations past.
+    use crate::tuning::schema_types::DefaultValue;
+    for (path, guard) in [("div.dyn_small", 32usize), ("div.dyn_rem_small", 64)] {
+        let DefaultValue::Table(t) = crate::tuning::knob(path).unwrap().default else { panic!("{path} is a table") };
+        let table = Table2 { t, rows: Box::leak(row_index(t).into_boxed_slice()) };
+        for q in [8usize, 100, 20000] {
+            assert_eq!(dyn_div_small(&table, q, guard, leaf), Some(DivAlg::Knuth), "{path}");
+            assert_eq!(dyn_div_small(&table, q, guard + 1, leaf), None, "{path}");
+        }
+    }
+}
+
+// The live dispatcher: Knuth where nothing else can run, the table's algorithm where it names
+// one, and the public entries exact at divisors across the table and wherever the equations
+// send a shape.
+#[test]
+fn test_dyn_div_table_and_entries() {
+    let leaf = k::div::bz();
+    for (rem, table) in [(false, k::div::dyn_small()), (true, k::div::dyn_rem_small())] {
+        for d_len in [1usize, 2, 20, 33, 40, 70, 110] {
             for q_len in [1usize, 7, 8, 40, 300] {
                 let (n, d) = (rand_nonzero_vec(q_len + d_len, 61_000 + (q_len * 7 + d_len) as u64), rand_nonzero_vec(d_len, 62_000 + d_len as u64));
                 let mut q = vec![0u64; q_len];
                 let r = division_preflight(&n, &d, &mut q).expect("a nonempty request");
-                if d_len <= guard {
-                    assert_eq!(dyn_div_alg(&r, rem), DivAlg::Knuth, "d {d_len} q {q_len} rem {rem}");
+                let alg = dyn_div_alg(&r, rem);
+                if !dyn_div_has_choice(q_len + 1, d_len, leaf) {
+                    assert_eq!(alg, DivAlg::Knuth, "d {d_len} q {q_len} rem {rem}");
+                } else if let Some(want) = dyn_div_small(table, q_len + 1, d_len, leaf) {
+                    assert_eq!(alg, want, "d {d_len} q {q_len} rem {rem}");
                 }
                 // Whatever it picks, the entry agrees with forced Knuth.
                 let (mut want_q, mut want_n) = (vec![0u64; q_len], n.clone());

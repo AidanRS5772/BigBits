@@ -1,13 +1,10 @@
-// Every performance knob, declared once (docs/tuning_system.md, "The schema"). build.rs reads this
-// file to generate the accessors (`k::<section>::<knob>()`), the `resolved::` constants and the
-// live store; the crate reads it at run time for `tuning::get`/`set` and the tuner. Shared by
-// build.rs and the crate, so it uses only `super::schema_types`.
-//
-// Phase 1 declares each section's old `mod.rs` constants as `Interim` knobs, under their own
-// names, with today's values; the per-section checklist in docs/tuning_system.md says how. Keep
-// sections in derive order (base, mul, div, sqrt, bin_split, series, consts, theta, agm, exp, ln).
+// Every performance knob, declared once (docs/tuning_system.md, "The schema"). build.rs reads
+// this file to generate the accessors, the `resolved::` constants and the live store; the crate
+// reads it at run time for `tuning::get`/`set` and the tuner. Uses only `super::schema_types`.
+// `Interim` knobs are old `mod.rs` constants under their own names. Keep sections in dependency
+// order (base, mul, div, sqrt, bin_split, series, consts, theta, agm, exp, ln).
 
-use super::schema_types::{Alg, DefaultValue, Derivation, Kind, Knob, Range, Section, Threads, Ty};
+use super::schema_types::{Alg, DefaultValue, Kind, Knob, Range, Section, Threads, Ty};
 
 // mul.kara's algorithms: schoolbook, and Karatsuba (chunking for s <= ceil(l / 2), a level above).
 // Karatsuba needs s >= 4: on 3 x 3 a level's cross product is 3 x 3 again.
@@ -17,6 +14,11 @@ const SERIES_SMALL_ALGS: &[Alg] =
     &[Alg { name: "horner", min: 0 }, Alg { name: "rect", min: 0 }, Alg { name: "bin_split", min: 0 }, Alg { name: "model", min: 0 }];
 
 const KARA_ALGS: &[Alg] = &[Alg { name: "school", min: 1 }, Alg { name: "karatsuba", min: 4 }];
+
+// div.dyn_small's and div.dyn_rem_small's picks, in `utils::div::DIV_SMALL_PICKS`' order: the
+// last hands the division to the equations.
+const DIV_SMALL_ALGS: &[Alg] =
+    &[Alg { name: "knuth", min: 0 }, Alg { name: "bz", min: 0 }, Alg { name: "nr", min: 0 }, Alg { name: "model", min: 0 }];
 
 // mul.kara's default: today's is_school_at(l, s, 63, 52.0) exactly, as change points over (s, l)
 // (rows s = 1..64; every row from 64 on is Karatsuba). test_kara_default_is_todays_boundary checks it
@@ -56,26 +58,27 @@ pub const SCHEMA: &[Section] = &[
     },
     Section {
         name: "mul",
-        version: 17,
+        version: 18,
         derive: 10,
         after: &["base"],
         doc: "Multiplication: schoolbook, Karatsuba, FFT and NTT for products, squares, high and \
               middle products and squares mod B^m - 1, and the NTT's parallel gates.",
         knobs: &[
-            // Karatsuba's schoolbook boundary (Phase 2's pilot, derived from the models below).
+            // Karatsuba's schoolbook boundary, measured an index at a time.
             Knob::new(
                 "kara",
                 "",
                 Ty::Table { algs: KARA_ALGS, measure: "short limbs s, long limbs l", inputs: 2 },
                 DefaultValue::Table(KARA_DEFAULT),
             )
-            .kind(Kind::Derived(Derivation::Table))
+            .kind(Kind::Table)
             .doc(
                 "Schoolbook or Karatsuba for an l x s product (l >= s), by change points over \
                  (s, l): Karatsuba's sub-products, its scratch sizing and the product dispatchers' \
-                 schoolbook tier all read it. Derived by comparing mul_buf with one Karatsuba level \
-                 over schoolbook leaves (cargo tune derive). The default is the old is_school \
-                 boundary (chunking_karatsuba 63, karatsuba 52.0).",
+                 schoolbook tier all read it. Measured: mul_buf against karatsuba_entry_dyn at \
+                 each index, a row at a time under the rows before it (tuner/sections/mul.rs, \
+                 kara_table). The default is the old is_school boundary (chunking_karatsuba 63, \
+                 karatsuba 52.0).",
             ),
             // Leaf kernels' cost models (Phase 2's pilot): t = scale W + shift, in ns.
             Knob::f64("school_scale", "SERIES_NS_PRODUCT", 0.3567)
@@ -84,42 +87,29 @@ pub const SCHEMA: &[Section] = &[
             Knob::f64("school_shift", "", 20.4)
                 .kind(Kind::Model { work: "mul_buf's fixed cost" })
                 .doc("ns of mul_buf's fixed cost."),
-            // A Karatsuba level's fitted form (decided 2026-11-09: a mid-range composite keeps its
-            // theoretical form, with constants fitted to its own measured times, where assembling it
-            // from base units misses its real overhead).
-            Knob::f64("kara_scale", "", 1.039)
-                .kind(Kind::Model { work: "karatsuba_core: its three sub-products' predicted time" })
-                .doc("A Karatsuba level's time per ns of its three sub-products' predictions."),
-            Knob::f64("kara_shift", "", 68.67)
-                .kind(Kind::Model { work: "karatsuba_core's fixed cost" })
-                .doc("ns of a Karatsuba level's fixed cost."),
-            // Each fit's relative rms error. A derivation acts on a predicted difference only past
-            // the combined error of the two models it compares, so a model never decides what it
-            // can't resolve.
-            Knob::f64("school_err", "", 0.04)
-                .float_range(0.0, 1.0)
-                .kind(Kind::Model { work: "the mul_buf fit's relative rms residual" })
-                .doc("Relative rms error of mul_buf's model."),
-            Knob::f64("kara_err", "", 0.02)
-                .float_range(0.0, 1.0)
-                .kind(Kind::Model { work: "the Karatsuba level fit's relative rms residual" })
-                .doc("Relative rms error of the Karatsuba level's model."),
-            Knob::f64("chunk_scale", "", 0.8506)
-                .kind(Kind::Model { work: "chunking_karatsuba over schoolbook products: its chunk products' fitted schoolbook time" })
-                .doc("Chunking Karatsuba's fitted form, scale (chunk products) + pass (l + s) + shift: ns per ns of its chunk products."),
-            Knob::f64("chunk_pass", "", 2.532)
-                .kind(Kind::Model { work: "chunking_karatsuba: l + s limbs (clearing out, adding each chunk in)" })
-                .doc("Its ns per operand limb."),
-            Knob::f64("chunk_err", "", 0.03)
-                .float_range(0.0, 1.0)
-                .kind(Kind::Model { work: "that fit's relative rms residual" })
-                .doc("Its fit's relative rms error."),
-            // Recursive Karatsuba and the FFT entries in their fitted forms, each fitted to its own
-            // entry's times. mul_dyn's dispatch compares the product ones per call (`MulEq`:
-            // kara_rec_*, chunk_rec_* and fft_*; since 2026-11-11), so their defaults matter on a
-            // target with no preset: Karatsuba's are the M1's fit (2026-11-11, under the form with
-            // a schoolbook weight), and fft_scale is set so the two cross about where the old
-            // x86-tuned ratio (1.96) put the crossing, near 230 limbs.
+            // hi_mul_buf's own equation: its window's limb products, a term a row or a column, and a
+            // shift, for each of its two kernels.
+            Knob::f64("hi_rows_scale", "", 0.3819)
+                .kind(Kind::Model { work: "hi_mul_buf_by_rows: its limb products, l s - (s - 2)(s - 3) / 2 for a window of l limbs by s" })
+                .doc("ns per limb product of hi_mul_buf's rows kernel."),
+            Knob::f64("hi_rows_row", "", 2.867)
+                .kind(Kind::Model { work: "hi_mul_buf_by_rows: its rows, a limb of the shorter operand each" })
+                .doc("ns per row of hi_mul_buf's rows kernel."),
+            Knob::f64("hi_rows_shift", "", 5.599)
+                .kind(Kind::Model { work: "hi_mul_buf_by_rows' fixed cost" })
+                .doc("ns of the rows kernel's fixed cost."),
+            Knob::f64("hi_cols_scale", "", 0.4562)
+                .kind(Kind::Model { work: "hi_mul_buf_cols: its limb products, l s - (s - 2)(s - 3) / 2 for a window of l limbs by s" })
+                .doc("ns per limb product of hi_mul_buf's columns kernel."),
+            Knob::f64("hi_cols_col", "", 1.54)
+                .kind(Kind::Model { work: "hi_mul_buf_cols: its columns, a limb of the window each" })
+                .doc("ns per column of hi_mul_buf's columns kernel."),
+            Knob::f64("hi_cols_shift", "", 5.874)
+                .kind(Kind::Model { work: "hi_mul_buf_cols' fixed cost" })
+                .doc("ns of the columns kernel's fixed cost."),
+            // Recursive Karatsuba's and the FFT's fitted equations, which mul_dyn compares per call
+            // (`MulEq`). Their defaults matter on a target with no preset: Karatsuba's are the M1's fit, and
+            // fft_scale puts the crossing where the old x86-tuned ratio did, near 230 limbs.
             Knob::f64("kara_rec_scale", "", 1.838)
                 .kind(Kind::Model { work: "karatsuba_entry_dyn, s above half of l: karatsuba_cost(l, s) = l^1.585 - (l - s)^1.585" })
                 .doc("Recursive Karatsuba's fitted form (karatsuba_entry_dyn, s above half of l): ns per unit of karatsuba_cost(l, s) = l^1.585 - (l - s)^1.585."),
@@ -130,31 +120,17 @@ pub const SCHEMA: &[Section] = &[
                      recursion's leaves still do. With the scale it stands where a fitted exponent \
                      stood until 2026-11-11 (the user's decision: every fit linear in its constants).",
                 ),
-            Knob::f64("kara_rec_err", "", 0.03)
-                .float_range(0.0, 1.0)
-                .kind(Kind::Model { work: "that fit's relative rms residual" })
-                .doc("Its fit's relative rms error."),
             Knob::f64("chunk_rec_scale", "", 1.856)
                 .kind(Kind::Model { work: "karatsuba_entry_dyn, s at most half of l (chunking): chunking_karatsuba_cost(l, s) = l s^0.585" })
                 .doc("Recursive Karatsuba's fitted form (karatsuba_entry_dyn, s at most half of l (chunking)): ns per unit of chunking_karatsuba_cost(l, s) = l s^0.585."),
             Knob::f64("chunk_rec_school", "", 0.0275)
                 .kind(Kind::Model { work: "karatsuba_entry_dyn, s at most half of l (chunking): l s limb products" })
                 .doc("Its ns per limb product l s: schoolbook's share of the time, as mul.kara_rec_school."),
-            Knob::f64("chunk_rec_err", "", 0.03)
-                .float_range(0.0, 1.0)
-                .kind(Kind::Model { work: "that fit's relative rms residual" })
-                .doc("Its fit's relative rms error."),
             Knob::f64("fft_scale", "", 0.49)
                 .kind(Kind::Model { work: "fft_entry: fft_transform_work(N) = rho(o) N log2 N at its transform size N" })
                 .doc("fft_entry's ns per unit of transform work."),
-            Knob::f64("fft_err", "", 0.03)
-                .float_range(0.0, 1.0)
-                .kind(Kind::Model { work: "that fit's relative rms residual" })
-                .doc("fft_entry's fit's relative rms error."),
-            // The old boundary's two parameters, which now only scale the static series model's
-            // product work, and is_karatsuba's ratios against the NTT: the static products'
-            // dispatch, swept at N = 8192. (The ratios against the FFT, which no decision had read
-            // since dynamic products took fitted equations, were purged on 2026-11-11.)
+            // The old boundary's two parameters, which only scale the static series model's product work,
+            // and is_karatsuba's ratios against the NTT: the static products' dispatch, swept at N = 8192.
             Knob::usize("chunking_karatsuba", "CHUNKING_KARATSUBA_CUTOFF", 63).doc(
                 "The old is_school's short length for s <= half. Dispatch reads mul.kara now; this \
                  only scales mul_work's chunking tier (the series cost model) until mul_ns \
@@ -248,7 +224,7 @@ pub const SCHEMA: &[Section] = &[
     },
     Section {
         name: "div",
-        version: 8,
+        version: 9,
         derive: 1,
         after: &["base", "mul"],
         doc: "Division and reciprocals: Knuth, Burnikel-Ziegler and Newton-Raphson, with \
@@ -275,19 +251,31 @@ pub const SCHEMA: &[Section] = &[
                 .doc("bz_2_1_cost's scale on d^log2(3) where the block's products are Karatsuba."),
             Knob::f64("bz_2_1_karatsuba_to_fft", "BZ_2_1_KARATSUBA_TO_FFT", 2.733850808)
                 .doc("bz_2_1_cost's scale on d log2^2 d where the block's products are transforms."),
-            Knob::usize("dyn_knuth_d", "", 32)
-                .kind(Kind::Derived(Derivation::Extent))
-                .doc(
-                    "div_dyn takes Knuth without reading its equations at divisors up to this width: \
-                     the widest at which they pick Knuth for every quotient. Computed by the tuner \
-                     from the fitted equations (it times nothing), as mul.kara is for small products.",
-                ),
-            Knob::usize("dyn_rem_knuth_d", "", 64)
-                .kind(Kind::Derived(Derivation::Extent))
-                .doc("div_rem_dyn's counterpart of dyn_knuth_d."),
-            // The dynamic division algorithms' fitted runtime equations (DivEq), compared per call by
-            // div_dyn and div_rem_dyn (2026-11-11). Their defaults are the M1's fit, so a target
-            // with no preset dispatches by them until it is tuned.
+            Knob::new(
+                "dyn_small",
+                "",
+                Ty::Table { algs: DIV_SMALL_ALGS, measure: "divisor limbs d, quotient limbs q", inputs: 2 },
+                DefaultValue::Table(&[1, 1, 0, 33, 1, 3]),
+            )
+            .kind(Kind::Table)
+            .doc(
+                "div_dyn's choice for a division so small that reading its equations would be \
+                 past the tuning system's share of it, by change points over (d, q): Knuth, BZ, \
+                 NR, or the equations. Measured: each algorithm that can take the shape timed \
+                 forced at each index, and the decision beside them (tuner/sections/div.rs, \
+                 small_table). The default keeps Knuth at divisors to 32 limbs and reads the \
+                 equations past them.",
+            ),
+            Knob::new(
+                "dyn_rem_small",
+                "",
+                Ty::Table { algs: DIV_SMALL_ALGS, measure: "divisor limbs d, quotient limbs q", inputs: 2 },
+                DefaultValue::Table(&[1, 1, 0, 65, 1, 3]),
+            )
+            .kind(Kind::Table)
+            .doc("div_rem_dyn's counterpart of dyn_small (the default: Knuth at divisors to 64 limbs)."),
+            // The dynamic division algorithms' fitted equations (`DivEq`), compared per call by div_dyn and
+            // div_rem_dyn. Their defaults are the M1's fit.
             Knob::f64("knuth_ns_qd", "", 0.405)
                 .kind(Kind::Model { work: "Knuth division (div_prepared_dyn forced): q d limb products" })
                 .doc("Knuth's ns per quotient limb times divisor limb."),
@@ -300,14 +288,7 @@ pub const SCHEMA: &[Section] = &[
             Knob::f64("knuth_ns_shift", "", 22.0)
                 .kind(Kind::Model { work: "Knuth division: fixed cost" })
                 .doc("Knuth's fixed cost in ns."),
-            Knob::f64("knuth_ns_err", "", 0.03)
-                .float_range(0.0, 1.0)
-                .kind(Kind::Model { work: "that fit's relative rms residual" })
-                .doc("Knuth's fit's relative rms error."),
-            // NR's products are priced one by one, by tier (DivEq::nr_parts), since 2026-11-10: a
-            // multiple of M(h, h), a full product's price, fitted at 4.2-4.7%. The defaults here
-            // are that form's offline fit to the M1's timings (1.7%; 2.6% held out), not yet a
-            // tuner fit.
+            // NR's products are priced one by one, by tier (`DivEq::nr_parts`).
             Knob::f64("nr_ns_mid_school", "", 2.329)
                 .kind(Kind::Model { work: "NR division, quotient only: its schoolbook middle products, each schoolbook's n x n time (short side below mul.fft_mid)" })
                 .doc("NR's (quotient only) multiple of its schoolbook middle products' predicted time."),
@@ -323,10 +304,6 @@ pub const SCHEMA: &[Section] = &[
             Knob::f64("nr_ns_q", "", 3.231)
                 .kind(Kind::Model { work: "NR division, quotient only: q" })
                 .doc("Its ns per quotient limb."),
-            Knob::f64("nr_ns_err", "", 0.03)
-                .float_range(0.0, 1.0)
-                .kind(Kind::Model { work: "that fit's relative rms residual" })
-                .doc("Its fit's relative rms error."),
             Knob::f64("nr_rem_ns_mid_school", "", 2.096)
                 .kind(Kind::Model { work: "NR division with remainder: its schoolbook middle products" })
                 .doc("NR's (with remainder) multiple of its schoolbook middle products' predicted time."),
@@ -348,15 +325,8 @@ pub const SCHEMA: &[Section] = &[
             Knob::f64("nr_rem_ns_d", "", 1.512)
                 .kind(Kind::Model { work: "NR division with remainder: d" })
                 .doc("Its ns per divisor limb."),
-            Knob::f64("nr_rem_ns_err", "", 0.03)
-                .float_range(0.0, 1.0)
-                .kind(Kind::Model { work: "that fit's relative rms residual" })
-                .doc("Its fit's relative rms error."),
-            // BZ's three constants were predicted (2026-11-10): the M1 was throttling when the
-            // equation changed, so they come from the fit with each timing divided by its shape's
-            // Knuth speed (1.04, 0.99, 0; 3.1% rms). Five tuner fits on the machine at one steady
-            // speed then read 1.044-1.046, 0.981-0.984 and 0 at 2.2-2.4% rms, so the predicted
-            // values stand as defaults (docs/tuning_implementation.md).
+            // BZ's constants: the recurrence over mul's and Knuth's equations is nearly exact (about 1.04
+            // and 0.98 on the M1).
             Knob::f64("bz_ns_block", "", 1.031)
                 .kind(Kind::Model {
                     work: "BZ: its 2/1 blocks, each the recursion's products sum 2^k M(d / 2^k) and its Knuth leaves, and a padded top block by its quotient's significant pieces",
@@ -365,10 +335,6 @@ pub const SCHEMA: &[Section] = &[
             Knob::f64("bz_ns_top", "", 0.9764)
                 .kind(Kind::Model { work: "BZ: a Knuth top block, Knuth's equation at (top, d)" })
                 .doc("BZ's multiple of a Knuth top block's predicted time."),
-            Knob::f64("bz_ns_err", "", 0.031)
-                .float_range(0.0, 1.0)
-                .kind(Kind::Model { work: "that fit's relative rms residual" })
-                .doc("BZ's fit's relative rms error."),
             Knob::usize("dyn_rcp_knuth_nr", "DYN_RCP_KNUTH_NR_CUTOFF", 36).kind(Kind::Sweep)
                 .doc("rcp_dyn is Knuth up to this precision and NR above."),
             Knob::usize("static_div_karatsuba_ntt_nr_bz", "STATIC_DIV_KARATSUBA_NTT_NR_BZ_CUTOFF", 842)
@@ -485,10 +451,10 @@ pub const SCHEMA: &[Section] = &[
     },
     Section {
         name: "series",
-        version: 5,
-        // 3: the small-series table's layout (octave frames, four q buckets, ten kinds; rows of
-        // 16 to a class). A table of another layout would be misread, so it falls through.
-        derive: 3,
+        version: 8,
+        // 5: the small-series table's layout (octave frames, eight kinds, rows of 16 to a kind). A
+        // table of another layout would be misread, so it falls through.
+        derive: 5,
         // The dynamic equations are built on mul's and division's; the static model's mul_work
         // follows mul's dispatch.
         after: &["base", "mul", "div", "bin_split"],
@@ -496,143 +462,96 @@ pub const SCHEMA: &[Section] = &[
               splitting. Dynamic nodes compare fitted runtime equations, one an algorithm: its \
               own parts (SeriesEq over Parts), with products priced by mul's equations and \
               finalize's division by division's (their defaults are the M1's fit). Static \
-              nodes keep the shared ns per unit of work (approximate). Ahead of the equations, \
-              a table for short series (series.small, derived from the series.short_* prices, \
-              which are fitted on the series under its extent, as the main ones are on those \
-              past it), the small ranges that go to Horner without them, and two guards on the shape's \
-              ratios, rho (x's bits over the bits a term fixes) and beta (the exact fraction's \
-              width over the frame). The equations are fitted, and the guards swept, on a \
+              nodes keep the shared ns per unit of work (approximate), and the small ranges \
+              that go to Horner without it. Ahead of the equations, a measured table for the \
+              series short enough that reading them is past the tuning system's share of the \
+              call (series.small), and a guard on one of the shape's ratios, rho (x's bits over \
+              the bits a term fixes), which takes rect outright for a wide x. The equations are \
+              fitted to the series they are read for, and the guard swept, on a \
               synthetic family of series scattered over frame, terms, x's width and the \
               coefficients' size (tuner/synth.rs): the evaluators are general, and nothing here \
               is fitted to a caller's series.",
         knobs: &[
-            Knob::f64("horner_ns_product", "", 1.115)
+            Knob::f64("horner_ns_product", "", 1.034)
                 .kind(Kind::Model { work: "Horner (series_eval_dyn_at forced, the entry's own work taken off): its high products by a multi-limb x, by mul's equations" })
                 .doc("Horner's multiple of its high products' predicted time (x of 3 limbs or more)."),
-            Knob::f64("horner_ns_div1", "", 0.0)
+            Knob::f64("horner_ns_div1", "", 2.987)
                 .kind(Kind::Model { work: "Horner: limbs of div_prim passes" })
                 .doc("Horner's ns per limb of a division by a one-limb Q."),
-            Knob::f64("horner_ns_div2", "", 3.893)
+            Knob::f64("horner_ns_div2", "", 3.891)
                 .kind(Kind::Model { work: "Horner: limbs of div_prim2 passes" })
                 .doc("Horner's ns per limb of a division by a two-limb Q."),
-            Knob::f64("horner_ns_mul1", "", 0.4163)
+            Knob::f64("horner_ns_mul1", "", 0.3928)
                 .kind(Kind::Model { work: "Horner: limbs of mul_prim and add_mul passes" })
                 .doc("Horner's ns per limb of a pass by a one-limb multiplier."),
-            Knob::f64("horner_ns_mul2", "", 1.336)
-                .kind(Kind::Model { work: "Horner: limbs of mul_prim2 passes" })
-                .doc("Horner's ns per limb of a pass by a two-limb multiplier."),
-            Knob::f64("horner_ns_light", "", 0.1322)
+            Knob::f64("horner_ns_light", "", 0.1579)
                 .kind(Kind::Model { work: "Horner: limbs zero-filled or copied" })
                 .doc("Horner's ns per limb zero-filled or copied."),
-            Knob::f64("horner_ns_term", "", 5.963)
+            Knob::f64("horner_ns_term", "", 9.349)
                 .kind(Kind::Model { work: "Horner: terms" })
                 .doc("Horner's ns per term, for its coefficients and weights."),
-            Knob::f64("horner_ns_call", "", 3.642)
+            Knob::f64("horner_ns_call", "", 2.753)
                 .kind(Kind::Model { work: "Horner: calls of its linear kernels" })
                 .doc("Horner's ns per call of a linear kernel."),
-            Knob::f64("rect_ns_product", "", 1.008)
-                .kind(Kind::Model { work: "rect (forced, on Horner's prices for the linear kernels): its powers' and blocks' high products, by mul's equations" })
+            Knob::f64("horner_ns_step", "", 17.82)
+                .kind(Kind::Model { work: "Horner: groups" })
+                .doc("Horner's ns per group: its division's fixed cost and the scan that forms it."),
+            Knob::f64("horner_pass2", "", 3.463)
+                .float_range(1.0, 16.0)
+                .kind(Kind::Model { work: "mul_prim2's ns a limb over mul_prim's, each timed in place over 64-1024 limbs and fitted as a L + c" })
+                .doc("What a limb of a pass by a two-limb multiplier costs in Horner's kernels, in limbs of a pass by a one-limb one: Horner's price for such passes is this times horner_ns_mul1."),
+            Knob::f64("rect_ns_product", "", 1.019)
+                .kind(Kind::Model { work: "rect (forced, on Horner's prices for the kernels they share): its powers' and blocks' high products, by mul's equations (hi_mul_buf's own within mul.dyn_partial_mul limbs)" })
                 .doc("Rect's multiple of its high products' predicted time."),
-            Knob::f64("rect_ns_div1", "", 2.869)
+            Knob::f64("rect_ns_div1", "", 3.404)
                 .kind(Kind::Model { work: "rect: limbs of div_prim passes (its groups end at its blocks, so it makes them in every range; Horner's long series hardly make one)" })
                 .doc("Rect's ns per limb of a division by a one-limb Q."),
-            Knob::f64("rect_ns_call", "", 5.137)
-                .kind(Kind::Model { work: "rect: calls of its linear kernels" })
-                .doc("Rect's ns per call of a linear kernel."),
-            Knob::f64("rect_ns_one", "", 686.1)
+            Knob::f64("rect_ns_add", "", 0.3965)
+                .kind(Kind::Model { work: "rect: limbs of its term adds (each term's weight times its power, an add_mul pass into the frame)" })
+                .doc("Rect's ns per limb of a term's weighted power added into the accumulator."),
+            Knob::f64("rect_ns_term", "", 17.55)
+                .kind(Kind::Model { work: "rect: terms" })
+                .doc("Rect's ns per term, for its coefficients, its weight and its adds' calls."),
+            Knob::f64("rect_ns_one", "", 657.5)
                 .kind(Kind::Model { work: "rect: 1" })
                 .doc("Rect's fixed ns a call (its three scratch acquisitions among it)."),
-            Knob::f64("bin_split_ns_product", "", 1.013)
+            Knob::f64("bin_split_ns_product", "", 1.017)
                 .kind(Kind::Model { work: "binary splitting (forced; trees that split across the pool left out): its merges' and x-leaves' products, by mul's equations" })
                 .doc("Binary splitting's multiple of its products' predicted time."),
-            Knob::f64("bin_split_ns_division", "", 0.9417)
+            Knob::f64("bin_split_ns_division", "", 1.001)
                 .kind(Kind::Model { work: "binary splitting: finalize's division, by division's equations" })
                 .doc("Binary splitting's multiple of finalize's division's predicted time."),
-            Knob::f64("bin_split_ns_div1", "", 1.385)
+            Knob::f64("bin_split_ns_div1", "", 2.371)
                 .kind(Kind::Model { work: "binary splitting: limbs of finalize's div_prim pass (a one-limb Q)" })
                 .doc("Binary splitting's ns per limb of a division by a one-limb Q."),
-            Knob::f64("bin_split_ns_mul2", "", 0.8229)
+            Knob::f64("bin_split_ns_mul2", "", 0.4104)
                 .kind(Kind::Model { work: "binary splitting: limbs of passes by a two-limb multiplier" })
                 .doc("Binary splitting's ns per limb of a pass by a two-limb multiplier."),
-            Knob::f64("bin_split_ns_add", "", 0.2491)
+            Knob::f64("bin_split_ns_add", "", 0.1222)
                 .kind(Kind::Model { work: "binary splitting: limbs added or shifted" })
                 .doc("Binary splitting's ns per limb of an addition or bit shift."),
-            Knob::f64("bin_split_ns_light", "", 0.3143)
+            Knob::f64("bin_split_ns_light", "", 0.1805)
                 .kind(Kind::Model { work: "binary splitting: limbs zero-filled or copied" })
                 .doc("Binary splitting's ns per limb zero-filled or copied."),
-            Knob::f64("bin_split_ns_term", "", 1.431)
+            Knob::f64("bin_split_ns_term", "", 0.9234)
                 .kind(Kind::Model { work: "binary splitting: terms" })
                 .doc("Binary splitting's ns per term."),
-            Knob::f64("bin_split_ns_call", "", 4.435)
+            Knob::f64("bin_split_ns_call", "", 1.920)
                 .kind(Kind::Model { work: "binary splitting: calls of its linear kernels" })
                 .doc("Binary splitting's ns per call of a linear kernel."),
-            Knob::f64("bin_split_ns_alloc", "", 6.506)
+            Knob::f64("bin_split_ns_alloc", "", 21.39)
                 .kind(Kind::Model { work: "binary splitting: allocations" })
                 .doc("Binary splitting's ns per allocation."),
-            Knob::f64("short_horner_ns_product", "", 1.103)
-                .kind(Kind::Model { work: "Horner (series_eval_dyn_at forced, the entry's own work taken off): its high products by a multi-limb x, by mul's equations" })
-                .doc("Short series (the small-series table's derivation only): Horner's multiple of its high products' predicted time (x of 3 limbs or more)."),
-            Knob::f64("short_horner_ns_div1", "", 2.857)
-                .kind(Kind::Model { work: "Horner: limbs of div_prim passes" })
-                .doc("Short series (the small-series table's derivation only): Horner's ns per limb of a division by a one-limb Q."),
-            Knob::f64("short_horner_ns_div2", "", 3.712)
-                .kind(Kind::Model { work: "Horner: limbs of div_prim2 passes" })
-                .doc("Short series (the small-series table's derivation only): Horner's ns per limb of a division by a two-limb Q."),
-            Knob::f64("short_horner_ns_mul1", "", 0.3092)
-                .kind(Kind::Model { work: "Horner: limbs of mul_prim and add_mul passes" })
-                .doc("Short series (the small-series table's derivation only): Horner's ns per limb of a pass by a one-limb multiplier."),
-            Knob::f64("short_horner_ns_mul2", "", 0.6331)
-                .kind(Kind::Model { work: "Horner: limbs of mul_prim2 passes" })
-                .doc("Short series (the small-series table's derivation only): Horner's ns per limb of a pass by a two-limb multiplier."),
-            Knob::f64("short_horner_ns_light", "", 0.2266)
-                .kind(Kind::Model { work: "Horner: limbs zero-filled or copied" })
-                .doc("Short series (the small-series table's derivation only): Horner's ns per limb zero-filled or copied."),
-            Knob::f64("short_horner_ns_term", "", 6.356)
-                .kind(Kind::Model { work: "Horner: terms" })
-                .doc("Short series (the small-series table's derivation only): Horner's ns per term, for its coefficients and weights."),
-            Knob::f64("short_horner_ns_call", "", 3.81)
-                .kind(Kind::Model { work: "Horner: calls of its linear kernels" })
-                .doc("Short series (the small-series table's derivation only): Horner's ns per call of a linear kernel."),
-            Knob::f64("short_rect_ns_product", "", 1.266)
-                .kind(Kind::Model { work: "rect (forced, on Horner's prices for the linear kernels): its powers' and blocks' high products, by mul's equations" })
-                .doc("Short series (the small-series table's derivation only): Rect's multiple of its high products' predicted time."),
-            Knob::f64("short_rect_ns_div1", "", 2.479)
-                .kind(Kind::Model { work: "rect: limbs of div_prim passes (its groups end at its blocks, so it makes them in every range; Horner's long series hardly make one)" })
-                .doc("Short series (the small-series table's derivation only): Rect's ns per limb of a division by a one-limb Q."),
-            Knob::f64("short_rect_ns_call", "", 6.333)
-                .kind(Kind::Model { work: "rect: calls of its linear kernels" })
-                .doc("Short series (the small-series table's derivation only): Rect's ns per call of a linear kernel."),
-            Knob::f64("short_rect_ns_one", "", 151.5)
-                .kind(Kind::Model { work: "rect: 1" })
-                .doc("Short series (the small-series table's derivation only): Rect's fixed ns a call (its three scratch acquisitions among it)."),
-            Knob::f64("short_bin_split_ns_product", "", 1.02)
-                .kind(Kind::Model { work: "binary splitting (forced; trees that split across the pool left out): its merges' and x-leaves' products, by mul's equations" })
-                .doc("Short series (the small-series table's derivation only): Binary splitting's multiple of its products' predicted time."),
-            Knob::f64("short_bin_split_ns_division", "", 0.9191)
-                .kind(Kind::Model { work: "binary splitting: finalize's division, by division's equations" })
-                .doc("Short series (the small-series table's derivation only): Binary splitting's multiple of finalize's division's predicted time."),
-            Knob::f64("short_bin_split_ns_div1", "", 2.728)
-                .kind(Kind::Model { work: "binary splitting: limbs of finalize's div_prim pass (a one-limb Q)" })
-                .doc("Short series (the small-series table's derivation only): Binary splitting's ns per limb of a division by a one-limb Q."),
-            Knob::f64("short_bin_split_ns_mul2", "", 0.7603)
-                .kind(Kind::Model { work: "binary splitting: limbs of passes by a two-limb multiplier" })
-                .doc("Short series (the small-series table's derivation only): Binary splitting's ns per limb of a pass by a two-limb multiplier."),
-            Knob::f64("short_bin_split_ns_add", "", 0.2229)
-                .kind(Kind::Model { work: "binary splitting: limbs added or shifted" })
-                .doc("Short series (the small-series table's derivation only): Binary splitting's ns per limb of an addition or bit shift."),
-            Knob::f64("short_bin_split_ns_light", "", 0.246)
-                .kind(Kind::Model { work: "binary splitting: limbs zero-filled or copied" })
-                .doc("Short series (the small-series table's derivation only): Binary splitting's ns per limb zero-filled or copied."),
-            Knob::f64("short_bin_split_ns_term", "", 1.12)
-                .kind(Kind::Model { work: "binary splitting: terms" })
-                .doc("Short series (the small-series table's derivation only): Binary splitting's ns per term."),
-            Knob::f64("short_bin_split_ns_call", "", 4.019)
-                .kind(Kind::Model { work: "binary splitting: calls of its linear kernels" })
-                .doc("Short series (the small-series table's derivation only): Binary splitting's ns per call of a linear kernel."),
-            Knob::f64("short_bin_split_ns_alloc", "", 6.346)
-                .kind(Kind::Model { work: "binary splitting: allocations" })
-                .doc("Short series (the small-series table's derivation only): Binary splitting's ns per allocation."),
-            Knob::f64("bin_split_par_gain", "", 0.3)
+            Knob::f64("bin_split_ns_div2", "", 8.089)
+                .kind(Kind::Model { work: "binary splitting: finalize's division by a two-limb Q, a quotient limb" })
+                .doc("Binary splitting's ns per quotient limb of a division by a two-limb Q."),
+            Knob::f64("bin_split_ns_mul1", "", 0.2777)
+                .kind(Kind::Model { work: "binary splitting: limbs of passes by a one-limb multiplier" })
+                .doc("Binary splitting's ns per limb of a pass by a one-limb multiplier."),
+            Knob::f64("bin_split_ns_step", "", 9.086)
+                .kind(Kind::Model { work: "binary splitting: an x-leaf's terms" })
+                .doc("Binary splitting's ns per term of an x-leaf."),
+            Knob::f64("bin_split_par_gain", "", 0.5000)
                 .kind(Kind::Model { work: "trees that split across the pool: the gain under which the serial trees' prices predict them best" })
                 .threads(Threads::Pool)
                 .valid(Range::Float { min: 0.0, max: 1.0 })
@@ -651,26 +570,21 @@ pub const SCHEMA: &[Section] = &[
             Knob::new(
                 "small",
                 "",
-                Ty::Table { algs: SERIES_SMALL_ALGS, measure: "class x 16 + the frame's bucket, terms", inputs: 2 },
+                Ty::Table { algs: SERIES_SMALL_ALGS, measure: "kind x 16 + the frame's bucket, terms", inputs: 2 },
                 DefaultValue::Table(&[0, 0, 3]),
             )
-            .kind(Kind::Derived(Derivation::Table))
+            .kind(Kind::Table)
             .doc(
                 "Dynamic nodes: what a short series runs, read ahead of everything else, by \
-                 change points over (class x 16 + the frame's bucket, terms): Horner, rect, binary \
-                 splitting, or the equations (every cell past the table's extent). A bucket is \
-                 the octave of the frame's limbs; a class is the kind and x's width, q's size \
-                 and whether r is past 1 (utils::series::small_class). Derived from the equations at each class's representative shape \
-                 (cargo tune derive), so a short series reads no equation: evaluating them \
-                 costs as much as a series under a microsecond does. The default hands every \
-                 range to the equations.",
-            ),
-            Knob::f64("bin_split_beta", "", 8.0).kind(Kind::Sweep).threads(Threads::Pool).doc(
-                "Dynamic nodes: binary splitting isn't predicted, or taken, where its tree's \
-                 width (P's limbs) passes this many frames and another algorithm can sum the \
-                 range. Its numbers are the exact fraction's, so past a few frames it loses in \
-                 proportion (2-3x at 3 to 9 frames, 30-60x past 64 on the M1). A value no shape \
-                 reaches (the sweep's last candidate, 1e9) turns the guard off.",
+                 change points over (kind x 16 + the frame's bucket, terms): Horner, rect, binary \
+                 splitting, or the equations (every index where reading them is within the \
+                 tuning system's share of the call). A bucket is the octave of the frame's \
+                 limbs; a kind is the family and x's width, eight of them \
+                 (utils::series::small_class). Measured: at each index a spread of synthetic \
+                 series of the kind is timed under every algorithm that can sum each, with the \
+                 decision beside them, and the cell is the pick that costs them least together \
+                 (tuner/sections/series.rs, small_table). The default hands every range to the \
+                 equations.",
             ),
             Knob::f64("rect_rho", "", 32.0).kind(Kind::Sweep).doc(
                 "Dynamic nodes: rect is taken without the equations, at its balance block \

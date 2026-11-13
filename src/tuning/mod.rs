@@ -1,17 +1,11 @@
-//! Performance knobs: the cutoffs, cost-model coefficients and parallel gates that choose among
-//! correct algorithms (docs/tuning_system.md). Every knob is declared once in `schema.rs`;
-//! build.rs generates, per knob, an accessor `k::<section>::<knob>()` and a constant
-//! `resolved::<section>::<KNOB>`.
-//!
-//! - In a normal build an accessor is a `const fn` returning the resolved value, so it compiles
-//!   to the same code as the `pub const` it replaced (invariant 4).
-//! - With the `tune` feature it reads a live cell that `set`/`apply` change between calls
-//!   (invariant 5: never while a library call runs). It is then not a `const fn`, so code that
-//!   needs a knob in a const context (an array length, a const generic) reads `resolved::`
-//!   instead, and only tests may do that: `src/utils` always reads accessors, or live values
-//!   would be bypassed.
-//!
-//! Everything here is doc-hidden and unstable until Phase 3.
+//! Performance knobs: the cutoffs, runtime-equation constants and parallel gates that choose
+//! among correct algorithms (docs/tuning_system.md). Every knob is declared once in `schema.rs`;
+//! build.rs generates an accessor `k::<section>::<knob>()` and a constant
+//! `resolved::<section>::<KNOB>` for each. In a normal build an accessor is a `const fn`
+//! returning the resolved value. With the `tune` feature it reads a live cell that `set`/`apply`
+//! change between calls (never while a library call runs); code that needs a knob in a const
+//! context reads `resolved::`, and only tests may: `src/utils` always reads accessors.
+//! Doc-hidden and unstable until Phase 3.
 
 pub mod file;
 pub mod hash;
@@ -127,9 +121,8 @@ pub fn parse_spec(spec: &str) -> Result<Vec<(usize, Value)>, KnobError> {
     Ok(out)
 }
 
-/// Sets the live value of the knob at `path`, after checking its type and valid range. A table is
-/// leaked: the tuner sets tables a few thousand times at most, and readers may still hold the
-/// old slice.
+/// Sets the live value of the knob at `path`, after checking its type and valid range. A table
+/// is leaked: readers may still hold the old slice.
 #[cfg(feature = "tune")]
 pub fn set(path: &str, v: Value) -> Result<(), KnobError> {
     prepare(path, &v).map(install)
@@ -178,9 +171,8 @@ pub fn cli() {
     tuner::cli()
 }
 
-/// A knob value made ready to install with one store: `prepare` looks its path up, and leaks a
-/// copy of a table, on every call, so code that switches between values many times (the tuner's
-/// interleaved comparisons) prepares each once.
+/// A knob value ready to install with one store. `prepare` looks its path up (and leaks a copy
+/// of a table) on every call, so code that switches between values many times prepares each once.
 #[cfg(feature = "tune")]
 #[derive(Clone, Copy)]
 pub enum Handle {

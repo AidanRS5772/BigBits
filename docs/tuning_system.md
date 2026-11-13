@@ -181,9 +181,11 @@ by hand.
   [Derivations](#derivations)).
 - **Dispatcher.** A place that chooses among algorithms: `mul_dyn`, the division entries,
   Karatsuba's choice for its sub-products, and so on. At or above its *extent* it compares the
-  algorithms' predictions on every call. Below the extent it reads its *table*: change points,
-  derived from the same predictions, that say which algorithm has the least prediction at each
-  small shape. See [Dispatch](#dispatch).
+  algorithms' predictions on every call. Below the extent it reads its *table*: change points
+  that say which algorithm to run at each small shape (derived from the same predictions in
+  this plan; measured since 2026-11-12, at every index where reading the predictions would
+  cost more than 5% of the call: revision note 16 under "How knobs are tuned"). See
+  [Dispatch](#dispatch).
 - **Leaf kernel.** Code whose cost is its own inner loop: `mul_buf`, `sqr_buf`, `hi_mul_buf`,
   `hi_sqr_buf`, `mid_mul_buf`, the FFT and NTT transforms, Knuth division, the binomial root, and
   the base primitives. Each has a cost model.
@@ -330,7 +332,7 @@ presets/                       (Phase 2) tuning files checked into the repositor
   aarch64-macos.toml
 src/tuning/
   mod.rs                       include!(concat!(env!("OUT_DIR"), "/tuning.rs")); the public tune API
-  schema_types.rs              Section, Knob, Ty, Range, DefaultValue, Kind, Derivation, Threads (plain data)
+  schema_types.rs              Section, Knob, Ty, Range, DefaultValue, Kind, Threads (plain data; `Derivation` went on 2026-11-13)
   schema.rs                    pub const SCHEMA: &[Section] = &[...]  (the only place knobs are declared)
   hash.rs                      FNV-1a over a section's canonical values (shared with build.rs)
   file.rs                      the tuning-file subset parser and writer (shared with build.rs)
@@ -339,7 +341,8 @@ src/tuning/
   measure.rs                   batched, interleaved timing of forced entries; a median per shape
   fit.rs                       weighted non-negative least squares on relative error; lack-of-fit report
   sweep.rs                     crossovers between two code paths of one kernel
-  derive.rs                    the derivation types (table, extent, parallel gate, balance point, …)
+  derive.rs                    the derivation types (table, extent, parallel gate, balance point, …); gone 2026-11-12
+  tables.rs, dispatch.rs       (as built) the one rule every dispatch table is measured by, and its check
   sections/{base,mul,div,sqrt,bin_split,series,consts}.rs   each section's kernels, shapes and derivations
 src/utils/*.rs                 work functions and runtime predictors, next to their algorithms
 src/tests/test_tuning.rs       schema checks; the random-knob correctness test (`tune` feature)
@@ -644,6 +647,10 @@ list [SECTION]               knobs, kinds, valid and search ranges, resolved and
 check [SECTION ...]          random-knob correctness smoke test; no timing
 ```
 
+As built, `derive` is gone (2026-11-12, revision note 16 under "How knobs are tuned"): nothing is
+derived, a table is measured by `tune SECTION --tables`, and `dispatch` checks the rule that
+says where a dispatcher has one. CLAUDE.md's "Commands" lists the commands as they are.
+
 `--resume` makes long tunes safe to interrupt. Each section is written to `--out` as soon as it
 finishes, so a stopped run loses at most the section that was in progress. Every run ends with a
 derive, even a stopped one, so the file's derived knobs always match its measured ones.
@@ -662,8 +669,9 @@ derive, even a stopped one, so the file's derived knobs always match its measure
 > 2. **More than one input: fitted runtime equations.** For a dispatcher over two or more inputs
 >    (products, divisions), each algorithm gets a runtime equation in its theoretical form, with
 >    constants fitted to that algorithm's own measured times over a grid of shapes. Dispatch
->    compares the fitted equations (per call for large inputs; as a table computed from them for
->    small ones).
+>    compares the fitted equations per call, and reads a table where that would cost more than
+>    5% of the call (a measured table since 2026-11-12, item 16; computed from the equations
+>    until then).
 > 3. **No purely derived runtimes.** An algorithm's equation may depend on another's (a Karatsuba
 >    level's includes its sub-products' fitted schoolbook time), but its constants are always
 >    fitted to its own measurements, never assembled from base units alone.
@@ -690,8 +698,10 @@ derive, even a stopped one, so the file's derived knobs always match its measure
 >    `base`'s cost units (`pass`, `call`, `mul_pass`, `div_pass`, `div_setup`, `alloc`, `fill`,
 >    `rayon_wake`, `rayon_task`, `thread`, `eval`), the schoolbook-square and Karatsuba-square
 >    level fits, `model.rs`, `dispatch.rs`, `threads.rs` and `DeriveCost`/`RuntimeCost`. Every
->    mention of them below is historical. Chunking Karatsuba, which alone read `base`, has its
->    own fit (`mul.chunk_*`).
+>    mention of them below is historical. Chunking Karatsuba, which alone read `base`, had its
+>    own fit (`mul.chunk_*`) until 2026-11-12, when it went with the Karatsuba level's
+>    (`mul.kara_{scale,shift,err}`): both were read only to derive `mul.kara`, which is
+>    measured now (item 16).
 > 8. **Parallel algorithms (2026-11-10).** A tune runs at the thread count the code will be used
 >    at (users will be told to do so). The tuner finds each thread-dependent value twice, serial
 >    and fully parallel, and the library chooses between the two sets at run time. Parallel gates
@@ -738,7 +748,9 @@ derive, even a stopped one, so the file's derived knobs always match its measure
 >    than the gate's allowance (3% quick, 2% normal, 1% thorough: `Level::gate`, the user's
 >    numbers, set wider than the sweeps' tie band so that noise from one tune to the next
 >    doesn't reject a section), with a 95% interval that excludes 1, or an exact output differs,
->    the section is dropped: its values and the file go back, and the summary says so. A single
+>    the section is dropped: its values and the file go back, and the summary says so. A
+>    section whose values came out the ones before it isn't timed (since 2026-11-13: the two
+>    sides would be the same values, and the comparison noise). A single
 >    workload more than 2% slower is listed and never drops anything. A tune therefore can't
 >    leave a machine's workloads more than that allowance slower, on average, than it found them. `cargo tune check` runs the same
 >    comparison for a file against the layers below it. A rejected fit is still written, marked
@@ -771,11 +783,93 @@ derive, even a stopped one, so the file's derived knobs always match its measure
 >    (item 9). `mul.fft_karatsuba` and `mul.fft_chunking_karatsuba`, read by no decision since,
 >    were purged with mul's version 17 on 2026-11-11.
 >
+> 16. **A dispatcher's table is measured, and one rule says where it has one (2026-11-12, the
+>    user's decisions).** "The table should be reworked and derived from actual measurments at
+>    each index size instead of the table being derived from the fits. This should be the case
+>    across the board", and "if dispatch is more then 5% of runtime at that size then use a
+>    table. This should be enforced system wide."
+>    - *The rule.* Where reading a dispatcher's fitted equations would cost more than
+>      `tables::SHARE` (5%) of the call, the dispatcher reads a table; past that it reads the
+>      equations. The share is one constant for every dispatcher, and the user's to move ("If
+>      the 5% rule creates exsesively large tables then we can revaluate it to be larger"):
+>      `--share X` runs a tune, the check or the series report under another number, and every
+>      table's evidence gives its size at the shares above its own, from the same timings.
+>    - *The table.* At every index of its grid, each algorithm that can take the shape is
+>      timed, forced, and the dispatcher's decision is timed beside them at explicit knobs
+>      (`tuner/tables.rs`: `Cell`, `row`, `measure`; one builder for every table, a `Spec` a
+>      table). A cell is the fastest algorithm (a pick stays within the tie band; one cell
+>      between two of another pick is dropped), and a row ends at the first index where the
+>      decision is within the share of the fastest algorithm's time. A step of a coarse grid
+>      is read at the shortest call it stands for. So an extent is nothing chosen or
+>      predicted: it is where the measured decision stops costing too much. A row may stand
+>      for several kinds of call (the series' table: a kind of series, timed on a spread of
+>      them): its cell is then the pick that costs them least together, and reading the
+>      equations is one of the picks, taken where no one algorithm serves the kind.
+>    - *Enforced.* `dispatch::TABLES` is the list of every dispatcher that reads fitted
+>      equations at run time, each with its table: `mul_dyn` and `mul.kara`, `div_dyn` and
+>      `div.dyn_small`, `div_rem_dyn` and `div.dyn_rem_small`, the series' entry and
+>      `series.small`. `cargo tune dispatch`, and the end of every tune, times the decision
+>      against the entry's call on indices where the equations are read and names any past the
+>      share (non-zero exit past 1.25 times it); `test_every_table_is_a_dispatchers` holds the
+>      schema's table knobs to the list and requires that no knob is derived.
+>    - *What it replaced.* `Kind::Table` is a measured kind (part of its section's hash; a
+>      file's table of an older layout falls through with the section's `derive` number).
+>      Gone: `tuner/derive.rs` and `cargo tune derive`; the Karatsuba level's and chunking's
+>      fits; division's Knuth guards `div.dyn_knuth_d` and `div.dyn_rem_knuth_d` (a table with
+>      one row is what they were); the series' short prices `series.short_*`, the fit a
+>      regime, and `horner_first` for dynamic nodes. The series' equations are fitted on the
+>      series they are read for: those whose timed decision is within the share. Numbers:
+>      `docs/tuning_implementation.md`, "Tables measured, under one rule".
+>    - *A fit takes the shapes its equation is read for* (the user's rule, later the same
+>      day). A dispatcher's equations are not read where its table names an algorithm, so a
+>      tune fits them twice from one set of timings: once to measure the tables under, then
+>      on what the tables leave (`sections::div::tune_late`, `sections::series::tune_late`,
+>      `Rows`; mul's Karatsuba and FFT fits already follow `mul.kara` and skip what it gives
+>      to schoolbook). Equations that are prices inside other equations at any size
+>      (schoolbook's product, `hi_mul_buf`'s, Knuth's division) keep every shape. It moved no
+>      fit by more than half a point: same log entry, "A fit takes the shapes its equation is
+>      read for".
+>    - *What it costs, and what was tried.* An index just past a table pays up to the share
+>      for its decision where a rule computed from the equations paid nothing: division's
+>      Knuth guards, which the user gave up for the one rule's sake. The series' table is
+>      rows by kind (the family and x's width, eight) and the octave of the frame, over the
+>      terms: the user's layout, a ninth the size of the 72 classes it was first measured on.
+>      An index on the theory's two ratios and a size was scored at the user's request and
+>      lost 10% at every grain: short series follow their fixed costs, which follow the raw
+>      sizes, and rho is 0 for the half of them with no x.
+>    - *The series' fits under the line, and one guard fewer* (2026-11-13; the user: "try
+>      find an alternative form for the fit for horners and binary spliting so that both fall
+>      in the 5% hold out rms threshold", then "implement the new fit" and "if the beta gaurd
+>      is causing a slow down remove it and rely purely on the table and the fired
+>      equations"). Horner's and binary splitting's equations had read 6.2% and 7.5% held out
+>      on the series the rule gives them. Fitting the times to the kernels' own counts said
+>      which was wrong: Horner's form (a price a kernel call, every call alike: now a price a
+>      group and the calls of a term's own step) and two of its counts; binary splitting's
+>      form alone (no price for its one-limb passes, for finalize by a two-limb Q, or for an
+>      x-leaf's term). In the preset: 3.3%, 2.8% (rect) and 3.6%, and under the line at the
+>      quick and normal levels too, which a form is now tuned at before it is called sound (a
+>      price few series exercise passes or fails by the held-out split: Horner's two-limb
+>      pass is priced by the kernels' ratio to the one-limb one for that reason). The guard
+>      on beta, which kept binary splitting from being predicted past 8 frames of tree, was
+>      barring it where the fitted equation was right, and is gone: the table and the
+>      equations decide. `docs/tuning_implementation.md`, "Horner's and binary splitting's
+>      equations under the line, and the beta guard gone".
+>    - *Leftovers cleared* (2026-11-13, later). `Kind::Derived`, `Derivation` and the tuning
+>      file's `pinned` key are gone from the code: no knob had been derived since the tables
+>      became measured, so every knob is measured and in its section's hash, and a section's
+>      `derive` number is only its table's layout. The fits' `*_err` knobs are gone too (each
+>      fit's rms, which only the derived tables' margins read; it is in the evidence of the
+>      fit's constants). What the text below says of derived knobs, `pinned`, `--unpin` and
+>      `_err` is the plan's history. Same log entry, "The tuner's leftovers cleared, and a full
+>      retune".
+>
 > What stays from the text below: fixed constants, the fit on relative error, fitting only where
 > an algorithm competes, levels and budgets, evidence in the tuning file, and the end-to-end check
 > of every decision. What goes: "composites have no measured values", the 39 measured / 66 derived
 > split, and derivations of tables, extents, gates and balance points from predictions alone.
-> Gates and balance points are one-input decisions, so they are sweeps.
+> Gates and balance points are one-input decisions, so they are sweeps; tables and their extents
+> are measured (item 16), and the `derive` command, derive runs and "derived" notes in the text
+> below are history.
 
 The method has one rule: **measure only what can't be computed.** Every value is one of three
 things:
@@ -927,7 +1021,9 @@ A dispatcher has two regions, split at its *extent*:
   `is_karatsuba`'s ratio, `DivCutoffs`) go away.
 - **Below the extent, it reads a table.** Here evaluating predictions would cost too much of the
   call. The table is derived from the same predictions: the algorithm with the least prediction
-  at every shape below the extent, stored as change points.
+  at every shape below the extent, stored as change points. (As built since 2026-11-12: the
+  table is measured, the fastest algorithm timed at each index, and "too much" is 5% of the
+  call, timed too; revision note 16 under "How knobs are tuned".)
   - A one-input table is a short list of sizes, usually one, which is what today's cutoff is.
   - A two-input table has one short list per value of the shorter input, and the extent bounds its
     rows. Tables cover only small inputs. No dispatcher tabulates large ones.
@@ -1233,13 +1329,15 @@ Phase 1 migrated 2026-11-08: `base.prim_adx` and `base.limb_adx` (x86_64 only; t
 
 Phase 2 so far (2026-11-10): measured `mul.school_{scale,row,shift,err}`, `mul.school_sqr_{scale,row,shift,err}`, `mul.kara_{scale,pass,shift,err}` and `mul.kara_sqr_{scale,pass,shift,err}` (the Karatsuba levels are fitted forms, decision 7; the `_err` knobs are each fit's relative rms, used as decision margins); derived `mul.kara` (a two-input table, read by `is_school`) and `mul.karatsuba_sqr`. The names differ from the proposal below where the implementation settled them. The other interim knobs remain.
 
+Since 2026-11-12 (mul version 18, revision note 16): `mul.kara` is a measured table (`Kind::Table`; `sections::mul::kara_table`: `mul_buf` against `karatsuba_entry_dyn` at every index, a row at a time, each step under the rows before it), and the fits it was derived from, `mul.kara_{scale,shift,err}` and `mul.chunk_{scale,pass,err}`, are gone. `mul_dyn` reads its two equations past the table for under 5% of a product at every index tried (`cargo tune dispatch`).
+
 Phase 1 migrated 2026-11-08: the 22 interim knobs `mul.<old name, lowercased, without _CUTOFF>` (`mul.ntt_par_radix3` and `_radix5` for the radix gates, `mul.sqr_bnm1_fft` a `Follows` of `mul.fft_sqr`). The random-knob test found `is_school_at`'s parabola cancelling catastrophically for large c; it is computed as `1.5 l − l²/(2c)` now (same boundaries at practical c), and `mul.karatsuba` ≥ 3.
 
 | Knob | Today | Kind | Work | Notes |
 |---|---|---|---|---|
 | `mul.school_{scale,shift}` | — | Model | `mul_buf`: l·s limb products | scale defaults to `SERIES_NS_PRODUCT` |
 | `mul.school_sqr_{scale,shift}` | — | Model | `sqr_buf`: n(n+1)/2 | |
-| `mul.hi_school_{scale,shift}` | — | Model | `hi_mul_buf`: the window's column products plus guard columns | columns or rows per `mul.hi_mul_rows` |
+| `mul.hi_rows_{scale,row,shift}`, `mul.hi_cols_{scale,col,shift}` | — | Model | `hi_mul_buf`: the window's column products plus its two guard columns, l s - (s - 2)(s - 3) / 2, with a term a row (rows kernel) or a column (columns kernel) | built 2026-11-12 as `HiEq` (planned here as `mul.hi_school_{scale,shift}`): one equation a kernel, as the two differ in what their fixed cost attaches to; read by the series' equations |
 | `mul.hi_school_sqr_{scale,shift}` | — | Model | `hi_sqr_buf` | |
 | `mul.mid_school_{scale,shift}` | — | Model | `mid_mul_buf`: n² | |
 | `mul.fft_{scale,shift}`, `mul.fft_point` | — | Model | one real transform, ρ(o)·N·log2 N at the actual N; per-point passes (decompose, pointwise product, rounding, accumulate) | shared by the product, square, middle-product and cyclic-square entries; ρ(o) is the fixed per-architecture `FFT_ODD_COST` |
@@ -1278,6 +1376,8 @@ Phase 1 migrated 2026-11-08: 19 interim knobs, `div.<old name, lowercased, witho
 | `div.bz_leaf` | dispatcher (d) | Knuth, a BZ level | `BZ_CUTOFF` | BZ's recursion |
 | `div.bz_top` | dispatcher (d, q) | the top block by Knuth, BZ's padded 2/1 block | `BZ_TOP_PADDED_COST_SCALE`; `SCHOOL_TO_KARATSUBA` and `KARATSUBA_TO_FFT` in `bz_2_1_cost` | the hidden constants go away with `bz_2_1_cost` (Phase 0 moves them to `mod.rs` until then) |
 | `div.rcp_dyn`, `div.rcp_static` | dispatcher (R) | Knuth, NR | `DYN_RCP_KNUTH_NR_CUTOFF`, `STATIC_RCP_KNUTH_NR_CUTOFF` | |
+
+**As built (revision notes 10 and 16):** the dynamic quotient entries compare fitted equations (`DivEq`), and since 2026-11-12 (div version 9) read a measured table first where those cost more than 5% of the division: `div.dyn_small` and `div.dyn_rem_small` (`Kind::Table`, rows by the divisor's limbs, change points over the quotient's, a cell Knuth, BZ, NR or "the equations"; `sections::div::small_table`). They replace `div.dyn_knuth_d` and `div.dyn_rem_knuth_d`, the widest divisor at which the equations picked Knuth for every quotient, which were computed from the equations. A shape only Knuth can take reads neither.
 
 ### Section `sqrt` (2 model knobs, 9 derived; upstream: base, mul, div)
 
@@ -1330,18 +1430,47 @@ factorial's, and BBP's two) scattered over frame, terms and x's width, each algo
 competes; and the dispatch has two guards ahead of the equations, on the shape's ratios rho
 (x's bits over the bits a term fixes) and beta (the exact fraction's width over the frame):
 `series.bin_split_beta`, `series.rect_rho` and `series.rect_x_limbs`, Sweep knobs measured
-through the entry itself on series of 50 us and more. The constants that went on 2026-11-11
+through the entry itself on series of 50 us and more (the guard on beta went on 2026-11-13:
+below). The constants that went on 2026-11-11
 (`horner_ns_one`, `bin_split_ns_mul1`) are not in the lists above any more. The log is in
 `docs/tuning_implementation.md`, "Built: the series tuned as general evaluators". And a short
-series reads no equation: `series.small` (Derived, a table like `mul.kara`) holds what to run
-by (class x 16 + the frame's bucket, terms), derived from the equations at each class's
-representative shape out to where they put a series past 20 us ("The small-series table" in the
-same file; its layout was cut to 2602 change points on 2026-11-12: octave frames, four q
-buckets, ten kinds); `cargo tune derive` rederives it (`cargo tune derive --file FILE series`
-for it alone). Since 2026-11-12 the prices are two sets: `series.{horner,rect,bin_split}_ns_*`,
-fitted on the series past the table's extent (where the dispatch reads the equations), and
-`series.short_{horner,rect,bin_split}_ns_*`, fitted on those under it and read only by the
-table's derivation; rect has `rect_ns_div1`, its own price for one-limb divisions.
+series reads no equation: `series.small` (a table like `mul.kara`) holds what to run by
+(class x 16 + the frame's bucket, terms). Rect has `rect_ns_div1`, its own price for one-limb
+divisions; on 2026-11-12 (series version 6) rect's counts were read against counters in its
+kernel and corrected, and its own prices became `rect_ns_{product,div1,add,term,one}` (its term
+adds are its own kernel's passes, and a price a term takes the place of its price a call); high
+products within `mul.dyn_partial_mul` limbs are priced by `hi_mul_buf`'s own equation in mul's
+section, for Horner as for rect (`docs/tuning_implementation.md`, "Rect's counts read against
+the kernel, and hi_mul_buf's own equation").
+
+**Since later on 2026-11-12 (series version 7, revision note 16): the table is measured.**
+`series.small` is `Kind::Table`, by (kind x 16 + the frame's bucket, terms), a kind being the
+family and x's width (eight; the layout's number is the section's `derive`, 5): for every kind
+and octave of frames, over the terms, a spread of synthetic series of the kind is timed under
+each algorithm that can sum each, forced, with the decision beside them; a cell is the pick that
+costs them least together (reading the equations among the picks), and a row ends where the
+decision is within 5% of every one of them (`sections::series::small_table`). Until then it was derived from equations fitted to short
+series (`series.short_{horner,rect,bin_split}_ns_*`, 22 constants, gone with the fit a regime
+and with `cargo tune derive`), at each class's representative shape and out to where they put a
+series past 20 us. There is one set of prices again, fitted on the series the equations are
+read for (the timed decision within the share), and `horner_first`'s two knobs are read by
+static nodes only. "Tables measured, under one rule" in `docs/tuning_implementation.md` has the
+numbers.
+
+**Since 2026-11-13 (series version 8, revision note 16's last item): the forms that fit.**
+Horner's prices are `series.horner_ns_{product,div1,div2,mul1,light,term,call,step}`: `step` is
+a group (its division's fixed cost), `call` counts what a term's own step does besides its add
+(three for a step by a one-limb x, one by a wider x, one for BBP), and a pass by a two-limb
+multiplier is priced at `series.horner_pass2` times `mul1`: the ratio of `mul_prim2`'s ns a limb
+to `mul_prim`'s, a Model knob the section's tune measures on the two kernels (3.46 on the M1),
+with no fitted price of its own. Binary splitting's are
+`series.bin_split_ns_{product,division,div1,div2,mul1,mul2,add,light,term,call,alloc,step}`:
+`div2` is finalize's division by a two-limb Q, a quotient limb (`div1` by a one-limb one;
+division's own equations from three), `mul1` is back, and `step` is a term of an x-leaf. Rect's
+five are as they were, on Horner's prices for the kernels they share. `series.bin_split_beta`
+is gone with its guard: `series.rect_rho` and `series.rect_x_limbs` are the dispatch's one
+guard, and binary splitting's equation is read, and fitted, at any beta. The equations' columns
+are `Parts`' thirteen (`Parts::N`).
 
 | Knob | Today | Kind | Work | Notes |
 |---|---|---|---|---|
@@ -1807,8 +1936,9 @@ Decide each of these where it first matters, and record the answer here.
 4. **Cache levels (2026-11-08).** Not modeled. One cost model per kernel, fitted only where the
    kernel competes.
 5. **Two-dimensional boundaries (2026-11-08).** Large inputs compare cost models at run time.
-   Lookup tables are kept to small inputs, where comparing models wouldn't amortize, and an extent
-   per dispatcher bounds them. The same rule applies to one-input decisions, whose tables are a
+   Lookup tables are kept to small inputs, where comparing models wouldn't amortize (since
+   2026-11-12: where it would cost more than 5% of the call, and the tables are measured:
+   revision note 16 under "How knobs are tuned"), and an extent per dispatcher bounds them. The same rule applies to one-input decisions, whose tables are a
    few change points each. Today's boundary forms (`is_school_at`, `is_karatsuba`, `DivCutoffs`)
    retire in Phase 2. See [Dispatch](#dispatch).
 8. **Sweeps for one input, fitted equations for several (2026-11-10).** See the note at the top

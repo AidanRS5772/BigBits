@@ -1,41 +1,150 @@
-//! Section `mul`'s measurements (the pilot, docs/tuning_implementation.md P2.3): the schoolbook
-//! kernels' cost models and the Karatsuba level's fitted form, each fitted where it competes, on
-//! shapes scattered over that area (`design::products`) and judged on the half held out.
+//! Section `mul`: the schoolbook kernels' equations (the full product's, the high product's
+//! two), fitted where each competes; `mul.kara`, the schoolbook-against-Karatsuba table,
+//! measured (`kara_table`); and under it recursive Karatsuba's and the FFT's equations, which
+//! `mul_dyn` compares past the table, with the one-input cutoffs as sweeps (`tune_late`).
 
 use crate::tuning::resolve::Value;
-use crate::tuning::tuner::derive::{chunk_products, level_products, school_with};
 use crate::tuning::tuner::design::{products, Design};
-use crate::tuning::tuner::fit::{analyze, fit_split, Fit};
-use crate::tuning::tuner::measure::{pad, time_fit, time_min, Level, Probe};
+use crate::tuning::tuner::fit::fit_named;
+use crate::tuning::tuner::measure::{pad, time_fit, time_min, Level, PadBuf, Probe};
 use crate::tuning::tuner::out::{push_fit, Tuned};
-use crate::tuning::tuner::sweep::{cutoff_sweep, dense_around, geo, ints, keep, keep_or_take, lost, pairs, sweep_cutoff};
+use crate::tuning::tuner::sweep::{cutoff_sweep, dense_around, geo, geo_to, ints, keep, keep_or_take, lost, pairs, sweep_cutoff};
+use crate::tuning::tuner::tables::{self, Plan, Row, Spec};
 use crate::utils::mul::{
-    chunking_karatsuba, chunking_karatsuba_cost, karatsuba_entry_static, karatsuba_sqr_entry_static, ntt_entry_static,
-    ntt_sqr_entry_static, fft_entry, fft_mul_size, fft_sqr_entry, fft_transform_work, karatsuba_core,
-    karatsuba_cost, karatsuba_entry_dyn, karatsuba_sqr_core, karatsuba_sqr_entry_dyn, mul_buf, sqr_buf,
+    chunking_karatsuba_cost, karatsuba_entry_static, karatsuba_sqr_entry_static, ntt_entry_static, ntt_sqr_entry_static, fft_entry,
+    fft_mul_size, fft_sqr_entry, fft_transform_work, hi_mul_buf_by_rows, hi_mul_buf_cols, hi_window_products, karatsuba_cost,
+    karatsuba_entry_dyn, karatsuba_sqr_core, karatsuba_sqr_entry_dyn, mul_buf, school_at, sqr_buf,
 };
 use std::hint::black_box;
 
 type Mul = fn(&[u64], &[u64], &mut [u64]) -> u64;
 type Sqr = fn(&[u64], &mut [u64]) -> u64;
+// A middle product: long[2n - 1] by short[n] into out[n].
+type Mid = fn(&[u64], &[u64], &mut [u64]) -> (u64, u64);
 
-// `mul.kara` with every shape on schoolbook, so a Karatsuba level's sub-products are leaves.
-pub(crate) fn all_school() -> Value {
-    Value::Table(vec![1, 1, 0])
+// Rows of `mul.kara` below this are schoolbook throughout.
+const KARA_FROM: usize = 8;
+// The table ends after this many rows in a row that are Karatsuba throughout (the last stands
+// for every wider short side), and at `KARA_ROWS` whatever it finds.
+const KARA_RUN: usize = 6;
+const KARA_ROWS: usize = 512;
+
+// `mul.kara`'s rows, a short side s at a time. A row's Karatsuba runs on the rows before it, so
+// a row is measured in three steps, each under what is settled so far: the square, the
+// near-square shapes (to l = 2s - 2), the chunked ones (to 4s). The entry asks the table about
+// its own shape first, so a step's indices are Karatsuba's in the live table while timed.
+struct KaraSpec {
+    s: usize,
+    step: u8,
+    // The row in hand's cells so far; the rows done; how many of the last are Karatsuba throughout.
+    cells: Vec<tables::Cell>,
+    rows: Vec<Row>,
+    run: usize,
+    eps: f64,
+}
+
+impl KaraSpec {
+    // A row's grid: every l from s to 4s while that is 40 or fewer, else sixteen to the octave, with
+    // the two either side of where a level gives way to chunking.
+    fn grid(s: usize) -> Vec<u32> {
+        let (s, top) = (s as u32, 4 * s as u32);
+        let mut g: Vec<u32> = if top - s < 40 { (s..=top).collect() } else { tables::octave_steps(s, top, 16.0) };
+        g.extend([2 * s - 2, 2 * s - 1, top]);
+        g.sort_unstable();
+        g.dedup();
+        g
+    }
+
+    // The table of the rows done and the row in hand, which with `forced` is Karatsuba's from that l.
+    fn table(&self, forced: Option<u32>) -> Vec<u32> {
+        let mut t: Vec<u32> = (1..KARA_FROM as u32).flat_map(|s| [s, s, 0]).collect();
+        t.extend(tables::assemble(&self.rows, |_, _| false));
+        let mut points = tables::row(&self.cells, None, self.eps, tables::share());
+        if let Some(l) = forced.filter(|_| points.last().is_none_or(|p| p.1 != 1)) {
+            points.push((l, 1));
+        }
+        for (l, pick) in points {
+            t.extend([self.s as u32, l, pick]);
+        }
+        t
+    }
+}
+
+impl Spec for KaraSpec {
+    fn equations(&self) -> Option<u32> {
+        None
+    }
+
+    fn group(&mut self) -> Option<Vec<(u32, Vec<u32>)>> {
+        if self.run >= KARA_RUN || self.s > KARA_ROWS {
+            return None;
+        }
+        let s = self.s as u32;
+        let sizes: Vec<u32> = Self::grid(self.s)
+            .into_iter()
+            .filter(|&l| match self.step {
+                0 => l == s,
+                1 => l > s && l <= 2 * s - 2,
+                _ => l >= 2 * s - 1,
+            })
+            .collect();
+        crate::tuning::set("mul.kara", Value::Table(self.table(sizes.first().copied()))).expect("a valid table");
+        Some(vec![(s, sizes)])
+    }
+
+    fn probes(&self, key: u32, size: u32, pass: usize, probes: &mut Vec<Probe<'static>>) -> Vec<Plan> {
+        for f in [mul_buf as Mul, karatsuba_entry_dyn] {
+            probes.push(product(f)((size as usize, key as usize), pass));
+        }
+        vec![Plan { picks: vec![0, 1], ..Plan::default() }]
+    }
+
+    fn settled(&mut self, rows: Vec<Row>) {
+        self.cells.extend(rows.into_iter().flat_map(|r| r.cells));
+        if self.step == 2 {
+            let (s, cells) = (self.s as u32, std::mem::take(&mut self.cells));
+            let points = tables::row(&cells, None, self.eps, tables::share());
+            self.run = if points == [(s, 1)] { self.run + 1 } else { 0 };
+            self.rows.push(Row { key: s, sizes: Self::grid(self.s), points, cells });
+            self.s += 1;
+        }
+        self.step = (self.step + 1) % 3;
+    }
+}
+
+/// The `mul.kara` table and its evidence: at each index (s, l), `mul_buf` against
+/// `karatsuba_entry_dyn`. The table decides at every size, so each row is measured over its
+/// whole grid; a pick stays while within the tie band of the other.
+pub fn kara_table(level: Level) -> (Vec<u32>, String) {
+    let saved = crate::tuning::snapshot();
+    let mut spec = KaraSpec { s: KARA_FROM, step: 0, cells: Vec::new(), rows: Vec::new(), run: 0, eps: level.eps() };
+    let tally = tables::measure(level, &mut spec, level.eps());
+    crate::tuning::restore(&saved);
+    // The all-Karatsuba run the table ends on: its first row stands for the rest.
+    let keep = spec.rows.len() - spec.run.saturating_sub(1).min(spec.rows.len());
+    spec.rows.truncate(keep);
+    let t = spec.table(None);
+    let first = |m: u32| spec.rows.iter().find(|r| tables::pick_at(&r.points, m * r.key) == Some(1)).map_or(0, |r| r.key);
+    let ev = format!(
+        "measured (table): Karatsuba from {} for squares and {} at l = 4s; every row from s = {} is Karatsuba throughout; {} change points; {}",
+        first(1),
+        first(4),
+        spec.rows.last().map_or(0, |r| r.key),
+        t.len() / 3,
+        tally.text()
+    );
+    (t, ev)
 }
 
 pub fn tune(level: Level) -> Vec<Tuned> {
     let mut out = Vec::new();
     let n = level.fit_shapes(60);
-    // mul_buf, W = (l s, 1), fitted where it competes with Karatsuba: as a level's
-    // sub-products (from about 10 limbs) and against a level (to about 100), at every ratio a row
-    // of mul.kara's table covers (l to 4s). A wider range of sizes fits the crossover worse, as
-    // the row kernels' cost per limb isn't constant across it.
-    let fit = fit_lin(
+    // mul_buf, fitted where it competes with Karatsuba (10 to about 100 limbs, l to 4s): a wider
+    // range fits the crossover worse.
+    fit_lin(
         level,
         &mut out,
         &["school_scale", "school_shift"],
-        "school_err",
         "mul_buf, s 10-96, l from s to 4s; W = l s, 1",
         &products(n, (10, 96), (1.0, 4.0), |_, _| true),
         |(l, s)| vec![(l * s) as f64, 1.0],
@@ -47,56 +156,39 @@ pub fn tune(level: Level) -> Vec<Tuned> {
             })
         },
     );
-    let school = school_with(fit.beta[0], fit.beta[1]);
-
-    // The next two fits run with mul.kara all schoolbook, so their sub-products are leaves.
-    let saved = crate::tuning::snapshot();
-    crate::tuning::set("mul.kara", all_school()).unwrap();
-    // One karatsuba_core level over schoolbook leaves, in its theoretical form with fitted
-    // constants: scale * (three sub-products) + shift, at every shape a level takes (s above
-    // half of l).
+    // hi_mul_buf's two kernels, each forced on windows of l limbs by an operand of 2 limbs to the
+    // window: the window's limb products, a term a row (rows kernel) or a column, and a shift. The
+    // columns kernel to a third past `mul.hi_mul_row`: a wider range fits it worse where it runs.
+    let cols_to = (4 * crate::tuning::k::mul::hi_mul_row() / 3).clamp(16, 256);
+    let windows = |from: f64, to: f64| {
+        Design::of(0, n, (from, to), (1.0, 2.0), |l, y| {
+            let l = l.round() as usize;
+            Some((l, ((2.0 * (l as f64 / 2.0).powf(y.log2())).round() as usize).clamp(2, l)))
+        })
+    };
+    let window = |f: Mul| {
+        move |(l, s): (usize, usize), pass: usize| binary(format!("hi window {l}x{s}"), f, pad(l, l as u64 * 73, pass), pad(s, s as u64 * 79, pass), pad(l, 37, pass))
+    };
     fit_lin(
         level,
         &mut out,
-        &["kara_scale", "kara_shift"],
-        "kara_err",
-        "karatsuba_core over schoolbook leaves, s 24-96, l from s to 2s - 2",
-        &products(n, (24, 96), (1.0, 2.0), |l, s| s > (l + 1) / 2),
-        |(l, s)| vec![level_products(l, s, &school), 1.0],
-        |(l, s), pass| {
-            let h = (l + 1) / 2;
-            let (a, b) = (pad(l, l as u64 * 37, pass), pad(s, s as u64 * 41, pass));
-            let (mut o, mut cross, mut scratch) = (pad(l + s - 1, 5, pass), pad(2 * h + 3, 7, pass), pad(4 * l + 8, 9, pass));
-            Probe::new(format!("kara level {l}x{s}"), move || {
-                black_box(karatsuba_core(black_box(&a), black_box(&b), h, &mut o, &mut cross, &mut scratch));
-            })
-        },
+        &["hi_rows_scale", "hi_rows_row", "hi_rows_shift"],
+        "hi_mul_buf_by_rows, windows of 12-342 limbs by 2 limbs to the window; W = its limb products, s, 1",
+        &windows(12.0, 342.0),
+        |(l, s)| vec![hi_window_products(l as f64, s as f64), s as f64, 1.0],
+        window(hi_mul_buf_by_rows),
     );
-    // chunking_karatsuba over schoolbook products: scale * (its chunk products' fitted
-    // schoolbook time) + pass * (l + s). This is the table's chunking
-    // term, fitted on chunking itself rather than assembled from pass units (the user's
-    // decision, 2026-11-10).
     fit_lin(
         level,
         &mut out,
-        &["chunk_scale", "chunk_pass"],
-        "chunk_err",
-        "chunking_karatsuba over schoolbook products, s 24-96, l from 2s to 4s",
-        &products(n, (24, 96), (2.0, 4.0), |l, s| s <= (l + 1) / 2),
-        |(l, s)| vec![chunk_products(l, s, |a, b| school(a.max(b) as f64, a.min(b) as f64)), (l + s) as f64],
-        |(l, s), pass| {
-            let (a, b) = (pad(l, l as u64 * 67, pass), pad(s, s as u64 * 71, pass));
-            let (mut o, mut scratch) = (pad(l + s - 1, 33, pass), pad(8 * l + 64, 35, pass));
-            Probe::new(format!("chunking {l}x{s}"), move || {
-                black_box(chunking_karatsuba(black_box(&a), black_box(&b), &mut o, &mut scratch));
-            })
-        },
+        &["hi_cols_scale", "hi_cols_col", "hi_cols_shift"],
+        &format!("hi_mul_buf_cols, windows of 2-{cols_to} limbs by 2 limbs to the window; W = its limb products, l, 1"),
+        &windows(2.0, cols_to as f64),
+        |(l, s)| vec![hi_window_products(l as f64, s as f64), l as f64, 1.0],
+        window(hi_mul_buf_cols),
     );
-    crate::tuning::restore(&saved);
 
-    // mul.karatsuba_sqr as a sweep: sqr_buf against one level over sqr_buf leaves at every size
-    // from 40 to 140. The two are within a few percent over a wide range there, where the fitted
-    // models' margin put the cutoff anywhere from 75 to 79 between runs.
+    // mul.karatsuba_sqr, a sweep: sqr_buf against one level over sqr_buf leaves, 40 to 140 limbs.
     let sizes: Vec<usize> = (40..=140).collect();
     let saved = crate::tuning::snapshot();
     crate::tuning::set("mul.karatsuba_sqr", Value::Int(usize::MAX as u64)).unwrap();
@@ -104,7 +196,7 @@ pub fn tune(level: Level) -> Vec<Tuned> {
         sizes
             .iter()
             .flat_map(|&n| {
-                let h = (n + 1) / 2;
+                let h = n.div_ceil(2);
                 let (a, a2) = (pad(n, n as u64 * 47, pass), pad(n, n as u64 * 47, pass));
                 let (mut o, mut o2) = (pad(2 * n - 1, 25, pass), pad(2 * n - 1, 27, pass));
                 let (mut cross, mut scratch) = (pad(2 * h + 1, 29, pass), pad(8, 31, pass));
@@ -120,29 +212,30 @@ pub fn tune(level: Level) -> Vec<Tuned> {
             .collect()
     });
     crate::tuning::restore(&saved);
-    out.push(sweep_cutoff("mul.karatsuba_sqr", &sizes, &pairs(&t), level.eps()).0);
+    out.push(sweep_cutoff("mul.karatsuba_sqr", &sizes, &pairs(&t), 0, level.eps()).0);
     out
 }
 
-// A product's probe through `f`, and a square's.
+// A product's probe through `f`; a square's.
 fn product(f: Mul) -> impl Fn((usize, usize), usize) -> Probe<'static> {
-    move |(l, s), pass| {
-        let (a, b) = (pad(l, l as u64 * 53, pass), pad(s, s as u64 * 59, pass));
-        let mut o = pad(l + s - 1, 19, pass);
-        Probe::new("product", move || {
-            black_box(f(black_box(&a), black_box(&b), &mut o));
-        })
-    }
+    move |(l, s), pass| binary("product", f, pad(l, l as u64 * 53, pass), pad(s, s as u64 * 59, pass), pad(l + s - 1, 19, pass))
 }
 
 fn square(f: Sqr) -> impl Fn(usize, usize) -> Probe<'static> {
-    move |n, pass| {
-        let a = pad(n, n as u64 * 61, pass);
-        let mut o = pad(2 * n - 1, 23, pass);
-        Probe::new("square", move || {
-            black_box(f(black_box(&a), &mut o));
-        })
-    }
+    move |n, pass| unary("square", f, pad(n, n as u64 * 61, pass), pad(2 * n - 1, 23, pass))
+}
+
+// `f` on two operands into `o`, and on one, as probes.
+fn binary<R: 'static>(name: impl Into<String>, f: fn(&[u64], &[u64], &mut [u64]) -> R, a: PadBuf, b: PadBuf, mut o: PadBuf) -> Probe<'static> {
+    Probe::new(name, move || {
+        black_box(f(black_box(&a), black_box(&b), &mut o));
+    })
+}
+
+fn unary(name: &str, f: Sqr, a: PadBuf, mut o: PadBuf) -> Probe<'static> {
+    Probe::new(name, move || {
+        black_box(f(black_box(&a), &mut o));
+    })
 }
 
 // `steps` sizes from `lo`, `per_octave` to a doubling.
@@ -155,53 +248,45 @@ fn shapes_of(sizes: &[usize], mults: &[f64], cap: usize) -> Vec<(usize, usize)> 
     sizes.iter().flat_map(|&s| mults.iter().map(move |m| ((s as f64 * m).round() as usize, s))).filter(|&(l, s)| l + s <= cap).collect()
 }
 
-// The static Karatsuba-to-NTT ratio sweeps' shapes: l the near-square multiples of s
-// (`is_karatsuba`'s Karatsuba ratio) or the unbalanced ones (its chunking ratio).
+// The static Karatsuba-to-NTT ratio sweeps' multiples of s: near-square, and unbalanced (chunking).
 const NEAR_M: [f64; 4] = [1.0, 1.2, 1.5, 1.9];
 const FAR_M: [f64; 4] = [2.0, 3.0, 4.0, 8.0];
 
-// Fits t = b0 w0 + b1 w1 + ... to the probes of `design`'s shapes (`feats` gives a shape's
-// regressors w, a 1 among them where the form has a shift), judged on the shapes it holds out.
-// Records the knobs `keys` names (the constants, in order; one that solves negative isn't needed
-// and reads 0) and `err` (the rms it is judged by) with `what` in their evidence, and returns the
-// fit.
+// Fits t = b . w to the probes of `design`'s shapes (`feats` gives a shape's regressors),
+// judged on the shapes held out, and records the knobs `keys` (the scale first) with `what`
+// in their evidence.
 fn fit_lin(
     level: Level,
     out: &mut Vec<Tuned>,
     keys: &[&'static str],
-    err: &'static str,
     what: &str,
     design: &Design<(usize, usize)>,
     feats: impl Fn((usize, usize)) -> Vec<f64>,
     probe: impl Fn((usize, usize), usize) -> Probe<'static>,
-) -> Fit {
+) {
     let timed = time_fit(level, |pass| design.shapes.iter().map(|&s| probe(s, pass)).collect());
     let rows: Vec<Vec<f64>> = design.shapes.iter().map(|&s| feats(s)).collect();
-    let fixed = vec![0.0; rows.len()];
-    let mut fit = fit_split(&rows, &timed.ns, &fixed, &design.held);
-    fit.noise = Some(timed.noise);
-    push_fit(out, keys, err, &fit, fit.evidence() + " (" + what + ")");
-    analyze(&format!("mul.{}: {what}", err.trim_end_matches("_err")), keys, &rows, &timed.ns, &fixed, &design.held);
-    fit
+    let name = keys[0].strip_suffix("_scale").unwrap_or(keys[0]);
+    let fit = fit_named(&format!("mul.{name}: {what}"), keys, &rows, &timed.ns, &vec![0.0; rows.len()], &design.held, Some(timed.noise));
+    push_fit(out, keys, &fit, fit.evidence() + " (" + what + ")");
 }
 
-/// mul's second phase, measured once `mul.kara` and `mul.karatsuba_sqr` are derived and live:
-/// recursive Karatsuba through its real entries, and the FFT entries, each in its fitted form.
+/// Second phase, once `mul.kara` is in force: recursive Karatsuba's and the FFT's equations
+/// through their real entries, then the cutoffs.
 pub fn tune_late(level: Level) -> Vec<Tuned> {
     let mut out = Vec::new();
-    // Recursive Karatsuba in each regime: its theoretical work at the exponent log2 3, plus
-    // schoolbook's l s, which its leaves still do. The schoolbook weight stands where a fitted
-    // exponent stood (the user's decision, 2026-11-11), so these are linear fits like every
-    // other. (A term a limb and a shift were in the form at first, and the timings didn't need
-    // them.)
+    // Recursive Karatsuba in each regime: its work at the exponent log2 3, plus schoolbook's l s
+    // for its leaves.
     let n = level.fit_shapes(60);
+    // Fitted on the shapes they are read for: not where `mul.kara` says schoolbook.
+    let kara = crate::tuning::k::mul::kara();
+    let read = move |l: usize, s: usize| !school_at(kara, l, s);
     fit_lin(
         level,
         &mut out,
         &["kara_rec_scale", "kara_rec_school"],
-        "kara_rec_err",
-        "karatsuba_entry_dyn, s 96-1300, l from s to 2s - 2; W = karatsuba_cost, l s",
-        &products(n, (96, 1300), (1.0, 2.0), |l, s| s > (l + 1) / 2),
+        "karatsuba_entry_dyn, s 96-1300, l from s to 2s - 2, where mul.kara doesn't say schoolbook; W = karatsuba_cost, l s",
+        &products(n, (96, 1300), (1.0, 2.0), |l, s| s > l.div_ceil(2) && read(l, s)),
         |(l, s)| vec![karatsuba_cost(l, s), (l * s) as f64],
         product(karatsuba_entry_dyn),
     );
@@ -209,9 +294,8 @@ pub fn tune_late(level: Level) -> Vec<Tuned> {
         level,
         &mut out,
         &["chunk_rec_scale", "chunk_rec_school"],
-        "chunk_rec_err",
-        "karatsuba_entry_dyn, s 96-650, l from 2s to 8s; W = chunking_karatsuba_cost, l s",
-        &products(n, (96, 650), (2.0, 8.0), |l, s| s <= (l + 1) / 2),
+        "karatsuba_entry_dyn, s 96-650, l from 2s to 8s, where mul.kara doesn't say schoolbook; W = chunking_karatsuba_cost, l s",
+        &products(n, (96, 650), (2.0, 8.0), |l, s| s <= l.div_ceil(2) && read(l, s)),
         |(l, s)| vec![chunking_karatsuba_cost(l, s), (l * s) as f64],
         product(karatsuba_entry_dyn),
     );
@@ -219,21 +303,22 @@ pub fn tune_late(level: Level) -> Vec<Tuned> {
         level,
         &mut out,
         &["fft_scale"],
-        "fft_err",
-        "fft_entry, s 96-2200, l from s to 8s; W = its transform's work",
-        &products(n, (96, 2200), (1.0, 8.0), |_, _| true),
+        "fft_entry, s 96-2200, l from s to 8s, where mul.kara doesn't say schoolbook; W = its transform's work",
+        &products(n, (96, 2200), (1.0, 8.0), read),
         |(l, s)| vec![fft_transform_work(fft_mul_size(l, s))],
         product(fft_entry),
     );
 
-    // The static entries below are swept at N = 8192 only: approximate values, as a static
-    // decision's best value also depends on N (the user's decision, 2026-11-11: approximate
-    // static values until static memory handling is reworked).
+    // Live before the sweeps below, whose entries dispatch through mul_dyn's comparison of them.
+    for t in &out {
+        t.set_live("mul").expect("a fitted value is valid");
+    }
+
+    // Static entries are swept at one N: approximate values.
     const N: usize = 8192;
 
-    // The one-input and static Karatsuba-to-transform decisions, as sweeps: both entries timed at
-    // each shape, and the value (a cutoff, or is_karatsuba's ratio against the NTT) with the least
-    // measured time lost. (Dynamic products compare the equations fitted above per call.)
+    // The one-input and static Karatsuba-to-transform decisions: both entries timed at each shape,
+    // the value with the least time lost.
     let pair = |shapes: &[(usize, usize)], a: Mul, b: Mul| {
         pairs(&time_min(level, |pass| shapes.iter().flat_map(|&sh| [product(a)(sh, pass), product(b)(sh, pass)]).collect()))
     };
@@ -242,17 +327,15 @@ pub fn tune_late(level: Level) -> Vec<Tuned> {
     };
     let tie = level.eps();
 
-    let sq_sizes = grid(150.0, 26, 8.0); // 150 to about 1300
-    let t = pair_sq(&sq_sizes, karatsuba_sqr_entry_dyn, fft_sqr_entry);
-    let dense = dense_around(sweep_cutoff("mul.fft_sqr", &sq_sizes, &t, tie).1, usize::MAX);
-    let t = pair_sq(&dense, karatsuba_sqr_entry_dyn, fft_sqr_entry);
-    out.push(sweep_cutoff("mul.fft_sqr", &dense, &t, tie).0);
-    let sizes = grid(256.0, 22, 6.0); // 256 to about 2900
+    // A square cutoff: a coarse pass over `sizes`, then a dense one around its choice (to `cap`).
+    let mut sqr_cutoff = |path: &'static str, sizes: &[usize], cap: usize, a: Sqr, b: Sqr| {
+        let dense = dense_around(sweep_cutoff(path, sizes, &pair_sq(sizes, a, b), 0, tie).1, cap);
+        out.push(sweep_cutoff(path, &dense, &pair_sq(&dense, a, b), 0, tie).0);
+    };
+    sqr_cutoff("mul.fft_sqr", &grid(150.0, 26, 8.0), usize::MAX, karatsuba_sqr_entry_dyn, fft_sqr_entry); // 150 to about 1300
     let sq_sizes: Vec<usize> = grid(500.0, 26, 8.0).into_iter().filter(|&n| n <= 3600).collect();
-    let t = pair_sq(&sq_sizes, karatsuba_sqr_entry_static::<N>, ntt_sqr_entry_static::<N>);
-    let dense = dense_around(sweep_cutoff("mul.static_ntt_sqr", &sq_sizes, &t, tie).1, 3600);
-    let t = pair_sq(&dense, karatsuba_sqr_entry_static::<N>, ntt_sqr_entry_static::<N>);
-    out.push(sweep_cutoff("mul.static_ntt_sqr", &dense, &t, tie).0);
+    sqr_cutoff("mul.static_ntt_sqr", &sq_sizes, 3600, karatsuba_sqr_entry_static::<N>, ntt_sqr_entry_static::<N>);
+    let sizes = grid(256.0, 22, 6.0); // 256 to about 2900
     for (path, mults, chunking) in [("mul.ntt_karatsuba", NEAR_M, false), ("mul.ntt_chunking_karatsuba", FAR_M, true)] {
         let shapes = shapes_of(&sizes, &mults, 6000);
         let t = pair(&shapes, karatsuba_entry_static::<N>, ntt_entry_static::<N>);
@@ -263,11 +346,8 @@ pub fn tune_late(level: Level) -> Vec<Tuned> {
     out
 }
 
-/// `cargo tune equations`: Karatsuba against the FFT for dynamic products. Both entries and
-/// `mul_dyn` are timed over two grids of shapes the equations weren't fitted on, and the report
-/// gives the measured time lost by comparing the fitted equations (`MulEq`) and by `mul_dyn`
-/// itself, with each equation's error against these timings. (Until 2026-11-11 it also reported
-/// the ratio rule the equations replaced, whose two knobs are purged.)
+/// `cargo tune equations`: Karatsuba, the FFT and `mul_dyn` timed on shapes the equations weren't
+/// fitted on; the time lost by the equations' comparison and by `mul_dyn`, and each equation's error.
 pub fn equations(level: Level) {
     use crate::utils::mul::{mul_dyn, MulEq};
     let eq = MulEq::read();
@@ -281,7 +361,7 @@ pub fn equations(level: Level) {
         let t = time_min(level, |pass| {
             shapes.iter().flat_map(|&sh| [karatsuba_entry_dyn as Mul, fft_entry, mul_dyn].map(|f| product(f)(sh, pass))).collect()
         });
-        // mul_dyn itself, dispatch and all, against the better forced entry at each shape.
+        // mul_dyn, dispatch and all, against the better forced entry.
         let whole: Vec<f64> = t.chunks(3).map(|c| c[2] / c[0].min(c[1]) - 1.0).collect();
         let whole = (whole.iter().sum::<f64>() / whole.len() as f64, whole.iter().cloned().fold(f64::MIN, f64::max));
         let t: Vec<(f64, f64)> = t.chunks(3).map(|c| (c[0], c[1])).collect();
@@ -300,9 +380,8 @@ pub fn equations(level: Level) {
     }
 }
 
-// The NTT's four parallel gates. Each acts at every level of a transform, so each is a parameter
-// swept through the NTT entries on the tune's pool: the dynamic entries where mul_dyn takes them
-// (past the FFT's limits, 70000 limbs here) and the static ones at a few thousand limbs.
+// The NTT's four parallel gates, each swept through the NTT entries on the tune's pool: the
+// dynamic ones at 70000 limbs (past the FFT's limits), the static at a few thousand.
 fn ntt_gates(level: Level, out: &mut Vec<Tuned>) {
     use crate::tuning::tuner::sweep::{param_sweep, with_knob};
     use crate::utils::mul::{ntt_entry_dyn, ntt_sqr_entry_dyn};
@@ -339,9 +418,8 @@ fn ntt_gates(level: Level, out: &mut Vec<Tuned>) {
     }
 }
 
-// mul's remaining one-input decisions, each a sweep of its two code paths: the high products
-// (hi_*_buf against the guarded product; columns against rows inside hi_*_buf), the middle
-// products (mid_mul_buf against the transform) and the cyclic square.
+// The remaining one-input decisions, each a sweep of its two code paths: high products, middle
+// products, the cyclic square.
 fn late_cutoffs(level: Level, out: &mut Vec<Tuned>) {
     use crate::utils::mul::{
         bnm1_size, fft_mid_mul, fft_sqr_mod_bnm1, hi_mul_buf, hi_mul_buf_by_rows, hi_mul_buf_cols, hi_mul_guarded_dyn,
@@ -349,42 +427,17 @@ fn late_cutoffs(level: Level, out: &mut Vec<Tuned>) {
         mid_mul_buf, ntt_mid_mul_static, sqr_mod_bnm1_dyn,
     };
     const N: usize = 4096;
-    // Sizes eight to a doubling from `lo` to `hi`.
-    let grid = |lo: f64, hi: usize| -> Vec<usize> { geo(lo, 8.0).take_while(|&n| n <= hi).collect() };
-    // A window of w limbs from operands of 2w and w limbs (a square's operand: w limbs).
-    let hi_mul = |f: Mul, wide: usize| {
-        move |w: usize, pass: usize| {
-            let (a, b) = (pad(wide * w, w as u64 * 3, pass), pad(w, w as u64 * 5, pass));
-            let mut o = pad(w, 7, pass);
-            Probe::new("hi_mul", move || {
-                black_box(f(black_box(&a), black_box(&b), &mut o));
-            })
-        }
-    };
-    let hi_sqr = |f: Sqr| {
-        move |w: usize, pass: usize| {
-            let a = pad(w, w as u64 * 11, pass);
-            let mut o = pad(w, 13, pass);
-            Probe::new("hi_sqr", move || {
-                black_box(f(black_box(&a), &mut o));
-            })
-        }
-    };
-    let mid = |f: fn(&[u64], &[u64], &mut [u64]) -> (u64, u64)| {
-        move |n: usize, pass: usize| {
-            let (l, s) = (pad(2 * n - 1, n as u64 * 17, pass), pad(n, n as u64 * 19, pass));
-            let mut o = pad(n, 23, pass);
-            Probe::new("mid", move || {
-                black_box(f(black_box(&l), black_box(&s), &mut o));
-            })
-        }
-    };
+    let grid = |lo: f64, hi: usize| geo_to(lo, 8.0, hi); // eight sizes to a doubling
+    // A window of w limbs from operands of `wide` w and w limbs; a square's from w limbs.
+    let hi_mul = |f: Mul, wide: usize| move |w: usize, pass: usize| binary("hi_mul", f, pad(wide * w, w as u64 * 3, pass), pad(w, w as u64 * 5, pass), pad(w, 7, pass));
+    let hi_sqr = |f: Sqr| move |w: usize, pass: usize| unary("hi_sqr", f, pad(w, w as u64 * 11, pass), pad(w, 13, pass));
+    let mid = |f: Mid| move |n: usize, pass: usize| binary("mid", f, pad(2 * n - 1, n as u64 * 17, pass), pad(n, n as u64 * 19, pass), pad(n, 23, pass));
     let every: Vec<usize> = (6..=200).collect();
     out.push(cutoff_sweep(level, "mul.hi_mul_row", &every, None, 0, &|w, p| [hi_mul(hi_mul_buf_cols, 1)(w, p), hi_mul(hi_mul_buf_by_rows, 1)(w, p)]));
     out.push(cutoff_sweep(level, "mul.hi_sqr_row", &every, None, 0, &|w, p| {
         [hi_sqr(hi_sqr_buf_cols)(w, p), hi_sqr(hi_sqr_buf_by_rows)(w, p)]
     }));
-    // The guarded products dispatch through mul_*/sqr_*, so they run under the values tuned above.
+    // The guarded products dispatch through mul_*/sqr_*: they run under the values tuned above.
     let (g, gs) = (grid(96.0, 1500), grid(96.0, 1300));
     out.push(cutoff_sweep(level, "mul.dyn_partial_mul", &g, Some(1500), 0, &|w, p| [hi_mul(hi_mul_buf, 2)(w, p), hi_mul(hi_mul_guarded_dyn, 2)(w, p)]));
     out.push(cutoff_sweep(level, "mul.static_partial_mul", &gs, Some(1300), 0, &|w, p| {
@@ -394,13 +447,13 @@ fn late_cutoffs(level: Level, out: &mut Vec<Tuned>) {
     out.push(cutoff_sweep(level, "mul.static_partial_sqr", &gs, Some(1300), 0, &|w, p| {
         [hi_sqr(hi_sqr_buf)(w, p), hi_sqr(hi_sqr_guarded_static::<N>)(w, p)]
     }));
-    // The middle products switch at n >= knob, so the knob is one past the last schoolbook size.
+    // The middle products switch at n >= knob: one past the last schoolbook size.
     out.push(cutoff_sweep(level, "mul.fft_mid", &grid(32.0, 700), Some(700), 1, &|n, p| [mid(mid_mul_buf)(n, p), mid(fft_mid_mul)(n, p)]));
     out.push(cutoff_sweep(level, "mul.ntt_mid", &grid(128.0, 2000), Some(2000), 1, &|n, p| {
         [mid(mid_mul_buf)(n, p), mid(ntt_mid_mul_static::<N>)(n, p)]
     }));
-    // The cyclic square at its own sizes m = bnm1_size, a of m limbs: sqr_dyn and a fold (the
-    // knob at its maximum inside the probe's entry) against the cyclic FFT.
+    // The cyclic square at m = bnm1_size: sqr_dyn and a fold (the knob at its maximum inside the
+    // probe) against the cyclic FFT.
     let mut ms: Vec<usize> = (48..=1200).map(bnm1_size).collect();
     ms.dedup();
     let saved = crate::tuning::get("mul.sqr_bnm1_fft").expect("declared");
@@ -425,11 +478,9 @@ fn late_cutoffs(level: Level, out: &mut Vec<Tuned>) {
     }));
 }
 
-// One of is_karatsuba's ratios (the knob at `path`) as a sweep over `shapes`: Karatsuba where its
-// cost form is below ratio * fft_cost.
+// One of is_karatsuba's ratios as a sweep: Karatsuba where its cost is below ratio * fft_cost.
 fn sweep_ratio(path: &'static str, shapes: &[(usize, usize)], t: &[(f64, f64)], chunking: bool, tie: f64) -> Tuned {
     use crate::utils::mul::fft_cost;
-    // Each shape's (Karatsuba cost, FFT cost): neither depends on the ratio.
     let costs: Vec<(f64, f64)> =
         shapes.iter().map(|&(l, s)| (if chunking { chunking_karatsuba_cost(l, s) } else { karatsuba_cost(l, s) }, fft_cost(l, s))).collect();
     let loss = |r: f64| lost(t, |i| costs[i].0 < r * costs[i].1);

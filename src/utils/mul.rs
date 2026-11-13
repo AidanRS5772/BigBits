@@ -4411,6 +4411,72 @@ impl MulEq {
     }
 }
 
+/// The limb products hi_mul_buf makes for a window of l limbs of an l x s product (2 <= s <= l):
+/// every column of the window, and the two guard columns below it, which carry into it. The
+/// s - 3 columns below those, (s - 2)(s - 3) / 2 products, are the triangle it skips. (For a
+/// short side past the window the kernels read only its top l limbs' worth: s = l.)
+pub fn hi_window_products(l: f64, s: f64) -> f64 {
+    l * s - (s - 2.0) * (s - 3.0) / 2.0
+}
+
+/// The fitted runtime equation of `hi_mul_buf`, the high product of windows within
+/// `mul.dyn_partial_mul` limbs (knobs `mul.hi_rows_*` and `mul.hi_cols_*`, since 2026-11-12, the
+/// user's decision: the price of a kernel belongs to the kernel, where the series' equations
+/// had read mul's full-product schoolbook equation for it, 15% and 31% off). Its two kernels do
+/// the same `hi_window_products` and differ in what their fixed cost attaches to: the rows
+/// kernel takes a pass a limb of the shorter operand, the columns kernel a column a limb of the
+/// window. Read once per decision by what prices a high product (the series' equations).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HiEq {
+    /// hi_mul_buf_by_rows: scale W + row s + shift, as [scale, row, shift].
+    pub rows: [f64; 3],
+    /// hi_mul_buf_cols: scale W + col l + shift, as [scale, col, shift].
+    pub cols: [f64; 3],
+    /// `mul.hi_mul_row`: windows of up to this many limbs go by columns.
+    pub row: f64,
+}
+
+impl HiEq {
+    pub fn read() -> Self {
+        HiEq {
+            rows: [k::mul::hi_rows_scale(), k::mul::hi_rows_row(), k::mul::hi_rows_shift()],
+            cols: [k::mul::hi_cols_scale(), k::mul::hi_cols_col(), k::mul::hi_cols_shift()],
+            row: k::mul::hi_mul_row() as f64,
+        }
+    }
+
+    /// Whether a window of l limbs (a mean over several, so not whole) goes by rows.
+    pub fn by_rows(&self, l: f64) -> bool {
+        l > self.row
+    }
+
+    /// hi_mul_buf's predicted ns for a window of l limbs by an operand of s (clipped to the
+    /// window).
+    pub fn ns(&self, l: f64, s: f64) -> f64 {
+        let s = s.min(l);
+        let (rows, w) = (self.by_rows(l), hi_window_products(l, s));
+        let [a, b, c] = if rows { self.rows } else { self.cols };
+        a * w + b * if rows { s } else { l } + c
+    }
+
+    /// `ns` as a polynomial in the window, [q2, q1, q0] of q2 l^2 + q1 l + q0, for the kernel
+    /// `rows` names and an operand of x limbs that the window holds `whole`, or that is clipped
+    /// to it (s = l): what a sum over many windows is taken from in closed form.
+    pub fn poly(&self, rows: bool, whole: bool, x: f64) -> [f64; 3] {
+        let [a, b, c] = if rows { self.rows } else { self.cols };
+        if !whole {
+            // W = l^2 - (l - 2)(l - 3) / 2, and the term a row or a column is in l either way.
+            return [a / 2.0, 2.5 * a + b, c - 3.0 * a];
+        }
+        let cut = (x - 2.0) * (x - 3.0) / 2.0;
+        if rows {
+            [0.0, a * x, b * x + c - a * cut]
+        } else {
+            [0.0, a * x + b, c - a * cut]
+        }
+    }
+}
+
 // mul_dyn's choice for l >= s. The table decides small products before the equations are read
 // (constants in a normal build, eleven live values in a tune build).
 pub fn dyn_dispatch(l: usize, s: usize) -> MulDynDispatch {

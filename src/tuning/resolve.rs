@@ -1,12 +1,10 @@
-// Resolving knob values (docs/tuning_system.md, "build.rs"): the schema's defaults, then each layer
-// (the target's preset, then the machine's own file, `BIGBITS_TUNING`), then `Follows` defaults. Also the
-// schema's own checks and each value's validity (invariant 1). Shared by build.rs, which runs it
-// at build time, and the crate, where the tuner's `derive --file` (and Phase 4's runtime loading)
-// run the same code. Std only; other shared files through `super::`.
+// Resolving knob values: the schema's defaults, then each layer (the target's preset, then the
+// machine's own file, `BIGBITS_TUNING`), then `Follows` defaults; and the schema's own checks
+// and each value's validity. Shared by build.rs and the crate (the tuner's `status`). Std only.
 
 use super::file::{File, Num, Raw};
 use super::hash;
-use super::schema_types::{Alg, DefaultValue, Knob, Range, Section, Ty};
+use super::schema_types::{Alg, DefaultValue, Kind, Knob, Range, Section, Ty};
 
 /// A knob's value. Usize and U64 knobs hold `Int`.
 #[derive(Clone, Debug, PartialEq)]
@@ -78,7 +76,7 @@ pub fn flat(schema: &'static [Section]) -> Vec<FlatKnob> {
 }
 
 /// Keys of a file section that describe the section rather than set a knob.
-pub const META_KEYS: [&str; 6] = ["version", "derive", "tuned", "level", "upstream", "pinned"];
+pub const META_KEYS: [&str; 5] = ["version", "derive", "tuned", "level", "upstream"];
 
 /// Architectures a knob's `arch` may name (`CARGO_CFG_TARGET_ARCH` spellings).
 pub const KNOWN_ARCHES: [&str; 6] = ["x86_64", "aarch64", "x86", "arm", "riscv64", "wasm32"];
@@ -387,10 +385,8 @@ impl Target<'_> {
     }
 }
 
-/// Whether a machine's own tuning file may be layered for `target`. `cargo tune` records the
-/// machine it measured as [meta] target = "<arch>-<os>"; a file that names another target is
-/// another machine's (or the host's, in a cross build), and its measurements don't apply. A file
-/// that names none is taken as it is.
+/// Whether a machine's own tuning file may be layered for `target`: not one whose [meta] target
+/// names another (another machine's, or the host's in a cross build). One that names none is taken.
 pub fn layer_target_ok(file: &File, target: &Target) -> Result<(), String> {
     let Some(Raw::Str(tuned_on)) = file.section("meta").and_then(|m| m.value("target")) else {
         return Ok(());
@@ -419,36 +415,27 @@ pub struct Resolved {
     pub warnings: Vec<String>,
 }
 
-/// The hash of `section`'s resolved measured values (`Kind::measured`, plus its pinned knobs).
-pub fn section_hash(
-    flat: &[FlatKnob],
-    values: &[Value],
-    section: &str,
-    pinned: &[&str],
-) -> u64 {
-    let pairs: Vec<(&str, String)> = flat
-        .iter()
-        .zip(values)
-        .filter(|(f, _)| f.section.name == section && (f.knob.kind.measured() || pinned.contains(&f.knob.name)))
-        .map(|(f, v)| (f.knob.name, v.text()))
-        .collect();
-    hash::hash_pairs(&pairs)
+/// The hash of `section`'s resolved values.
+pub fn section_hash(flat: &[FlatKnob], values: &[Value], section: &str) -> u64 {
+    let pairs: Vec<(&str, String)> =
+        flat.iter().zip(values).filter(|(f, _)| f.section.name == section).map(|(f, v)| (f.knob.name, v.text())).collect();
+    hash::fnv1a(hash::canonical(&pairs).bytes())
 }
 
-/// The `upstream` string recorded with a section's derived values: `section:hash` for each of its
+/// The `upstream` string recorded with a section's values: `section:hash` for each of its
 /// upstream sections, from the given resolved values.
 pub fn upstream_text(flat: &[FlatKnob], values: &[Value], section: &Section) -> String {
     let parts: Vec<String> = section
         .after
         .iter()
-        .map(|a| format!("{a}:{:016x}", section_hash(flat, values, a, &[])))
+        .map(|a| format!("{a}:{:016x}", section_hash(flat, values, a)))
         .collect();
     parts.join(" ")
 }
 
 /// Layers `layers` over `schema`'s defaults for `target`, resolves `Follows` defaults, and checks
 /// every value. Warnings: unknown sections and keys, a section whose `version` differs (it falls
-/// through whole), one whose `derive` differs (its derived values fall through), a stale upstream
+/// through whole), one whose `derive` differs (its tables fall through), a stale upstream
 /// hash, and a value for another architecture. Errors: a value of the wrong type or outside its
 /// valid range, and a tuning file of an unknown format.
 pub fn resolve(
@@ -496,11 +483,7 @@ pub fn resolve(
                 }
             }
             let derive_ok = matches!(fs.value("derive"), Some(Raw::Int(d)) if *d == sec.derive as i128);
-            let pinned: Vec<&str> = match fs.value("pinned") {
-                Some(Raw::Str(s)) => s.split_whitespace().collect(),
-                _ => Vec::new(),
-            };
-            let mut stale_derived = false;
+            let mut stale_tables = false;
             for e in &fs.entries {
                 if META_KEYS.contains(&e.key.as_str()) {
                     continue;
@@ -511,8 +494,9 @@ pub fn resolve(
                     continue;
                 };
                 let k = flat[i].knob;
-                if !k.kind.measured() && !pinned.contains(&k.name) && !derive_ok {
-                    stale_derived = true;
+                // A table's layout is the section's `derive` number.
+                if k.kind == Kind::Table && !derive_ok {
+                    stale_tables = true;
                     continue;
                 }
                 if let Some(a) = k.arch {
@@ -532,10 +516,10 @@ pub fn resolve(
                     Err(msg) => errs.push(format!("{lname}, line {}: `{}`: {msg}", e.line, flat[i].path)),
                 }
             }
-            if stale_derived {
+            if stale_tables {
                 warnings.push(format!(
-                    "{lname}: [{}]'s derived values are from another derive version (the crate's is {}); \
-                     they fall through: run `cargo tune derive`",
+                    "{lname}: [{}]'s tables are of another layout (its derive number; the crate's is {}); \
+                     they fall through: run `cargo tune tune {0} --tables`",
                     sec.name, sec.derive
                 ));
             }
@@ -595,8 +579,8 @@ pub fn resolve(
         let now = upstream_text(&flat, &values, sec);
         if now != recorded {
             warnings.push(format!(
-                "{}: [{}] was derived from different upstream values ({recorded}; now {now}): \
-                 run `cargo tune derive`",
+                "{}: [{}] was tuned on different upstream values ({recorded}; now {now}): \
+                 tune it again (`cargo tune tune {1}`)",
                 layers[li].name, sec.name
             ));
         }

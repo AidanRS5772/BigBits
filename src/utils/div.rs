@@ -306,14 +306,51 @@ fn dyn_bz_top_padded(dlen: usize, top: usize) -> bool {
 // quotient width q_len + 1 and the effective divisor width.
 pub(crate) fn dyn_div_alg(r: &DivisionRequest, rem: bool) -> DivAlg {
     let (q, d) = (r.q_len + 1, r.d_len);
-    // Knuth without reading an equation: at a divisor so narrow that the equations pick Knuth
-    // for every quotient (the guard the tuner computes from them, as mul.kara's table spares
-    // small products the comparison), and where nothing else can run.
-    let guard = if rem { k::div::dyn_rem_knuth_d() } else { k::div::dyn_knuth_d() };
-    if d <= guard || !dyn_div_contested(q, d, k::div::bz()) {
+    // Knuth without reading an equation where nothing else can run.
+    let leaf = k::div::bz();
+    if !dyn_div_contested(q, d, leaf) {
         return DivAlg::Knuth;
     }
-    dyn_div_alg_at(q, d, rem, &DivEq::read(), &MulEq::read(), k::mul::kara())
+    // A division so small that reading the equations would be past the tuning system's share
+    // of it reads the measured table (as mul.kara's spares small products the comparison).
+    let table = if rem { k::div::dyn_rem_small() } else { k::div::dyn_small() };
+    match dyn_div_small(table, q, d, leaf) {
+        Some(alg) => alg,
+        None => dyn_div_alg_at(q, d, rem, &DivEq::read(), &MulEq::read(), k::mul::kara()),
+    }
+}
+
+/// The picks of `div.dyn_small` and `div.dyn_rem_small`, in order: the last hands the division
+/// to the equations.
+#[doc(hidden)]
+pub const DIV_SMALL_PICKS: [Option<DivAlg>; 4] = [Some(DivAlg::Knuth), Some(DivAlg::BZ), Some(DivAlg::NR), None];
+
+/// A small-division table's pick for a logical quotient width q over a divisor of d limbs
+/// (change points over (d, q)), at an explicit table and BZ leaf (invariant 6): None where it
+/// hands the division to the equations, or names an algorithm that can't take the shape (NR
+/// needs nr_split's room, BZ a divisor past its leaf), so any valid table is correct.
+#[doc(hidden)]
+pub fn dyn_div_small(table: &crate::tuning::table::Table2, q: usize, d: usize, bz_leaf: usize) -> Option<DivAlg> {
+    let alg = DIV_SMALL_PICKS.get(table.pick(d, q)).copied().flatten()?;
+    dyn_div_can(alg, q, d, bz_leaf).then_some(alg)
+}
+
+/// Whether `alg` can take a division of logical quotient width q by d limbs: Knuth always, NR
+/// with nr_split's room, BZ at a divisor past its leaf.
+#[doc(hidden)]
+pub fn dyn_div_can(alg: DivAlg, q: usize, d: usize, bz_leaf: usize) -> bool {
+    match alg {
+        DivAlg::Knuth => true,
+        DivAlg::NR => q > 1 && nr_split(d + q - 1, q).is_some(),
+        DivAlg::BZ => q > 1 && d > bz_leaf,
+    }
+}
+
+/// Whether the dynamic quotient dispatch has a choice at the shape, without reading an equation
+/// (`dyn_div_contested`, for the tuner's table).
+#[doc(hidden)]
+pub fn dyn_div_has_choice(q: usize, d: usize, bz_leaf: usize) -> bool {
+    dyn_div_contested(q, d, bz_leaf)
 }
 
 // Whether NR or BZ can take the shape at all, without reading an equation: NR needs nr_split's

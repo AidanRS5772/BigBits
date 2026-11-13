@@ -21,7 +21,7 @@ table when a stage lands, and correct the plan where the implementation changed 
 | 7 | Phase 1: `theta`, `agm`, `exp`, `ln` | landed 2026-11-09: outputs identical (161 items, both builds); bias 1.0034× (trans items; `exp_static` at 4–64 limbs +1–2% in the tune build, a few atomic reads in a µs call), 1.0001× (series items); all 313 random-knob vectors passed first time |
 | P2.1 | Phase 2: runtime prediction layer (`Dispatcher`, `CostCtx`, tables, threads, presets layer) | landed 2026-11-09 except the generator's table and step-function knobs, which arrive with the first table knob (the pilot's switch): `tuning/{threads,model,table,dispatch}.rs` with tests; `build.rs` layers `presets/<arch>-<os>.toml` (else `<arch>.toml`) |
 | P2.2 | Phase 2: tuner skeleton (`cargo tune`) | landed 2026-11-09: `cargo tune tune [SECTION…] [--level] [--out] [--write-preset] [--threads]`, `derive [--file]`, `list`, `status [--file]`; batched interleaved timing on performance cores, NNLS on relative error with a lack-of-fit report, sections merged into the file with evidence and upstream hashes. Not yet: sweeps, `check`, `--resume`, `--pin`, process isolation |
-| P2.3 | Phase 2: sections (base, pilot, mul, div, sqrt, bin_split + series, consts, trans), presets | **done on the M1 (2026-11-10)**: `presets/aarch64-macos.toml` is a thorough tune through the final flow (eight sections, each kept by the end-to-end gate; no rejected fit; the build resolves it with no warning). Dynamic products and divisions dispatch on fitted equations, every one-input decision is a sweep, static values are approximate, and any checkout can tune itself into `presets/local.toml`. Open: the x86 preset (the user's, on the i7), and the series' dispatch equations, rebuilt on fitted equations on 2026-11-10 (the log's last entry) and still marked above the 5% line. The history of how it got here is in the log below. Earlier status, kept for the record: in progress (2026-11-10). In `presets/aarch64-macos.toml` (thorough, M1): `base`'s units; mul's schoolbook, Karatsuba-level, recursive-Karatsuba, FFT and static-NTT fitted models; `mul.kara` derived; and seven sweeps (`mul.karatsuba_sqr`, `fft_sqr`, `fft_karatsuba`, `fft_chunking_karatsuba`, `static_ntt_sqr`, `ntt_karatsuba`, `ntt_chunking_karatsuba`). Not done in mul: FFT-to-NTT, high and middle products, the NTT's parallel gates, the cyclic square, `mul_ns` and per-call comparison above an extent. Then every later section and the x86 preset |
+| P2.3 | Phase 2: sections (base, pilot, mul, div, sqrt, bin_split + series, consts, trans), presets | **done on the M1 (2026-11-10)**: `presets/aarch64-macos.toml` is a thorough tune through the final flow (eight sections, each kept by the end-to-end gate; no rejected fit; the build resolves it with no warning). Dynamic products and divisions dispatch on fitted equations, every one-input decision is a sweep, static values are approximate, and any checkout can tune itself into `presets/local.toml`. Open: the x86 preset (the user's, on the i7). The series' dispatch equations, rebuilt on fitted equations on 2026-11-10 and marked above the 5% line until 2026-11-13, are under it since ("Horner's and binary splitting's equations under the line, and the beta guard gone": 3.4%, 2.7% and 3.6% held out in the preset of that day's full retune), and nothing in the preset is marked. The history of how it got here is in the log below. Earlier status, kept for the record: in progress (2026-11-10). In `presets/aarch64-macos.toml` (thorough, M1): `base`'s units; mul's schoolbook, Karatsuba-level, recursive-Karatsuba, FFT and static-NTT fitted models; `mul.kara` derived; and seven sweeps (`mul.karatsuba_sqr`, `fft_sqr`, `fft_karatsuba`, `fft_chunking_karatsuba`, `static_ntt_sqr`, `ntt_karatsuba`, `ntt_chunking_karatsuba`). Not done in mul: FFT-to-NTT, high and middle products, the NTT's parallel gates, the cyclic square, `mul_ns` and per-call comparison above an extent. Then every later section and the x86 preset |
 
 Handoffs to the i7-8750H (x86), tracked here until done:
 - `base` bias check (Stage 4): the ADX cutoffs compile out on AArch64.
@@ -312,7 +312,7 @@ with its old harness in the `faa9971` worktree.
   paths of each: `mul.hi_mul_row`/`hi_sqr_row` (columns against rows, every window from 6 to 200),
   `mul.{dyn,static}_partial_{mul,sqr}` (`hi_*_buf` against the guarded product, operands of 2w and w
   limbs), `mul.fft_mid`/`ntt_mid` (`mid_mul_buf` against the transform; these switch at n >= knob,
-  so `sweep_cutoff_plus` adds one) and `mul.sqr_bnm1_fft` (`sqr_dyn` and a fold against the cyclic
+  so `sweep_cutoff`'s `plus` adds one) and `mul.sqr_bnm1_fft` (`sqr_dyn` and a fold against the cyclic
   FFT, at `bnm1_size`s). M1, normal level, new value (old: old's mean loss on the same timings):
   `hi_mul_row` 21 (24: 0.01%), `hi_sqr_row` 95 (90: 0.02%), `dyn_partial_mul` 318 (312: 0.46%),
   `static_partial_mul` 284 (408: 3.38%), `dyn_partial_sqr` 337 (464: 4.47%), `static_partial_sqr`
@@ -423,7 +423,7 @@ consts, trans); the x86 preset on the i7.
   move one shape. A rejected fit's evidence says `REJECTED`, and `cargo tune tune` ends with the
   list of them (it still writes the file).
   *Samples:* a level's thoroughness is the spread its samples must come under, (interquartile
-  range) / median: 5% quick, 2.5% normal, 1% thorough (`Level::spread`). `time_probes` takes at
+  range) / median: 5% quick, 2.5% normal, 1% thorough (`Level::spread`). `measure::sample` (`time_probes` then) takes at
   least `rounds` samples of each probe, then keeps sampling the unsettled ones up to
   `max_rounds` (6x). The tune ends with how many measurements never settled, and says the machine
   was busy when that passes 5% of them.
@@ -644,7 +644,7 @@ tuned (157 knobs: 29 sweeps, 58 equation constants, 70 interim).
 - **The tie band, and the new sections validated end to end (2026-11-11).**
   *Tie band.* Where a knob hardly matters its best value follows noise (exp's square count read
   64, then 8, against 24, all within 0.1%), and a sweep on the pool can't see what such a knob
-  costs on one thread. So every sweep (`sweep_cutoff_plus`, `pick_param`, `sweep_ratio`) now
+  costs on one thread. So every sweep (`sweep_cutoff`, `pick_param`, `sweep_ratio`) now
   keeps the knob's previous value unless another loses less by more than the level's ε
   (`Level::eps`: 3% / 1% / 0.5% of mean time lost; the rule and its evidence are one function,
   `sweep::keep_or_take`, since the 2026-11-11 simplification pass, which also removed the
@@ -2047,13 +2047,14 @@ about the 'rect' series."
 - *A fit a regime* (`Regime` in `sections/series.rs`). A workload is long or short by whether
   the short prices in force put its best algorithm past `SMALL_EXTENT_NS`, the test the
   table's derivation makes. The long series' fit gives the equations the dispatch reads
-  (`SeriesEq::read`); the short series' gives `series.short_*` (21 constants,
-  `SeriesEq::read_short`), which only the table's derivation reads. The table could not be
+  (`SeriesEq::read`); the short series' gives `series.short_*` (21 constants then, 22 since
+  rect's equation changed later that day; `SeriesEq::read_short`), which only the table's derivation reads. The table could not be
   derived from the long fit: its prices read 21-24% on short series for Horner and binary
   splitting. The family is walked three times its count for the long regime, which keeps about
   a quarter of what it walks.
-- *Rect's own price for one-limb divisions* (`series.rect_ns_div1`; `SeriesEq::RECT` is
-  product, div1, call, fixed; approved by the user afterwards, 2026-11-12: "That addition to
+- *Rect's own price for one-limb divisions* (`series.rect_ns_div1`; `SeriesEq::RECT` was
+  product, div1, call, fixed, and is product, div1, add, term, fixed since later that day;
+  approved by the user afterwards, 2026-11-12: "That addition to
   the Rect equation is ok"). Forced by the regime fit, not proposed before it: rect's groups
   end at its blocks, so it divides by a one-limb Q in every range, where Horner's groups fill
   two limbs and its long series hardly make one (1 of 67 in the report's set). Horner's long
@@ -2295,6 +2296,1066 @@ change to mul (an algorithm, its equation, mul's version and a retune of what is
 mul): the user's call, not made.
 
 
+### Rect's counts read against the kernel, and hi_mul_buf's own equation (2026-11-12)
+
+The user: "this pass through is dedicated to trying to find an accurate runtime model for the
+rectangular splitting algorithm. By accurate we mean that the model falls into the hold-out rms
+of under 5%"; then, on the form proposed: "Move the tier price in to the mul section and
+implement it."
+
+**How it was found.** Every row of rect's record up to 22 changed a price or a set of shapes.
+None could check a count, as there was nothing to check one against. So the kernel was given
+counters (a scratch worktree: `mul_acc`, `div_acc`, `add_pass`, `mul_frac`, `group` each
+recording its limbs and calls, and every high product its (l, s)), and 747 rect shapes of the
+synthetic family were timed at up to seven block lengths each (3830 timings, the rect kernel
+alone at an explicit block length; passes differ 0.87%) and counted. That splits the error in
+two: the model's counts against the kernel's, and prices fitted to the kernel's own counts.
+
+*The counts were wrong, by amounts that vary shape to shape, which no price absorbs.* The
+model over the kernel, long series, every block length (geometric mean, and the spread of the
+log):
+
+| Count | Before | After |
+|---|---|---|
+| term adds and R passes (`mul1`) | 1.74, spread 22% | adds 1.02, 5%; R passes 1.00, 2.6% |
+| divisions (`div1`) | 1.15, 21% (1.42 at 1.5-3 blocks, 1.04 past 12) | 1.01, 5% |
+| products, as priced | 1.06, 9% | 1.006, 1.3% |
+| block products' area alone | 1.10, 15% | 1.00, 0.3% |
+| copies | not counted for a guarded product | 1.01, 2.5% |
+
+What was miscounted, each read off `rect_hyper` and its helpers:
+
+1. *A power's width.* Power j was taken as j times x's limbs. The powers are exact and
+   `low_zeros` strips their zero low limbs, so it is ceil(j bits(x) / 64): an x of two limbs
+   has 65 to 128 bits. This is the "narrow x" error of rows 19-21 (add limbs 1.23 high at two
+   limbs, 1.02 at every width once fixed), and it is in every term add, every block product's
+   short side and the block length whose power fills the accumulator.
+2. *Passes a term add.* Counted as two. `add_term` splits the weight at the term's bit within a
+   limb and skips a half that is zero, so a weight of b bits makes about 1 + b / 64: 0.97
+   (`geo56`, a weight of 1), 1.20 (`den32`), 1.24 (`fact`), 1.54 (`geo8`) in the kernel.
+3. *Limbs a term add.* Taken as the lesser of the mean power and the mean frame. The kernel
+   takes the lesser term by term, and within a block the powers grow as the frames shrink, so
+   the two cross: a closed form a block now, summed over sampled blocks.
+4. *Where a group divides.* Every group of a block was charged at the block's shallowest frame.
+   A group divides at its own shallowest term's.
+5. *Copies.* A guarded high product is made in scratch and its window copied out, and each
+   power is scanned for its zero low limbs. With both counted, rect's own price for a limb
+   copied fits at 0.127 ns against Horner's 0.132, where the old count wanted 0.22.
+
+And two smaller ones: the shallowest block's product is by its own, shorter power; and the
+accumulator's own length sits a fraction of a limb off a term's frame (the sum a division takes
+is Q / q times a term, what it leaves is a q below it, in a top limb half full on average),
+which is derived from where the bits land and not fitted, and takes the block products' area
+from 1.14 with a 16% spread to 1.00 with 5.5% on short series.
+
+*Prices on the kernel's exact counts* give the floor for any equation of this kind: 4.6% held
+out with five prices of rect's own, 3.5-3.7% with the high products of `hi_mul_buf`'s tiers
+priced apart from the guarded ones. So the counts were worth about three points and the high
+product's price most of another.
+
+**The forms, on the corrected counts** (the same timings, fitted on the half not held out; the
+tune's points, the report's, and a third set; the form in use read 8.3 / 7.6 / 7.5):
+
+| Rect's own prices | Held out | Over every block length |
+|---|---|---|
+| product, div1, term, fixed (its adds at Horner's `mul1`) | 4.8 / 5.4 / 4.4 | 5.5% |
+| + add | 4.6 / 4.9 / 4.3 | 5.4% |
+| + a multiple for the products `hi_mul_buf` runs | 3.8 / 4.2 / 3.6 | 4.1% |
+
+The third was proposed as rect's own constant. The user moved it to where it belongs: the
+price of a kernel is the kernel's, in mul's section.
+
+**`hi_mul_buf`'s equation** (`HiEq`, `mul.hi_rows_*` and `mul.hi_cols_*`). Its two kernels were
+timed forced on 543 (window, operand) shapes. Both make the same limb products, the window's
+columns and the two guard columns below it, W = l s - (s - 2)(s - 3) / 2, and differ in what
+their fixed cost attaches to:
+
+| Kernel | Form | Held out | As priced before (mul_buf's equation on the area) |
+|---|---|---|---|
+| rows (`hi_mul_buf_by_rows`) | a W + b s + c: a term a row | 2.2% (2.7% in the tune) | 14.6%, 10% low |
+| columns (`hi_mul_buf_cols`) | a W + b l + c: a term a column | 3.5% (3.8% in the tune) | 31%, 18% low |
+
+The term a row is 2.9 ns a limb of the shorter operand, and the rows fit is flat across that
+operand's width (2.4% at two limbs, 1.9-2.2% from three to the window). Without it (W and a
+shift) the rows kernel reads 9.5%. The columns kernel is fitted to a third past where
+`mul.hi_mul_row` stands: its cost isn't this form over a wide range (3.5% to 32 limbs, 4.2% to
+48 and to 64). The series' `SeriesEnv::hi_ns` reads it for windows within
+`mul.dyn_partial_mul`, and Horner's closed-form sum of its products by x (`school_products`)
+was rewritten on it: its frames' stretches are now cut where the frame passes the kernels'
+cutoff as well as where it passes x. Division's NR keeps its own fitted multiple a tier.
+
+**As built.** `Shape::rect_parts` in closed form (no loop over terms: the dispatch evaluates it
+for three block lengths): the divisions and R passes from two lattice sums (`frame_from_lifted`
+at the groups' mean offset), the term adds from a closed form a block (the whole powers'
+limbs exactly, from a 64 x 65 table of the sums of ceil(j a / 64); the blocks that hold every
+power whole in one step, the rest sampled), the products at each block's own length.
+`SeriesEq::RECT` is product, div1, add, term, fixed: rect's term adds are `add_mul` passes of a
+weight over a power, which Horner has no price for, and its price a term takes the place of
+its price a call. `series.rect_ns_call` is gone, `rect_ns_add` and `rect_ns_term` are new
+(and the short pair); the series section is at version 6. The short regime walks the family
+three times over as the long one does: one walk left rect 20 short shapes at the normal level
+for five constants.
+
+**The M1 preset, retuned** (`presets/aarch64-macos.toml`, thorough, mains power, battery full;
+all nine sections kept by the gate, no fit rejected). Held out, with the preset before:
+
+| Equation | Before | Now |
+|---|---|---|
+| rect, long series | 8.2% | **2.8%** over 62 (2.7% fitted on 125) |
+| Horner, long series | 5.8% | **4.7%** over 100 (3.7% fitted on 223) |
+| binary splitting, long series | 3.9% | 3.6% over 68 |
+| rect, short series (the table's prices) | 6.2% over 22 | 7.6% over 68 |
+| Horner, short series | 9.7% | 7.4% |
+| binary splitting, short series | 10.5% | 9.4% |
+
+For the first time the three equations the dispatch reads are all under the line, and none of
+them is marked; the three short sets of prices stay NOISY. Horner came under it without being
+touched: its products by a multi-limb x are the same kernel, and its product multiple went
+from 1.115 to 1.025 (it had been absorbing the kernel's price). Rect's prices: product 1.024,
+div1 3.43 ns a limb, add 0.384 ns a limb, 18.6 ns a term; its fixed cost solved negative and is
+left out. `hi_mul_buf`: rows 0.382 W + 2.87 s + 5.6 ns, columns 0.456 W + 1.54 l + 5.9 ns. The
+gate: mul 0.9992, div 1.0003, sqrt 0.9989, bin_split 0.9953, series 0.9820 (against the
+schema's defaults, as its version changed), theta 1.0007, agm 1.0006, exp 0.9995, ln 1.0008;
+listed past 2%: `exp_dyn` 1040 (1.023), two series (1.020, 1.029). The small-series table
+derived to 2531 change points. One caution, the same as for the preset before: the sweeps'
+"samples" line read 6.0% unsettled (1285 of 21360), past its 5% warning; the 10474 fit probes'
+passes differ 2.3% (0.6-0.7% for the series' fits). And one sweep moved a value that a test
+stood on: `bin_split.dyn_engel_leaf_limbs` 48 to 64, which puts a tree of
+`test_bin_split_parts_count_the_tree` on the leaf cutoff, where the level walk is two nodes off
+(the known limit below); the test's tolerance now says "a node or two" in nodes.
+
+On the report's unseen long series (`cargo tune series`, thorough, the old tree against the
+new before the retune, each fitted on one half and read on the other): rect 7.5% to 2.9%,
+Horner 6.7% to 4.9%, and the picks under the fitted equations lose 0.14% and 0.02% of the total
+time (0.30% and 0.06%), worst 8.7% and 3.2% (17.9% and 12.6%).
+
+**Under the retuned preset** (`cargo tune series`, thorough, 235 long and 725 short unseen
+workloads; the two halves of each):
+
+- Long series: the live equations read Horner 4.1% and 3.1%, rect 3.0% and 3.3%; their picks
+  lose 0.11% and 0.02% of the total time, worst 6.7% and 2.7% (the preset before: 0.26% and
+  0.06%, worst 17.9% and 12.6%); the entry itself, its dispatch included, 0.34% and 0.10%
+  (0.47% and 0.26%), worst 7.8% and 3.4% (18.3% and 13.7%).
+- Short series: the table takes 697 of the 725. The picks lose 1.40% of the total time on one
+  half (worst 52%) and 2.11% on the other, where one workload carries it (below); the entry
+  1.89% and 2.41%.
+- End to end in a normal build, the old tree with its preset against the new with its own
+  (`benches/tuning_bias.rs --compare`, outputs identical on every item): the series items
+  0.988 on the geometric mean (26 items: factorial series at a wide x 0.82 and 0.90, as rect
+  takes a better block length, 6 where it took 4; one series 1.035, where the balance
+  candidate moved from 121 to 145 and 121 was the faster; one 1.016 from the dispatch's cost;
+  a BBP series 1.022 from bin_split's retuned gates); exp, ln, theta and agm 0.998 (48 items).
+  `exp_dyn` and `ln_dyn` from 300 to 8400 limbs: 0.99-1.015 on one thread, 0.95-1.02 on eight.
+
+**A corner the rederived table lost.** Two terms at an x past 32 limbs, in a frame of 256
+limbs or more (`hyper fact w548 t2 x18748`: Horner 16.4 us, rect 0.63, binary splitting 18.7):
+the table before said rect there, and this one says binary splitting, 3.5 to 30 times slower on
+such a series (6.5 us for 1.7 at an x of 48 limbs, 55 for 1.8 at 293). The equations, read
+for the series itself, pick rect in both trees. The cell is decided at the class's
+representative shape (an x of 48 limbs for "more than 32"), where binary splitting's short
+equation reads 2.0 us for a tree that takes 6.4 (and Horner's 5.1 for 18.2): a near tie in the
+predictions, which rect's refitted short prices tipped (its one-limb division at 3.18 ns a
+limb for 2.48, its fixed cost at 288 ns for 152). At three and four terms both tables say
+binary splitting there, for a rect 4.7 and 3.4 times faster. It is the table's derivation
+standing on equations that are a factor of three off on few-term trees at a wide x, not rect's
+equation; exp's and ln's own chunks don't land on it (above). Not fixed here: what to do with
+a cell whose two best predictions are within the equations' own error (leave it to the
+equations, at the cost of reading them), or with a kind of x that is open at the top, is a
+question about the table.
+
+**What it costs, and what is left.**
+
+- *The dispatch.* `rect_parts` does more: a decision that predicts rect went from 260-490 ns
+  to 370-610 in a normal build on the shapes tried, 100-310 ns more (it was 570-710 before the
+  table for the powers' limbs and the whole blocks taken in one step). A table pick of rect computes its
+  block length the same way.
+- *Rect's short prices* did not improve (7.6%). The tuner's forced time includes computing
+  the block length, about 290 ns of fixed cost on series of a microsecond; the rect kernel
+  alone, timed at an explicit block length, fits at 5.8% on short series.
+- *A q that grows* (`fact`): the groups are larger at the shallow end, where the frames are
+  long, and the model spreads them evenly: its divisions read 4.7% high (8.7% spread). Weighting
+  the two Gauss points by their groups takes the bias to 1.5% and was left out, as it moved no
+  fit. It is Horner's count as well.
+- *The block length.* Among the lengths timed (the model's pick, half, double, a quarter, four
+  times) the best is 8% faster than the old model's pick on long series on average. The new
+  equation reads 4.1% over every block length, so more candidates than three could now be
+  told apart; not tried, as each costs an evaluation.
+- *The powers' products* run over the whole accumulator though a power's low limbs are zero
+  (a third to a half of the work where a block's power fills it): a change to the kernel, not
+  to its model.
+
+### Tables measured, under one rule (2026-11-12)
+
+The user: "one thing that was left in a bit of a broken state before the table for fast series
+evaluations where the dispatcher would have genuine over head. The table should be reworked and
+derived from actual measurments at each index size instead of the table being derived from the
+fits. This should be the case across the board. Furthermore, I think standardizing where a table
+should be used tuning system wide would be useful. So I think a cutoff like if dispatch is more
+then 5% of runtime at that size then use a table. This should be enforced system wide." And,
+while it was being built: "If the 5% rule creates exsesively large tables then we can revaluate
+it to be larger and thus make the tables smaller."
+
+**The rule.** Where reading a dispatcher's fitted equations costs more than `tables::SHARE`
+(0.05) of the call, the dispatcher reads a table; past that it reads the equations. One constant
+for every dispatcher. `--share X` puts another number in its place for one run of `tune`,
+`dispatch` or `series`, and every table's evidence gives its size at the larger shares from the
+same timings (`tables::sizes_above`, `rows_at`).
+
+**The builder** (`tuner/tables.rs`, one for every table; a table is a `Spec`: its rows and
+grids, the probes of an index, and what to do with the rows of a group once measured).
+- At every index of a row's grid, in ascending size, each algorithm that can take the shape is
+  timed, forced, and the dispatcher's decision is timed beside them: its equations read at
+  explicit knobs, as a normal build has them. `measure` takes a row a few indices at a time
+  (`time_fit`: three batches of every probe in shuffled rounds, two passes with the buffers
+  moved, the least kept).
+- `row` is the rule on a row's timings, with nothing timed, so tests give it made-up ones. A cell
+  is the pick that costs least: the time under it over the fastest algorithm's. The pick before
+  it stays while its cost is within the tie band, and a pick that lasts one cell between two of
+  another is dropped. A row ends at the first index where the decision is within the share of
+  the call (`Cell::past`), which is the equations', and nothing past it is timed.
+- A step of a coarse grid is timed at one of its sizes and stands for shorter calls too:
+  `Cell::least` is the shortest as a fraction of the one timed, and the rule is read there. (The
+  series' steps are timed at their last term count and read at their first, and their octaves of
+  frames at the smallest frame. Before this the check below found 11 real series up to 8.1%
+  past the rule at indices the table had handed on; after it 2 or 3 within a point of the line.)
+- An index may stand for several calls (`Cell::of`, a `Timed` each; the series' kinds, below).
+  Its pick is the one that costs them least together, the mean of each call's time over its own
+  fastest algorithm's, a call that can't run the pick being left to the equations; and it is the
+  equations' by the rule only when the decision is within the share of every one of them.
+- Reading the equations is itself one of a cell's picks, at its own cost (`Cell::read`: the
+  decision paid on every call). With one call at an index its fastest algorithm always costs
+  less, so this changes nothing there.
+
+**The four tables** (`dispatch::TABLES`).
+- `mul.kara` (`sections::mul::kara_table`): `mul_buf` against `karatsuba_entry_dyn` at every
+  (s, l), s from 8 and l to 4s, a row at a time in three steps (the square; the near-square
+  shapes to l = 2s - 2, a level; the chunked ones), each under the rows and steps before it, as a
+  level's sub-products and a chunked product's chunks are earlier rows'. It has no "equations"
+  pick (it is where schoolbook wins; `mul_dyn` past it reads its two equations for under 5% of a
+  product everywhere tried), so its rows are measured over their whole grid, and it stops after
+  six rows that are Karatsuba throughout. **A trap:** the Karatsuba entry asks the table about
+  its own shape before anything else, so with the table-so-far saying "schoolbook" both probes
+  ran schoolbook, tied, and the first table read "Karatsuba from 211 for squares". The indices of
+  the step being timed are Karatsuba's in the live table while they are timed. On the M1:
+  Karatsuba from 44 limbs for squares and 49 at l = 4s (96 change points; every row from s = 61 is Karatsuba throughout); the table derived from the fits said 46 and 66 (it only switched past a margin of the
+  two fits' errors, which is widest where the two cost curves cross at a shallow angle).
+- `div.dyn_small`, `div.dyn_rem_small` (`sections::div::small_table`): rows by the divisor's
+  limbs (every one to 64, then eight an octave), change points over the logical quotient width
+  (2 to 24, then eight an octave), only shapes where something besides Knuth can run; a cell
+  Knuth, BZ, NR or the equations. They stop when a group of eight rows is the equations' from
+  its first index. On the M1 they hold only Knuth cells: 32 change points with rows of their own at divisors to 38 limbs (quotient only) and 57 at divisors to 108 (with remainder).
+- `series.small`: below.
+
+**Enforced** (`tuner/dispatch.rs`). `TABLES` is every dispatcher that reads fitted equations at
+run time with its table. `cargo tune dispatch`, and the last lines of every tune, time the
+decision (at explicit knobs) against the entry's own call on indices over each dispatcher's
+small sizes where the dispatch in force reads its equations, and name the indices past the
+share; past 1.25 times it the command exits non-zero. `test_every_table_is_a_dispatchers` holds
+the schema's table knobs to the list and requires that no knob is derived.
+
+**What went.** `tuner/derive.rs` and `cargo tune derive` (a table is measured by `tune SECTION
+--tables`); the fits of one Karatsuba level and of chunking (`mul.kara_{scale,shift,err}`,
+`mul.chunk_{scale,pass,err}`), which were read only to derive `mul.kara`; division's Knuth
+guards `div.dyn_knuth_d` and `div.dyn_rem_knuth_d`; the series' short prices (`series.short_*`,
+22 constants), the fit a regime (`Regime`, `SeriesEq::read_short`, `Shape::of_class`) and
+`horner_first` for dynamic nodes. `Kind::Table` is a measured kind: part of its section's hash,
+and a file's table of another layout falls through with the section's `derive` number. mul is at
+version 18, div at 9, series at 7 (its table's layout number, `derive`, at 5).
+
+#### The series' equations under the rule
+
+There is one set of prices again, fitted on the series the equations are read for: those whose
+timed decision is within the share of the fastest algorithm's time (`SeriesTiming::read`). That
+puts series from a few microseconds in the fits, where the derived table's extent had kept them
+past a predicted 20 us. On one set of 960 workloads (thorough), held out, by the share:
+
+| share | read for | Horner | rect | binary splitting | their picks lose (mean, worst) |
+|---|---|---|---|---|---|
+| 1% | 208 | 3.8% | 3.4% | 5.7% | 0.05%, 5.5% |
+| 2% | 334 | 8.0% | 3.9% | 5.9% | 0.09%, 5.7% |
+| 5% | 501 | 6.6% | 4.8% | 7.2% | 0.19%, 9.5% |
+| 10% | 641 | 6.9% | 5.1% | 7.7% | 0.22%, 11.9% |
+| 20% | 780 | 6.9% | 4.8% | 7.9% | 0.27%, 13.9% |
+| no table | 960 | 7.5% | 7.1% | 8.4% | 0.28%, 17.1% |
+
+So at the rule's 5% Horner's and binary splitting's fits are back above the line (NOISY, marked
+again: "Marked problems"), with rect under it, and their picks lose a fifth of a percent. The
+share moves the fits far more than it moves any table's size.
+
+#### The series' table: its index
+
+As first measured the table kept the derived one's index: a row a class and an octave of
+frames, 72 classes (ten kinds of x, four buckets of q's bits, an r past 1 or not), each timed on
+one synthetic series. 1873 change points at 5% (2636 at 1%, 1596 at 10%, 1310 at 20%), against
+the derived table's 2602.
+
+The user: "I feel like there are simpiler strategies and that complex of a table is causing an
+explosion in entries?" It was: 691 rows of 2.7 change points on average, 691 of the 1877 being
+each row's end, and no two neighbouring octaves ever the same row (each ends on its own
+extent).
+
+**The two ratios and a size** (the user's proposal: "That table will only have three indexes so
+it shouldnt be too large"), scored on kept timings (`BIGBITS_TUNE_VERBOSE=1`: every series timed
+at every index, and 960 unseen workloads), on the 459 workloads the table is for. Regret is the
+call's time over the fastest algorithm's, less 1, the decision paid where the equations are
+read; time-weighted is the extra time over the total.
+
+| ratios bucketed by | size | cells used / dense | time-weighted | mean | worst |
+|---|---|---|---|---|---|
+| half an octave | frame | 616 / 15288 | 10.9% | 11.5% | 149% |
+| an octave | frame | 266 / 4056 | 10.1% | 10.2% | 149% |
+| 2 octaves | frame | 121 / 1176 | 9.8% | 9.9% | 163% |
+| 4 octaves | frame | 65 / 384 | 15.0% | 14.0% | 828% |
+| 8 octaves | frame | 40 / 120 | 15.9% | 14.1% | 828% |
+| an octave | frame x terms | 253 / 2704 | 7.7% | 9.7% | 149% |
+| 2 octaves | frame x terms | 113 / 784 | 8.1% | 10.5% | 163% |
+| any | terms | 39-267 | 16-18% | 17% | 3055% |
+| (no table) | | 0 | 13.6% | 23.4% | 114% |
+| (the 72 classes) | | 1873 points | 2.0% | 1.0% | 46% |
+
+About 10% at every grain: the grain is not what limits it. rho is 0 for every series with no x,
+233 of the 459 (they lose 14-18%, those with an x 4-8%); scored on the very cells it was built
+from the index still loses 3.6% at half an octave and 5.6% at two; and what decides a short
+series is its fixed costs a call and a term, which follow the frame and the terms themselves.
+(rho and beta were derived for long series, where the work decides.) Frame, terms and one more
+coordinate do better (frame, terms and rho at two octaves: 402 cells of 1848, 4.7% and 3.8%),
+and the classes merged do best.
+
+**The user's choice**: "Lets go with the 7 x-kinds, no q, no r 203 pionts table. That is roughly
+the size I want cahces to be at and the mean is still less then 2% and the weighted less then
+3%."
+
+**The numbers that choice was made on were wrong, and mine.** I had given 1.9% on the mean and
+2.7% of the time, worst 96%. Built (a row a kind and an octave, each cell timed on the kind's
+members, the 72 series the classes had been, and taking the pick that costs them least
+together), the table was 205 change points and lost 2.9% and 4.1%, worst 107%, on the series it
+is for; and it took about a hundred longer series, which the equations had been right about, and
+lost 3.9% on the mean on those (2.1% with no table at all), one of them 426% slow. Two errors in
+the scoring: it counted only the series the table is for, and a row that stands for a whole kind
+reaches the longer series of that kind as well; and it had fitted each cell's pick to the
+classes still inside the rule's extent at that index (the others' rows having ended), where the
+builder has to pick for all of the kind.
+
+**The replay.** A scratch script (not kept in the repo) rebuilds the table from the kept member timings as
+`tables::row`, `measure` and `assemble` do and looks it up as `SeriesNode::small` does. It agreed
+with the live table's pick on 960 of 960 workloads, and it scores every workload, the decision
+paid where the equations are read. On it (mean / time-weighted / worst, in %):
+
+| layout | rule | points | the table's 458 | the equations' 502 | all 960 |
+|---|---|---|---|---|---|
+| no table | | 0 | 23.3 / 13.7 / 114 | 2.08 / 0.41 / 76 | 12.2 / 0.57 / 114 |
+| 7 kinds | as built | 205 | 2.94 / 4.11 / 107 | 3.88 / 1.22 / 426 | 3.43 / 1.26 / 426 |
+| 7 kinds | equations a pick | 190 | 2.13 / 3.07 / 47 | 2.82 / 1.18 / 426 | 2.49 / 1.21 / 426 |
+| 8 kinds: 17-32 limbs and more apart | as built | 231 | 2.83 / 3.84 / 107 | 3.05 / 0.44 / 143 | 2.94 / 0.48 / 143 |
+| 8 kinds: 17-32 limbs and more apart | equations a pick | 219 | 2.11 / 3.03 / 47 | 1.99 / 0.40 / 76 | 2.05 / 0.44 / 76 |
+| 6 kinds: 2-16 limbs one | equations a pick | 183 | 2.08 / 3.05 / 58 | 1.97 / 0.40 / 76 | 2.03 / 0.44 / 76 |
+| 9 kinds: 3-8 and 9-16 apart too | equations a pick | 257 | 1.99 / 2.71 / 46 | 2.01 / 0.40 / 76 | 2.00 / 0.43 / 76 |
+| 9 kinds x q to 16 bits or more | as built | 506 | 1.38 / 2.07 / 46 | 1.97 / 0.40 / 76 | 1.69 / 0.42 / 76 |
+| 10 widths x 4 q x r (the classes) | either | 1881 | 0.98 / 1.96 / 47 | 1.90 / 0.40 / 76 | 1.46 / 0.42 / 76 |
+
+Two things carry it. *The equations as a pick*: where no one algorithm serves a kind's spread
+(Horner is 2x off for a q of 8 bits at many terms, binary splitting 2x off for one of 62), a cell
+that names either loses 100% on half of the kind, and paying for the decision loses a few
+percent on all of it. *An x past 32 limbs as its own kind*: the 426% was an x of 414 limbs,
+7 terms in 598 limbs, read off a row timed on x of 28 and of 48 limbs, where binary splitting
+wins; and with q split as well it was a 2-term series at an x of 293 limbs given binary
+splitting where rect is 30x faster (the corner the derived table had lost, below).
+
+**As built** (8 kinds; the user was told and went on: "Run the full retune"): `SMALL_KINDS` = 8
+(BBP, Engel, Hyper with no x, an x to a limb, of 2 limbs, 3-16, 17-32, more), no bucket of q
+and no flag for r in the class, the series section's `derive` number 5. The members
+(`member_cell`, `MEMBERS`): for each width of x (none for BBP, for Engel and for Hyper; 12 and
+60 bits; 2 limbs; 7 and 14; 28; 48) coefficients of 8, 16, 32 and 62 bits, with an r past 1 and
+without. On the M1 (the retune below): 218 change points, 1316 indices timed
+(each on its kind's 4 to 16 members), Horner in 66% of the table's cells, rect in 17%, binary
+splitting in 17%; at 146 of the table's 1229 indices no one algorithm serves the kind and the
+equations are read, the decision up to 26% of the call there. On the 960 unseen workloads
+(`cargo tune series`, thorough), where the table decides (459): its picks lose 1.48% on the mean
+and 2.26% of the time, worst 45.0% (the 72 classes: 0.80%, 1.67%, 46.3%; the seven kinds as first
+built: 2.87%, 3.90%, 107%), and the entry itself, its dispatch included, 3.00% and 3.45% (2.56%
+and 2.52%; 3.66% and 4.35%). With the decision paid where the table hands a series to the
+equations the call loses 2.13% and 3.14% there, 1.91% and 0.41% where the equations are read
+(worst 77%), 2.01% and 0.44% over all 960: the replay had said 2.11 / 3.03, 1.99 / 0.40 and
+2.05 / 0.44. The equations' own picks, on the series they are read for: 0.94% and 0.56% on the
+mean on the two halves (0.16% and 0.04% of the time; worst 76% and 48%). And the corner the
+derived table had lost is right: a two-term series at an x of 293 limbs in a frame of 275 runs
+rect from the table, 631 ns where Horner takes 16.6 us.
+
+The dispatch check reports the indices such a table hands to the equations past the share as
+the table's own choice (`Verdict::chosen`), not as a breach: at 146 of the table's 1229 indices on the M1, the decision up to 26% of the call there (in `cargo tune dispatch`'s sample, 6 of 98 indices: 8.0% to 16.7%).
+
+#### Division: what the rule costs
+
+The end-to-end comparison (`benches/tuning_bias.rs`, normal builds, this tree over the one
+before) read the division grid 1.3% slower, single shapes to 7%. 12 of its 40 shapes are at
+divisors within the old guards, where `d <= guard` returned Knuth with one compare at any
+quotient: they read the equations now (which answer Knuth), as the tables hand a division on as
+soon as the decision is within 5% of it.
+
+| division | before | now | new / old |
+|---|---|---|---|
+| `div_dyn` 16/8, `div_rem_dyn` 40/32 | one compare | the table: Knuth | 1.007, 1.009 |
+| `div_dyn` 40/32 | one compare | the equations | 1.073 |
+| `div_dyn`, `div_rem_dyn` 40/16 | one compare | the equations | 1.052, 1.045 |
+| `div_rem_dyn` 76/64, 96/48, 88/64 | one compare | the equations | 1.040, 1.029, 1.021 |
+| `div_dyn`, `div_rem_dyn` 88/24, 138/8; `div_rem_dyn` 260/60 | one compare | the equations | 1.009-1.016 |
+
+The 12 as a group: 1.028. About 15-22 ns a quotient-only division and 20-65 ns with a remainder
+(from the ratios and Knuth's fitted time; not timed directly). A measured table can't say what
+the guard said: "Knuth at every quotient" is a property of the equations, and by measurement it
+would take timing every quotient. The ways out were a lower share (the tables were 95 and 82
+change points at 1%), the guard back in front of the equations (it changes no pick they would
+make, but it is computed from the fits), or accepting it. The user: "Ok well just accept it then
+it is within the noise threshold roughly anyway. (For the sake of consistency)".
+
+#### A tuner bug the comparison found: sweeps before the fits they depend on
+
+`hi_mul_dyn` at 300 limbs was 14.8% slower than in the tree before, and `agm_dyn`, `theta_dyn`
+and `exp_dyn` at 300 limbs and `div_dyn` 1200/600 3-5.5%. `mul.dyn_partial_mul` had come out at
+312 where every tune before had it at 242. mul's second phase fits recursive Karatsuba's and the
+FFT's equations and then sweeps the cutoffs whose guarded side dispatches through `mul_dyn`, and
+the fits were only made live when the phase returned. This tune began mul from the schema's
+defaults (its version had gone to 18), whose `mul.fft_scale` is 0.49 against the M1's 0.574, so
+`mul_dyn` took the FFT too early throughout the sweep, the guarded product ran slow from 242 to
+317 limbs, and the sweep "kept" the default. A build with 242 in its place: `hi_mul_dyn` 300
+0.867, `agm_dyn` 300 0.952, `theta_dyn` 300 0.966, `exp_dyn` 300 0.971, `div_dyn` 1200/600
+0.961. `tune_late` sets its fits live before its sweeps now. It would have bitten the first tune
+on any new target (the x86 handoff). The gate could not have caught it (its "before" was the
+same defaults), and the mean over mul's 45 items read 1.0006: it was in the items.
+
+#### The retune, and the checks
+
+`cargo tune tune --level thorough --write-preset` on the M1, 35 minutes (17:28 to 18:03; it
+was 25 before the tables were measured), all nine sections kept by the gate, no fit rejected. The
+machine was unplugged when it began and on charge from a few minutes in; a fixed workload held
+within 0.5% over five runs just before. The sweeps' "samples" line read 6.4% unsettled, past its
+5% warning, as the three presets before it had (5.9%, 6.0%, 6.8%); the fits' passes differ 1.9%
+over 64426 probes. (A first retune the same afternoon, before the series' layout was changed and
+with the sweep bug above in it, is not the preset.)
+
+- mul: `mul.kara` Karatsuba from 44 limbs for squares and 49 at l = 4s, 96 change points;
+  `mul.dyn_partial_mul` 244 (a clean crossover: no time lost at it, where 312 lost 1.5% and 8.2%
+  at worst). Held out: schoolbook 3.9%, `hi_mul_buf` by rows 2.6% and by columns 3.8%, recursive
+  Karatsuba 2.7%, recursive chunking 1.6%, the FFT 3.6%.
+- div: `div.dyn_small` 32 change points, rows of its own at divisors to 38 limbs;
+  `div.dyn_rem_small` 57, to 108. Held out: Knuth 2.2%, NR 3.0% and 3.8% with the remainder, BZ
+  2.4%.
+- series: Horner 6.6% and binary splitting 8.1% held out (NOISY), rect 3.1%; `series.small` 218
+  change points (184 at a share of 10%, 158 at 20%).
+- `cargo tune dispatch`: `mul_dyn` reads its equations at 34 of the indices tried, the decision
+  0.7% of the call on average; `div_dyn` at 98, 2.3%; `div_rem_dyn` at 88, 1.7%; each within 5%
+  at every one. The series' entry at 98, 1.8%, past the rule at 6 by the table's own choice (8.0%
+  to 17%).
+- Both suites pass under the preset (593, and 606 with `tune`).
+
+**End to end** (`benches/tuning_bias.rs`, normal builds, this tree and preset over the tree and
+preset before the change, six processes a side; every output hash the same):
+
+| section | items | new / old | the items that moved |
+|---|---|---|---|
+| series | 26 | 1.0054 | `hyper geo56 w64 t64 x256` 1.145; `geo8 w64 t256 x64` 1.039; `engel fact w8 t30` 1.027; `hyper fact w30 t200 x1920` 0.971 |
+| trans | 48 | 1.0044 | `exp_dyn` and `ln_dyn` at 2 to 16 limbs 1.018-1.038; `exp_dyn` 120 1.026; `ln_dyn` 30 0.968 |
+| mul | 45 | 1.0012 | nothing outside its interval (`hi_mul_dyn` 300 was 1.148 with the cutoff at 312) |
+| div | 22 | 1.0024 | `div_rem_dyn` 120/60 1.016 |
+| divgrid | 40 | 1.0105 | the shapes the guards settled: 40/32 1.073, 40/16 1.052 and 1.044, 76/64 1.041, 96/48 1.029, 88/64 1.022 |
+| sqrt | 42 | 1.0022 | nothing outside its interval |
+
+So the change is a small loss end to end, 0.1% to 1% a section, and nothing gained in speed: what
+it buys is tables that are timings and not consequences of fits, one rule a reader can state for
+every dispatcher and a check that holds each to it, a series table an eighth of the size, and the
+table corner and the sweep bug found on the way. The losses are the two the user took on: the
+division's hand-over to the equations, and the series' table by kinds (its picks on short series,
+and the short series of `exp_dyn` and `ln_dyn` at a few limbs, which the 72 classes had closer).
+The gate cannot see either: its "before" is the preset of the same design.
+
+#### A fit takes the shapes its equation is read for
+
+The user's rule, asked while reading the series' fits (2026-11-12): "are the fits also fit to
+samples that would fall in the table?", then "go ahead and remove the samples that the table
+would decide and not the equations, well see if that makes a difference. Furthermore, do that for
+every algorithm that has a table as it is just good practice to not fit over samples that the
+fits arnt used for."
+
+**What a fit took before.** The series' fits took a series when its own timed decision was
+within the share of its fastest algorithm's time (`SeriesTiming::read`). That is the rule applied
+to one series; the table applies it to a kind. A row goes on while any member of its kind is past
+the share, so it takes series that are within it, and a cell whose pick is "the equations" hands
+them series that are past it. On the report's 960 unseen series, 77 of the 501 the fits took were
+series the table decides (median 2.9 us), and 37 the table hands to the equations (0.5 to 7.6 us,
+the decision 5% to 14% of the call) were in no fit. Division's fits took every (q, d) from 4 to
+4096 limbs, the tables' area included. mul's Karatsuba and FFT fits start at 96 limbs, past
+`mul.kara` on the M1 (Karatsuba's throughout from 61), with nothing that held them to it.
+
+**What was built.** An equation is fitted on the calls it is read for:
+
+- A dispatcher's equations are not read where its table names an algorithm, so those samples are
+  out of their fits: the series' three equations (`Rows::Table`: the series `series.small` names
+  no algorithm for); division's NR, NR with remainder and BZ (`Rows::Read`, `read_for`: not where
+  the entry's own table names one); mul's recursive Karatsuba, recursive chunking and FFT (not
+  where `mul.kara` says schoolbook: nothing on the M1).
+- An equation that is a price inside other equations is read at any size it runs at, and keeps
+  every shape: schoolbook's product and `hi_mul_buf`'s (the series' and division's models),
+  Knuth's division (BZ's leaves and Knuth top block, a series' finalize). This reading of the
+  rule is mine: taken to the letter it would leave schoolbook's fit no shapes at all.
+- **A tune fits twice from one set of timings.** A table has to be measured under some equations
+  (the decision is timed beside the algorithms, and rect's block length under a table pick is
+  the model's), and a fit can only leave out what a table decides once that table exists. So
+  div's and the series' first phase fits as before (division on every shape, the series by each
+  one's own decision), the tables are measured under that fit, and a second phase
+  (`sections::div::tune_late`, `sections::series::tune_late`) fits again on what the tables
+  leave, with nothing timed again. The first fit's evidence carries no verdict; the second is
+  the one judged, and its evidence gives the first's rms and the samples left out. The series'
+  guards moved to the second phase, so they are swept under the equations that are written
+  (the rule on a phase's fits and its sweeps). mul already had the order: its table, then those
+  fits.
+- The reports follow: `cargo tune series` fits and judges on the series the table in force names
+  no algorithm for (under `--share X`, which no table was measured at, by each series' own
+  decision), and `cargo tune division --refit` fits by `Rows::Read` and judges the equations'
+  picks on the shapes the tables leave them.
+- `test_fits_leave_out_what_tables_decide` checks both predicates at tables made by hand.
+
+**Whether it makes a difference: it does not.** On one set of timings (the report's 960 unseen
+series, thorough, `--timings`), held out:
+
+| the fits take | series | Horner | rect | binary splitting |
+|---|---|---|---|---|
+| each series by its own decision, within 5% (before) | 501 | 6.8% | 4.2% | 6.9% |
+| those, less the 77 the table decides | 424 | 6.7% | 3.9% | 6.8% |
+| what the table leaves (the rule as built: less the 77, with the 37 handed on) | 461 | 6.9% | 4.0% | 7.5% |
+
+Leaving out what the table decides moves the fits by 0.1 to 0.3 points. The 37 short series the
+table hands to the equations cost binary splitting 0.7 points, and they belong in: the equations
+are read for them. (The middle row was a temporary switch for this comparison, not a rule the
+tuner has.) The picks' loss on the held-out half is 0.10% and 0.11% on the mean under the last
+two, worst 8.6%. So Horner's and binary splitting's fits are not above the line because of table samples;
+what moves them is how short the series are (at a share of 1%, 3.6%, 2.5% and 4.9% on the same
+timings), which is the models on series of a few microseconds.
+
+**A tune under it** (`cargo tune tune div series --level thorough`, to a scratch file, 11 minutes
+48; mains power, the battery full; the gate kept both; 4 of 2540 sweep measurements unsettled,
+the fits' passes differ 1.9%). **The preset was not rewritten** (the user's rule: no retune
+unprompted), so it holds the fits of the retune above.
+
+| equation | first fit | after the tables | left out |
+|---|---|---|---|
+| Knuth | 2.2% | 2.2% | none (a price: every shape) |
+| NR, quotient only | 2.9% | 2.9% | 26 of 726 shapes |
+| NR with remainder | 3.3% | 3.3% | 41 of 726 |
+| BZ | 2.3% | 2.3% | 0 of 858 (its divisors are past the leaf, 99 limbs, where the tables have rows only for the shortest quotients, at divisors to 117) |
+| series Horner | 6.6% | 6.2% (NOISY) | the table takes 78 within the share and hands on 39 past it: 467 of 960 read |
+| series rect | 3.1% | 3.1% | the same |
+| series binary splitting | 8.0% | 7.5% (NOISY) | the same |
+
+The tables it measured: `div.dyn_small` 34 change points (divisors to 38 limbs),
+`div.dyn_rem_small` 50 (to 117), `series.small` 220; the guards stayed at 8, 32 and 16. The
+gate: div 1.0004 [0.9997, 1.0011] over 182 workloads, series 1.0005 [0.9992, 1.0017] over 78,
+against the preset's values, so nothing moves end to end either. `cargo tune dispatch` as
+before (every dispatcher within 5% where it reads its equations; the series' entry past it at 6
+indices by the table's own choice).
+
+What it leaves open:
+
+- Rect's block length under a table pick is still read from rect's equation
+  (`SeriesNode::small`), at series that are now outside its fit by the rule. Before the rule at
+  most 9 of the 53 such series in the unseen set were in rect's fit (the 9 whose own decision
+  was within the share), so little changed, but the reader is there. The same would hold for BZ's top-block choice under a table cell of BZ (none on the
+  M1: every cell is Knuth).
+- A series' finalize is priced by `dyn_div_best`, the least of division's equations without the
+  table, so in the tables' area it can read NR's equation where NR's fit has no shapes now.
+  The tables measured Knuth fastest there and the price takes the least prediction, so a wrong
+  NR price could only lower it. Not measured and not changed: the price read the equations
+  without the table before this too.
+- `cargo tune tune --tables` measures tables alone: the equations in the file stay the ones
+  fitted under the tables before.
+
+#### What it left
+
+- Horner's and binary splitting's equations are above the 5% line on the series the rule gives
+  them (the table above): a lower share takes them under it (3.8% and 5.7% at 1%) at the cost of
+  more indices timed; the user's number. Fitting them only on what the table leaves does not
+  ("A fit takes the shapes its equation is read for" above: 6.2% and 7.5% in a tune, 6.9% and
+  7.5% on unseen series). (Closed the next day by their forms: "Horner's and binary splitting's
+  equations under the line, and the beta guard gone" below.)
+- Division pays up to the share where the guards paid nothing (accepted).
+- The series' table on 8 kinds loses more than the 72 classes did on the series it is for
+  (its picks 1.5% on the mean and 2.3% of the time against 0.8% and 1.7%; the entry, its dispatch included, 3.0% and 3.5% against 2.6% and 2.5%), for a table an eighth the size: the user's trade.
+- End to end the change costs 0.1% to 1% a section against the tree before it (the table
+  above). One series item is 14.5% slower (`hyper geo56 w64 t64 x256`: an x of 4 limbs with
+  56-bit coefficients, a kind whose row is shared with 8-bit ones), not looked into.
+- The members of a kind are a fixed spread (x to 48 limbs, coefficients to 62 bits); an x far
+  past them is read off the widest kind's row, as the 414-limb one was before that kind was
+  split. Coefficients past 64 bits have no row (the equations).
+- `Kind::Derived` and `Derivation` are still in `schema_types.rs`, with the resolver's handling
+  and its tests: no knob of the schema has the kind. (Gone on 2026-11-13, with the `pinned`
+  key: "The tuner's leftovers cleared, and a full retune".)
+- `div_rem_dyn` 1030/1000 was 6.7% slower in the first comparison and reads the equations in
+  both trees: it read 1.003 after the retune, so it went with the cutoff's fix and the refit, and was not a pick of the tables'.
+
+### Horner's and binary splitting's equations under the line, and the beta guard gone (2026-11-13)
+
+The user: "I need yo to try find an alternative form for the fit for horners and binary
+spliting so that both fall in the 5% hold out rms threshold." And on the result: "Go ahead and
+implement the new fit and retune everything upstream. Also consider expanding the table if the
+new fit slows dispatch. As for your questions the only question I have an opinion on is if the
+beta gaurd is causing a slow down remove it and rely purely on the table and the fired
+equations."
+
+Both are under it, with rect, at every level, and nothing in the series section is marked.
+Held out, in a tune (the judged fit, after the table):
+
+| level | Horner | rect | binary splitting |
+|---|---|---|---|
+| quick | 3.5% | 4.4% | 3.8% |
+| normal | 4.0% | 3.3% | 3.3% |
+| thorough (the preset) | 3.3% | 2.8% | 3.6% |
+| thorough, the forms before | 6.2% | 3.1% | 7.5% |
+
+#### The method: the form's floor on the kernel's own counts
+
+The counters that fixed rect, with one step added in front. In a scratch copy the primitives
+`utils/series.rs` imports (`div_prim`, `div_prim2`, `mul_prim`, `mul_prim2`, `mul_add_prim`,
+`add_mul`, `sub_mul`, `add_buf`, the shifts, `mul_dyn`, `hi_mul_dyn`, `div_dyn`) are shadowed by
+wrappers of the same names that count limbs and calls, so only the series' own calls are
+counted; composite calls are recorded by their lengths and priced at the dump with the model's
+own `SeriesEnv`, and a counting allocator gives the allocations. One row a workload and
+algorithm, on the report's workloads, joined with `series_parts.tsv`.
+
+**The step in front: fit the times to the kernel's own counts under the form as it is.** That
+is the best the form can do, and it says which of two things is wrong. On the 461 unseen series
+the equations are read for (yesterday's timings; fitted / held out):
+
+| fitted on | Horner | binary splitting |
+|---|---|---|
+| the model's counts, the form as it was | 5.6% / 6.9% | 6.3% / 7.5% |
+| the kernel's counts, the form as it was | 5.0% / 5.8% | 4.5% / 4.9% (its one-limb passes priced) |
+| the kernel's counts, the new form | 3.1% / 3.3% | 2.9% / 2.9% |
+| the model's corrected counts, the new form | 3.3% / 3.2% | 2.9% / 3.0% |
+
+Rect had been the first case (counts wrong, form right). Horner is mostly the second: on exact
+counts its form still read 5.8%. Binary splitting is purely the second: the model on
+its own counts reads what the kernel's do once the form has the prices (its columns are within
+0.3-2.2% of the time of the kernel's, the `add` limbs 3.2%).
+
+#### Horner
+
+**The form.** Its fixed costs were a price a term and a price a kernel call, every call
+alike. They are not alike: `div_prim2` measures 3.8 ns a limb and 12 ns a call (its
+reciprocal), a term's add a few ns, and a step by a one-limb x is three calls of its own
+(`mul_dyn` copies the operand and makes the pass, `mul_frac` copies it back). On the kernel's
+counts:
+
+| fixed-cost prices | fitted / held out |
+|---|---|
+| a term, a call (every kernel call) | 5.0% / 5.8% |
+| ... and a group | 4.6% / 5.2% |
+| a group, and a term by kernel path (plain, one-limb x, wider x, BBP) | 3.1% / 3.3% |
+| a term, a group, a call of the term's own step (3 for a one-limb x, 1 for a wider x, 1 for BBP) | 3.1% / 3.3% |
+| ... with 2 calls for a one-limb x; with 4 | 3.4% / 3.7%; 3.4% / 3.4% |
+
+The fourth row is what is built: `term` (every term: its coefficients, its weight and
+its add, 9.4 ns), `step` (a group: its division's reciprocal and the scan that forms it, 18 ns)
+and `call` (what a term's own step does besides: 2.7 ns each). Four prices a term by path fit
+the same and say the same thing (8.5, 17.4, 10.8 and 11.6 ns).
+
+**Two counts.** On the old model's limbs the new form read 5.2% / 6.4%; with the kernel's
+division limbs 3.9% / 5.7%; with its multiplier passes as well 3.2% / 3.4%.
+
+- *A product by R runs over what the group below left.* The model charged it at the group's own
+  frame. A range of one group multiplies nothing: 9 terms of an 8-bit q in 760 limbs were charged
+  a two-limb pass over all of them, 28% of the call. And the shallowest group's R is its own few
+  terms', a one-limb pass when they fit a limb (`Groups::left`, `next`).
+- *A q that grows makes groups that grow towards the shallow end*, where the frames are widest.
+  The model had groups of one mean size with what was left over at the shallow end: 37% more
+  division limbs than the kernel's for 132 terms of q(n) = n in 285 limbs, all priced as two-limb
+  divisions. `Shape::groups` now takes the range's bits of ∏q over what a group holds (the
+  budget less half a term): that many groups, the last a part of one; their divisions' limbs from
+  the frames at the two Gauss points, each at the top of its group; the shallowest group a whole
+  division at the first term's frame however few its terms, by a one-limb Q while its bits fit
+  one. The range's bits are `Shape::qs`: q as c n^d through the two Gauss points, summed by
+  Stirling's formula, because their mean alone is 2-3.5% high for q(n) = n from n = 1 and one
+  group or two turns on less (38 terms: 148 bits, which the mean reads as 154). The budget is
+  128 bits for p Q, of which a one-bit p takes none (the model allowed 127: 16 terms of an 8-bit
+  q where the kernel takes 17). The division's count error went from 3.5% of the time (rms over
+  the series) to 1.3%.
+
+**The price of a two-limb pass is the one-limb price times the kernels' ratio**
+(`SeriesEq::HORNER_PASS2`, 3.3: `mul_prim2` measures 1.05-1.26 ns a limb where `mul_prim` does
+0.31-0.39, and the fit is the same from 3.0 to 3.6). Fitted on its own it passed at the thorough
+level and sat on the line at the normal one, which I had not run before reporting the form:
+
+| Horner, held out, each level's own tune | quick | normal | thorough |
+|---|---|---|---|
+| nine prices, the two-limb pass fitted | 3.9% | 5.0-5.1% (NOISY, twice) | 3.6-3.7% |
+| eight, the two-limb pass tied | 3.5% | 4.0% | 3.5% |
+
+With the halves swapped the normal level read 3.7%: the split, not the form. A two-limb pass is
+a large part of few series' time (seven of the normal tune's 209), and that tune's fitted half
+had only short-frame ones, where a price a limb and the price a group can't be told apart: it
+read 2.03 ns a limb and 9.4 ns a group for 1.44 and 17.2 on the other half. **A new form is
+tuned at all three levels before it is called sound**, and for each price the series where it
+is over a tenth of the time are counted in each half. Horner so has eight prices, as it had: a
+price a group in place of a fitted one for two-limb passes. The ratio was a constant set by hand
+at first (`SeriesEq::HORNER_PASS2`), and is the measured knob `series.horner_pass2` since later
+that day (the next entry): 3.46.
+
+#### Binary splitting
+
+Three prices, on counts that needed no change:
+
+- **Its passes by a one-limb multiplier** (`mul1`, 0.28 ns a limb). The form analysis of
+  2026-11-11 had left the price out, on series past the derived table's extent; on the series the
+  rule on tables gives the equations it is a tenth of the time, and the fit goes from 6.3% / 7.5%
+  to 4.5% / 5.1% with it alone.
+- **Finalize's division by a two-limb Q** (`div2`, 8.05 ns a quotient limb, beside `div1` for a
+  one-limb Q). Division's equations are fitted from four limbs, and Knuth's reads 27% high at
+  two (10.2 ns a quotient limb for 8.1 measured, at every quotient from 33 limbs to 1001) and 6%
+  at three. A series of few terms ends in exactly that division, at 50-87% of its time. With it:
+  3.5% / 4.0%. (The price is the series' own, as `div1` is. In division's section it would be
+  a retune of division for a divisor only the series' finalize reads the equation at.)
+- **A term of an x-leaf** (`step`, 9.1 ns): a step of its own, its product by x and the passes
+  around it, beyond its limbs and its calls. With it: 2.9% / 2.9%.
+
+Every one of both forms' prices is needed: with any one left out the held-out rms goes up (the
+least, binary splitting's `add`: 3.0% to 3.3%; Horner's group: 3.2% to 4.7%).
+
+#### What was tried and ruled out
+
+- *The family's large denominators.* `div_prim2` and `div_prim` are data-dependent: on fresh
+  buffers they run 11% and 17% slower for some divisors (the products of the family's 16- to
+  32-bit `sized` q, 2^(bits - 1) and a little: 4.26-4.36 ns a limb for 3.85, 3.71 for 3.17), and
+  on one repeated buffer the same (the predictor learns the correction branch), so a short
+  workload timed in a loop reads cleaner than a long one. A price of their own for those
+  members' divisions moves Horner's fit from 5.0% / 5.8% to 4.9% / 5.7% on the kernel's counts,
+  and they don't explain the normal level's line either (4.9% with it).
+- *Terms that land within a limb of the last* (a price for them): 3.2% / 3.2% from 3.4% / 3.5%
+  with a term price by path, which the x terms told apart by x's width do as well (3.1% / 3.3%).
+- *Both of a one-limb x step's copies as limbs*: 3.3% / 3.2%, as built.
+- *A fixed cost for Horner, a price a product, a price a leaf or a merge for binary splitting*:
+  each solved 0 or negative.
+
+#### The beta guard
+
+Binary splitting was neither predicted nor taken where its tree's width passed
+`series.bin_split_beta` (8) frames and another algorithm could sum the range. With its equation
+fitting, the guard was the largest loss left on the series the equations are read for: on two
+unseen series of a few microseconds it barred binary splitting where the equations predicted
+it right (7873 ns for Horner and 4709 for binary splitting, measured 7928 and 4543), 75% and 67%
+slow, and its sweep, on series from 50 us, could not see them. Under the same table and
+equations, on the 138 unseen series whose decision the guard changes:
+
+| the entry over the fastest algorithm | guard on | guard off |
+|---|---|---|
+| worst | 75% | 7% |
+| mean, under 10 us (51 series) | 3.5% | 1.6% |
+| mean, 10-100 us (48) | 0.5% | 1.8% |
+| mean, 0.1-1 ms (35) | 0.06% | 0.53% |
+| of their total time | 0.10% | 0.53% (the other 822 series: 0.45% and 0.53%) |
+
+What the guard spared is the tree's walk in the decision: 47 ns becomes 200-570 on such a
+range without a wide x, and the median over the 138 goes from 590 to 857 ns. It is gone, with its knob and its sweep
+(`SeriesGuards` keeps rect's two): the equations are read at any beta, and what the dearer
+decision costs a short series is the table's to answer by the rule. The table measured after it
+is 227 change points (218-220 before), 1549 indices timed for 1385, and takes 546 of the 960
+unseen series for 499-517.
+
+#### The retune, and the checks
+
+`cargo tune tune series exp ln --level thorough --write-preset` (9.5 minutes, mains power, a
+fixed workload within 2% over five runs before it): the sections built on series with it, whose
+values came out as they were. Series is at version 8: `horner_ns_step`, `bin_split_ns_div2`,
+`bin_split_ns_mul1` and `bin_split_ns_step` are new, `horner_ns_mul2` and `bin_split_beta` gone,
+and `Parts` has a thirteenth column, `step`.
+
+- Fits (held out): Horner 3.3% over 194 of 395 shapes, rect 2.8% over 57 of 115, binary
+  splitting 3.6% over 164 of 328 (their first fits, before the table: 3.2%, 2.8%, 4.7%); 0
+  rejected, 0 noisy; 58747 fit probes whose passes differ 1.2%.
+- Prices. Horner: product 1.032, div1 2.991, div2 3.876, mul1 0.4027, light 0.1538, term 9.424,
+  call 2.660, step 18.02. Rect: product 1.019, div1 3.416, add 0.3896, term 17.54, fixed 656.
+  Binary splitting: product 1.018, division 1.001, div1 2.360, div2 8.051, mul1 0.2796, mul2
+  0.3959, add 0.1249, light 0.1795, term 0.9010, call 1.910, alloc 21.46, step 9.138; gain 0.4.
+- The gate kept all three: series 0.969 over 78 workloads (against the defaults with no table:
+  the preset's old section fell through at the new version, so this gate says little), exp
+  1.0014, ln 0.9997. Listed: `hyper geo56 w64 t64 x256` 14% slower, the item the table's layout
+  cost on 2026-11-12.
+- The dispatch check: the series' entry reads its equations at 83 of the indices tried, the
+  decision 2.4% of the call on average (2.1% at 93 before the guard went), 11 past the share by
+  the table's own choice.
+- 960 unseen series (`cargo tune series`), under the preset. Where the equations are read (414):
+  their picks lose 0.07% and 0.02% on the mean on the two halves, worst 12.4% and 2.4% (0.72%
+  and 0.08%, worst 73% and 9%, the day before); the equations read Horner 3.1% and 2.9%, rect
+  3.2% and 3.2%; the entry, its dispatch included, 2.9% and 2.3% on the mean, worst 22% (3.1%
+  and 2.1%, worst 75%), and of the total time 0.48% and 0.33% (0.45% and 0.15%: the dearer
+  decision, 0.4% on series past 100 us for 0.1%). Where the table decides (546): its picks
+  1.7% on the mean and 2.3% of the time, worst 48%, the entry 2.2% and 2.3% (1.7%, 2.2%, 48%;
+  2.4% and 2.4%).
+- End to end, normal builds, against the tree and preset of 2026-11-12 (`benches/tuning_bias.rs`,
+  outputs identical): series items 1.003 over 26 (0.972 to 1.022), exp/ln/theta/agm 0.999 over
+  48. No gain in speed, as the picks were already within a tenth of a percent of the time.
+- 596 tests, 610 with `tune`.
+
+#### What it left
+
+- **The decision costs more**: about 4% (median, a tune build) for the model itself, 1-2% for a
+  q of one size and 7-13% (10 ns) for one that grows (`Shape::qs`: up to four logarithms), and
+  the tree's walk on ranges the guard used to settle. The table answers for it where it is past
+  5% of a call and nothing does under that: 0.3% of the time on the unseen series past 100 us. A lower bound read
+  off binary splitting's own equation (its finalize and its root's products, O(1)) would spare
+  the walk where it can't win, with no pick changed: a shortcut computed from the equations, so
+  proposed and not built.
+- **Binary splitting's `div1` and `div2` rest on few series** (finalize by a Q of one or two
+  limbs: 2-5 series a half at quick and normal). It passes in the judged direction at every
+  level (3.7%, 3.2%, 3.6%), and with the halves swapped reads 8.5% and 7.8% at quick and normal:
+  the half that is fitted then has no series of the one-limb kind, and prices it 0.
+- **Rect's groups** still came from `Shape::group_of`: the mean size for a q that grows, and
+  127 bits of room. Its fit is under the line (2.8%), and it reads Horner's corrected prices.
+  (One model with Horner's since later that day: the next entry.)
+- **Knuth's equation at two- and three-limb divisors** is 27% and 6% high: only the series'
+  finalize reads it there, through a price of its own at two. And the division kernels' speed
+  turns on the divisor (above), which the family's `sized` denominators sit on the slow side of.
+- **Static nodes** keep the old shared prices and counts.
+- **Rect's fixed cost** is not determined: 148 to 656 ns from one fit to the next.
+
+#### The tuner's leftovers cleared, and a full retune (2026-11-13, later)
+
+An audit of the tuning code after the change above found nothing dead in it (no unused item, no
+suppressed warning, no name of a removed feature), and eight things to settle. The user:
+"Implement everything up to 6 as is for 7 leave failed fits as marked noisy and go ahead and fit
+over all beta addressing number 8. Leave all cosmetic changes out of this pass."
+
+1. **`cargo test` failed on a machine that had tuned itself.** `test_accessors_match_resolved`
+   built its layers from the preset alone, and `cargo tune tune` writes `presets/local.toml`,
+   which the build layers over it. The test layers the machine's own file as `build.rs` does
+   (the path `BIGBITS_TUNING` named at build time, unless the file is another target's). Checked
+   both ways with a file that moves one sqrt knob: it passes, and without the layer it fails.
+2. **The ratio of a two-limb pass to a one-limb one is measured.** It was a constant set by
+   hand (3.3, from a scratch benchmark), which x86 would have read as the M1's. It is the knob
+   `series.horner_pass2`: `mul_prim2` and `mul_prim` timed in place at lengths of 64 to 1024
+   limbs, each fitted as a L + c, the ratio of the two a (`sections::series::pass2_ratio`: 1.264
+   over 0.365 ns a limb, 3.46 in the preset's tune, and 3.47 at the quick and normal levels). Taken
+   as a tune's first measurement, over 16 to 1024 limbs, both kernels read 1.85 times their
+   time at the quick level with the passes 22% apart (the ratio itself held, 3.36): it is taken
+   after the series' timings, and from 64 limbs, where the passes agree to 0.5%.
+3. **Text from removed guards**: the help's line for `cargo tune series`, two comments, and the
+   division report's filter for `knuth_d` keys.
+4. **The ten `*_err` knobs are gone** (`mul.{school,hi_rows,hi_cols,kara_rec,chunk_rec,fft}_err`,
+   `div.{knuth,nr,nr_rem,bz}_ns_err`): each fit's rms as a knob of its own, the margins the
+   derived tables read, which nothing had read since the tables became measured. The rms is in
+   the evidence of every constant of its fit. They were in mul's and division's hashes, so every
+   section built on those would have warned until tuned again: the reason for the retune below.
+5. **`Kind::Derived` and `Derivation` are gone**, with the `pinned` key of a tuning file, which
+   marked a derived knob as a measurement. Every knob is measured and in its section's hash
+   (`section_hash` takes no pinned list), and a section's `derive` number is only its table's
+   layout (`Section::derive`; the method `Kind::follows_derive` that said so went later that
+   day). The resolver's test of that number is on a table now.
+6. **One model of a group's size.** Horner's `groups` and rect's `group_of` were two: rect's
+   took the mean of q's bits at the two Gauss points for the range's and left 127 bits for p Q.
+   `Shape::group_room`, `whole_group` and `group_count` are shared; `group_of` is the whole
+   number for a q of one size and the terms over the count for one that grows. Rect still takes
+   one size for all its blocks: its groups end at its blocks.
+7. *(Unchanged, the user's word.)* A series or division fit above the line is marked NOISY and
+   written, not REJECTED, as a model already revised once.
+8. **Binary splitting is timed and fitted at every beta.** Its area stopped at a beta of 24
+   where another algorithm can run, and since the guard on beta went its equation is read past
+   it. On the morning's unseen series the equation fitted to 24 read the 13 series past it at
+   3.4% (mean +0.2%), and fitting them moved no price (3.05% and 3.04% to 3.06% and 3.02%); a
+   run of each takes 14% longer. More trees split across the pool are in the gain's set (83 for
+   26).
+
+With all of it, the series section alone, held out: quick Horner 3.2%, rect 3.4%, binary
+splitting 4.0%; normal 3.9%, 2.9%, 3.5%.
+
+**The retune** (`cargo tune tune --level thorough --write-preset`, 36 minutes, mains power, a
+fixed workload within 2% over five runs before it). All nine sections kept; 0 fits rejected, 0
+noisy; 73387 fit probes whose passes differ 1.8%; two whole-algorithm sweeps UNSTABLE and kept
+(`mul.ntt_par_conv` 512, `bin_split.dyn_hyper_leaf_terms` 32). **The sweeps' "samples" line read
+5.9% unsettled, past its 5% warning**, as every full thorough tune of this machine has (5.9-6.8%).
+
+| fit | held out |
+|---|---|
+| mul: schoolbook; `hi_mul_buf` rows, columns | 3.9%; 2.7%, 3.8% |
+| mul: recursive Karatsuba, chunking; FFT | 2.7%, 1.6%; 3.5% |
+| div: Knuth; NR, with remainder; BZ | 2.2%; 3.0%, 3.8%; 2.6% |
+| series: Horner, rect, binary splitting | 3.4%, 2.7%, 3.6% |
+
+Tables: `mul.kara` 94 change points (Karatsuba from 44 for squares and 49 at l = 4s),
+`div.dyn_small` 34, `div.dyn_rem_small` 48, `series.small` 232. Gates, after over before: mul
+1.0022, div 1.0002, sqrt 0.9999, bin_split 1.0043, series 0.9998, theta 0.9996, agm 1.0004, exp
+0.9996, ln 1.0004. The dispatch check as before (the series' decision 2.4% of the call).
+
+On 960 unseen series under the preset: where the equations are read (413) their picks lose
+0.10% and 0.01% on the mean, worst 11.4% and 2.5%, the equations read Horner 3.1% and 3.3% and
+rect 3.0% and 3.5%, and the entry 2.9% and 2.2% (worst 22%); where the table decides (547) its
+picks lose 1.8% on the mean and 2.3% of the time, the entry 2.0% and 1.8%.
+
+End to end, normal builds, against the build before the pass (outputs identical in all): mul
+1.002 over 45 items, div 1.001 over 22, the division grid 1.000 over 40, sqrt 1.001 over 42,
+series 1.003 over 26, exp/ln/theta/agm 1.000 over 48. Two items:
+
+- **`div_rem_dyn` 1030/1000 is 6% slower** (1.063; the tune's gate listed it at 1.057). NR with
+  remainder against BZ at a quotient of 31 limbs over 1000: the equations have them within a
+  percent or two there and the clock 6% apart, and the shape has flipped between retunes
+  before ("What it left" under "Tables measured, under one rule"). NR with remainder's
+  constants moved 5-17% from the tune before (its schoolbook high-product multiple 0.65 to
+  0.76, its term in q 3.63 to 3.92) at the same 3.8% rms: its tiers are not told apart well.
+- **`mul_dyn` 100x100 reads 15% slower in the bench, and it is not the tune.** mul's source is
+  untouched, and the old and new `mul.kara` pick the same on its path (Karatsuba at 100 and at
+  50 and 51, schoolbook at 25 and 26: the tables differ at 76 unbalanced shapes, none on it).
+  With the old mul values in the new build it is still 9.5% slower than the old build (0.97 of
+  the new build's time), and the tune's own gate, which compares values in one process, did not
+  list it: the binary's layout. Each build against itself reads 0.99-1.00 on the item.
+
+596 tests, 610 with `tune`. Not in this pass (the user's word): clippy's 18 style notes in
+`src/tuning`, the preset's repeated evidence comments, the line-reduction pass.
+
+#### A simplification pass over `src/tuning` (2026-11-13, last)
+
+The user ran the simplify review over all of `src/tuning` (four reviewers in parallel: reuse,
+simplification, efficiency, altitude; 55 findings between them, many the same mechanism seen
+from two sides). The rule held to while applying them: what a tune measures, fits and writes
+stays as it was, since the preset had just been written and was not to be retuned. One thing
+a tune does differently is marked below.
+
+- **The tune loop names no section.** `sections::SectionTuner` carries a section's first
+  phase, its dispatch tables (each knob's key and its measurement) and its second phase, so
+  the loop runs one block for every section, and `--tables` takes the sections whose list of
+  tables isn't empty. The three-armed `match` on "mul", "div" and "series" and the list
+  `TABLED` are gone: a section that gains a table is a line of `sections::SECTIONS`. The
+  gate's item sections are one table too (`check::ITEM_SECTIONS`: each label with the schema
+  sections whose knobs its calls read, in the order `cargo tune check` prints them).
+- **One way to make a fit's record.** `fit::fit_named` (the form's analysis when the tune was
+  asked for it, the split fit, the timings' noise) is what mul's, division's and the series'
+  fits call, where each had its own wrapper; and `Fit::worst` (the row of the largest
+  residual, and the residual) is what division's and the series' evidence name their worst
+  shape from, where each solved for it again. mul's `fit_lin` names its equation from its
+  scale's key; division's four lists of keys are module constants, which `cargo tune division
+  --refit` filters by; division's `fit_equations` takes the noise as the number it always was.
+- **The series tuner.** `EQS` (each equation's name and columns) and `prices` stand where the
+  three equations were spelled out in four places; `col("mul1")` where bare column numbers
+  were (`(4, 5, ratio)`, `base[9]`, `base[12]`); `framed` is the frame a context is summed in
+  at a precision, which four walkers computed (the dispatch check's among them); the guard
+  sweep's `Loads` lost the predicate it took when there were two guards; a table member's
+  shift is `Synth::decay` (the closure it replaces repeated the members' own rules: the same
+  numbers); `fit_equations` computes each gain's rms once; and `report` no longer sets the
+  trees' parts a second time after each fit. `Synth::decay` has a default (three members had
+  the same body) and `synth::x_static` is the leaked x four places built.
+- **The table builder and the timing loop.** `tables::measure` reads the run's share itself
+  and times `PER_WAVE` sizes a wave (every caller passed the same two); `tables::pick_at` and
+  `sizes_above` (from a table's rows) replace three and two copies; `measure::less_harness`
+  is the one place a harness's time is taken off a probe's (three were); `measure::dump`
+  writes a developer's TSV (four ways before, one of which didn't make the directory);
+  `sample` and `sample_at` are one function, as nothing has sampled a subset of probes since
+  the whole-algorithm timings went; and division's probes share `numerator`, `placed_divisor`
+  and `copy_probe` between the fit's timings, the two tables and the dispatch check (the same
+  seeds, and the same order of allocation at each site, which division's timings are
+  sensitive to).
+- **Residue.** `Kind::follows_derive` (the resolver tests the kind where it used it, and
+  `Section::derive`'s comment says what the number is); `table::pick2`, which only the tests
+  called (it is their oracle, in the test file now); comments that still spoke of derived
+  values; `merge_into`'s `Vec` of one section; `exp_ln_items`' argument that was always
+  "trans"; `Level::fit_batches`, 3 at every level (a constant); `hash::table_bits`'s own copy
+  of `fnv1a`'s loop; `Design::of` and `of3` sharing their tail; `sweep::geo_to` for six
+  `geo(..).take_while(..)`; `Tuned::set_live` for four `tuning::set(&format!(..))`; candidates'
+  losses computed once where an argmin's comparator computed them on both sides
+  (`pick_param`, `top_block_scale`, the series' gain).
+- **The one change in what a tune does: a section whose values came out the ones before it
+  is not gated.** The gate then timed the same values on both sides: noise, which could in
+  principle drop the section, for every round of every workload of the section and of those
+  built on it (a reviewer's estimate from the code, not timed: 5-9 s a section at the
+  thorough level). The loop prints "its values are the ones before it, so there is nothing
+  to compare" and counts the section as kept. In a quick tune started from the preset it
+  fired for sqrt, theta, agm, exp and ln.
+
+**Not done, each for a reason**: step functions, `Knob::threads`, `Knob::search`,
+`Kind::Model`'s `work` and `Ty::Table`'s `measure` have no reader today, but
+`docs/tuning_system.md` still plans one for each (the user's call). A phase's timings still
+reach its second phase through a thread-local (`KEPT`); a `Tuned` still holds its key and
+not its path, and a fit's REJECTED or NOISY is still counted from its evidence's text; whether
+a gate item's output is exact is still read from its name (`check::exact`): each a redesign
+across forty-odd call sites or the file shared with the bench, proposed and left. The series'
+`fit_equations` still writes the gain's parts into its input, and its family is still walked
+once for the rows and once a pass for the probes (under half a second a tune). Division's
+unread second numerator of a quotient-only probe stays, as taking it out moves the buffers its
+timings are sensitive to. Not exact, so left: mul's coarse-then-dense square sweeps as
+`cutoff_sweep` (they clip sizes and count edges differently), `top_block_scale` through
+`keep_or_take` (its evidence's text differs), sqrt's and division's per-probe knob installs
+through `with_knob` (a boxed call inside the timed region). Of clippy's 18 notes in
+`src/tuning` three are left: `is_multiple_of` twice, in files `build.rs` shares (it needs a
+recent toolchain and the crate declares none), and one rewrite by De Morgan in division's
+timings that reads no better.
+
+**Checked.** `cargo tune series --level thorough --timings FILE` on kept timings, which fits
+and scores without timing anything: its report and both of its dumps (`series_parts.tsv`,
+`series_workloads.tsv`) are byte for byte what they were, as are `cargo tune list` and
+`cargo tune status`. `benches/tuning_bias.rs --hash`: all 227 lines the same as the build
+before the pass (the items, their order and every output). A quick full tune to a scratch
+file with the tuner before and after: the same sections and the same keys, the tables within
+a few change points of each other, and evidence that differs only where it depends on the
+timings (kept or taken, agree or not, a mark). **That second tune's first fit was disturbed, and the cause is the
+binary's first launch, not the machine's load** (found in the pass after this one, which
+corrects what was first written here): the tuner's executable had just been copied, and a
+freshly copied executable's first launch on this Mac has its first seconds slowed. Three of
+three first launches of a fresh copy read schoolbook's equation 25-39% high with its passes
+37-38% apart (REJECTED, and division's NR multiples bent to match); the same file launched
+again, six times over three builds of the tuner, gave 0.3556 to 0.3601. A quick tune's first
+fit is a few seconds long, so it takes the whole of it (the series' `pass2_ratio`, moved
+out of first place for reading 1.85 times slow there, was probably the same thing). Whether a freshly *built* executable (the
+usual `cargo tune` after a change) is slowed alike was not tested: run the tuner once, on
+anything, before a quick tune whose first fit will be read. 596 tests,
+610 with `tune`. `src/tuning` is 8752 lines from 8760: the pass took out duplication, not
+size.
+
+#### A clean-up pass over `src/tuning` (2026-11-13, after it)
+
+The user's `/clean_code` over all of `src/tuning`: simpler algorithms and architecture, fewer
+functions and lines, terse comments, with results bit for bit the same and nothing outside
+the directory touched but these documents. `src/tuning` went from 8752 lines to 7934 (code
+6726 to 6487, comments 1506 to 955), from 425 functions to 396 and from 47 structs to 45. No
+asymptotic complexity changed.
+
+- **Comments are terse, and history is not in them.** A comment says what a thing is and the
+  one reason that would stop a wrong change; the dated anecdotes, the user's words and the
+  numbers of past runs are in this document and in `CLAUDE.md`, where they already were.
+- **Merged.** The series family's three walkers without an x (`hyper_one`, `engel`, `bbp`,
+  with `frames_terms`) are one generic `plain`; `par_rms` and `par_rms_of` are one function
+  over any set of timings; `sweep_cutoff` and `sweep_cutoff_plus` are one (the `plus`
+  argument); mul's six probe constructors go through `binary` and `unary`; the gate's two
+  division loops through `div_pair`; `fnv` is inside `h`; `Level`'s eleven `match` blocks are
+  one table lookup a method (`Level::of`).
+- **Folded into their one caller.** In the series tuner: `entry_lost` (which the report called
+  twice a band: once now), `rms`, `price_key` (a column's knob looked up once, not twice),
+  `loads` and `sweep_guard` (into `sweep_guards`), `SmallSpec::count`, and the three
+  `*_cell` constructors and `decay` (the `by_q!` macro makes the context itself). In
+  division's: `eq_pick` (the report computed each pick three times: once now), `timings_tsv`,
+  `SmallSpec::widths` and `quotients`. In the tune loop: `table_into`, `section`,
+  `set_values` and `load` (one `set_live` returns the resolver's warnings). Elsewhere:
+  `time_probes`, `quantile`, `fit::analyze`, `check::owners`, `hash::hash_pairs`,
+  `file::num_text`, and the registry's three wrappers (closures in `SECTIONS`; `div::tune_late`
+  takes the level it ignores).
+- **Structs gone.** The series' `Loads` and `Named`: the walk is implemented on a plain
+  `Vec` and a plain `HashMap`.
+- **Less work.** `cargo tune series` copies its timings once for the live equations' parts
+  where it saved and restored them around every fit; the reports above; `run`'s commands
+  share one `ready` (their level, on the pool).
+
+**Checked** as the pass before: `cargo tune series --timings` on kept timings and its two
+dumps byte for byte the same, `cargo tune list` and `status` the same, `tuning_bias --hash`
+the same on all 227 lines, 596 tests and 610 with `tune`. A quick full tune to a scratch file wrote the same sections and
+keys as the tune before both passes, ran all three second phases, and skipped the gate for
+the five sections whose values did not change; mul alone on a second launch fitted
+schoolbook at 0.3559 and 0.3601, recursive Karatsuba at 1.845 and 1.843 and the FFT at 0.576
+and 0.575 (the tuners before: 0.356, 1.846, 0.576).
+
+**Held back, as they would change a number or a measurement**: `sample`'s own batch loop
+through `batch()` (it keeps a batch's total where `batch` returns the time a call, and
+(ns / iters) * iters is not ns to the last bit, which can move the point a probe's budget
+runs out); division's `stat` for BZ's top block through `sweep::lost` (0 against NaN on an
+empty set); the school fit's probe through `binary` (a call through a pointer inside a
+probe of tens of ns, where it calls `mul_buf` directly); `divisor` and `placed_divisor` as
+one (they differ in where the buffer lies, which division's timings read); the gate's
+workload closures through shared helpers (they are the measuring instrument); and NR's two
+fits as one loop over `rem` (three branches in it for a dozen lines). The schema's `doc`
+strings, `work` strings and step functions are data or the plan's, and were left.
+
 ## Marked problems
 
 The rule (the user's, 2026-11-10): a rejected fit is reported with a proposed form and waits
@@ -2353,13 +3414,40 @@ of regressors) and `target/tuning/division_fit.tsv` (the fitted grid's timings).
 
 ### The series' dispatch equations
 
-**Where they stand (2026-11-12).** Fitted on a synthetic family, not on exp's and ln's chunks
+**None of the three is marked since 2026-11-13** ("Horner's and binary splitting's equations
+under the line, and the beta guard gone" above). Held out in the M1 preset's tune: Horner 3.3%,
+rect 2.8%, binary splitting 3.6%, and under the line at the quick and normal levels as well.
+What did it was the method that had fixed rect, with the form's floor on the kernel's own
+counts read first: Horner needed a price a group and its calls counted by what a term's step
+does (and two counts corrected: the frames its products by R run over, and its groups for a q
+that grows), binary splitting three prices its form lacked (its one-limb passes, finalize by a
+two-limb Q, an x-leaf's term). What follows is the record up to that change.
+
+**Where they stood under the rule on tables (2026-11-12, "Tables measured, under one rule"
+above).** There is one set of prices, fitted on every series whose timed decision is within 5%
+of the call, which starts at a few microseconds (the derived table's extent had kept the fits
+past a predicted 20 us, and the short prices are gone with it). There, held out on the M1:
+Horner 6.6%, rect 3.1%, binary splitting 8.1%. Horner's and binary splitting's are above the line again and NOISY (this model was
+revised once: the rule on a revised model holds), rect's under it. Their picks lose 0.6-0.9% on the mean and 0.04-0.16% of the time on the series they are read for (worst 48% and 76%).
+What takes them under the line is in hand and is the user's number: at a share of 1% the same
+timings read 3.8%, 3.4% and 5.7% (the table in that entry). **Tested and ruled out (2026-11-12,
+"A fit takes the shapes its equation is read for"):** that they are above the line because the
+fits took series the table decides. Fitted only on what the table leaves, a tune reads Horner
+6.2%, rect 3.1% and binary splitting 7.5% held out (6.6%, 3.1% and 8.0% on each series' own
+decision, from the same timings), and on unseen series 6.9%, 4.0% and 7.5% (6.8%, 4.2%, 6.9%).
+The misfit is the models on series of a few microseconds. Not tried: counters in Horner's and
+binary splitting's kernels on short series, the method that brought rect under the line. What
+follows is the record up to that change.
+
+**Where they stood (2026-11-12, after "Rect's counts read against the kernel, and
+hi_mul_buf's own equation" above).** Fitted on a synthetic family, not on exp's and ln's chunks
 ("Built: the series tuned as general evaluators"), and a regime at a time ("Applied: a fit a
 regime and whole groups"). Held out, on the M1: for the long series, whose equations the
-dispatch reads, Horner 5.8%, **rect 8.2%** and binary splitting 3.9% (under the line, no
-longer marked); for the short ones, whose prices only the table's derivation reads, 9.7%, 6.2%
-and 10.5%. Rect's long fit is the one furthest out, and "Rect: everything tried" below is its
-whole record. The figures between here and there are the history of the fit on the callers'
+dispatch reads, Horner 4.7%, rect 2.8% and binary splitting 3.6%, **all under the line and
+none of them marked**; for the short ones, whose prices only the table's derivation reads,
+7.4%, 7.6% and 9.4%, which stay NOISY. (Before that day's last change: 5.8%, 8.2% and 3.9%;
+9.7%, 6.2% and 10.5%.) "Rect: everything tried" below is rect's whole record, and how it came
+under the line. The figures between here and there are the history of the fit on the callers'
 series.
 
 In use for dynamic nodes since 2026-11-10: one fitted runtime equation an algorithm (`SeriesEq`
@@ -2431,35 +3519,27 @@ rms is held out unless it says otherwise, and "the line" is 5%.
 | 20 | 11-12 | A product multiple of its own by x's width (to 4, 8 or 16 limbs, or three widths), same shapes | The narrow multiple fits 0.77-0.86 against 1.00, which is what the probe of row 16 read for short sides of 3-5 limbs (0.79): the bias at a narrow x goes (+2.3% to -0.5% at 2-4 limbs) and the fit reads 6.7-7.1% from 7.4% |
 | 21 | 11-12 | A price for the one-limb multiplier passes (the term adds) of its own at a narrow x; and both that and the product multiple | 0.30 ns a limb against 0.40-0.45: 6.8-6.9%, an x of 2-4 limbs at 6.4-6.6% from 8.7%. With both free the two trade off (products 0.94, passes 0.33): 6.8%. An x of 5-16 limbs stays at 7-9% under every form. A call price by width does nothing (7.4%) |
 | 22 | 11-12 | The user's hypothesis: mul lacks a chunking FFT, which would suit rect's uneven products | A chunking FFT is 1.1-1.6x faster than `mul_dyn` from a short side of 192 limbs under a long side 8 times it, but no series the tuner fits makes such a product (frames stop at 1024 limbs), mul's equation predicts those products within 7% as they are, and rect's error is at an x of 2-16 limbs. Not the cause; worth having for mul on its own account (the user's call) |
+| 23 | 11-12 | Counters in the kernel (a scratch worktree), and rect timed alone at up to seven block lengths: the model's counts against the kernel's, 747 shapes | The counts are off, by amounts that vary shape to shape: term adds and R passes 1.74 of the kernel's (spread 22%), divisions 1.15 (21%; 1.42 at 1.5-3 blocks), products 1.06 (9%). And over every block length the form in use reads 10.1%, not 7.6%: wrong in m as well |
+| 24 | 11-12 | Prices fitted to the kernel's own counts: the floor for an equation of this kind | 4.6% with five prices of its own, 3.5-3.7% with `hi_mul_buf`'s products priced apart from the guarded ones. About three points are counts, most of another the high product's price |
+| 25 | 11-12 | A power's width from x's bits, ceil(j bits / 64), not j times its limbs (the kernel skips a power's zero low limbs) | Row 19's "narrow x": add limbs 1.23 of the kernel's at two limbs and 1.11 at 3-4 become 1.02 at every width; the block products' short side becomes exact |
+| 26 | 11-12 | A term add's passes, 1 + (its weight's bits) / 64 in place of two; its limbs the lesser of its power and its frame term by term, in closed form a block; a group's division at its own frame, not its block's | Adds 1.74 to 1.02 (spread 22% to 5%); divisions 1.15 to 1.01 (21% to 5%). Rows 20-21's 0.30 ns a limb against 0.40-0.45 was the passes: a count, not a price |
+| 27 | 11-12 | The guarded product's copy out of scratch and the scan of each power for zero limbs, counted; the accumulator's length a fraction of a limb off the frame, from where the bits land | The residual's -0.39 correlation with the share of copies goes (shapes of many powers of a narrow x on a long accumulator read 16-19% fast); block products' area 1.10 (15%) to 1.00 (0.3%) |
+| 28 | 11-12 | Forms on the corrected counts: the four prices as they were; + its own price for the term adds; + a multiple for `hi_mul_buf`'s products | 4.8 / 5.4 / 4.4; 4.6 / 4.9 / 4.3; 3.8 / 4.2 / 3.6 on three sets (8.3 / 7.6 / 7.5 before). The third proposed as rect's own constant |
+| 29 | 11-12 | The user: the tier's price into mul's section. `hi_mul_buf`'s own equation, a kernel: its limb products, a term a row or a column, a shift (`HiEq`) | Rows 2.7% and columns 3.8% held out, where mul_buf's equation on the area read 14.6% and 31%. Rect needs no multiple of its own for the tier, and Horner's products by x take the same price |
+| 30 | 11-12 | As built and tuned: `SeriesEq::RECT` is product, div1, add, term, fixed over the corrected counts; the preset retuned | **2.8% held out over 62** (2.7% fitted on 125). Horner 4.7% and binary splitting 3.6%: no long equation is marked. Rect's short prices 7.6% (the table's derivation only) |
 
-**What that leaves.** Rect is predicted like the others over every size (row 15), and from an
-x of 17 limbs its long series read 5.9-6.2%, Horner's level (rows 19-21). What is out is long
-series at an x of 2 to 16 limbs, where the equation reads 4-8% too slow on average (9-13%
-rms) and rect's time is mostly its scalar steps, not its products (row 17). Ruled out as the
-whole of it: prices shared across widths (rows 5, 9, 18), the number of shapes (rows 7, 15),
-the regime (rows 10, 11), the chunking FFT (row 22). Found, each worth about half a point: at
-a narrow x either the products with a short side of a few limbs or the term adds are
-predicted a quarter too high (rows 20, 21; one data set can't tell them apart, since both
-scale with the terms there). Neither brings the fit under 6.7%, and an x of 5 to 16 limbs
-stays at 7-9% whatever is priced apart, so the rest is a count in `Shape::rect_parts`. Not
-examined yet, and where to look first:
+**How it ended.** Rows 1-22 moved prices and shapes; what was wrong was counts (rows 23-27),
+and the price of one kernel that had been read off another's equation (row 29). The method
+that found it is the one to reach for first when a fit of counted work won't conform: put
+counters in the kernel, compare them with the model's counts shape by shape, and fit prices to
+the kernel's own counts to learn what the form can do at best. A count that is off by a
+constant factor is absorbed by its price and never shows; one whose error varies with the
+shape is the misfit. Rows 19-21 had seen the symptom from the outside (too slow at a narrow
+x, a term-add price that wanted 0.30 for 0.40-0.45) and could not tell a price from a count.
 
-- the term adds (`mul1`: two passes of each term's weight over its power's significant limbs,
-  taken as the mean of min(p, j xl) over a block's powers and capped by the mean active
-  frame), by timing the kernel's own lengths against that mean at an x of 2-4 limbs;
-- the products with a short side under 10 limbs, where mul's schoolbook equation is read
-  outside what it was fitted on (the proposal of row 16, which rows 20-21 say is worth half a
-  point for rect);
-- the groups in a block (`per_block = ceil(m / g)`, with g a real number) and the calls
-  (`n_groups + 2 wl t + 2 m`);
-- row 4's two notes, never rechecked on the family.
-
-To read a change: `BIGBITS_TUNE_VERBOSE=1 cargo tune series --timings FILE` writes every
-workload's parts to `target/tuning/series_parts.tsv`, and a count changed in the library is
-read against the same timings on the next run. The by-width fits of rows 17-21 are one-off
-scripts over that file, not kept in the repo. What the misfit costs meanwhile: the picks on
-long series lose 0.14-0.23% of measured time (worst 13%), and the rect guard settles the
-shapes where rect is far ahead without reading its equation.
+What is still open is in the log entry above ("What it costs, and what is left"): the
+dispatch's own cost, rect's short prices, a q that grows along the range, more candidate block
+lengths, and the powers' products over their zero limbs.
 
 `cargo tune series` is the report to rerun; `--timings FILE` keeps its timings, so a change to
 a count is read against the same measurements.
@@ -2472,21 +3552,41 @@ blocking:
 
 1. **x86: the user's, on the i7**, by "The x86 handoff" below: the FFT's odd-part factors
    first, then the standard flow.
-2. **The series' dispatch equations**, marked above. As of 2026-11-12, long series: Horner
-   5.8%, rect 8.2%, binary splitting 3.9% (no longer marked); picks lose 0.14-0.23% on long
-   series and 0.30-1.66% on short ones. Rect's whole record and where to look next are under
-   "Rect: everything tried to bring it under the line".
+2. **The series' dispatch equations: under the line, none marked** (2026-11-13, "Horner's and
+   binary splitting's equations under the line, and the beta guard gone"): 3.4%, 2.7% and 3.6%
+   held out in the preset. What that entry leaves: the decision costs about 4% more for the
+   model and walks binary splitting's tree on the ranges the beta guard used to settle (0.3% of
+   the time on unseen series past 100 us; a lower bound from the tree's own equation would
+   spare it, proposed and not built); and binary splitting's prices for finalize by a one- or
+   two-limb Q rest on a few series a half at the lower levels. (Rect's groups and the two-limb
+   ratio, open in that entry, were settled the same day: "The tuner's leftovers cleared, and a
+   full retune", which leaves `div_rem_dyn` 1030/1000 6% slower, a near tie of NR with remainder
+   and BZ that flips between retunes.) Still open from rect's fix ("Rect's counts
+   read against the kernel, and hi_mul_buf's own equation"): more candidate block lengths. The
+   corner the derived table had lost (two terms at an x past 32 limbs in a frame of 256 limbs or
+   more going to binary splitting) is closed by measuring the table: a two-term series at an x
+   of 293 limbs in a frame of 275 runs rect from the table, 631 ns where Horner takes 16.6 us
+   and binary splitting more.
+2c. **What the rule on tables costs** (same entry): a division at a divisor the old Knuth
+   guards settled reads the equations once the decision is within 5% of it (12 of the division
+   grid's 40 shapes, 2.8% slower as a group), accepted by the user for the one rule's sake; and
+   the series' table on 8 kinds loses more on short series than the 72 classes did (its picks 1.5% on the mean and 2.3% of the time against 0.8% and 1.7%; the entry, its dispatch included, 3.0% and 3.5% against 2.6% and 2.5%)
+   for an eighth of the size, the user's trade. Either moves with the share or the layout.
 2a. **A chunking FFT for mul** (2026-11-12): 1.1-1.6x for `mul_dyn` from a short side of 192
    limbs under a long side 8 times it, with chunks of 4 to 15 times the short side ("The table
    shrunk, ..."). An algorithm, its equation, mul's version and a retune of what is built on
    mul: the user's call, not made.
-2b. **A fitted equation for the high product, and mul's fits on unbalanced products**
-   (proposed 2026-11-12, not applied): worth about half a point of rect's fit at a narrow x
-   and Horner's at a wide one, by the same day's later reading.
+2b. **mul's fits on unbalanced products** (proposed 2026-11-12, not applied): mul_buf's
+   equation reads 20% high at a short side of 3-9 limbs under a long side of 25-99, and 60%
+   under 25 (4.5% from 100 limbs). The other half of that proposal, a fitted equation for the
+   high product, is built (`HiEq`, the same day). Division's NR still prices its schoolbook
+   high products as half a schoolbook product with a fitted multiple of its own; it could read
+   `HiEq` in place of it, which means a retune of div and what is built on it.
 3. **The series' model over general series** (2026-11-11): the frame (rho, beta), the fit on
    the synthetic family and the guards are built ("Built: the series tuned as general
-   evaluators" above, which lists what it leaves: the dispatch's own cost on short series,
-   `horner_first` on general shapes, the pool-split trees, wide coefficients). And mul, div,
+   evaluators" above, which lists what it leaves: the pool-split trees, wide coefficients; the
+   dispatch's own cost on short series is the measured table's since 2026-11-12, and
+   `horner_first` is a static node's only). And mul, div,
    sqrt, theta and agm in the M1 preset were tuned on battery with the sweeps' "samples" line
    at 5.9% (bin_split, series, exp and ln were tuned again on mains power): a rerun would
    settle whether that mattered.
@@ -2504,8 +3604,10 @@ blocking:
    limbs past a 4096-byte alignment against the working buffer (measured at q = 6, d = 1024).
    A property of the library, found through the tuner; not looked into.
 7. **Linux core pinning** has never been built for or run on Linux.
-8. **Deferred by the user**: the line-reduction pass over the tuning code; the
-   `cargo-bigbits` driver (the rest of Phase 3); `runtime-tuning` (Phase 4).
+8. **Deferred by the user**: the `cargo-bigbits` driver (the rest of Phase 3);
+   `runtime-tuning` (Phase 4). The tuning code had its simplification pass on 2026-11-13 ("A
+   simplification pass over `src/tuning`": duplication and residue, 8 lines net, so not a
+   reduction in size); what that pass proposed and left is listed at its end.
 
 ## The x86 handoff
 
@@ -2540,6 +3642,9 @@ cargo tune equations --level normal                         # products: time los
 cargo tune division --level normal                          # divisions: the same for div_dyn, div_rem_dyn
 cargo test --lib && cargo test --lib --features tune        # again, under the preset
 ```
+
+The series' two-limb ratio needs nothing by hand: `series.horner_pass2` is measured by the series
+section's tune on `mul_prim2` and `mul_prim` (3.46 on the M1; read its evidence line for x86's).
 
 To make the preset cover every x86-64 OS, rename it `presets/x86_64.toml` (`build.rs` reads
 `<arch>-<os>.toml` first, then `<arch>.toml`).

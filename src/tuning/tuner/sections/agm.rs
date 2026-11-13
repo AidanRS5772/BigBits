@@ -1,6 +1,5 @@
-//! Section `agm`: the tail caps (`agm.dyn_tail_terms`, `agm.static_tail_terms`), each a parameter
-//! sweep over 0..=19 through the `_at` entries, which take the cap. Static at N = 1100 only (an
-//! approximate value, like every static decision).
+//! Section `agm`: the tail caps, each a parameter sweep through the `_at` entries, which take
+//! the cap. Static at N = 1100 only.
 
 use crate::tuning::resolve::Value;
 use crate::tuning::tuner::measure::{pad, Level, Probe};
@@ -10,8 +9,7 @@ use crate::utils::trans::{agm_dyn_at, agm_static_at};
 use std::hint::black_box;
 
 pub fn tune(level: Level) -> Vec<Tuned> {
-    // A spread of caps rather than all twenty, and sizes four apart (fewer measurements: the
-    // user's decision, 2026-11-11). Both defaults (10 and 4) are among them.
+    // A spread of caps and sizes four apart; both defaults (10 and 4) are among them.
     let cands = ints(&[2, 4, 6, 8, 9, 10, 12, 14, 16, 19]);
     let cap = |v: &Value| int(v) as usize;
     // a and b of n limbs in an n-limb frame, as the logarithm calls it (b the smaller).

@@ -1191,25 +1191,22 @@ fn check_node_costs<N: SeriesNode>(ctx: &N::Ctx, max_m: u64, what: &str) {
                 let costs = N::costs(ctx, a, b, len, zeros, None);
                 let what = format!("{what} [{a}, {b}) len {len} zeros {zeros}");
                 check_costs(costs, ok, max_m.min(b - a), &what);
-                // horner_first skips the model, only for ranges Horner can sum.
+                // horner_first skips the model, only for ranges Horner can sum, and only for a
+                // node with no table (a dynamic node reads the small-series table there).
                 let first = N::horner_first(ctx, a, b, len, zeros);
-                assert!(!first || ok.horner, "{what}");
-                // Past horner_first the guards settle what they can, and the least prediction
-                // decides among what they leave.
+                assert!((!first || ok.horner) && !(first && N::TABLED), "{what}");
+                // Past it rect's guard settles what it can, and the least prediction decides
+                // the rest.
                 let g = N::guards(ctx, a, b, len, zeros);
                 let (alg, m) = N::decide(ctx, a, b, len, zeros);
                 assert!(ok.allows(alg), "{what}: decided {alg:?}");
                 assert!(alg != SeriesAlg::Rect || m.is_some_and(|m| m >= 1 && m as u64 <= b - a), "{what}: rect at {m:?}");
                 if g.rect_first {
                     assert_eq!(alg, SeriesAlg::Rect, "{what}");
-                } else if g.no_bin_split {
-                    let rest = Costs { bin_split: f64::INFINITY, ..costs };
-                    assert!(alg == rest.pick() && alg != SeriesAlg::BinSplit, "{what}: {alg:?}");
                 } else {
                     assert_eq!(alg, costs.pick(), "{what}");
                 }
                 assert!(!g.rect_first || ok.rect, "{what}");
-                assert!(!g.no_bin_split || ok.horner || ok.rect, "{what}");
                 // The small-series table is read ahead of both, and only ever names an
                 // algorithm that can sum the range.
                 let small = N::small(ctx, a, b, len, zeros);
@@ -1248,34 +1245,18 @@ fn test_small_series_table_layout() {
     assert_eq!((small_frame(1), small_frame(3), small_frame(5), small_frame(6), small_frame(11), small_frame(12), small_frame(255)), (Some(0), Some(1), Some(2), Some(2), Some(3), Some(3), Some(7)));
     assert_eq!((small_frame(256), small_frame(511), small_frame(512), small_frame(65535)), (Some(8), Some(8), Some(9), Some(SMALL_ROWS - 1)));
     assert_eq!((small_frame_span(5), small_frame_span(8), small_frame_span(15)), ((32, 63), (256, 511), (32768, 65535)));
-    // Classes: the kind and x's width, q's bucket, and whether r is past 1; none past 64 bits.
+    // A class is the kind alone: the family and x's width, whatever q's and r's sizes; none
+    // past 64 bits, which the table doesn't hold.
     assert_eq!(small_class(0, 1, 0), Some(0));
-    assert_eq!(small_class(0, 8, 0), small_class(0, 3, 0));
-    assert_ne!(small_class(0, 9, 0), small_class(0, 8, 0));
-    assert_ne!(small_class(0, 17, 0), small_class(0, 16, 0));
-    assert_eq!(small_class(0, 17, 0), small_class(0, 32, 0));
-    assert_eq!(small_class(0, 33, 0), small_class(0, 64, 0));
-    assert_ne!(small_class(2, 8, 1), small_class(2, 8, 5), "r of 1 and r past 1");
+    assert_eq!(small_class(0, 8, 0), small_class(0, 64, 0));
+    assert_eq!(small_class(2, 8, 1), small_class(2, 40, 5), "neither q's size nor an r past 1 is in the class");
+    assert_ne!(small_class(1, 8, 0), small_class(2, 8, 1));
     assert_eq!(small_class(1, 65, 0), None);
     assert_eq!(small_class(2, 8, 70), None);
-    let kinds: Vec<usize> = [0u64, 2, 16, 17, 64, 65, 128, 129, 256, 257, 512, 513, 1024, 1025, 2048, 2049].iter().map(|&b| small_kind_hyper(b)).collect();
-    // An x of 3 to 8 limbs is one kind.
-    assert_eq!(kinds, [2, 3, 3, 4, 4, 5, 5, 6, 6, 6, 6, 7, 7, 8, 8, 9]);
-    assert!(SMALL_CLASSES == SMALL_KINDS * SMALL_Q_BITS.len() * 2 && small_class(SMALL_KINDS - 1, 64, 64) == Some(SMALL_CLASSES - 1));
-    // Every class but BBP's and Engel's with an r has a shape, which Horner can sum and rect
-    // only with an x of two limbs or more.
-    for class in 0..SMALL_CLASSES {
-        let kind = class / 2 / SMALL_Q_BITS.len();
-        match Shape::of_class(class, 20, 30) {
-            None => assert!(kind < 2 && class % 2 == 1, "class {class}"),
-            Some((shape, ok)) => {
-                assert!(ok.horner && ok.rect == (shape.x_limbs() >= 2) && (kind >= 5) == ok.rect, "class {class}");
-                let c = shape.predictions(ok);
-                assert!(ALGS.iter().filter_map(|&a| c.of(a)).all(|ns| ns.is_finite() && ns > 0.0), "class {class}: {c:?}");
-                assert!(ok.allows(shape.decide_at(ok, Guarded::default()).0));
-            }
-        }
-    }
+    let kinds: Vec<usize> = [0u64, 2, 16, 17, 64, 65, 128, 129, 256, 1024, 1025, 2048, 2049].iter().map(|&b| small_kind_hyper(b)).collect();
+    // No x, an x to a limb, of 2 limbs, of 3 to 16, of 17 to 32, and of more.
+    assert_eq!(kinds, [2, 3, 3, 3, 3, 4, 4, 5, 5, 5, 6, 6, 7]);
+    assert!(SMALL_KINDS == 8 && small_class(SMALL_KINDS - 1, 64, 64) == Some(SMALL_KINDS - 1));
     // A table by hand: class 3 at frames of 4-7 limbs runs Horner to 9 terms, binary splitting
     // from 10 and leaves 200 and more to the equations; at 8 limbs and up, rect from 3 terms.
     let key = |class: usize, frame: usize| (class * SMALL_ROWS + small_frame(frame).unwrap()) as u32;
@@ -1293,7 +1274,7 @@ fn test_small_series_table_layout() {
     assert_eq!(small_pick(&table, 2, 4, 5), Some(SeriesAlg::Horner), "below the first row: its first pick");
     // The default table hands everything to the equations.
     let none = Table2 { t: &[0, 0, 3], rows: &[0] };
-    assert!((0..SMALL_CLASSES).all(|c| [1, 30, 255, 4000].iter().all(|&f| small_pick(&none, c, f, 7).is_none())));
+    assert!((0..SMALL_KINDS).all(|c| [1, 30, 255, 4000].iter().all(|&f| small_pick(&none, c, f, 7).is_none())));
     // The live table through a node: its class, and a pick the range's own eligibility allows.
     type N = DynNodeHyper<Exp>;
     let ctx = DynHyperCtx::new(&[0x1234_5678], 80);
@@ -1306,9 +1287,9 @@ fn test_small_series_table_layout() {
     }
 }
 
-// The dispatch's guards at explicit knobs: rect outright from a rho and an x width, binary
-// splitting left out past a beta while another algorithm can sum the range; what `decide` then
-// runs; and that rect at the guard's block length (the balance, unpredicted) sums the range.
+// The dispatch's guard at explicit knobs: rect outright from a rho and an x width; what `decide`
+// then runs (binary splitting has no guard: its equation is read at any beta); and that rect at
+// the guard's block length (the balance, unpredicted) sums the range.
 #[test]
 fn test_guards_settle_ranges_by_their_ratios() {
     type N = DynNodeHyper<Exp>;
@@ -1326,29 +1307,27 @@ fn test_guards_settle_ranges_by_their_ratios() {
     // the shift's 2561 bits and q's, over the frame.
     assert!((s.rho() - 240.0).abs() < 1e-9 && s.x_limbs() == 40, "{}", s.rho());
     assert!((240.0..250.0).contains(&s.beta()), "{}", s.beta());
-    let at = |beta: f64, rho: f64, x: usize| SeriesGuards { bin_split_beta: beta, rect_rho: rho, rect_x: x };
-    assert_eq!(s.guards(ok, &at(8.0, 8.0, 16)), Guarded { rect_first: true, no_bin_split: true });
-    assert_eq!(s.guards(ok, &at(1e9, 1e9, 0)), Guarded::default(), "both off");
-    assert!(s.guards(ok, &at(1e9, 240.0, 40)).rect_first, "at its rho and its x");
-    assert!(!s.guards(ok, &at(1e9, 240.5, 40)).rect_first && !s.guards(ok, &at(1e9, 240.0, 41)).rect_first);
-    assert!(!s.guards(ok, &at(s.beta(), 1e9, 0)).no_bin_split && s.guards(ok, &at(s.beta() - 0.5, 1e9, 0)).no_bin_split);
-    // Binary splitting stays where nothing else can sum the range, and rect's guard needs rect.
+    let at = |rho: f64, x: usize| SeriesGuards { rect_rho: rho, rect_x: x };
+    assert_eq!(s.guards(ok, &at(8.0, 16)), Guarded { rect_first: true });
+    assert_eq!(s.guards(ok, &at(1e9, 0)), Guarded::default(), "off");
+    assert!(s.guards(ok, &at(240.0, 40)).rect_first, "at its rho and its x");
+    assert!(!s.guards(ok, &at(240.5, 40)).rect_first && !s.guards(ok, &at(240.0, 41)).rect_first);
+    // Rect's guard needs rect.
     let (none, horner) = (Eligible { horner: false, rect: false }, Eligible { horner: true, rect: false });
-    assert_eq!(s.guards(none, &at(0.0, 0.0, 0)), Guarded::default());
-    assert_eq!(s.guards(horner, &at(0.0, 0.0, 0)), Guarded { rect_first: false, no_bin_split: true });
+    assert_eq!(s.guards(none, &at(0.0, 0)), Guarded::default());
+    assert_eq!(s.guards(horner, &at(0.0, 0)), Guarded::default());
     // An x of one limb has no rho to speak of, and a narrow tree no beta.
     let narrow = N::shape(&DynHyperCtx::new(&[5], 3000), 1, 4, 200, 0);
     assert!(narrow.rho() < 0.01 && narrow.beta() < 1.0, "{} {}", narrow.rho(), narrow.beta());
 
-    // decide: rect at a block length within the range under its guard; under the beta guard
-    // alone the better of Horner and rect by their predictions; with neither, any of the three.
+    // decide: rect at a block length within the range under its guard; without it, the least
+    // of the three predictions, binary splitting's among them at a beta of 240 (it is far the
+    // dearest there, by its own equation and not by a guard).
     let costs = N::costs(&ctx, a, b, len, 0, None);
-    let (alg, m) = s.decide_at(ok, Guarded { rect_first: true, no_bin_split: true });
+    let (alg, m) = s.decide_at(ok, Guarded { rect_first: true });
     let m = m.expect("rect's block length");
     assert!(alg == SeriesAlg::Rect && (1..=300).contains(&m), "{alg:?} {m}");
-    let (alg, _) = s.decide_at(ok, Guarded { rect_first: false, no_bin_split: true });
-    let want = if costs.rect.unwrap().1 <= costs.horner.unwrap() { SeriesAlg::Rect } else { SeriesAlg::Horner };
-    assert_eq!(alg, want);
+    assert!(costs.bin_split.is_finite() && costs.bin_split > 4.0 * costs.rect.unwrap().1.min(costs.horner.unwrap()), "{costs:?}");
     assert_eq!(s.decide_at(ok, Guarded::default()).0, costs.pick());
     assert_eq!(s.decide_at(none, Guarded::default()).0, SeriesAlg::BinSplit);
     // The live dispatch is `decide_at` under the live knobs' verdict.
@@ -1494,9 +1473,13 @@ fn test_bin_split_parts_count_the_tree() {
     // tree's leaves and merges (two buffers a leaf; a merge's P and Q, and BBP's cross product;
     // finalize's scratch). The walk takes q's size at the range's midpoint for every node of a
     // level, where the tree's own estimate is smaller at its left nodes than at its right ones,
-    // so with a level right at the leaf cutoff the two can differ by a node or two.
+    // so with a level right at the leaf cutoff the two can differ by a node or two: within a
+    // fifth, or two leaves and their merges where that is more (1000 terms at shift 7 under an
+    // Engel leaf of 64 limbs: the walk's 250-term nodes are all leaves at 66 limbs' estimate,
+    // and the tree splits the two on the right).
     let env = SeriesEnv::read();
     let allocs = |leaves: u64, merges: u64, per_merge: u64| (2 * leaves + per_merge * merges + 1) as f64;
+    let near = |got: f64, want: f64, per_merge: u64| (got - want).abs() <= (0.2 * want).max((2 * (2 + per_merge)) as f64);
     for shift in [1u64, 7, 64, 200, 4096] {
         for t in [1u64, 2, 3, 5, 8, 13, 100, 257, 1000] {
             // Trees narrow enough to stay on the caller's thread, where the counts are whole.
@@ -1507,11 +1490,11 @@ fn test_bin_split_parts_count_the_tree() {
             let (leaves, merges) = tree_nodes::<DynNodeEngel<Exp>>(&ctx, 1, 1 + t);
             let got = DynNodeEngel::<Exp>::parts(&ctx, 1, 1 + t, 8, 0, None, &env)[2].unwrap().alloc;
             let want = allocs(leaves, merges, 2);
-            assert!((got - want).abs() <= 0.2 * want, "engel shift {shift} t {t}: {got} allocations, the tree makes {want}");
+            assert!(near(got, want, 2), "engel shift {shift} t {t}: {got} allocations, the tree makes {want}");
             let (leaves, merges) = tree_nodes::<DynNodeBBP<BbpLin>>(&ctx, 1, 1 + t);
             let got = DynNodeBBP::<BbpLin>::parts(&ctx, 1, 1 + t, 8, 0, None, &env)[2].unwrap().alloc;
             let want = allocs(leaves, merges, 3);
-            assert!((got - want).abs() <= 0.2 * want, "bbp shift {shift} t {t}: {got} allocations, the tree makes {want}");
+            assert!(near(got, want, 3), "bbp shift {shift} t {t}: {got} allocations, the tree makes {want}");
             // A tree of one leaf, and one of one term a leaf, are counted exactly.
             if leaves == 1 || leaves == t {
                 assert_eq!(got, want, "bbp shift {shift} t {t}");
@@ -1523,12 +1506,12 @@ fn test_bin_split_parts_count_the_tree() {
 #[test]
 fn test_horner_products_closed_form() {
     // Horner's products by a multi-limb x in hi_mul_buf's tier are summed in closed form over the
-    // frames' four stretches (the whole accumulator, holding x whole, shorter than x, one limb).
-    // Against the same sum taken term by term: a frame of L limbs by x of xl costs schoolbook's
-    // a (L m - m (m - 1) / 2) + c for m = min(xl, L).
+    // frames' stretches (the whole accumulator; falling, cut where the frame passes the kernels'
+    // cutoff and where it passes x; one limb). Against the same sum taken term by term: a frame
+    // of L limbs by x of xl costs hi_mul_buf's own equation (`HiEq`), x clipped to the frame.
     let mut rng = StdRng::seed_from_u64(94);
     let env = SeriesEnv::read();
-    let [a, c] = crate::utils::mul::MulEq::read().school;
+    let hi = crate::utils::mul::HiEq::read();
     let partial = crate::tuning::k::mul::dyn_partial_mul();
     for xl in [2usize, 3, 7, 40] {
         let x = rand_x(64 * xl as u64, &mut rng);
@@ -1541,13 +1524,7 @@ fn test_horner_products_closed_form() {
                     continue;
                 }
                 let (top, k) = ((len + zeros + 2) as f64, extra as f64);
-                let want: f64 = (1..=t)
-                    .map(|i| {
-                        let l = (top - k * i as f64 / 64.0).clamp(1.0, acc as f64);
-                        let m = (xl as f64).min(l);
-                        a * (l * m - m * (m - 1.0) / 2.0) + c
-                    })
-                    .sum();
+                let want: f64 = (1..=t).map(|i| hi.ns((top - k * i as f64 / 64.0).clamp(1.0, acc as f64), xl as f64)).sum();
                 let got = DynNodeHyper::<Exp>::parts(&ctx, 1, 1 + t, len, zeros, None, &env)[0].unwrap().product;
                 assert!((got - want).abs() <= 1e-9 * want, "xl {xl} shift {shift} len {len} zeros {zeros} t {t}: {got} != {want}");
             }
@@ -1559,21 +1536,126 @@ fn test_horner_products_closed_form() {
 fn test_series_equations_share_horners_kernel_prices() {
     // Rect runs Horner's kernels, so its equation takes Horner's prices for their passes (the
     // two-limb divisions, the passes by one- and two-limb multipliers, the fills and copies)
-    // and has its own for its products, calls and fixed cost, and for the one-limb divisions,
-    // which its groups make in every range and Horner's long series hardly make at all. The
-    // same for both sets of prices, the long series' and the short ones'.
-    assert_eq!(SeriesEq::RECT, [0, 2, 9, 11]);
-    for eq in [SeriesEq::read(), SeriesEq::read_short()] {
-        for c in 0..12 {
-            if SeriesEq::RECT.contains(&c) || c == 8 {
+    // and has its own for what is its own: its products and fixed cost, a term, its term adds
+    // (add_mul passes of a weight over a power), and the one-limb divisions, which its groups
+    // make in every range and Horner's long series hardly make at all. It has no price a call
+    // or a group: its adds' calls and its groups' fixed costs are in its price a term.
+    assert_eq!(SeriesEq::RECT, [0, 2, 6, 8, 11]);
+    for eq in [SeriesEq::read()] {
+        for c in 0..Parts::N {
+            if SeriesEq::RECT.contains(&c) {
                 continue;
             }
-            assert_eq!(eq.rect[c], eq.horner[c], "column {}", Parts::NAMES[c]);
+            assert_eq!(eq.rect[c], if c == 9 || c == 12 { 0.0 } else { eq.horner[c] }, "column {}", Parts::NAMES[c]);
         }
         // No price for work an algorithm doesn't do.
         for (name, cols, prices) in [("horner", &SeriesEq::HORNER[..], &eq.horner), ("bin_split", &SeriesEq::BIN_SPLIT[..], &eq.bin_split)] {
-            for c in (0..12).filter(|c| !cols.contains(c)) {
-                assert_eq!(prices[c], 0.0, "{name}: column {}", Parts::NAMES[c]);
+            for c in (0..Parts::N).filter(|c| !cols.contains(c)) {
+                // Horner's price for two-limb passes is its one-limb price times the kernels' ratio.
+                let want = if name == "horner" && c == 5 { crate::tuning::k::series::horner_pass2() * prices[4] } else { 0.0 };
+                assert_eq!(prices[c], want, "{name}: column {}", Parts::NAMES[c]);
+            }
+        }
+    }
+}
+
+// A Hyper series with a 32-bit q and r = 1: rect's narrow accumulator divides by a one-limb Q,
+// so its groups hold exactly two terms.
+struct Q32H;
+impl HyperSeries for Q32H {
+    const START: u64 = 1;
+    fn tail_bits(_: u64, _: i64) -> u64 {
+        0
+    }
+    fn p(_: u64) -> u64 {
+        1
+    }
+    fn q(n: u64) -> u64 {
+        (1 << 31) + 2 * n + 1
+    }
+    fn r(_: u64) -> u64 {
+        1
+    }
+}
+
+// An x of exactly `bits` bits whose limbs are all nonzero.
+fn x_bits(bits: u64) -> Vec<u64> {
+    let len = bits.div_ceil(64) as usize;
+    let mut x = vec![0x9e37_79b9_7f4a_7c15u64; len];
+    let top = bits - 64 * (len as u64 - 1);
+    x[len - 1] = (x[len - 1] >> (64 - top)) | 1 << (top - 1);
+    x
+}
+
+#[test]
+fn test_rect_groups_divide_at_their_own_frames() {
+    // Eight terms in blocks of four, groups of two: the kernel divides after terms 7, 5, 3 and 1
+    // (deepest first), each time over the frame of that term, not twice over each block's
+    // shallowest (which read 1.4x the kernel's limbs on a range of two blocks). 320 bits a term
+    // from the shift: term i's frame is len + 2 - 5 i limbs. The sum a division takes is a q
+    // above its term (the group's other q) in a top limb half full: 31 / 64 - 1 / 2 limbs more.
+    let env = SeriesEnv::read();
+    let (x, len) = (x_bits(128), 60);
+    let ctx = DynHyperCtx::new(&x, 128 + 320);
+    let r = DynNodeHyper::<Q32H>::parts(&ctx, 1, 9, len, 0, Some(4), &env)[1].unwrap();
+    let frame = |i: usize| (len + 2 - 5 * i) as f64 + 31.0 / 64.0 - 0.5;
+    let want = frame(1) + frame(3) + frame(5) + frame(7);
+    assert!((r.div1 - want).abs() < 0.01, "{} limbs divided, the kernel's groups take {want}", r.div1);
+    assert_eq!((r.div2, r.term, r.mul1, r.mul2), (0.0, 8.0, 0.0, 0.0), "{r:?}");
+    // One block: the same four groups, at the same frames.
+    let r = DynNodeHyper::<Q32H>::parts(&ctx, 1, 9, len, 0, Some(8), &env)[1].unwrap();
+    assert!((r.div1 - want).abs() < 0.01, "{} limbs divided in one block", r.div1);
+}
+
+#[test]
+fn test_rect_powers_are_as_wide_as_x_bits() {
+    // Power j of x' has x's bits j times over, and the kernel skips its zero low limbs: an x of
+    // two limbs and 66 bits makes powers of 2, 3, ..., 9 limbs (ceil(66 j / 64)) where one of
+    // 128 bits makes 2, 4, ..., 16. One block of eight terms in a frame that holds every power
+    // whole, so each term adds its power once, and a second time as often as its weight spills:
+    // the weights are 1 and a 31-bit q by turns, 15.5 of 64 places on average.
+    let env = SeriesEnv::read();
+    let len = 200;
+    let spill = 1.0 + 15.5 / 64.0;
+    for (bits, limbs) in [(128u64, 72.0), (66, 44.0), (70, 44.0), (65, 44.0), (127, 72.0)] {
+        let x = x_bits(bits);
+        let r = DynNodeHyper::<Q32H>::parts(&DynHyperCtx::new(&x, bits + 64), 1, 9, len, 0, Some(8), &env)[1].unwrap();
+        let want = spill * limbs;
+        assert!((r.add - want).abs() < 1e-3 * want, "x of {bits} bits: {} limbs added, its powers have {want}", r.add);
+    }
+}
+
+#[test]
+fn test_rect_adds_closed_form() {
+    // Rect's term adds are summed block by block in closed form: a term adds its power over the
+    // power's limbs or the limbs under its own bit, whichever is fewer, and within a block the
+    // one grows as the other falls. Against the same sum taken term by term.
+    let env = SeriesEnv::read();
+    for bits in [70u64, 128, 200, 1000] {
+        let x = x_bits(bits);
+        for k in [1u64, 20, 64, 300] {
+            let ctx = DynHyperCtx::new(&x, bits + k);
+            for (len, zeros, t, m) in [(40usize, 0usize, 60u64, 7usize), (40, 0, 60, 60), (300, 2, 500, 31), (300, 0, 90, 16), (64, 0, 1000, 5), (500, 1, 40, 40)] {
+                let r = DynNodeHyper::<Q32H>::parts(&ctx, 1, 1 + t, len, zeros, Some(m), &env)[1].unwrap();
+                let (p, xw, under, fall) = ((len + 3) as f64, bits as f64 / 64.0, (len + zeros + 1) as f64, k as f64 / 64.0);
+                let mut want = 0.0;
+                // The blocks from the deep end, each of m terms but the shallowest; the terms of
+                // a block of n are in pairs but for one left over when n is odd.
+                let n_blocks = t.div_ceil(m as u64);
+                let first_len = t - (n_blocks - 1) * m as u64;
+                for b in 0..n_blocks {
+                    let (first, n) = if b == 0 { (1, first_len) } else { (1 + first_len + (b - 1) * m as u64, m as u64) };
+                    let others = (2 * (n / 2)) as f64 / n as f64;
+                    let h = others * 15.5 / 64.0;
+                    for u in 0..n {
+                        let (power, inside) = (((u + 1) as f64 * xw).ceil().min(p), under - fall * (first + u) as f64);
+                        if inside <= 0.0 {
+                            continue;
+                        }
+                        want += if power <= inside.min(p) { (1.0 + h) * power } else { (inside.min(p) - 0.5).max(0.0) + h * (inside.min(p) + 0.5) };
+                    }
+                }
+                assert!((r.add - want).abs() <= 0.03 * want + 2.0, "x {bits} bits, k {k}, len {len}, zeros {zeros}, t {t}, m {m}: {} != {want}", r.add);
             }
         }
     }
@@ -1610,15 +1692,131 @@ fn test_horner_groups_are_whole() {
     // Nine terms: the shallowest group holds the one left over.
     let h = N::parts(&Shift(4096), 1, 10, len + 64, zeros, None, &env)[0].unwrap();
     assert_eq!(h.div2 + h.div1, (3 * 64 + frame(1) + frame(2) + frame(6)) as f64, "{h:?}");
-    // A q that grows fills groups of several sizes: the budget over its mean bits, less half a
-    // term. q(n) = n over 1000 terms has 7.7 and 9.6 bits at its Gauss points, 8.7 on average.
+    // Nine terms' shallowest group is one term: a one-limb Q, divided by div_prim.
+    assert_eq!((h.div1, h.step), ((64 + frame(1)) as f64, 3.0), "{h:?}");
+    // A q that grows fills groups that grow towards the shallow end: the range's bits over what
+    // a group holds of its 128 (all but the half term it leaves unfilled). q(n) = n over 1000
+    // terms is log2 1000! = 8529 bits, 69 groups.
     let e = <DynNodeEngel<Exp> as SeriesNode>::parts(&Shift(64), 1, 1001, 100, 1, None, &env)[0].unwrap();
-    let groups = e.call - e.term;
-    assert!((groups - (1000.0f64 / (128.0 / 8.67 - 0.5)).ceil()).abs() <= 1.0, "{groups} groups of 1000 terms");
+    let walked = walk_groups(1, 1001, |_| 1, |n| n as u128).len() as f64;
+    assert!((e.step - walked).abs() <= 1.0 && (walked - 69.0).abs() <= 1.0, "{} groups of 1000 terms, the kernel's rule makes {walked}", e.step);
     // And 32 terms of it, 118 bits in all, are one group: one division, over the first term's
-    // frame.
+    // frame, by a two-limb Q.
     let e = <DynNodeEngel<Exp> as SeriesNode>::parts(&Shift(1152), 1, 33, 564, 18, None, &env)[0].unwrap();
-    assert_eq!((e.call - e.term, e.div1 + e.div2), (1.0, (564 + 18 + 2 - 18) as f64), "{e:?}");
+    assert_eq!((e.step, e.div1, e.div2), (1.0, 0.0, (564 + 18 + 2 - 18) as f64), "{e:?}");
+}
+
+// The kernel's grouping rule (`group` in series.rs) walked term by term from the deep end: a
+// group takes terms while Q = ∏q and p Q stay within 128 bits, 32 at most. Each group's
+// shallowest term and its Q's bits, deepest group first.
+fn walk_groups(a: u64, b: u64, p: impl Fn(u64) -> u128, q: impl Fn(u64) -> u128) -> Vec<(u64, u32)> {
+    let (mut out, mut n) = (Vec::new(), b);
+    while n > a {
+        let (mut m, mut q_all, mut p_max) = (0u64, 1u128, 0u128);
+        for j in (a..n).rev() {
+            let (pj, qj) = (p(j), q(j));
+            let fits = q_all.checked_mul(qj).is_some_and(|nq| p_max.max(pj).checked_mul(nq).is_some());
+            if m != 0 && (m == 32 || !fits) {
+                break;
+            }
+            (q_all, p_max, m) = (q_all * qj, p_max.max(pj), m + 1);
+        }
+        n -= m;
+        out.push((n, 128 - q_all.leading_zeros()));
+    }
+    out
+}
+
+#[test]
+fn test_horner_groups_of_a_growing_q() {
+    // Horner's divisions for a q that grows, against the kernel's rule walked term by term: the
+    // groups' count, the limbs they divide (each at the frame of its shallowest term), and
+    // which of them a one-limb Q divides (div_prim: the shallowest group, when the few terms
+    // the others leave it fit a limb). q(n) = n (exp's) and 4 n + 3, in frames of a few terms to
+    // a limb down to a term in twenty limbs, where a range is one group or two.
+    let env = SeriesEnv::read();
+    let frame = |len: usize, k: u64, i: u64| ((len + 2) as f64 - k as f64 * i as f64 / 64.0).clamp(1.0, (len + 4) as f64);
+    let mut worst = (0.0f64, String::new());
+    for (t, len) in [(27u64, 788usize), (38, 845), (47, 375), (77, 82), (96, 79), (132, 285), (165, 276), (215, 441), (1000, 100), (3000, 900)] {
+        let k = 64 * len as u64 / t;
+        for bbp in [false, true] {
+            let (h, groups) = if bbp {
+                (DynNodeBBP::<BbpLin>::parts(&Shift(k), 1, 1 + t, len, 0, None, &env)[0].unwrap(), walk_groups(1, 1 + t, |_| 1, |n| (4 * n + 3) as u128))
+            } else {
+                (DynNodeEngel::<Exp>::parts(&Shift(k), 1, 1 + t, len, 0, None, &env)[0].unwrap(), walk_groups(1, 1 + t, |_| 1, |n| n as u128))
+            };
+            let limbs = |one: bool| groups.iter().filter(|g| (g.1 <= 64) == one).map(|g| frame(len, k, g.0)).sum::<f64>();
+            let (one, two) = (limbs(true), limbs(false));
+            let what = format!("{} terms of {} in {len} limbs: {} groups, {:.0} + {:.0} limbs; the kernel's rule {} groups, {one:.0} + {two:.0}", t, if bbp { "4 n + 3" } else { "n" }, h.step, h.div1, h.div2, groups.len());
+            assert!((h.step - groups.len() as f64).abs() <= 1.0, "{what}");
+            let off = (h.div1 + h.div2) / (one + two) - 1.0;
+            if off.abs() > worst.0 {
+                worst = (off.abs(), what.clone());
+            }
+            // Within a group's worth at the first term's frame where the count is a group off (a
+            // range a hair from a whole number of groups), and a tenth otherwise.
+            let slack = if h.step == groups.len() as f64 { 0.1 * (one + two) } else { frame(len, k, 1) + 0.1 * (one + two) };
+            assert!((h.div1 + h.div2 - one - two).abs() <= slack, "{what}");
+        }
+    }
+    assert!(worst.0 < 0.5, "{}", worst.1);
+}
+
+// A Hyper series without x whose 8-bit q and r fill a 128-bit group with seventeen terms.
+struct Geo8T;
+impl HyperSeries for Geo8T {
+    no_tail!(1);
+    fn p(_: u64) -> u64 {
+        1
+    }
+    fn q(n: u64) -> u64 {
+        131 + 2 * (n & 31)
+    }
+    fn r(n: u64) -> u64 {
+        129 + 2 * (n & 31)
+    }
+}
+
+#[test]
+fn test_horner_products_by_r_run_over_what_the_group_below_left() {
+    // A group's product by R runs over the sum as the group below left it, so the deepest
+    // group multiplies nothing: one group, no pass at all; and the shallowest group's R is its
+    // own few terms', a one-limb pass when they fit a limb.
+    let env = SeriesEnv::read();
+    let ctx = DynHyperCtx::new_shift(6072);
+    let one = DynNodeHyper::<Geo8T>::parts(&ctx, 1, 10, 760, 0, None, &env)[0].unwrap();
+    assert_eq!((one.step, one.mul1, one.mul2), (1.0, 0.0, 0.0), "{one:?}");
+    // 56 terms at 7.5 limbs a term: the kernel's rule makes groups from the deep end, and each
+    // but the deepest multiplies the frame of the group below it.
+    let (t, len, k) = (56u64, 413usize, 480u64);
+    let h = DynNodeHyper::<Geo8T>::parts(&DynHyperCtx::new_shift(k), 1, 1 + t, len, 0, None, &env)[0].unwrap();
+    let groups = walk_groups(1, 1 + t, |_| 1, |n| (131 + 2 * (n & 31)) as u128);
+    let frame = |i: u64| ((len + 2) as f64 - k as f64 * i as f64 / 64.0).clamp(1.0, (len + 4) as f64);
+    // Deepest first: a group's pass is over the frame of the group before it in this order.
+    let passes: f64 = groups.windows(2).map(|w| frame(w[0].0)).sum();
+    assert_eq!(h.step, groups.len() as f64, "{h:?}");
+    assert!((h.mul1 + h.mul2 - passes).abs() <= 0.1 * passes, "{} limbs multiplied by R, the kernel's groups {passes}", h.mul1 + h.mul2);
+}
+
+#[test]
+fn test_bin_split_finalize_and_x_leaf_terms() {
+    // Finalize's division is a pass a quotient limb by a Q of one limb (div1) or two (div2: the
+    // division's own equations start at four, and Knuth's reads 27% high at two), and
+    // division's equation from three. Q32's terms add 31 bits each to Q.
+    let env = SeriesEnv::read();
+    let tree = |t: u64| DynNodeEngel::<Q32>::parts(&Shift(4096), 1, 1 + t, 300, 0, None, &env)[2].unwrap();
+    let (one, two, more) = (tree(2), tree(4), tree(7));
+    assert_eq!((one.div1, one.div2, one.division), (301.0, 0.0, 0.0), "{one:?}");
+    assert_eq!((two.div1, two.div2, two.division), (0.0, 301.0, 0.0), "{two:?}");
+    assert!(more.div1 == 0.0 && more.div2 == 0.0 && more.division > 0.0, "{more:?}");
+    // Only an x-leaf's terms are steps.
+    assert_eq!((one.step, two.step, more.step), (0.0, 0.0, 0.0));
+    let mut rng = StdRng::seed_from_u64(95);
+    let x = rand_x(64 * 3, &mut rng);
+    for t in [1u64, 5, 40, 300] {
+        let p = DynNodeHyper::<Exp>::parts(&DynHyperCtx::new(&x, 64 * 3 + 9), 1, 1 + t, 40, 0, None, &env)[2].unwrap();
+        assert_eq!(p.step, t as f64, "{t} terms: {p:?}");
+    }
 }
 
 // Typed contexts: term counts and zeros from each series' tail bound.

@@ -1,19 +1,20 @@
-//! The tuner (docs/tuning_system.md, "The tuner"), in tune builds only. `cargo tune` runs `cli()`
-//! through `examples/tune.rs`. It measures each section's model knobs and sweeps, sets them live,
-//! and merges them into a tuning file with their evidence.
+//! The tuner (docs/tuning_system.md), in tune builds only: `cargo tune` runs `cli()` through
+//! `examples/tune.rs`. It measures each section's knobs, sets them live, and merges them into a
+//! tuning file with their evidence.
 
 pub mod check;
 mod check_items;
-pub mod derive;
 pub mod design;
+pub mod dispatch;
 pub mod fit;
 pub mod measure;
 pub mod out;
 pub mod sections;
 pub mod sweep;
+pub mod tables;
 pub mod synth;
 
-use crate::tuning::{self, file, resolve, schema_types::Kind, schema_types::Section, Value};
+use crate::tuning::{self, file, resolve, schema_types::Kind, Value};
 use measure::Level;
 use std::path::PathBuf;
 
@@ -21,9 +22,16 @@ use std::path::PathBuf;
 pub(crate) const HOST: resolve::Target<'static> = resolve::Target { arch: std::env::consts::ARCH, os: std::env::consts::OS };
 
 const USAGE: &str = "usage: cargo tune <command>
-  tune [SECTION ...] [--level quick|normal|thorough] [--out FILE] [--write-preset] [--threads N] [--no-gate] [--analyze]
-      measure the sections' model knobs (all registered sections when none are named) and merge
-      them into FILE. The default is this machine's own file, the one BIGBITS_TUNING names
+  tune [SECTION ...] [--level quick|normal|thorough] [--out FILE] [--write-preset] [--threads N] [--no-gate] [--analyze] [--tables]
+      measure the sections' knobs (all registered sections when none are named), and their
+      dispatchers' tables after them (mul.kara, div.dyn_small and div.dyn_rem_small,
+      series.small: each index of a table timed, and a row ended where reading the dispatcher's
+      equations is within 5% of the call), and merge them into FILE. A section's equations are
+      fitted again after its tables, from the same timings, on the shapes they are read for
+      (not those the tables decide). --tables measures only the
+      tables of the sections named (after a change to a table's layout). --share X on tune,
+      dispatch or series puts another number in the rule's place for the run (0.02 for 2%):
+      what the tables and the equations would be under it. The default is this machine's own file, the one BIGBITS_TUNING names
       (presets/local.toml in a checkout), which the next build layers over the target's preset;
       --write-preset writes presets/<target>.toml itself. Each section ends with the end-to-end
       check as a gate: if its values make its workloads slower on average than the values
@@ -34,13 +42,10 @@ const USAGE: &str = "usage: cargo tune <command>
   check [--file FILE] [SECTION ...] [--level L]
       the end-to-end check on its own: public calls timed under FILE's values (default: this
       machine's own file) and under the layers below it, the preset and the defaults
-  derive [--file FILE] [mul] [div] [series] [--check] [--compare]
-                       derive from the measured values (FILE's, else the build's); the pilot reports
-                       mul.kara (schoolbook / one Karatsuba level) against today's is_school, and
-                       --check times both sides and the level's parts against their predictions;
-                       --compare times mul_dyn under the build's table and the derived one.
-                       Naming sections rewrites only theirs in FILE: mul's table, div's Knuth
-                       guards, the series' small-series table
+  dispatch [--level L]
+      the rule every dispatcher is held to, checked: for mul_dyn, div_dyn, div_rem_dyn and the
+      series' entry, on indices where each reads its equations under the values in force, what
+      that decision costs against the call (at most 5%: an index past it belongs in a table)
   equations [--level L]
                        Karatsuba against the FFT for dynamic products: the measured time lost by
                        comparing the fitted equations and by mul_dyn itself, on shapes the
@@ -50,10 +55,11 @@ const USAGE: &str = "usage: cargo tune <command>
                        equations to, for div_dyn and div_rem_dyn: timings to FILE, and on the half
                        held out the measured time lost by the fitted equations' picks (--refit:
                        fitted now, to the other half) and by the entries themselves
-  series [--level L] [--set 'PATH=VALUE;...'] [--timings FILE] [--rederive]
-                       the series equations and guards on synthetic series no tune takes: the
-                       measured time lost by the picks under the live prices and under refitted
-                       ones, and by the entry itself (--set: with those knob values)
+  series [--level L] [--set 'PATH=VALUE;...'] [--timings FILE]
+                       the series equations, rect's guard and the table on synthetic series no tune takes:
+                       where the equations are read, the measured time lost by the picks under
+                       the live prices and under refitted ones, and by the entry itself; where
+                       the table decides, the time its picks lose (--set: with those knob values)
   list [SECTION]       every knob: kind, valid range, live value
   status [--file FILE] the layers a build of this checkout resolves (the target's preset, then
                        this machine's file) and which supplies each section; with --file, that
@@ -64,7 +70,7 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 }
 
 // The flags that take no value; every other `--flag` is followed by one.
-const SWITCHES: [&str; 7] = ["--write-preset", "--refit", "--check", "--compare", "--no-gate", "--analyze", "--rederive"];
+const SWITCHES: [&str; 5] = ["--write-preset", "--refit", "--no-gate", "--analyze", "--tables"];
 
 fn switch(args: &[String], name: &str) -> bool {
     debug_assert!(SWITCHES.contains(&name), "`positional` must know {name} takes no value");
@@ -104,24 +110,44 @@ pub fn cli() {
 pub fn run(args: &[String]) -> Result<(), String> {
     let Some(cmd) = args.first() else { return Err("no command".into()) };
     let rest = &args[1..];
+    // --share X: the rule's number for this run, in place of 5%.
+    if let Some(v) = flag(rest, "--share") {
+        let share: f64 = v.parse().ok().filter(|s: &f64| *s > 0.0 && *s < 1.0).ok_or_else(|| format!("bad --share `{v}` (a fraction of the call, as 0.05)"))?;
+        tables::set_share(share);
+    }
+    // A command that times something: its level, on the pool.
+    let ready = || -> Result<Level, String> {
+        let level = level_flag(rest)?;
+        setup_pool(None)?;
+        Ok(level)
+    };
     match cmd.as_str() {
         "tune" => tune(rest),
         "list" => {
             list(positional(rest).first().map(String::as_str));
             Ok(())
         }
-        "derive" => derive(flag(rest, "--file"), &positional(rest), switch(rest, "--check"), switch(rest, "--compare")),
+        "derive" => Err("nothing is derived any more: the tables are measured (`cargo tune tune SECTION --tables` measures a section's alone)".into()),
+        "dispatch" => {
+            let level = ready()?;
+            measure::settle_counts();
+            let ok = dispatch::report(level);
+            fit_line();
+            if ok {
+                Ok(())
+            } else {
+                Err("a dispatcher's decision is past the rule's share of its call: measure its table again (`cargo tune tune SECTION --tables`)".into())
+            }
+        }
         "equations" => {
-            let level = level_flag(rest)?;
-            setup_pool(None)?;
+            let level = ready()?;
             measure::settle_counts();
             sections::mul::equations(level);
             samples_line(level);
             Ok(())
         }
         "division" => {
-            let level = level_flag(rest)?;
-            setup_pool(None)?;
+            let level = ready()?;
             let out = flag(rest, "--out").unwrap_or_else(|| "target/tuning/division.tsv".into());
             measure::settle_counts();
             sections::div::division(level, std::path::Path::new(&out), switch(rest, "--refit")).map_err(|e| e.to_string())?;
@@ -129,30 +155,18 @@ pub fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "series" => {
-            let level = level_flag(rest)?;
-            setup_pool(None)?;
-            // --set 'path=value;...': knob values for this run, for experiments.
+            let level = ready()?;
+            // --set 'path=value;...': knob values for this run.
             if let Some(set) = flag(rest, "--set") {
                 tuning::apply(&set).map_err(|e| e.to_string())?;
             }
             measure::settle_counts();
-            // --rederive: the small-series table derived now from the equations in force, for
-            // this run alone (a change to its classes or grid read without a tune).
-            if switch(rest, "--rederive") {
-                let (table, evidence) = derive::series_small_table(level.eps());
-                tuning::set("series.small", Value::Table(table)).map_err(|e| e.to_string())?;
-                println!("series.small, for this run: {evidence}");
-            }
             let cache = flag(rest, "--timings").map(PathBuf::from);
             sections::series::report(level, cache.as_deref());
             fit_line();
             Ok(())
         }
-        "check" => {
-            let level = level_flag(rest)?;
-            setup_pool(None)?;
-            check_file(flag(rest, "--file"), &positional(rest), level)
-        }
+        "check" => check_file(flag(rest, "--file"), &positional(rest), ready()?),
         "status" => match flag(rest, "--file") {
             Some(f) => status(&f),
             None => status_layers(),
@@ -169,7 +183,7 @@ fn tune(args: &[String]) -> Result<(), String> {
     let level = level_flag(args)?;
     let named = positional(args);
     for n in &named {
-        if !sections::sections().iter().any(|(s, _)| s == n) {
+        if !sections::sections().iter().any(|s| s.name == n) {
             return Err(format!("section `{n}` has nothing to measure yet"));
         }
     }
@@ -192,15 +206,15 @@ fn tune(args: &[String]) -> Result<(), String> {
         Some(t) => t.parse().map_err(|_| format!("bad --threads `{t}`"))?,
         None => std::thread::available_parallelism().map_or(1, |c| c.get()),
     };
-    // The file being merged into is the layer below: sections not measured now keep its values,
-    // so what is measured and derived here reads them (mul's equations under a `tune div`). A file
-    // another machine's target wrote (a checkout shared between machines, or a cross run) isn't
-    // this machine's to merge into.
+    // The file merged into is the layer below: sections not measured now keep its values. A file
+    // of another machine's target isn't this machine's to merge into.
     if out.exists() {
         let name = out.to_string_lossy();
         let f = read_file(&name)?;
         resolve::layer_target_ok(&f, &HOST).map_err(|why| format!("{name}: {why}; delete it or name another file with --out"))?;
-        load(&name, f)?;
+        for w in set_live(&[(name.to_string(), f)])? {
+            eprintln!("warning: {w}");
+        }
     }
     setup_pool(Some(threads))?;
     fit::set_analyze(switch(args, "--analyze"));
@@ -208,8 +222,7 @@ fn tune(args: &[String]) -> Result<(), String> {
     measure::fit_noise();
     sweep::stability_counts();
     sweep::edge_count();
-    // Evidence of every rejected fit, and of every noisy one whose model was already revised
-    // once (one fit sets several knobs with the same evidence).
+    // Each rejected fit's evidence, and each noisy one's (one fit sets several knobs with the same).
     let (mut rejected, mut noisy): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
     let mut note = |section: &str, tuned: &[out::Tuned]| {
         for t in tuned {
@@ -221,47 +234,59 @@ fn tune(args: &[String]) -> Result<(), String> {
             }
         }
     };
-    // The gate (unless --no-gate): each section's values against the values before it, on its
-    // own workloads and those of every section built on it. (section, why) of each one dropped.
+    // The gate: each section's values against those before it, on its workloads and those built on it.
     let gate = !switch(args, "--no-gate");
+    let tables_only = switch(args, "--tables");
     let mut dropped: Vec<(String, String)> = Vec::new();
-    let mut kept: Vec<String> = Vec::new();
-    for (name, tune_section) in &sections::sections() {
+    let mut kept = 0;
+    for tuner in sections::sections() {
+        let name = tuner.name;
         if !named.is_empty() && !named.iter().any(|n| n == name) {
             continue;
         }
-        eprintln!("tuning {name} ({})...", level.name());
+        // `--tables`: only the sections that have one.
+        if tables_only && tuner.tables.is_empty() {
+            continue;
+        }
+        eprintln!("{} {name} ({})...", if tables_only { "measuring the tables of" } else { "tuning" }, level.name());
         let (before, file_before) = (tuning::snapshot(), std::fs::read_to_string(&out).ok());
-        let tuned = tune_section(level);
-        set_tuned(name, &tuned)?;
-        note(name, &tuned);
-        let values: Vec<Value> = tuning::PATHS.iter().map(|p| tuning::get(p).unwrap()).collect();
-        let section = section(name);
-        let fs = out::section(section, &tuned, level.name(), &values);
-        // Each section is written as soon as it finishes, so an interrupted tune keeps it.
-        out::merge_into(&out, vec![fs], threads).map_err(|e| e.to_string())?;
-        if *name == "mul" {
-            // mul's second phase runs under the leaf boundaries derived from its first, and
-            // before the sections that are measured on top of mul.
-            derive_into(&out, level.eps(), true, true)?;
-            eprintln!("tuning mul, second phase ({})...", level.name());
-            let tuned = sections::mul::tune_late(level);
-            set_tuned("mul", &tuned)?;
-            note("mul", &tuned);
-            out::set_derived(&out, section, &tuned).map_err(|e| e.to_string())?;
+        let section = tuning::schema().iter().find(|s| s.name == name).expect("the tuner's sections are declared");
+        if !tables_only {
+            let tuned = (tuner.tune)(level);
+            set_tuned(name, &tuned)?;
+            note(name, &tuned);
+            let values: Vec<Value> = tuning::PATHS.iter().map(|p| tuning::get(p).unwrap()).collect();
+            let fs = out::section(section, &tuned, level.name(), &values);
+            // Written as soon as it finishes: an interrupted tune keeps it.
+            out::merge_into(&out, fs, threads).map_err(|e| e.to_string())?;
         }
-        if *name == "series" {
-            // The small-series table follows from the equations just fitted, and is in force
-            // for the gate and for the sections measured on top of the series.
-            derive_small(&out, level.eps())?;
+        // The tables are measured once the section's other values are in force, and are in force for
+        // its second phase (its equations fitted again on the shapes the tables leave them), for the
+        // gate and for the sections built on it.
+        for &(key, table) in tuner.tables {
+            let (table, evidence) = table(level);
+            let tuned = [out::Tuned { key, value: Value::Table(table), evidence }];
+            tuned[0].set_live(name)?;
+            eprintln!("  {name}.{key}: {}", tuned[0].evidence);
+            out::set_in_section(&out, section, &tuned).map_err(|e| e.to_string())?;
         }
-        if gate {
-            let after = tuning::snapshot();
+        if let Some(late) = tuner.late.filter(|_| !tables_only) {
+            eprintln!("tuning {name}, second phase ({})...", level.name());
+            let tuned = late(level);
+            set_tuned(name, &tuned)?;
+            note(name, &tuned);
+            out::set_in_section(&out, section, &tuned).map_err(|e| e.to_string())?;
+        }
+        let after = tuning::snapshot();
+        if gate && after == before {
+            // Every sweep kept its value: both sides would time the same values.
+            eprintln!("  check {name}: its values are the ones before it, so there is nothing to compare");
+        } else if gate {
             let rounds = check::compare(&before, &after, level, &|it| check::in_gate(tuning::schema(), name, it.section));
             let v = check::verdict(&rounds, level.gate());
             check::report(name, &v);
             if v.dropped {
-                // The values and the file go back to what they were before this section.
+                // The values and the file go back.
                 tuning::restore(&before);
                 match &file_before {
                     Some(text) => std::fs::write(&out, text),
@@ -278,13 +303,8 @@ fn tune(args: &[String]) -> Result<(), String> {
                 continue;
             }
         }
-        kept.push(name.to_string());
+        kept += 1;
     }
-    // The derived values follow the measured ones this tune kept: mul's table when mul was tuned
-    // and kept (a table rederived from fits that didn't move would pass no gate), and div's
-    // guards when either section's equations moved.
-    let is_kept = |s: &str| kept.iter().any(|k| k == s);
-    derive_into(&out, level.eps(), is_kept("mul"), is_kept("mul") || is_kept("div"))?;
     if out.exists() {
         eprintln!("wrote {}", out.display());
     } else {
@@ -297,12 +317,16 @@ fn tune(args: &[String]) -> Result<(), String> {
         eprintln!(
             "gate: {} of {} sections dropped (more than {:.0}% slower on average than the values before them, which stay in force)",
             dropped.len(),
-            dropped.len() + kept.len(),
+            dropped.len() + kept,
             100.0 * level.gate()
         );
         for (name, why) in &dropped {
             eprintln!("  {name}: {why}");
         }
+    }
+    // The rule the tables were measured by, checked under the values now in force.
+    for v in dispatch::check(level) {
+        eprintln!("dispatch: {}", dispatch::line(&v));
     }
     samples_line(level);
     fit_line();
@@ -324,47 +348,10 @@ fn tune(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-// Every tune ends with a derive, so a file's derived knobs match its measured ones: computes each
-// derived knob from the live values, sets it live and writes it to `out`. This first step is the
-// leaf boundaries, which mul's second phase is measured under.
-fn derive_into(out: &std::path::Path, eps: f64, kara: bool, guards: bool) -> Result<(), String> {
-    if kara {
-        let (table, evidence) = derive::kara_table(eps);
-        let v = Value::Table(table);
-        tuning::set("mul.kara", v.clone()).map_err(|e| e.to_string())?;
-        eprintln!("  mul.kara: {evidence}");
-        let tuned = [out::Tuned { key: "kara", value: v, evidence }];
-        out::set_derived(out, section("mul"), &tuned).map_err(|e| e.to_string())?;
-    }
-    if !guards {
-        return Ok(());
-    }
-    // div's Knuth guards follow from its equations and mul's, and time nothing either.
-    let tuned = sections::div::guards();
-    set_tuned("div", &tuned)?;
-    out::set_derived(out, section("div"), &tuned).map_err(|e| e.to_string())
-}
-
-// The series' small-series table, derived from the equations in force (it times nothing): set
-// live and written to `out`.
-fn derive_small(out: &std::path::Path, eps: f64) -> Result<(), String> {
-    let (table, evidence) = derive::series_small_table(eps);
-    let v = Value::Table(table);
-    tuning::set("series.small", v.clone()).map_err(|e| e.to_string())?;
-    eprintln!("  series.small: {evidence}");
-    let tuned = [out::Tuned { key: "small", value: v, evidence }];
-    out::set_derived(out, section("series"), &tuned).map_err(|e| e.to_string())
-}
-
-// The schema's declaration of a section the tuner names.
-fn section(name: &str) -> &'static Section {
-    tuning::schema().iter().find(|s| s.name == name).expect("the tuner's sections are declared")
-}
-
 // Sets `section`'s tuned values live and prints each with its evidence.
 fn set_tuned(section: &str, tuned: &[out::Tuned]) -> Result<(), String> {
     for t in tuned {
-        tuning::set(&format!("{section}.{}", t.key), t.value.clone()).map_err(|e| e.to_string())?;
+        t.set_live(section)?;
         eprintln!("  {section}.{} = {}   # {}", t.key, t.value.text(), t.evidence);
     }
     Ok(())
@@ -378,16 +365,7 @@ fn read_file(path: &str) -> Result<file::File, String> {
 // What `files` resolve to on this machine, lowest layer first.
 fn resolve_host(files: &[(String, file::File)]) -> Result<resolve::Resolved, String> {
     let layers: Vec<resolve::Layer> = files.iter().map(|(name, file)| resolve::Layer { name, file }).collect();
-    resolve::resolve(tuning::schema(), &layers, &HOST).map_err(|e| e.join("
-"))
-}
-
-// Sets every resolved value live.
-fn set_values(r: resolve::Resolved) -> Result<(), String> {
-    for (p, v) in tuning::PATHS.iter().zip(r.values) {
-        tuning::set(p, v).map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    resolve::resolve(tuning::schema(), &layers, &HOST).map_err(|e| e.join("\n"))
 }
 
 fn list(section: Option<&str>) {
@@ -399,7 +377,7 @@ fn list(section: Option<&str>) {
             Kind::Interim => "interim".to_string(),
             Kind::Model { .. } => "model".into(),
             Kind::Sweep => "sweep".into(),
-            Kind::Derived(d) => format!("derived {d:?}").to_lowercase(),
+            Kind::Table => "table (measured)".into(),
         };
         let v = tuning::get(&f.path).map(|v| v.text()).unwrap_or_default();
         let v = if v.len() > 60 { format!("{}…", &v[..60]) } else { v };
@@ -407,14 +385,17 @@ fn list(section: Option<&str>) {
     }
 }
 
-// Sets every value `files` resolve to live (lowest layer first), and returns them as a snapshot.
-fn set_live(files: &[(String, file::File)]) -> Result<tuning::Snapshot, String> {
-    set_values(resolve_host(files)?)?;
-    Ok(tuning::snapshot())
+// Sets every value `files` resolve to live; returns the resolver's warnings.
+fn set_live(files: &[(String, file::File)]) -> Result<Vec<String>, String> {
+    let r = resolve_host(files)?;
+    for (p, v) in tuning::PATHS.iter().zip(r.values) {
+        tuning::set(p, v).map_err(|e| e.to_string())?;
+    }
+    Ok(r.warnings)
 }
 
-// `cargo tune check`: FILE's values (this machine's own file when none is named) against the
-// layers below it, over every workload or those of the named sections' gates.
+// `cargo tune check`: FILE's values (default: this machine's own file) against the layers below
+// it, over every workload or those of the named sections' gates.
 fn check_file(path: Option<String>, named: &[String], level: Level) -> Result<(), String> {
     for n in named {
         if !tuning::schema().iter().any(|s| s.name == n) {
@@ -429,8 +410,8 @@ fn check_file(path: Option<String>, named: &[String], level: Level) -> Result<()
     };
     let name = path.display().to_string();
     let f = read_file(&name)?;
-    // The layers below FILE: the preset, unless FILE is the preset (then the schema's defaults).
-    // The machine's own file is left out, as FILE stands in its place.
+    // The layers below FILE: the preset, unless FILE is the preset. The machine's file is left out:
+    // FILE stands in its place.
     let same = |a: &str, b: &std::path::Path| match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(x), Ok(y)) => x == y,
         _ => std::path::Path::new(a) == b,
@@ -438,12 +419,14 @@ fn check_file(path: Option<String>, named: &[String], level: Level) -> Result<()
     let mut layers = layers_in_force()?;
     layers.retain(|(n, _)| !same(n, &path) && !machine.as_ref().is_some_and(|m| same(n, m)));
     let below = if layers.is_empty() { "the schema's defaults".to_string() } else { layers.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ") };
-    let before = set_live(&layers)?;
+    set_live(&layers)?;
+    let before = tuning::snapshot();
     layers.push((name.clone(), f));
-    let after = set_live(&layers)?;
+    set_live(&layers)?;
+    let after = tuning::snapshot();
     println!("check ({}): {name} against {below}; ratios are time under {name} over time under {below}", level.name());
     let rounds = check::compare(&before, &after, level, &|it| named.is_empty() || named.iter().any(|n| check::in_gate(tuning::schema(), n, it.section)));
-    for sec in ["mul", "div", "divgrid", "sqrt", "series", "consts", "trans"] {
+    for (sec, _) in check::ITEM_SECTIONS {
         let of: Vec<check::Rounds> = rounds.iter().filter(|r| r.section == sec).cloned().collect();
         if !of.is_empty() {
             check::report(sec, &check::verdict(&of, level.gate()));
@@ -457,14 +440,12 @@ fn check_file(path: Option<String>, named: &[String], level: Level) -> Result<()
     Ok(())
 }
 
-// This machine's own tuning file: the one BIGBITS_TUNING names (cargo passes the checkout's
-// [env] setting, presets/local.toml, to `cargo run` as it does to build.rs).
+// This machine's own tuning file: the one BIGBITS_TUNING names.
 fn machine_file() -> Option<PathBuf> {
     std::env::var_os("BIGBITS_TUNING").filter(|p| !p.is_empty()).map(PathBuf::from)
 }
 
-// The layers a build of this checkout resolves, found as build.rs finds them (from the
-// checkout's root): the target's preset, then the machine's own file.
+// The layers a build of this checkout resolves, as build.rs finds them: the preset, then the machine's file.
 fn layers_in_force() -> Result<Vec<(String, file::File)>, String> {
     let parse = |name: &str, text: &str| file::parse(text).map_err(|e| format!("{name}: {e}"));
     let mut files = Vec::new();
@@ -517,9 +498,9 @@ fn status_layers() -> Result<(), String> {
 }
 
 fn status(path: &str) -> Result<(), String> {
-    let f = read_file(path)?;
-    let r = resolve::resolve(tuning::schema(), &[resolve::Layer { name: path, file: &f }], &HOST).map_err(|e| e.join("\n"))?;
-    for s in f.sections.iter().filter(|s| s.name != "meta") {
+    let files = [(path.to_string(), read_file(path)?)];
+    let r = resolve_host(&files)?;
+    for s in files[0].1.sections.iter().filter(|s| s.name != "meta") {
         let tuned = s.get("tuned").map(|e| file::raw_text(&e.value)).unwrap_or_default();
         println!("[{}] tuned {tuned}, {} values", s.name, s.entries.len());
     }
@@ -529,20 +510,9 @@ fn status(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-// Sets every value the tuning file `f` (read from `path`) resolves to live, so measurements and
-// derivations read it.
-fn load(path: &str, f: file::File) -> Result<(), String> {
-    let r = resolve_host(&[(path.to_string(), f)])?;
-    for w in &r.warnings {
-        eprintln!("warning: {w}");
-    }
-    set_values(r)
-}
-
-// Measurements run as a caller's code does: on the calling thread, with parallel entries on
-// rayon's global pool (a private pool's worker measured the parallel NTT 9% faster than a caller
-// sees it). The global pool gets `threads` workers (all CPUs when None), on performance cores,
-// with stacks large enough for static entries' [u64; N] arrays. Only the first call configures it.
+// Measurements run as a caller's code does: on the calling thread, parallel entries on rayon's
+// global pool, which gets `threads` workers (all CPUs when None) on performance cores, with
+// stacks for static entries' arrays. Only the first call configures it.
 fn setup_pool(threads: Option<usize>) -> Result<(), String> {
     static DONE: std::sync::Once = std::sync::Once::new();
     let mut result = Ok(());
@@ -557,13 +527,7 @@ fn setup_pool(threads: Option<usize>) -> Result<(), String> {
     result
 }
 
-// mul's table and the cutoffs measured under it: what `derive --compare` switches between the
-// build's values and FILE's.
-const COMPARED: [&str; 6] =
-    ["mul.kara", "mul.karatsuba_sqr", "mul.fft_sqr", "mul.static_ntt_sqr", "mul.ntt_karatsuba", "mul.ntt_chunking_karatsuba"];
-
-// The fits' check of the machine: how far the two passes of every fit probe since the last call
-// were apart. It takes in whatever doesn't repeat from one pass to the next.
+// The fits' check of the machine: how far apart the two passes of every fit probe since the last call were.
 fn fit_line() {
     let (probes, noise) = measure::fit_noise();
     if probes > 0 {
@@ -575,8 +539,7 @@ fn fit_line() {
     }
 }
 
-// How many of the sweeps' measurements since the last call never settled: the sign the tuner
-// gives that the machine was busy or changing speed while it swept.
+// The sweeps' check: how many of their measurements since the last call never settled.
 fn samples_line(level: Level) {
     let (probes, unsettled) = measure::settle_counts();
     eprintln!(
@@ -586,125 +549,4 @@ fn samples_line(level: Level) {
         level.probe_budget_ns() / 1e9,
         if unsettled * 20 > probes { " -- more than 5%: the machine was busy or changing speed, so don't trust these numbers; measure again when it is quiet and on full power" } else { "" },
     );
-}
-
-// The level FILE's mul section was tuned at (normal when it doesn't say). The table's
-// derivation leaves Karatsuba inside a row only where schoolbook wins by the level's tie band,
-// so rederiving a file reproduces the table its tune wrote only at that tune's level.
-pub(crate) fn file_level(path: &str) -> Level {
-    read_file(path)
-        .ok()
-        .and_then(|f| match f.section("mul").and_then(|s| s.value("level")) {
-            Some(file::Raw::Str(l)) => Level::parse(l),
-            _ => None,
-        })
-        .unwrap_or(Level::Normal)
-}
-
-// The sections with derived values, in the order `derive` writes them.
-const DERIVED: [&str; 3] = ["mul", "div", "series"];
-
-fn derive(file: Option<String>, named: &[String], check: bool, compare: bool) -> Result<(), String> {
-    if let Some(other) = named.iter().find(|n| !DERIVED.contains(&n.as_str())) {
-        return Err(format!("derive: section '{other}' has no derived values (those that do: {})", DERIVED.join(", ")));
-    }
-    // Every section's, or only the named ones': a table whose layout changed is rederived
-    // without rewriting another section's.
-    let wanted = |s: &str| named.is_empty() || named.iter().any(|n| n == s);
-    let eps = file.as_deref().map_or(Level::Normal, file_level).eps();
-    // The build's table (the schema default, or a preset's), before FILE's replaces it.
-    let build: Vec<(&str, Value)> = COMPARED.iter().map(|p| (*p, tuning::get(p).expect("declared"))).collect();
-    if let Some(f) = &file {
-        load(f, read_file(f)?)?;
-    }
-    setup_pool(None)?;
-    if wanted("mul") {
-        let r = derive::kara_report(160, 640);
-        let (table, evidence) = derive::kara_table(eps);
-        println!("{evidence} ({} change points)", table.len() / 3);
-        println!(
-            "  against the live table: {} of {} shapes differ (squares from {} vs {}, l = 4s from {} vs {})",
-            r.disagree, r.shapes, r.square.0, r.square.1, r.chunked.0, r.chunked.1
-        );
-    }
-    if let Some(f) = &file {
-        // Rewrites FILE's derived values; times nothing.
-        derive_into(std::path::Path::new(f), eps, wanted("mul"), wanted("div"))?;
-        if wanted("series") {
-            derive_small(std::path::Path::new(f), eps)?;
-        }
-    }
-    let derived: Vec<(&str, Value)> = build.iter().map(|(p, _)| (*p, tuning::get(p).unwrap())).collect();
-    if compare {
-        use std::hint::black_box;
-        let report = |what: &str, names: Vec<String>, rows: Vec<(f64, f64)>| {
-            println!("compare {what}: under the build's values and the derived ones (ns)");
-            let mut logs = Vec::new();
-            for (name, (b, d)) in names.iter().zip(rows) {
-                logs.push((d / b).ln());
-                if (d / b - 1.0).abs() > 0.01 {
-                    println!("  {name:>10} {b:>10.0} {d:>10.0}  {:.3}", d / b);
-                }
-            }
-            let worst = logs.iter().cloned().fold(f64::MIN, f64::max);
-            println!(
-                "  derived / build: geometric mean {:.4} over {} shapes, worst {:.3} (shapes within 1% not listed)",
-                (logs.iter().sum::<f64>() / logs.len() as f64).exp(), logs.len(), worst.exp()
-            );
-        };
-        let sizes: Vec<usize> = sweep::geo(30.0, 5.0).take(34).collect();
-        let shapes: Vec<(usize, usize)> = sizes.iter().flat_map(|&s| [(s, s), (s + s / 2, s), (3 * s, s)]).collect();
-        let rows = derive::compare(Level::Normal, &build, &derived, &shapes, |(l, s), pass| {
-            let (a, b) = (measure::pad(l, 61, pass), measure::pad(s, 67, pass));
-            let mut o = measure::pad(l + s - 1, 71, pass);
-            Box::new(move || {
-                black_box(crate::utils::mul::mul_dyn(black_box(&a), black_box(&b), &mut o));
-            })
-        });
-        report("mul_dyn", shapes.iter().map(|(l, s)| format!("{l}x{s}")).collect(), rows);
-        let rows = derive::compare(Level::Normal, &build, &derived, &sizes, |n, pass| {
-            let a = measure::pad(n, 73, pass);
-            let mut o = measure::pad(2 * n - 1, 79, pass);
-            Box::new(move || {
-                black_box(crate::utils::mul::sqr_dyn(black_box(&a), &mut o));
-            })
-        });
-        report("sqr_dyn", sizes.iter().map(|n| n.to_string()).collect(), rows);
-        // The static entries at N = 8192, on the default pool.
-        let st: Vec<usize> = sweep::geo(256.0, 5.0).take(18).collect();
-        let st_shapes: Vec<(usize, usize)> = st.iter().flat_map(|&s| [(s, s), (2 * s, s)]).filter(|&(l, s)| l + s <= 6000).collect();
-        let rows = derive::compare(Level::Normal, &build, &derived, &st_shapes, |(l, s), pass| {
-            let (a, b) = (measure::pad(l, 83, pass), measure::pad(s, 89, pass));
-            let mut o = measure::pad(l + s - 1, 97, pass);
-            Box::new(move || {
-                black_box(crate::utils::mul::mul_static::<8192>(black_box(&a), black_box(&b), &mut o));
-            })
-        });
-        report("mul_static::<8192>", st_shapes.iter().map(|(l, s)| format!("{l}x{s}")).collect(), rows);
-        let st_sq: Vec<usize> = st.iter().cloned().filter(|&n| n <= 4000).collect();
-        let rows = derive::compare(Level::Normal, &build, &derived, &st_sq, |n, pass| {
-            let a = measure::pad(n, 101, pass);
-            let mut o = measure::pad(2 * n - 1, 103, pass);
-            Box::new(move || {
-                black_box(crate::utils::mul::sqr_static::<8192>(black_box(&a), &mut o));
-            })
-        });
-        report("sqr_static::<8192>", st_sq.iter().map(|n| n.to_string()).collect(), rows);
-    }
-    if check {
-        let shapes: Vec<(usize, usize)> =
-            [16, 24, 32, 40, 48, 56, 64, 80, 96, 128].iter().flat_map(|&s| [(s, s), (s + s / 3, s)]).collect();
-        println!("check (ns, measured / predicted):");
-        println!("  {:>9} {:>17} {:>17} {:>17} {:>17} {:>13}", "l x s", "mul_buf", "level", "level's products", "level overhead", "level/school");
-        for r in derive::kara_check(Level::Normal, &shapes) {
-            println!(
-                "  {:>9} {:>8.0} /{:>7.0} {:>8.0} /{:>7.0} {:>8.0} /{:>7.0} {:>8.0} /{:>7.0} {:>6.3} /{:>5.3}",
-                format!("{}x{}", r.l, r.s),
-                r.school.0, r.school.1, r.level.0, r.level.1, r.products.0, r.products.1,
-                r.level.0 - r.products.0, r.level.1 - r.products.1,
-                r.level.0 / r.school.0, r.level.1 / r.school.1
-            );
-        }
-    }
-    Ok(())
 }

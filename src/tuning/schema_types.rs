@@ -49,33 +49,16 @@ pub enum Range {
     Table,
 }
 
-/// How a derived knob's value is computed from measured knobs (Phase 2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Derivation {
-    Table,
-    Extent,
-    Gate,
-    Balance,
-    Structural,
-    Predictor,
-}
-
-/// How a knob's value is decided. `Interim` is one of the old `mod.rs` constants, migrated as it
-/// was in Phase 1; Phase 2 replaces each section's interim knobs with the other kinds.
+/// How a knob's value is decided. `Interim` is an old `mod.rs` constant migrated as it was.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Kind {
     Interim,
     Model { work: &'static str },
     Sweep,
-    Derived(Derivation),
-}
-
-impl Kind {
-    /// Measured values: those a section keeps when only its derive version is stale. Interim
-    /// knobs are hand-measured values, so they count as measured.
-    pub const fn measured(self) -> bool {
-        !matches!(self, Kind::Derived(_))
-    }
+    /// A dispatcher's table, measured: at each index where reading the dispatcher's equations would
+    /// cost more than `tuner::tables::SHARE` of the call, the algorithm that was fastest there. Its
+    /// layout is the section's `derive` number.
+    Table,
 }
 
 /// Which thread count a knob's predictions or value read.
@@ -107,7 +90,9 @@ pub struct Section {
     pub name: &'static str,
     /// Bumped when the section's measured knobs or their meaning change (invariant 10).
     pub version: u32,
-    /// Bumped when its derived knobs, derivations or the work functions they read change.
+    /// The layout of its tables (`Kind::Table`), bumped when one changes: a file's section loses its
+    /// tables, and nothing else, when only this number is stale. (Named for the knobs once computed
+    /// from measured ones; none are now.)
     pub derive: u32,
     /// Upstream sections, whose measured values are hashed into this section's upstream hash.
     pub after: &'static [&'static str],

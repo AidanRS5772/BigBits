@@ -1,15 +1,10 @@
-//! The end-to-end check: the same public calls timed under two sets of knob values, in one
-//! process. `cargo tune check` reports it for a tuning file against the layers below it, and
-//! every `cargo tune tune` ends each section with it as a gate (the user's decision of
-//! 2026-11-10): a section whose values make its own workloads, and those of every section built
-//! on it, slower on average than the values before it, by more than the level's allowance
-//! (`Level::gate`: 3%, 2%, 1%), is dropped, so a tune never leaves a machine more than that
-//! slower than it found it. The workloads are `check_items`' (shared with `benches/tuning_bias.rs`).
-//!
-//! Each round times one batch of every item under one set, then under the other, alternating
-//! which goes first; an item's result is the ratio of the pair, so the machine's speed at that
-//! moment cancels. A section's verdict is the mean log ratio over its items, with a 95% interval
-//! from the rounds.
+//! The end-to-end check: the same public calls (`check_items`) timed under two sets of knob
+//! values, in one process. `cargo tune check` reports it for a tuning file against the layers
+//! below it, and every tune ends each section with it as a gate: a section whose values make its
+//! workloads, and those of every section built on it, slower on average by more than
+//! `Level::gate` is dropped. Each round times one batch of every item under one set, then the
+//! other, alternating which goes first: an item's result is the pair's ratio, so the machine's
+//! speed cancels. A verdict is the mean log ratio over the items, with a 95% interval from the rounds.
 
 use super::check_items::{items, Item, T95};
 use super::measure::Level;
@@ -17,18 +12,17 @@ use crate::tuning::schema_types::Section;
 use crate::tuning::{restore, Snapshot};
 use std::time::Instant;
 
-/// The schema sections whose knobs an item section's calls read directly.
-pub fn owners(item_section: &str) -> &'static [&'static str] {
-    match item_section {
-        "mul" => &["mul"],
-        "div" | "divgrid" => &["div"],
-        "sqrt" => &["sqrt"],
-        "series" => &["bin_split", "series"],
-        "consts" => &["bin_split", "consts"],
-        "trans" => &["theta", "agm", "exp", "ln"],
-        _ => &[],
-    }
-}
+/// The items' sections, in the order a report prints them, each with the schema sections whose
+/// knobs its calls read directly.
+pub const ITEM_SECTIONS: [(&str, &[&str]); 7] = [
+    ("mul", &["mul"]),
+    ("div", &["div"]),
+    ("divgrid", &["div"]),
+    ("sqrt", &["sqrt"]),
+    ("series", &["bin_split", "series"]),
+    ("consts", &["bin_split", "consts"]),
+    ("trans", &["theta", "agm", "exp", "ln"]),
+];
 
 // Whether `section` is `into` or upstream of it, through the schema's `after` lists.
 fn feeds(schema: &[Section], section: &str, into: &str) -> bool {
@@ -38,12 +32,11 @@ fn feeds(schema: &[Section], section: &str, into: &str) -> bool {
 /// Whether an item section belongs to the gate of the schema section `tuned`: its calls read
 /// `tuned`'s knobs, directly or through a section built on it.
 pub fn in_gate(schema: &[Section], tuned: &str, item_section: &str) -> bool {
-    owners(item_section).iter().any(|o| feeds(schema, tuned, o))
+    ITEM_SECTIONS.iter().any(|s| s.0 == item_section && s.1.iter().any(|o| feeds(schema, tuned, o)))
 }
 
 /// Whether an item's outputs are the same under any valid knob values: full products, squares,
-/// residues and divisions. High and middle products, reciprocals, roots and the transcendental
-/// entries are specified only to within their error, which the algorithm chosen moves.
+/// residues and divisions. The rest are specified to within their error, which the algorithm moves.
 pub fn exact(name: &str) -> bool {
     ["mul_dyn", "mul_static", "sqr_dyn", "sqr_static", "sqr_mod_bnm1_dyn", "div_dyn", "div_rem_dyn", "div_static", "div_rem_static"]
         .iter()
@@ -159,8 +152,6 @@ pub fn verdict(rounds: &[Rounds], eps: f64) -> Verdict {
     Verdict { items: rounds.len(), all, slower, differ, dropped }
 }
 
-/// Prints a verdict: its mean and interval, the items listed as slower, and any exact output
-/// that differs.
 pub fn report(what: &str, v: &Verdict) {
     if v.items == 0 {
         eprintln!("  check {what}: no workloads");

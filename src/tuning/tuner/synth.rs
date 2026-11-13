@@ -1,27 +1,21 @@
-//! A synthetic family of series, for tuning the series evaluators as general evaluators: none of
-//! these is a caller's series, and nothing in the series section is fitted to one. Each member
-//! sets one of the things a series' coefficients decide, apart from the others:
-//!
-//! - their size, which is what a term adds to the exact fraction (binary splitting's numbers)
-//!   and what sets how many terms one of Horner's divisions covers: `Geo<LQ>`, q and r of LQ
-//!   bits with r / q about 1, so they add size and no convergence;
-//! - convergence of their own, on top of the shift's: `Den<LQ>`, q of LQ bits over r = 1, each
-//!   term at least LQ - 1 bits below the last; and `Fact`, q(n) = n, a factorial's, whose terms
-//!   converge faster the further they go;
-//! - for BBP, whose terms don't compound: `Odd`, 1 / (2n + 1), and `Big<LQ>`, a q of LQ bits.
-//!
-//! The other dials are the evaluation's: the frame, the shift (through `Synth::decay`, as the
-//! terms wanted) and x's width (`x_of`). Written against the crate's public paths, so
-//! `check_items.rs` and `benches/tuning_bias.rs` can take the family too.
+//! A synthetic family of series, for tuning the series evaluators as general evaluators: none is
+//! a caller's series. Each member sets one thing a series' coefficients decide: their size
+//! (`Geo<LQ>`: q and r of LQ bits, r / q about 1, so size and no convergence), convergence of
+//! their own (`Den<LQ>`: an LQ-bit q over r = 1; `Fact`: q(n) = n), and for BBP, whose terms
+//! don't compound, `Odd` (1 / (2n + 1)) and `Big<LQ>`. The other dials are the evaluation's: the
+//! frame, the shift (`Synth::decay`) and x's width (`x_of`). Written against the crate's public
+//! paths: `check_items.rs` and `benches/tuning_bias.rs` take the family too.
 
 use big_bits::utils::series::{BBPSeries, EngelSeries, HyperSeries};
 
 /// A member of the family.
 pub trait Synth {
     fn name() -> String;
-    /// The bits a term the shift should give (the decay s) for about `t` terms to reach `bits`
-    /// bits: the member's own convergence taken off, and at least 1.
-    fn decay(bits: u64, t: u64) -> u64;
+    /// The bits a term the shift should give for about `t` terms to reach `bits` bits: the member's
+    /// own convergence taken off, at least 1. By default the member converges by nothing of its own.
+    fn decay(bits: u64, t: u64) -> u64 {
+        (bits / t.max(1)).max(1)
+    }
 }
 
 /// q and r of LQ bits (8 to 62), r = q - 2: Hyper.
@@ -55,9 +49,6 @@ fn factorial(n: u64, s: i64) -> u64 {
 impl<const LQ: u32> Synth for Geo<LQ> {
     fn name() -> String {
         format!("geo{LQ}")
-    }
-    fn decay(bits: u64, t: u64) -> u64 {
-        (bits / t.max(1)).max(1)
     }
 }
 
@@ -121,10 +112,6 @@ impl<const LQ: u32> Synth for Big<LQ> {
     fn name() -> String {
         format!("big{LQ}")
     }
-    // A BBP term's q divides that term alone: the convergence is all the shift's.
-    fn decay(bits: u64, t: u64) -> u64 {
-        (bits / t.max(1)).max(1)
-    }
 }
 
 impl<const LQ: u32> BBPSeries for Big<LQ> {
@@ -185,9 +172,6 @@ impl Synth for Odd {
     fn name() -> String {
         "odd".into()
     }
-    fn decay(bits: u64, t: u64) -> u64 {
-        (bits / t.max(1)).max(1)
-    }
 }
 
 impl BBPSeries for Odd {
@@ -201,6 +185,11 @@ impl BBPSeries for Odd {
     fn q(n: u64) -> u64 {
         2 * n + 1
     }
+}
+
+/// `x_of`, leaked: a context borrows its x for as long as its probes live.
+pub fn x_static(bits: u64, seed: u64) -> &'static [u64] {
+    Box::leak(x_of(bits, seed).into_boxed_slice())
 }
 
 /// An odd x of exactly `bits` bits (at least 2) from `seed`.

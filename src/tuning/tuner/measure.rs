@@ -1,28 +1,17 @@
-//! Timing (docs/tuning_system.md, "Fitting a cost model" 2): each probe runs in batches long enough
-//! that the clock's resolution doesn't matter. There are two ways to time a set of probes.
-//!
-//! - For a fit (`time_fit`): a fixed few batches of every probe, taken in rounds that each visit
-//!   every probe once in a shuffled order, and the whole set twice. A fit pools its shapes, so its
-//!   constants gain from more shapes and not from a tighter time at each (the user's decision,
-//!   2026-11-11): there is no spread bound. The rounds spread a probe's batches in time, so a
-//!   disturbance longer than a batch costs several probes one batch each, which their medians
-//!   drop, and not one probe all of its batches; the shuffle keeps a machine that drifts from
-//!   bending the fit along the sizes; and the two passes' difference measures the noise.
-//! - For a sweep, whose decision is the ratio of two times at one size (`time_min`,
-//!   `time_fixed`): rounds interleave every probe so drift cancels between the two sides, and a
-//!   probe's value is the median of its rounds.
+//! Timing: each probe runs in batches long enough that the clock's resolution doesn't matter.
+//! For a fit (`time_fit`): a fixed few batches of every probe, in rounds that visit every probe
+//! once in a shuffled order, the whole set twice; no spread bound, as a fit gains from more
+//! shapes and not from a tighter time at each. For a sweep, whose decision is the ratio of two
+//! times at one size (`time_min`, `time_fixed`): rounds interleave every probe so drift cancels,
+//! and a probe's value is the median of its rounds.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-/// Asks the OS to run the calling thread on performance cores. On Apple silicon a loaded machine
-/// can put a process on its efficiency cores, which run about half as fast, and the first base
-/// fits on the M1 varied 2.5x between runs that way; the user-interactive QoS class keeps
-/// measurements on one kind of core. On Linux a hybrid CPU's fastest cores are read from sysfs
-/// and the thread is pinned to them (`fastest_of`): the measuring thread always, a pool worker
-/// only when the whole pool fits on those cores, as a pool larger than that runs on the slower
-/// ones in real use too. Written from the kernel's documentation and compile-checked only: it
-/// has not been run on a hybrid Linux machine. Elsewhere, and on a uniform CPU, it does nothing.
+/// Asks the OS to run the calling thread on performance cores. macOS: the user-interactive QoS
+/// class (a loaded M1 can put a process on its efficiency cores, half as fast). Linux: pinned to
+/// a hybrid CPU's fastest cores (`fastest_of`), a pool worker only when the whole pool fits on
+/// them; compile-checked only, never run on a hybrid Linux machine. Elsewhere nothing.
 pub fn prefer_fast_cores() {
     #[cfg(target_os = "macos")]
     {
@@ -57,8 +46,7 @@ pub fn prefer_fast_cores() {
     }
 }
 
-/// Each CPU's speed rating as Linux's sysfs gives it: `cpu_capacity` (ARM's scheduler capacity),
-/// else `cpufreq/cpuinfo_max_freq`. Empty off Linux, or where neither file exists.
+/// Each CPU's speed rating from sysfs: `cpu_capacity`, else `cpufreq/cpuinfo_max_freq`.
 pub fn linux_core_ratings() -> Vec<(usize, u64)> {
     let mut rated = Vec::new();
     for cpu in 0..1024 {
@@ -74,10 +62,8 @@ pub fn linux_core_ratings() -> Vec<(usize, u64)> {
     rated
 }
 
-/// The CPUs to measure on, from (cpu, rating) pairs: those within 15% of the highest rating, or
-/// None when that is all of them (a uniform machine) or nothing is rated. The margin keeps a
-/// hybrid Intel CPU's performance cores together (two "favored" ones report a slightly higher
-/// top frequency) while leaving out efficiency cores, which sit a quarter or more below.
+/// The CPUs to measure on: those within 15% of the highest rating (a hybrid Intel CPU's
+/// performance cores, not its efficiency ones), or None when that is all of them or none is rated.
 pub fn fastest_of(rated: &[(usize, u64)]) -> Option<Vec<usize>> {
     let top = rated.iter().map(|r| r.1).max()?;
     let fast: Vec<usize> = rated.iter().filter(|r| r.1 * 100 >= top * 85).map(|r| r.0).collect();
@@ -92,114 +78,68 @@ pub enum Level {
 }
 
 impl Level {
+    // A value by level: [quick, normal, thorough].
+    fn of<T: Copy>(self, v: [T; 3]) -> T {
+        v[self as usize]
+    }
     pub fn parse(s: &str) -> Option<Level> {
-        match s {
-            "quick" => Some(Level::Quick),
-            "normal" => Some(Level::Normal),
-            "thorough" => Some(Level::Thorough),
-            _ => None,
-        }
+        [Level::Quick, Level::Normal, Level::Thorough].into_iter().find(|l| l.name() == s)
     }
     pub fn name(self) -> &'static str {
-        match self {
-            Level::Quick => "quick",
-            Level::Normal => "normal",
-            Level::Thorough => "thorough",
-        }
+        self.of(["quick", "normal", "thorough"])
     }
-    /// The tie band ε.
+    /// The tie band.
     pub fn eps(self) -> f64 {
-        match self {
-            Level::Quick => 0.03,
-            Level::Normal => 0.01,
-            Level::Thorough => 0.005,
-        }
+        self.of([0.03, 0.01, 0.005])
     }
     /// The end-to-end gate's allowance: how much slower a section's workloads may run on average
-    /// under its tuned values than under the values before them, before the section is dropped.
-    /// 3%, 2% and 1% (the user's decision, 2026-11-10), wider than the tie band at normal and
-    /// thorough so that what one tune differs from the next by noise doesn't reject a section.
+    /// under its tuned values before it is dropped. Wider than the tie band, so that noise from
+    /// one tune to the next doesn't reject a section.
     pub fn gate(self) -> f64 {
-        match self {
-            Level::Quick => 0.03,
-            Level::Normal => 0.02,
-            Level::Thorough => 0.01,
-        }
+        self.of([0.03, 0.02, 0.01])
     }
+    /// The fewest samples of a sweep probe.
     pub fn rounds(self) -> usize {
-        match self {
-            Level::Quick => 5,
-            Level::Normal => 11,
-            Level::Thorough => 21,
-        }
+        self.of([5, 11, 21])
     }
-    /// The spread a probe's samples must come under before it is settled: (their interquartile
-    /// range) / (their median). The level's thoroughness is this bound; `rounds` is only the
-    /// fewest samples taken and `max_rounds` the most.
+    /// The spread a sweep probe's samples must come under to settle, (interquartile range) /
+    /// median: the level's thoroughness for a sweep.
     pub fn spread(self) -> f64 {
-        match self {
-            Level::Quick => 0.06,
-            Level::Normal => 0.04,
-            Level::Thorough => 0.02,
-        }
+        self.of([0.06, 0.04, 0.02])
     }
     pub fn max_rounds(self) -> usize {
         6 * self.rounds()
     }
-    /// The most time, in ns, one probe's samples may take in one pass. A probe that takes
-    /// milliseconds a call (a whole tree, a whole exp) is one call a sample, and chasing the
-    /// spread bound to `max_rounds` cost such a probe half a minute: with whole sections of them
-    /// a thorough tune passed an hour. Within the budget a probe takes as many of its minimum
-    /// rounds as fit (at least 5), then extra rounds only while unsettled and under budget.
+    /// The most ns one probe's samples may take in a pass: a probe of milliseconds a call is one
+    /// call a sample, and chasing the spread bound to `max_rounds` cost such probes minutes.
     pub fn probe_budget_ns(self) -> f64 {
-        match self {
-            Level::Quick => 5e7,
-            Level::Normal => 2.5e8,
-            Level::Thorough => 1e9,
-        }
+        self.of([5e7, 2.5e8, 1e9])
     }
-    /// Samples of each probe in a whole-algorithm measurement (`time_fixed`): a fixed count, as
-    /// such probes are one call of milliseconds a sample and most never meet the spread bound.
+    /// Samples of each probe in a whole-algorithm measurement (`time_fixed`).
     pub fn whole_rounds(self) -> usize {
-        match self {
-            Level::Quick => 5,
-            Level::Normal => 7,
-            Level::Thorough => 11,
-        }
+        self.of([5, 7, 11])
     }
     /// A batch's target length in ns.
     pub fn batch_ns(self) -> f64 {
-        match self {
-            Level::Quick => 2e5,
-            Level::Normal => 1e6,
-            Level::Thorough => 2e6,
-        }
+        self.of([2e5, 1e6, 2e6])
     }
     /// How many passes `time_min` takes.
     pub fn passes(self) -> usize {
-        match self {
-            Level::Quick => 1,
-            Level::Normal => 3,
-            Level::Thorough => 5,
-        }
+        self.of([1, 3, 5])
     }
-    /// Rounds in one pass of `time_fit`, each one batch of every probe: enough for a median to
-    /// drop one disturbed batch, at every level.
-    pub fn fit_batches(self) -> usize {
-        3
+    /// The level below, for what is timed in great numbers and only has to be put in order (a
+    /// table's indices).
+    pub fn lighter(self) -> Level {
+        self.of([Level::Quick, Level::Quick, Level::Normal])
     }
-    /// How many shapes a fit samples, from its count at the quick level: a level's thoroughness
-    /// for a fit is its shapes, twice as many at normal and four times at thorough.
+    /// How many shapes a fit samples, from its count at the quick level: the level's
+    /// thoroughness for a fit.
     pub fn fit_shapes(self, quick: usize) -> usize {
-        quick * match self {
-            Level::Quick => 1,
-            Level::Normal => 2,
-            Level::Thorough => 4,
-        }
+        quick * self.of([1, 2, 4])
     }
 }
 
-/// Whether `BIGBITS_TUNE_VERBOSE` is set: every probe's time, and the diagnostics files.
+/// Whether `BIGBITS_TUNE_VERBOSE` is set: every probe's time, and the dump files.
 pub fn verbose() -> bool {
     std::env::var_os("BIGBITS_TUNE_VERBOSE").is_some()
 }
@@ -216,13 +156,12 @@ impl<'a> Probe<'a> {
     }
 }
 
-// Probes measured, and those whose samples never came under the level's spread.
+// Sweep probes measured, and those whose samples never came under the level's spread.
 static PROBES: AtomicUsize = AtomicUsize::new(0);
 static UNSETTLED: AtomicUsize = AtomicUsize::new(0);
 
-/// (sweep probes measured by `time_probes`, those that hit `max_rounds` or their time budget
-/// still above the level's spread) since the last call, which resets both. Many unsettled probes
-/// mean a busy machine, or one changing speed: tune again later. (Fit probes have `fit_noise`.)
+/// (sweep probes measured, those still unsettled at `max_rounds` or their budget) since the last
+/// call, which resets both. Many unsettled: a busy machine, or one changing speed.
 pub fn settle_counts() -> (usize, usize) {
     (PROBES.swap(0, Ordering::Relaxed), UNSETTLED.swap(0, Ordering::Relaxed))
 }
@@ -231,23 +170,20 @@ pub fn settle_counts() -> (usize, usize) {
 pub struct Timed {
     /// ns per call of each probe: the least of its two passes (a disturbance only adds time).
     pub ns: Vec<f64>,
-    /// One pass's noise, relative: `pass_noise` of the two passes.
+    /// One pass's noise, relative (`pass_noise`).
     pub noise: f64,
 }
 
 // Fit probes measured, and the sum of their squared log pass ratios.
 static FIT_NOISE: std::sync::Mutex<(usize, f64)> = std::sync::Mutex::new((0, 0.0));
 
-/// (fit probes measured, their passes' noise as `pass_noise` gives it) since the last call, which
-/// resets both: the tuner's check of the machine for fits. The noise takes in whatever doesn't
-/// repeat from one pass to the next: timer noise, a machine changing speed, a buffer's placement.
+/// (fit probes measured, their passes' noise) since the last call, which resets both.
 pub fn fit_noise() -> (usize, f64) {
     let (n, sq) = std::mem::take(&mut *FIT_NOISE.lock().unwrap());
     (n, (sq / (2.0 * n.max(1) as f64)).sqrt())
 }
 
-/// The noise of one of two measurements of the same probes, relative: the rms of ln(a / b), over
-/// √2 as the difference of two carries both's.
+/// The noise of one of two measurements of the same probes: the rms of ln(a / b), over sqrt 2.
 pub fn pass_noise(a: &[f64], b: &[f64]) -> f64 {
     let sq: f64 = a.iter().zip(b).map(|(x, y)| (x / y).ln().powi(2)).sum();
     (sq / (2.0 * a.len().max(1) as f64)).sqrt()
@@ -263,15 +199,14 @@ fn shuffled(n: usize, seed: u64) -> Vec<usize> {
     order
 }
 
+/// Rounds in a pass of `time_fit`: enough for a median to drop one disturbed batch.
+const FIT_BATCHES: usize = 3;
+
 /// ns per call of the probes `build(pass)` makes, for a fit. In each of two passes the probes are
-/// built anew (with `pass` to move their buffers: see `pad`), each is run once (warm caches and
-/// scratch pools) and calibrated, and then `level.fit_batches()` rounds each time one batch of
-/// every probe, in an order shuffled anew each round; a probe's time in the pass is the median
-/// of its batches. The value is the least of the two passes, and their difference the noise.
-///
-/// Batches taken back to back, one probe at a time, were tried first (2026-11-11) and dropped:
-/// a disturbance of a few milliseconds took all of one probe's batches, and in a process's first
-/// second 5-7% of a fit's probes read up to 2.4x slow in one pass that way.
+/// built anew (`pass` moves their buffers: `pad`), run once and calibrated, then timed a batch
+/// each in `FIT_BATCHES` rounds, shuffled anew each round; a probe's time in a pass is the median
+/// of its batches, the value the least of the two passes, their difference the noise. (Batches
+/// taken back to back lost all of a probe's batches to one disturbance.)
 pub fn time_fit<'a>(level: Level, mut build: impl FnMut(usize) -> Vec<Probe<'a>>) -> Timed {
     let passes = [0, 1].map(|pass| {
         let mut probes = build(pass);
@@ -281,8 +216,8 @@ pub fn time_fit<'a>(level: Level, mut build: impl FnMut(usize) -> Vec<Probe<'a>>
         for i in order(0) {
             iters[i] = calibrate(&mut probes[i], level);
         }
-        let mut samples: Vec<Vec<f64>> = (0..n).map(|_| Vec::with_capacity(level.fit_batches())).collect();
-        for round in 0..level.fit_batches() {
+        let mut samples: Vec<Vec<f64>> = (0..n).map(|_| Vec::with_capacity(FIT_BATCHES)).collect();
+        for round in 0..FIT_BATCHES {
             for i in order(round + 1) {
                 samples[i].push(batch(&mut probes[i], iters[i]));
             }
@@ -313,8 +248,7 @@ fn batch(p: &mut Probe, iters: u64) -> f64 {
     t.elapsed().as_nanos() as f64 / iters as f64
 }
 
-// Runs the probe once (warm caches and scratch pools) and finds how many calls make a batch of
-// the level's length.
+// Runs the probe once (warm caches and scratch pools), then finds how many calls make a batch.
 fn calibrate(p: &mut Probe, level: Level) -> u64 {
     (p.run)();
     let mut n = 1u64;
@@ -332,67 +266,48 @@ fn sorted(mut v: Vec<f64>) -> Vec<f64> {
     v
 }
 
-// The value a fraction `f` of the way through sorted values, at the nearest index.
-fn quantile(sorted: &[f64], f: f64) -> f64 {
-    sorted[((sorted.len() - 1) as f64 * f).round() as usize]
-}
-
 /// (interquartile range) / median of the samples.
 pub fn spread(samples: &[f64]) -> f64 {
     let v = sorted(samples.to_vec());
-    (quantile(&v, 0.75) - quantile(&v, 0.25)) / quantile(&v, 0.5)
+    // The value a fraction of the way through, at the nearest index.
+    let at = |f: f64| v[((v.len() - 1) as f64 * f).round() as usize];
+    (at(0.75) - at(0.25)) / at(0.5)
 }
 
-/// ns per call of each probe: the median of its samples. Every probe is run warm (once, then
-/// through calibration) before any sample is kept. Each round times one batch of every probe
-/// still unsettled, in turn; a probe is settled once it has `level.rounds()` samples whose spread
-/// is under `level.spread()`, and rounds stop at `level.max_rounds()`.
-pub fn time_probes(probes: &mut [Probe], level: Level) -> Vec<f64> {
-    sample(probes, level, None)
-}
-
-/// ns per call of each probe from exactly `level.whole_rounds()` interleaved samples (their
-/// median), with no spread bound: for whole-algorithm probes, whose sweeps are judged by whether
-/// two such measurements choose the same value (`sweep::param_sweep`, `sweep::cutoff_sweep_whole`).
+/// ns per call from exactly `level.whole_rounds()` interleaved samples, no spread bound: for
+/// whole-algorithm probes, whose sweeps are judged by whether two such measurements agree.
 pub fn time_fixed(probes: &mut [Probe], level: Level) -> Vec<f64> {
     sample(probes, level, Some(level.whole_rounds()))
 }
 
+// ns per call of each probe, the median of its samples. Each round times one batch of every
+// probe still unsettled; a probe settles once it has `level.rounds()` samples whose spread is
+// under `level.spread()`, and rounds stop at `level.max_rounds()`. With `fixed`: that many
+// rounds of every probe, no spread bound.
 fn sample(probes: &mut [Probe], level: Level, fixed: Option<usize>) -> Vec<f64> {
-    let all: Vec<usize> = (0..probes.len()).collect();
-    sample_at(probes, level, fixed, &all)
-}
-
-/// `sample` over the probes at `idx` only (the others don't run), in that order.
-fn sample_at(probes: &mut [Probe], level: Level, fixed: Option<usize>, idx: &[usize]) -> Vec<f64> {
-    let iters: Vec<u64> = idx.iter().map(|&i| calibrate(&mut probes[i], level)).collect();
-    // Everything below indexes by position in idx.
-    // Each probe's buffer at its most samples, so none grows between timed batches (a `vec!` of
-    // one would clone it, and a clone keeps no capacity).
+    let n = probes.len();
+    let iters: Vec<u64> = probes.iter_mut().map(|p| calibrate(p, level)).collect();
+    // Each probe's buffer at its most samples: none grows between timed batches.
     let most = fixed.unwrap_or(level.max_rounds());
-    let mut samples: Vec<Vec<f64>> = (0..idx.len()).map(|_| Vec::with_capacity(most)).collect();
-    let mut spent = vec![0.0f64; idx.len()];
-    let mut open: Vec<usize> = (0..idx.len()).collect();
+    let mut samples: Vec<Vec<f64>> = (0..n).map(|_| Vec::with_capacity(most)).collect();
+    let mut spent = vec![0.0f64; n];
+    let mut open: Vec<usize> = (0..n).collect();
     let mut unsettled = 0;
-    for _ in 0..level.max_rounds() {
+    for _ in 0..most {
         for &i in &open {
             let t = Instant::now();
             for _ in 0..iters[i] {
-                (probes[idx[i]].run)();
+                (probes[i].run)();
             }
             let ns = t.elapsed().as_nanos() as f64;
             spent[i] += ns;
             samples[i].push(ns / iters[i] as f64);
         }
-        // A probe leaves once it has its minimum rounds (fewer if its budget ran out first, but
-        // at least 5) and is either settled or out of budget.
-        if let Some(rounds) = fixed {
-            if samples.first().map_or(true, |v| v.len() >= rounds) {
-                open.clear();
-                break;
-            }
+        // A fixed count is every round of every probe.
+        if fixed.is_some() {
             continue;
         }
+        // A probe leaves once it has its minimum rounds (at least 5) and is settled or out of budget.
         open.retain(|&i| {
             let (n, over) = (samples[i].len(), spent[i] >= level.probe_budget_ns());
             if n < 5 || (n < level.rounds() && !over) {
@@ -409,16 +324,28 @@ fn sample_at(probes: &mut [Probe], level: Level, fixed: Option<usize>, idx: &[us
         }
     }
     if fixed.is_none() {
-        PROBES.fetch_add(idx.len(), Ordering::Relaxed);
+        PROBES.fetch_add(n, Ordering::Relaxed);
         UNSETTLED.fetch_add(unsettled + open.len(), Ordering::Relaxed);
     }
     let t: Vec<f64> = samples.into_iter().map(median).collect();
     if verbose() {
-        for (&i, ns) in idx.iter().zip(&t) {
-            eprintln!("    {:<28} {ns:>12.2} ns", probes[i].name);
+        for (p, ns) in probes.iter().zip(&t) {
+            eprintln!("    {:<28} {ns:>12.2} ns", p.name);
         }
     }
     t
+}
+
+/// A timing less the harness's own work inside it, timed on its own; the floor only keeps a
+/// mistimed pair finite.
+pub fn less_harness(t: f64, harness: f64) -> f64 {
+    (t - harness).max(0.25 * t)
+}
+
+/// Writes a developer's dump to target/tuning/`name`; a failure is nothing to stop a tune for.
+pub fn dump(name: &str, text: &str) {
+    let _ = std::fs::create_dir_all("target/tuning");
+    let _ = std::fs::write(format!("target/tuning/{name}"), text);
 }
 
 pub fn median(v: Vec<f64>) -> f64 {
@@ -432,14 +359,12 @@ pub fn median(v: Vec<f64>) -> f64 {
 }
 
 /// ns per call of the probes `build(pass)` makes: the least over the level's passes of
-/// `time_probes`. Each pass builds its probes anew, with `pass` to vary where their buffers land
-/// (see `pad`): a disturbance, such as an unlucky buffer placement that slows one probe for a
-/// whole pass, only ever adds time, so the least pass is the cleanest.
+/// `sample`, each pass building its probes anew (a disturbance only adds time).
 pub fn time_min<'a>(level: Level, mut build: impl FnMut(usize) -> Vec<Probe<'a>>) -> Vec<f64> {
     let mut best: Vec<f64> = Vec::new();
     for pass in 0..level.passes() {
         let mut probes = build(pass);
-        let t = time_probes(&mut probes, level);
+        let t = sample(&mut probes, level, None);
         if best.is_empty() {
             best = t;
         } else {
@@ -451,16 +376,15 @@ pub fn time_min<'a>(level: Level, mut build: impl FnMut(usize) -> Vec<Probe<'a>>
     best
 }
 
-/// Runs `f` on a rayon pool of one thread, so a dynamic entry inside it sees one thread and stays
-/// serial: for decisions the library defines on one thread and scales for more.
+/// Runs `f` on a rayon pool of one thread, so a dynamic entry inside it stays serial.
 pub fn on_one_thread<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(1).stack_size(64 << 20).build().expect("a one-thread pool"))
         .install(f)
 }
 
-/// A buffer of `n` limbs from `seed`, placed `13 * pass + 1` limbs into its allocation, so each
-/// pass puts a probe's buffers at different offsets from each other.
+/// A buffer of `n` limbs from `seed`, `13 * pass + 1` limbs into its allocation: each pass puts
+/// a probe's buffers at different offsets from each other.
 pub fn pad(n: usize, seed: u64, pass: usize) -> PadBuf {
     let off = 13 * pass + 1;
     let mut x = seed | 1;

@@ -1,9 +1,8 @@
-// The tuning-file format (docs/tuning_system.md, "The tuning file format"): a subset of TOML that
-// presets, user files and the tuner share. `#` comments, `[section]` headers and `key = value`
-// lines, where a value is an integer (decimal, `_` allowed), a float (`inf` included), `true` or
-// `false`, a double-quoted string without escapes, or a flat array of numbers that may span lines.
-// Shared by build.rs and the crate, so std only; parsed by hand so users don't compile a TOML
-// parser.
+// The tuning-file format: a subset of TOML that presets, user files and the tuner share. `#`
+// comments, `[section]` headers and `key = value` lines, where a value is an integer (`_`
+// allowed), a float (`inf` included), `true` or `false`, a double-quoted string without
+// escapes, or a flat array of numbers that may span lines. Shared by build.rs: std only,
+// parsed by hand so users don't compile a TOML parser.
 
 use std::fmt::Write as _;
 
@@ -268,13 +267,6 @@ pub fn float_text(v: f64) -> String {
     format!("{v:?}")
 }
 
-pub fn num_text(n: Num) -> String {
-    match n {
-        Num::Int(v) => v.to_string(),
-        Num::Float(v) => float_text(v),
-    }
-}
-
 pub fn raw_text(r: &Raw) -> String {
     match r {
         Raw::Int(v) => v.to_string(),
@@ -282,7 +274,13 @@ pub fn raw_text(r: &Raw) -> String {
         Raw::Bool(v) => v.to_string(),
         Raw::Str(s) => format!("\"{s}\""),
         Raw::Array(a) => {
-            let items: Vec<String> = a.iter().map(|&n| num_text(n)).collect();
+            let items: Vec<String> = a
+                .iter()
+                .map(|n| match *n {
+                    Num::Int(v) => v.to_string(),
+                    Num::Float(v) => float_text(v),
+                })
+                .collect();
             format!("[{}]", items.join(", "))
         }
     }

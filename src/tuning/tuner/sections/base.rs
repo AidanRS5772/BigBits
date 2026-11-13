@@ -1,9 +1,7 @@
-//! Section `base` (x86-64 only): the two crossovers between a plain loop and its mulx/adcx (ADX)
-//! twin, each a cutoff sweep with the knob forced to each side: `base.prim_adx` through
-//! `mul_add_prim` and `base.limb_adx` through `add_mul_limb`. The ADX loop runs from n >= knob,
-//! so the knob is one past the last plain size. On a CPU without ADX there is nothing to choose
-//! and the section tunes nothing. Written on an aarch64 machine and only compile-checked for
-//! x86-64 there: its first real run is the x86 handoff's (docs/tuning_implementation.md).
+//! Section `base` (x86-64 only): the two crossovers between a plain loop and its mulx/adcx
+//! (ADX) twin, each a cutoff sweep with the knob forced to each side. The ADX loop runs from
+//! n >= knob. On a CPU without ADX the section tunes nothing. Compile-checked only: its first
+//! real run is the x86 handoff's (docs/tuning_implementation.md).
 
 use crate::tuning::resolve::Value;
 use crate::tuning::tuner::measure::{pad, Level, Probe};

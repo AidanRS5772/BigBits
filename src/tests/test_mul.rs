@@ -2360,6 +2360,42 @@ fn test_sqr_static_karatsuba_dispatch() {
 // ─── Section 10: High Multiply ──────────────────────────────────────────────
 
 #[test]
+fn test_hi_window_products_counts_the_kernels() {
+    // hi_mul_buf's kernels make every limb product in the window's columns and in the two guard
+    // columns below it: for a window of l limbs of an l x s product, the columns from s - 3 up.
+    for l in 2..40usize {
+        for s in 2..=l {
+            let d = s - 1;
+            let made = (0..l).flat_map(|i| (0..s).map(move |j| i + j)).filter(|&col| col + 2 >= d).count();
+            assert_eq!(hi_window_products(l as f64, s as f64), made as f64, "{l} x {s}");
+        }
+    }
+}
+
+#[test]
+fn test_hi_equation_polynomial_is_the_equation() {
+    // `HiEq::poly` is `HiEq::ns` as a polynomial in the window, for each kernel and for an
+    // operand the window holds whole or clips; and `ns` picks the kernel by the window and
+    // clips the operand to it.
+    let eq = HiEq { rows: [0.37, 3.1, 4.2], cols: [0.45, 1.6, 4.0], row: 24.0 };
+    for x in [2.0f64, 3.0, 7.0, 40.0] {
+        for l in [1.0f64, 2.5, 7.0, 24.0, 24.5, 39.0, 40.0, 41.5, 200.0] {
+            let (rows, whole) = (l > 24.0, l >= x);
+            let [q2, q1, q0] = eq.poly(rows, whole, x);
+            let (got, want) = (q2 * l * l + q1 * l + q0, eq.ns(l, x));
+            assert!((got - want).abs() <= 1e-9 * want.abs().max(1.0), "window {l} by {x}: {got} != {want}");
+            let s = x.min(l);
+            let [a, b, c] = if rows { eq.rows } else { eq.cols };
+            let by_hand = a * hi_window_products(l, s) + b * if rows { s } else { l } + c;
+            assert!((want - by_hand).abs() <= 1e-9 * by_hand.abs().max(1.0), "window {l} by {x}");
+        }
+    }
+    // The live equation prices a window with positive constants.
+    let live = HiEq::read();
+    assert!(live.ns(100.0, 5.0) > 0.0 && live.ns(8.0, 3.0) > 0.0);
+}
+
+#[test]
 fn test_hi_mul_buf_exact_when_full() {
     // When out.len() == a.len() + b.len() - 1, result should be exact
     for seed in 0u64..10 {

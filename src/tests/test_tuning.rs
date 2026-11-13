@@ -8,7 +8,7 @@
 
 use crate::tuning::file::{self, Num, Raw};
 use crate::tuning::resolve::{self, check_table, flat, Layer, Origin, Target, Value};
-use crate::tuning::schema_types::{Alg, Derivation, Kind, Knob, Range, Section, Threads, Ty};
+use crate::tuning::schema_types::{Alg, Kind, Knob, Range, Section, Threads, Ty};
 use crate::tuning::{self, PATHS, RESOLVED_BITS};
 
 #[test]
@@ -32,11 +32,24 @@ fn value_bits(v: &Value) -> u64 {
 fn build_layers() -> Vec<(String, file::File)> {
     let (arch, os) = (std::env::consts::ARCH, std::env::consts::OS);
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    [format!("presets/{arch}-{os}.toml"), format!("presets/{arch}.toml")]
+    let mut layers: Vec<(String, file::File)> = [format!("presets/{arch}-{os}.toml"), format!("presets/{arch}.toml")]
         .into_iter()
         .find_map(|n| std::fs::read_to_string(root.join(&n)).ok().map(|t| (n, file::parse(&t).unwrap())))
         .into_iter()
-        .collect()
+        .collect();
+    // Then the machine's own file, as build.rs layers it: the one BIGBITS_TUNING named when this
+    // was built (presets/local.toml in a checkout, which `cargo tune tune` writes), unless it
+    // was tuned on another target. Without it this file's first test failed on any machine
+    // that had tuned itself.
+    if let Some(path) = option_env!("BIGBITS_TUNING").filter(|p| !p.is_empty()) {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            let f = file::parse(&text).unwrap();
+            if resolve::layer_target_ok(&f, &Target { arch, os }).is_ok() {
+                layers.push((path.to_string(), f));
+            }
+        }
+    }
+    layers
 }
 
 // Every accessor returns the resolved value (in a tune build too: nothing here changes the cells).
@@ -98,11 +111,34 @@ fn test_bnm1_cutoff_follows_fft_sqr_by_default() {
 
 // mul.kara's default is the old is_school boundary exactly, at every shape the recursion and the
 // dispatchers can ask about (from s = 64 on every row is Karatsuba).
+// `Table2::pick` without the row index (a binary search for the row): the lookup's oracle.
+fn pick2(t: &[u32], s: u64, l: u64) -> usize {
+    assert!(t.len() >= 3 && t.len() % 3 == 0);
+    let (mut lo, mut hi) = (0, t.len() / 3);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if t[3 * mid] as u64 <= s {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if hi == 0 {
+        return t[2] as usize;
+    }
+    let mut i = hi - 1;
+    let row = t[3 * i];
+    while t[3 * i + 1] as u64 > l && i > 0 && t[3 * (i - 1)] == row {
+        i -= 1;
+    }
+    t[3 * i + 2] as usize
+}
+
 #[test]
 fn test_kara_default_is_todays_boundary() {
     use crate::tuning::resolved::mul::{KARA as RESOLVED, KARA_ROWS};
     use crate::tuning::schema_types::DefaultValue;
-    use crate::tuning::table::{pick2, row_index, Table2};
+    use crate::tuning::table::{row_index, Table2};
     use crate::utils::mul::{is_school_at, school_at};
     assert_eq!(row_index(RESOLVED), KARA_ROWS, "the generated index is the resolved table's");
     // The schema's default, whatever a preset resolves it to.
@@ -122,7 +158,7 @@ fn test_kara_default_is_todays_boundary() {
 
 #[test]
 fn test_table_lookups() {
-    use crate::tuning::table::{pick1, pick2};
+    use crate::tuning::table::pick1;
     let t = [1, 0, 9, 1, 40, 2];
     for (n, want) in [(0, 0), (1, 0), (8, 0), (9, 1), (39, 1), (40, 2), (u64::MAX, 2)] {
         assert_eq!(pick1(&t, n), want, "pick1 at {n}");
@@ -244,7 +280,7 @@ fn test_fits_recover_coefficients() {
 #[test]
 fn test_fit_evidence_marks() {
     use crate::tuning::tuner::fit::{Fit, ACCEPT_RMS, NOISY, REJECTED};
-    let fit = |rms: f64| Fit { beta: vec![1.0], se: vec![0.1], cond: 1.0, rel_rms: rms, max_rel: 2.0 * rms, n: 100, held: None, noise: None, dropped: vec![] };
+    let fit = |rms: f64| Fit { beta: vec![1.0], se: vec![0.1], cond: 1.0, rel_rms: rms, max_rel: 2.0 * rms, worst: None, n: 100, held: None, noise: None, dropped: vec![] };
     let (good, bad) = (fit(ACCEPT_RMS), fit(ACCEPT_RMS + 0.02));
     for e in [good.evidence(), good.evidence_revised()] {
         assert!(!e.contains(REJECTED) && !e.contains(NOISY), "{e}");
@@ -378,43 +414,217 @@ fn test_synthetic_series_converge_and_agree() {
     }
 }
 
-// The small-series table derived from the equations in force: a valid table of its type, whose
-// rows are one class's each and whose cells inside the extent name an algorithm the class's
-// shape can run; every row ends by handing the range to the equations; and the same equations
-// give the same table.
+// The rule every table is measured by (`tuner/tables.rs`), on made-up timings: an index is the
+// table's while the decision costs more than the share of the call, and takes the fastest
+// algorithm timed there; the pick before stays within the tie band; a pick of one cell between
+// two of another is dropped; the row ends at the first index within the share; and a larger
+// share ends it sooner, from the same timings.
 #[cfg(feature = "tune")]
 #[test]
-fn test_series_small_table_derives() {
-    use crate::tuning::resolve::check_table;
-    use crate::tuning::schema_types::Ty;
-    use crate::tuning::tuner::derive::series_small_table;
-    use crate::utils::series::{small_frame_span, Shape, SeriesAlg, SMALL_CLASSES, SMALL_PICKS, SMALL_ROWS};
-    let (t, evidence) = series_small_table(0.005);
-    let Ty::Table { algs, inputs, .. } = tuning::knob("series.small").unwrap().ty else { panic!("series.small is a table") };
-    check_table(algs, inputs, &t).unwrap();
-    assert!(evidence.starts_with("derived (table)") && t.len() % 3 == 0 && t.len() < 3 * 4000, "{evidence}");
-    let rows: Vec<&[u32]> = t.chunks(3).collect();
-    let mut seen = std::collections::BTreeSet::new();
-    for (i, r) in rows.iter().enumerate() {
-        let (class, bucket, pick) = (r[0] as usize / SMALL_ROWS, r[0] as usize % SMALL_ROWS, r[2] as usize);
-        assert!(class < SMALL_CLASSES && bucket < SMALL_ROWS && pick < SMALL_PICKS.len(), "row {i}: {r:?}");
-        let (lo, hi) = small_frame_span(bucket);
-        let (_, ok) = Shape::of_class(class, (lo + hi) / 2, r[1] as u64).expect("only classes with a shape have rows");
-        assert!(SMALL_PICKS[pick].map_or(true, |alg| ok.allows(alg)), "row {i}: {r:?}");
-        // A row's last change point is the equations' (the extent), unless it is all one pick
-        // to the grid's end.
-        let last_of_row = rows.get(i + 1).map_or(true, |n| n[0] != r[0]);
-        assert!(!last_of_row || SMALL_PICKS[pick].is_none() || r[1] > 1 << 14, "row {i}: {r:?} ends on an algorithm");
-        seen.insert(class);
+fn test_table_rule_on_made_up_timings() {
+    use crate::tuning::tuner::tables::{assemble, row, rows_at, Cell, Row, SHARE};
+    let cell = |size: u32, ns: &[(u32, f64)], decide: f64| Cell::one(size, ns.to_vec(), Some(decide));
+    // A decision of 50 ns. Algorithm 0 is the faster to 4 terms, 1 from 6; at 5 they are within
+    // 2% of each other. The call passes 1000 ns (20 decisions) at 9.
+    let cells = vec![
+        cell(1, &[(0, 100.0), (1, 180.0)], 50.0),
+        cell(2, &[(0, 200.0), (1, 260.0)], 50.0),
+        cell(4, &[(0, 400.0), (1, 420.0)], 50.0),
+        cell(5, &[(0, 505.0), (1, 500.0)], 50.0),
+        cell(6, &[(0, 640.0), (1, 560.0)], 50.0),
+        cell(8, &[(0, 900.0), (1, 760.0)], 50.0),
+        cell(9, &[(0, 1100.0), (1, 1001.0)], 50.0),
+        cell(12, &[(0, 1500.0), (1, 1300.0)], 50.0),
+    ];
+    assert_eq!(SHARE, 0.05);
+    assert_eq!(row(&cells, Some(9), 0.03, SHARE), [(1, 0), (6, 1), (9, 9)], "0 holds at 5 within the tie band, and 9 is the equations'");
+    assert_eq!(row(&cells, Some(9), 0.0, SHARE), [(1, 0), (5, 1), (9, 9)], "with no tie band the faster at 5 takes it");
+    // At a share of 10% the call only has to pass 500 ns, which the cell at 5 misses by a hair
+    // (500 is the fastest there, and 50 / 500 is the share exactly: within it).
+    assert_eq!(row(&cells, Some(9), 0.03, 0.10), [(1, 0), (5, 9)]);
+    assert_eq!(row(&cells, Some(9), 0.03, 0.60), [(1, 9)], "a decision under the share from the first index: the row is the equations'");
+    // A table with no equations (it decides at every size) reads every cell.
+    assert_eq!(row(&cells, None, 0.03, SHARE), [(1, 0), (6, 1)]);
+    // A pick that lasts one cell between two of another is dropped.
+    let blip = vec![
+        cell(1, &[(0, 100.0), (1, 150.0)], 50.0),
+        cell(2, &[(0, 300.0), (1, 200.0)], 50.0),
+        cell(3, &[(0, 300.0), (1, 450.0)], 50.0),
+        cell(4, &[(0, 400.0), (1, 600.0)], 50.0),
+    ];
+    assert_eq!(row(&blip, Some(9), 0.03, SHARE), [(1, 0)]);
+    // An index nothing can run at, or with no decision to read, never ends a row on its own.
+    let bare = vec![Cell::one(1, vec![(0, 10.0)], None), Cell::one(2, vec![(0, 1e6)], None)];
+    assert_eq!(row(&bare, Some(9), 0.03, SHARE), [(1, 0)]);
+    assert!(!bare[1].past(SHARE) && cells[6].past(SHARE) && !cells[5].past(SHARE));
+    // A cell's pick and its cost, the time under it over the fastest algorithm's: 1 where one
+    // call was timed.
+    assert_eq!(cells[0].fastest(), Some((0, 1.0)));
+    assert_eq!((cells[0].cost(1), cells[0].cost(7)), (Some(1.8), None));
+    assert_eq!(cells[0].share(), Some(0.5));
+    // An index that stands for several kinds of call times one of each, and its pick is the one
+    // that costs them least together: here 0, at 1.0 and 1.2 of the two calls' own bests, where
+    // 1 is at 1.5 and 1.0. The decision's share is the largest among them, so the index is the
+    // equations' only when it is within the share of every call.
+    use crate::tuning::tuner::tables::Timed;
+    let call = |ns: &[(u32, f64)], decide: f64| Timed { ns: ns.to_vec(), decide: Some(decide), note: Vec::new() };
+    let two = Cell { size: 3, of: vec![call(&[(0, 100.0), (1, 150.0)], 50.0), call(&[(0, 240.0), (1, 200.0)], 50.0)], least: 1.0 };
+    assert_eq!(two.fastest().map(|f| f.0), Some(0));
+    assert!((two.cost(0).unwrap() - 1.1).abs() < 1e-12 && (two.cost(1).unwrap() - 1.25).abs() < 1e-12);
+    assert_eq!(two.share(), Some(0.5));
+    assert!(!two.past(0.3) && two.past(0.5), "the first call's decision is half of it, the second's a quarter");
+    // A pick one of the calls can't run leaves that call to the equations: their pick taken as
+    // its fastest, and the decision paid. Here 1 still costs least (1.0 and 1.1 against 1.67
+    // and 1.0).
+    let part = Cell { size: 3, of: vec![call(&[(0, 100.0), (1, 60.0)], 10.0), call(&[(0, 100.0)], 10.0)], least: 1.0 };
+    assert_eq!(part.fastest().map(|f| f.0), Some(1));
+    assert!((part.cost(1).unwrap() - 1.05).abs() < 1e-12 && (part.cost(0).unwrap() - (100.0 / 60.0 + 1.0) / 2.0).abs() < 1e-12);
+    assert!(!Cell::one(1, vec![(0, 10.0)], None).bare() && Cell { size: 1, of: Vec::new(), least: 1.0 }.bare() && Cell::one(1, Vec::new(), Some(5.0)).bare());
+    // Reading the equations is a pick of an index too, at its own cost: the decision paid on
+    // every call. With one call the fastest algorithm always costs less (1 against 1 + its
+    // share). Where an index stands for calls that no one algorithm serves, it costs least:
+    // here either algorithm is 3x off for one call (a cost of 2), and the decision is a fifth
+    // of each (1.2), so the index is the equations', and the row goes on to the next.
+    let split = |size: u32| Cell { size, of: vec![call(&[(0, 100.0), (1, 300.0)], 20.0), call(&[(0, 300.0), (1, 100.0)], 20.0)], least: 1.0 };
+    assert!((split(1).read().unwrap() - 1.2).abs() < 1e-12 && (split(1).cost(0).unwrap() - 2.0).abs() < 1e-12);
+    assert_eq!(cells[0].read(), Some(1.5));
+    let mixed = vec![cell(1, &[(0, 100.0), (1, 180.0)], 50.0), split(2), split(3), cell(4, &[(0, 400.0), (1, 300.0)], 50.0), cell(40, &[(0, 4000.0), (1, 3000.0)], 50.0)];
+    assert_eq!(row(&mixed, Some(9), 0.03, SHARE), [(1, 0), (2, 9), (4, 1), (40, 9)]);
+    // Such a row doesn't end at its first index, though it may start as the equations'.
+    let starts = Row { key: 0, sizes: vec![2, 3, 4], points: row(&mixed[1..4], Some(9), 0.03, SHARE), cells: mixed[1..4].to_vec() };
+    assert_eq!(starts.points, [(2, 9), (4, 1)]);
+    assert!(!starts.all_equations(Some(9)));
+    let ends = Row { key: 0, sizes: vec![40], points: row(&mixed[4..], Some(9), 0.03, SHARE), cells: mixed[4..].to_vec() };
+    assert!(ends.points == [(40, 9)] && ends.all_equations(Some(9)));
+    // A step of a coarse grid stands for calls shorter than the one timed: the rule is read at
+    // the shortest. At 12 terms timed for a step from 10, the call that counts is 10 / 12 of it.
+    let step = Cell { least: 10.0 / 12.0, ..cell(10, &[(0, 1100.0)], 50.0) };
+    assert!(cell(10, &[(0, 1100.0)], 50.0).past(SHARE) && !step.past(SHARE) && (step.share().unwrap() - 50.0 / (1100.0 * 10.0 / 12.0)).abs() < 1e-12);
+    // Rows into a table: a row that repeats the one before it is left out where the keys are of
+    // one family, and the same rows at a larger share are a smaller table.
+    let rows: Vec<Row> = [16u32, 17, 32].iter().map(|&key| Row { key, sizes: vec![1, 2, 4, 5, 6, 8, 9, 12], points: row(&cells, Some(9), 0.03, SHARE), cells: cells.clone() }).collect();
+    let family = |a: u32, b: u32| a / 16 == b / 16;
+    assert_eq!(assemble(&rows, family), [16, 1, 0, 16, 6, 1, 16, 9, 9, 32, 1, 0, 32, 6, 1, 32, 9, 9]);
+    assert_eq!(assemble(&rows_at(&rows, Some(9), 0.03, 0.10), family), [16, 1, 0, 16, 5, 9, 32, 1, 0, 32, 5, 9]);
+    // A row whose grid ended inside the table hands what is past the grid to the equations.
+    let short = vec![Row { key: 1, sizes: vec![1, 2], points: vec![], cells: cells[..2].to_vec() }];
+    assert_eq!(assemble(&rows_at(&short, Some(9), 0.03, SHARE), family), [1, 1, 0, 1, 3, 9]);
+}
+
+// The rule is system-wide: the schema's table knobs are exactly the tables of the dispatchers
+// that read fitted equations (`dispatch::TABLES`), each measured by `tables::measure` and
+// checked by `cargo tune dispatch`; and no knob is derived from the fits any more.
+#[cfg(feature = "tune")]
+#[test]
+fn test_every_table_is_a_dispatchers() {
+    use crate::tuning::tuner::dispatch::TABLES;
+    let flat = resolve::flat(tuning::schema());
+    let tables: Vec<&str> = flat.iter().filter(|f| f.knob.kind == Kind::Table).map(|f| f.path.as_str()).collect();
+    let mut listed: Vec<&str> = TABLES.iter().map(|t| t.1).collect();
+    listed.sort_unstable();
+    let mut found = tables.clone();
+    found.sort_unstable();
+    assert_eq!(found, listed, "a table knob and a dispatcher's table are the same thing");
+    for f in &flat {
+        assert_eq!(matches!(f.knob.ty, Ty::Table { .. }), f.knob.kind == Kind::Table, "{}", f.path);
     }
-    // Every class with a shape has its own first row, so no lookup reads another class's.
-    for class in 0..SMALL_CLASSES {
-        assert_eq!(Shape::of_class(class, 1, 1).is_some(), seen.contains(&class), "class {class}");
-        assert!(!seen.contains(&class) || t.chunks(3).any(|r| r[0] as usize == class * SMALL_ROWS), "class {class} has no row at its first bucket");
+}
+
+// An equation is fitted on the calls it is read for: a fit after a section's tables leaves out
+// what those tables decide. Division at tables made by hand (the entry's own table, a pick that
+// can't take the shape handed on, past a row's extent), and the series by what its table names
+// for a workload, whatever the workload's own decision costs.
+#[cfg(feature = "tune")]
+#[test]
+fn test_fits_leave_out_what_tables_decide() {
+    use crate::tuning::table::{row_index, Table2};
+    use crate::tuning::tuner::sections::div::read_for;
+    use crate::tuning::tuner::sections::series::{Rows, SeriesTiming};
+    use crate::utils::series::{Guarded, SeriesAlg};
+    let table = |t: &'static [u32]| Table2 { t, rows: Box::leak(row_index(t).into_boxed_slice()) };
+    // Quotient only: at divisors of 8 to 39 limbs Knuth for quotients to 19 limbs, NR to 99, the
+    // equations from 100; from 40, BZ; from 60, the equations. With remainder: Knuth at every
+    // quotient for divisors to 15 limbs, the equations past.
+    let quo = table(Box::leak(Box::new([8, 2, 0, 8, 20, 2, 8, 100, 3, 40, 2, 1, 60, 1, 3])));
+    let rem = table(Box::leak(Box::new([1, 1, 0, 16, 1, 3])));
+    let (tables, leaf) = ([&quo, &rem], 99);
+    assert!(!read_for(false, 12, 20, tables, leaf), "the table names Knuth");
+    assert!(!read_for(false, 50, 20, tables, leaf), "the table names NR");
+    assert!(read_for(false, 100, 20, tables, leaf), "past the row's extent the equations are read");
+    assert!(read_for(false, 30, 70, tables, leaf), "a row of the equations");
+    assert!(read_for(false, 30, 45, tables, leaf), "BZ under its leaf can't take the shape: handed to the equations");
+    assert!(!read_for(false, 30, 45, tables, 40), "and past its leaf the table's BZ stands");
+    assert!(!read_for(true, 100, 12, tables, leaf) && read_for(true, 100, 16, tables, leaf), "with the remainder, that entry's table");
+    assert!(read_for(true, 12, 20, tables, leaf) && !read_for(false, 12, 20, tables, leaf), "each entry by its own table");
+
+    // A series: its fastest algorithm takes 1000 ns, and the table names an algorithm or doesn't.
+    let timing = |decide: f64, small: Option<SeriesAlg>| SeriesTiming {
+        name: String::new(),
+        held: false,
+        ns: [1000.0, f64::INFINITY, 2000.0],
+        auto: f64::INFINITY,
+        tree: f64::INFINITY,
+        entry: 0.0,
+        decide,
+        parts: [None; 3],
+        gained: Vec::new(),
+        small,
+        area: [true; 3],
+        guard: Guarded { rect_first: false },
+        rho: 0.0,
+        beta: 0.0,
+        dials: [0.0; 13],
+        class: None,
+    };
+    // By its own decision (a first fit, before a table): within the share or not.
+    assert!(timing(40.0, Some(SeriesAlg::Horner)).fitted(Rows::Share(0.05)) && !timing(60.0, None).fitted(Rows::Share(0.05)));
+    assert!(timing(60.0, None).fitted(Rows::Share(0.10)));
+    // By the table in force: a series it names an algorithm for is out though its decision is
+    // within the share (its kind's row goes on for another member), and one it hands to the
+    // equations is in though its decision is past it.
+    assert!(!timing(40.0, Some(SeriesAlg::Horner)).fitted(Rows::Table), "the table decides: no equation is read");
+    assert!(!timing(40.0, Some(SeriesAlg::Rect)).fitted(Rows::Table));
+    assert!(timing(60.0, None).fitted(Rows::Table), "handed to the equations: they are read");
+    assert!(timing(10.0, None).fitted(Rows::Table));
+}
+
+// Every class of the small-series table that a series can have is measured on a synthetic
+// series of that class: the algorithms that can sum it (binary splitting always, rect with an x
+// of two limbs or more) and the decision.
+#[cfg(feature = "tune")]
+#[test]
+fn test_series_table_cells_are_of_their_class() {
+    use crate::tuning::tuner::sections::series::{member_cell, member_kind, MEMBERS};
+    use crate::utils::series::SMALL_KINDS;
+    let (mut seen, mut kinds) = (0, vec![0usize; SMALL_KINDS]);
+    for member in 0..MEMBERS {
+        // A member is a width of x (ten of them, the first two BBP and Engel), q's bits (four)
+        // and an r past 1 or not.
+        let (rc, width) = (member % 2, member / 2 / 4);
+        for (len, n) in [(1usize, 1u64), (20, 30), (300, 5)] {
+            let mut probes = Vec::new();
+            let plan = member_cell(member, len, n, &mut probes);
+            assert_eq!(plan.is_some(), !(width < 2 && rc == 1), "member {member} at {len} limbs, {n} terms");
+            let Some(plan) = plan else { continue };
+            assert!(plan.decide && !plan.harness && plan.picks.contains(&2) && plan.picks.contains(&0), "member {member}: {plan:?}");
+            assert_eq!(plan.picks.contains(&1), width >= 5, "member {member}: rect needs an x of two limbs");
+            assert_eq!(probes.len(), plan.picks.len() + 1);
+            // Its series' numbers and two ratios are kept with it, for the dump.
+            assert_eq!(plan.note.len(), 15);
+            // Each probe runs: the algorithms forced over the explicit range, and the decision.
+            for p in probes.iter_mut() {
+                (p.run)();
+            }
+            seen += 1;
+        }
+        if !(width < 2 && rc == 1) {
+            kinds[member_kind(member)] += 1;
+        }
     }
-    // A short BBP or Engel series of a term or two is Horner's.
-    assert_eq!((t[0], SMALL_PICKS[t[2] as usize]), (0, Some(SeriesAlg::Horner)));
-    assert_eq!(series_small_table(0.005).0, t);
+    assert_eq!(seen, 3 * 72);
+    // Every kind of the table is timed on a spread of members: BBP and Engel on their four
+    // sizes of q, Hyper on eight a width of x (two widths to a limb and at 3-16 limbs, one else).
+    assert_eq!(kinds, [4, 4, 8, 16, 8, 16, 8, 8]);
 }
 
 // Which cores the tuner pins itself to on Linux, from each CPU's sysfs rating: the ones within
@@ -494,52 +704,6 @@ fn test_check_gate_verdicts() {
     assert!(in_gate(s, "series", "series") && in_gate(s, "series", "trans") && in_gate(s, "series", "consts") && !in_gate(s, "series", "sqrt"));
 }
 
-// `cargo tune derive --file` rederives at the level the file's mul section records, since the
-// table's derivation depends on the level's tie band; a file that doesn't say, or isn't there,
-// is taken at normal.
-#[cfg(feature = "tune")]
-#[test]
-fn test_derive_reads_the_files_level() {
-    use crate::tuning::tuner::file_level;
-    let dir = std::env::temp_dir();
-    let path = |tag: &str| dir.join(format!("bigbits-level-{tag}-{}.toml", std::process::id()));
-    for (tag, text, want) in [
-        ("thorough", "[mul]\nversion = 1\nlevel = \"thorough\"\n", "thorough"),
-        ("quick", "[div]\nlevel = \"thorough\"\n\n[mul]\nlevel = \"quick\"\n", "quick"),
-        ("silent", "[mul]\nversion = 1\n", "normal"),
-        ("other", "[div]\nlevel = \"thorough\"\n", "normal"),
-    ] {
-        let p = path(tag);
-        std::fs::write(&p, text).unwrap();
-        assert_eq!(file_level(&p.to_string_lossy()).name(), want, "{tag}");
-        let _ = std::fs::remove_file(&p);
-    }
-    assert_eq!(file_level(&path("missing").to_string_lossy()).name(), "normal");
-}
-
-// div's Knuth guards are derived from the equations in force and time nothing: under the live
-// knobs the derivation gives two widths, the remainder's at least the quotient's (NR's extra
-// product only makes Knuth win wider), and Knuth really is every quotient's pick at each.
-#[cfg(feature = "tune")]
-#[test]
-fn test_div_guards_derive_from_equations() {
-    use crate::tuning::resolve::Value;
-    use crate::tuning::tuner::sections::div::guards;
-    let g = guards();
-    assert_eq!(g.iter().map(|t| t.key).collect::<Vec<_>>(), ["dyn_knuth_d", "dyn_rem_knuth_d"]);
-    let width = |i: usize| match g[i].value {
-        Value::Int(v) => v as usize,
-        _ => panic!("a guard is a width"),
-    };
-    assert!(width(0) >= 1 && width(1) >= width(0), "{} {}", width(0), width(1));
-    let (eq, mul, kara) = (crate::utils::div::DivEq::read(), crate::utils::mul::MulEq::read(), crate::tuning::k::mul::kara());
-    for (i, rem) in [(0, false), (1, true)] {
-        for q in [2usize, 9, 100, 1000, 20000] {
-            assert_eq!(crate::utils::div::dyn_div_alg_at(q, width(i), rem, &eq, &mul, kara), crate::utils::div::DivAlg::Knuth, "q {q} rem {rem}");
-        }
-    }
-}
-
 #[cfg(feature = "tune")]
 #[test]
 fn test_tuner_output_resolves() {
@@ -551,7 +715,7 @@ fn test_tuner_output_resolves() {
     let values = resolve::resolve(tuning::schema(), &[], &target).unwrap().values;
     let mul = tuning::schema().iter().find(|s| s.name == "mul").unwrap();
     let tuned = vec![Tuned { key: "school_scale", value: Value::Float(0.31), evidence: "fit: test".into() }];
-    merge_into(&path, vec![section(mul, &tuned, "quick", &values)], 8).unwrap();
+    merge_into(&path, section(mul, &tuned, "quick", &values), 8).unwrap();
     let f = file::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
     std::fs::remove_file(&path).unwrap();
     assert_eq!(f.sections[0].name, "meta");
@@ -658,10 +822,10 @@ static TEST_SCHEMA: &[Section] = &[
             Knob::usize("i", "OLD_I", 10).int_range(1, 100),
             Knob::f64("f", "", 0.5).float_range(0.0, 1.0),
             Knob::bool("b", "", false),
-            Knob::usize("d", "", 7).kind(Kind::Derived(Derivation::Gate)),
             Knob::usize("fol", "", 0).follows("a.i", 1),
             Knob::usize("adx", "", 20).arch("x86_64"),
-            Knob::new("t", "", Ty::Table { algs: ALGS, measure: "n", inputs: 1 }, crate::tuning::schema_types::DefaultValue::Table(&[1, 0, 9, 1])),
+            Knob::new("t", "", Ty::Table { algs: ALGS, measure: "n", inputs: 1 }, crate::tuning::schema_types::DefaultValue::Table(&[1, 0, 9, 1]))
+                .kind(Kind::Table),
             Knob::new("st", "", Ty::U64, crate::tuning::schema_types::DefaultValue::Steps(&[(1, 5.0), (8, 11.0)]))
                 .threads(Threads::Pool),
         ],
@@ -721,13 +885,14 @@ fn test_resolver_versions_fall_through() {
     assert_eq!(val(&r, "a.i"), Value::Int(10), "another version falls through whole");
     assert!(r.warnings.iter().any(|w| w.contains("falls through")));
 
-    let r = res("[a]\nversion = 2\nderive = 2\ni = 20\nd = 9\n").unwrap();
-    assert_eq!(val(&r, "a.i"), Value::Int(20), "a stale derive keeps measured values");
-    assert_eq!(val(&r, "a.d"), Value::Int(7), "and drops derived ones");
+    // A table's layout is the section's `derive` number: under another it would be misread, so
+    // it falls through alone and the section's other values stay.
+    let r = res("[a]\nversion = 2\nderive = 2\ni = 20\nt = [1, 0, 5, 1]\n").unwrap();
+    assert_eq!(val(&r, "a.i"), Value::Int(20), "a stale layout number keeps the section's values");
+    assert_eq!(val(&r, "a.t"), Value::Table(vec![1, 0, 9, 1]), "and drops its table");
     assert!(r.warnings.iter().any(|w| w.contains("derive")));
-
-    let r = res("[a]\nversion = 2\nderive = 2\npinned = \"d\"\nd = 9\n").unwrap();
-    assert_eq!(val(&r, "a.d"), Value::Int(9), "a pinned derived value is a measurement");
+    let r = res("[a]\nversion = 2\nderive = 3\nt = [1, 0, 5, 1]\n").unwrap();
+    assert_eq!(val(&r, "a.t"), Value::Table(vec![1, 0, 5, 1]));
 }
 
 #[test]
@@ -756,9 +921,6 @@ fn test_resolver_upstream_hash() {
     assert!(up.starts_with("a:"), "{up}");
     let ok = res(&format!("[c]\nversion = 1\nderive = 1\nupstream = \"{up}\"\n")).unwrap();
     assert!(ok.warnings.is_empty(), "{:?}", ok.warnings);
-    // Derived knobs aren't measured, so they don't enter the hash.
-    let same = res(&format!("[a]\nversion = 2\nderive = 3\nd = 9\n[c]\nversion = 1\nderive = 1\nupstream = \"{up}\"\n")).unwrap();
-    assert!(same.warnings.is_empty(), "{:?}", same.warnings);
     let stale = res(&format!("[a]\nversion = 2\nderive = 3\ni = 50\n[c]\nversion = 1\nderive = 1\nupstream = \"{up}\"\n")).unwrap();
     assert!(stale.warnings.iter().any(|w| w.contains("upstream")), "{:?}", stale.warnings);
 }
@@ -920,6 +1082,8 @@ pub(super) mod random {
         ("base.limb_adx", 64),
         ("mul.chunking_karatsuba", 300),
         ("mul.kara", 200),
+        ("div.dyn_small", 300),
+        ("div.dyn_rem_small", 300),
         ("mul.ntt_par_conv", 4096),
         ("mul.ntt_par", 4096),
         ("mul.ntt_par_radix3", 4096),
@@ -1135,7 +1299,7 @@ pub(super) mod random {
             eprintln!("random-knob vector `{name}`: BIGBITS_KNOB_VECTOR='{spec}'");
             tuning::apply(&spec).unwrap_or_else(|e| panic!("vector {name}: {e}"));
             // The inputs depend only on the seed and the knob values, so a replay reproduces them.
-            let vector_seed = seed ^ crate::tuning::hash::fnv1a(spec.as_bytes());
+            let vector_seed = seed ^ crate::tuning::hash::fnv1a(spec.bytes());
             for (section, check) in SECTION_CHECKS {
                 let mut rng = StdRng::seed_from_u64(vector_seed);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&mut rng)));

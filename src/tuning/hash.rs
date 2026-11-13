@@ -5,9 +5,9 @@
 pub const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 pub const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-pub fn fnv1a(bytes: &[u8]) -> u64 {
+pub fn fnv1a(bytes: impl IntoIterator<Item = u8>) -> u64 {
     let mut h = FNV_OFFSET;
-    for &b in bytes {
+    for b in bytes {
         h ^= b as u64;
         h = h.wrapping_mul(FNV_PRIME);
     }
@@ -28,19 +28,8 @@ pub fn canonical(pairs: &[(&str, String)]) -> String {
     out
 }
 
-pub fn hash_pairs(pairs: &[(&str, String)]) -> u64 {
-    fnv1a(canonical(pairs).as_bytes())
-}
-
 /// A table knob's identity for `RESOLVED_BITS` and the accessor-agreement test: FNV-1a 64 over its
 /// numbers' little-endian bytes.
 pub fn table_bits(t: &[u32]) -> u64 {
-    let mut h = FNV_OFFSET;
-    for v in t {
-        for b in v.to_le_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-    }
-    h
+    fnv1a(t.iter().flat_map(|v| v.to_le_bytes()))
 }

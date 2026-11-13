@@ -1,5 +1,5 @@
-//! Writing tuning files (docs/tuning_system.md, "The tuning file format" and "Evidence"): each tuned
-//! section with its versions, level, date and upstream hash, and each value with its evidence.
+//! Writing tuning files: each tuned section with its versions, level, date and upstream hash,
+//! and each value with its evidence.
 
 use crate::tuning::file::{self, File, FileSection, Raw};
 use crate::tuning::resolve::{self, Value};
@@ -15,8 +15,15 @@ pub struct Tuned {
     pub evidence: String,
 }
 
+impl Tuned {
+    /// Makes the value live, as `section`'s knob.
+    pub fn set_live(&self, section: &str) -> Result<(), String> {
+        crate::tuning::set(&format!("{section}.{}", self.key), self.value.clone()).map_err(|e| e.to_string())
+    }
+}
+
 fn today() -> String {
-    // Days since the epoch to a civil date (proleptic Gregorian), without a date crate.
+    // Days since the epoch to a civil date, without a date crate.
     let days = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 / 86400;
     let z = days + 719468;
     let era = z.div_euclid(146097);
@@ -30,15 +37,13 @@ fn today() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// Records a fit's knobs: its constants under `keys` and the relative rms it is judged by under
-/// `err`, all with the fit's `evidence`, which also names any term left out for solving negative
-/// (its constant is written as 0).
-pub fn push_fit(out: &mut Vec<Tuned>, keys: &[&'static str], err: &'static str, fit: &Fit, evidence: String) {
+/// Records a fit's knobs: its constants under `keys`, with `evidence` and any term left out for
+/// solving negative (written as 0).
+pub fn push_fit(out: &mut Vec<Tuned>, keys: &[&'static str], fit: &Fit, evidence: String) {
     let evidence = evidence + &fit.dropped_text(keys);
     for (key, v) in keys.iter().zip(&fit.beta) {
         out.push(Tuned { key, value: Value::Float(*v), evidence: evidence.clone() });
     }
-    out.push(Tuned { key: err, value: Value::Float(fit.judged()), evidence });
 }
 
 // The tuning file at `path` and its text (an empty file and no text when there is none yet).
@@ -52,8 +57,8 @@ fn open(path: &Path) -> std::io::Result<(File, Option<String>)> {
     }
 }
 
-// Writes `f` to `path`, unless that is the text `read` from it: build.rs watches these files, so
-// a write that changes nothing (a derive of an up-to-date file) would rebuild the crate.
+// Writes `f` to `path`, unless that is the text `read` from it: build.rs watches these files,
+// and a write that changes nothing would rebuild the crate.
 fn save(path: &Path, f: &File, read: Option<String>) -> std::io::Result<()> {
     let text = file::write(f);
     if read.as_deref() == Some(text.as_str()) {
@@ -85,9 +90,9 @@ pub fn section(section: &'static Section, tuned: &[Tuned], level: &str, values: 
     fs
 }
 
-/// Merges `sections` into the tuning file at `path` (created if missing), replacing each section
+/// Merges `section` into the tuning file at `path` (created if missing), replacing the section
 /// whole, and records the machine in [meta].
-pub fn merge_into(path: &Path, sections: Vec<FileSection>, threads: usize) -> std::io::Result<()> {
+pub fn merge_into(path: &Path, section: FileSection, threads: usize) -> std::io::Result<()> {
     let (mut f, read) = open(path)?;
     if f.header.is_empty() {
         f.header = vec![
@@ -100,17 +105,15 @@ pub fn merge_into(path: &Path, sections: Vec<FileSection>, threads: usize) -> st
     meta.set("crate", Raw::Str(env!("CARGO_PKG_VERSION").into()), None);
     meta.set("target", Raw::Str(super::HOST.name()), None);
     meta.set("threads", Raw::Int(threads as i128), Some("the most threads checks went up to".into()));
-    let mut new = File::default();
-    new.sections = sections;
-    f.merge(&new);
+    f.merge(&File { sections: vec![section], ..File::default() });
     // Keep [meta] first.
     f.sections.sort_by_key(|s| s.name != "meta");
     save(path, &f, read)
 }
 
-/// Sets derived values in the tuning file at `path`, in sections it already holds (a section
-/// absent from the file gets its versions first).
-pub fn set_derived(path: &Path, section: &'static Section, tuned: &[Tuned]) -> std::io::Result<()> {
+/// Sets more values in a section of the file at `path` (a table, a second phase), recording the
+/// section's `derive` number, its tables' layout.
+pub fn set_in_section(path: &Path, section: &'static Section, tuned: &[Tuned]) -> std::io::Result<()> {
     let (mut f, read) = open(path)?;
     let fs = f.section_mut(section.name);
     if fs.get("version").is_none() {
