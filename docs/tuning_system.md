@@ -329,7 +329,7 @@ These are rules. Apply them to every knob, in every phase from 1 on.
 build.rs                       reads the schema (and from Phase 2 the presets), writes $OUT_DIR/tuning.rs
 presets/                       (Phase 2) tuning files checked into the repository, one per target
   x86_64.toml
-  aarch64-macos.toml
+  aarch64.toml
 src/tuning/
   mod.rs                       include!(concat!(env!("OUT_DIR"), "/tuning.rs")); the public tune API
   schema_types.rs              Section, Knob, Ty, Range, DefaultValue, Kind, Threads (plain data; `Derivation` went on 2026-11-13)
@@ -608,7 +608,7 @@ read. `build.rs` recomputes them from what it resolved.
 ### Presets
 
 `presets/` holds one tuning file per target the developers can measure. At first that means
-`x86_64.toml` from the i7-8750H and `aarch64-macos.toml` from the M1. A build on any other target
+`x86_64.toml` from the i7-8750H and `aarch64.toml` from the M1 (every aarch64 target takes the M1's values since 2026-11-13, the user's decision "for now"; it was `aarch64-macos.toml`). A build on any other target
 uses the schema defaults, which stay at today's mostly-x86 values. A preset is written only by
 `cargo tune <section> --write-preset`, which merges the measured sections into the file for the
 host target and keeps the others. Edit a preset by hand only to record a measurement made some
@@ -1648,7 +1648,7 @@ missing, and the tuner running on performance cores).
    - Compare with the Python fit and `cargo bench-bin-split`.
 7. **consts.**
 8. **Presets.** For each preset machine run `cargo tune --level thorough --write-preset`, writing
-   `presets/x86_64.toml` (i7-8750H) and `presets/aarch64-macos.toml` (M1).
+   `presets/x86_64.toml` (i7-8750H) and `presets/aarch64.toml` (M1).
 
 Done when (per section):
 - every derived knob passes its check at `normal`, or is pinned with a note saying why;

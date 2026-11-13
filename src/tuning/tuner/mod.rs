@@ -33,7 +33,8 @@ const USAGE: &str = "usage: cargo tune <command>
       dispatch or series puts another number in the rule's place for the run (0.02 for 2%):
       what the tables and the equations would be under it. The default is this machine's own file, the one BIGBITS_TUNING names
       (presets/local.toml in a checkout), which the next build layers over the target's preset;
-      --write-preset writes presets/<target>.toml itself. Each section ends with the end-to-end
+      --write-preset writes the target's preset itself (the file a build resolves:
+      presets/<arch>-<os>.toml, else presets/<arch>.toml; the first when neither exists). Each section ends with the end-to-end
       check as a gate: if its values make its workloads slower on average than the values
       before it, by more than 3% (quick), 2% (normal) or 1% (thorough), the section is dropped
       and those values stay (--no-gate: keep it anyway). --analyze is for whoever writes an
@@ -195,7 +196,9 @@ fn tune(args: &[String]) -> Result<(), String> {
                 l.display()
             );
         }
-        PathBuf::from(format!("presets/{}.toml", HOST.name()))
+        // The preset a build of this target resolves; `<arch>-<os>.toml` for a target's first.
+        let paths = HOST.preset_paths();
+        PathBuf::from(paths.iter().find(|p| std::path::Path::new(p).exists()).unwrap_or(&paths[0]))
     } else {
         match flag(args, "--out") {
             Some(o) => PathBuf::from(o),

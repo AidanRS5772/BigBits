@@ -1803,7 +1803,11 @@ fn test_bin_split_finalize_and_x_leaf_terms() {
     // Finalize's division is a pass a quotient limb by a Q of one limb (div1) or two (div2: the
     // division's own equations start at four, and Knuth's reads 27% high at two), and
     // division's equation from three. Q32's terms add 31 bits each to Q.
-    let env = SeriesEnv::read();
+    // Counted serial: a tree wide enough to split across the pool has its levels' counts
+    // divided by the gain, and whether one is depends on the gates in force (it is under the
+    // schema's defaults, which a target with no preset resolves).
+    let mut env = SeriesEnv::read();
+    env.par_gain = 0.0;
     let tree = |t: u64| DynNodeEngel::<Q32>::parts(&Shift(4096), 1, 1 + t, 300, 0, None, &env)[2].unwrap();
     let (one, two, more) = (tree(2), tree(4), tree(7));
     assert_eq!((one.div1, one.div2, one.division), (301.0, 0.0, 0.0), "{one:?}");

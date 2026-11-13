@@ -21,7 +21,7 @@ table when a stage lands, and correct the plan where the implementation changed 
 | 7 | Phase 1: `theta`, `agm`, `exp`, `ln` | landed 2026-11-09: outputs identical (161 items, both builds); bias 1.0034× (trans items; `exp_static` at 4–64 limbs +1–2% in the tune build, a few atomic reads in a µs call), 1.0001× (series items); all 313 random-knob vectors passed first time |
 | P2.1 | Phase 2: runtime prediction layer (`Dispatcher`, `CostCtx`, tables, threads, presets layer) | landed 2026-11-09 except the generator's table and step-function knobs, which arrive with the first table knob (the pilot's switch): `tuning/{threads,model,table,dispatch}.rs` with tests; `build.rs` layers `presets/<arch>-<os>.toml` (else `<arch>.toml`) |
 | P2.2 | Phase 2: tuner skeleton (`cargo tune`) | landed 2026-11-09: `cargo tune tune [SECTION…] [--level] [--out] [--write-preset] [--threads]`, `derive [--file]`, `list`, `status [--file]`; batched interleaved timing on performance cores, NNLS on relative error with a lack-of-fit report, sections merged into the file with evidence and upstream hashes. Not yet: sweeps, `check`, `--resume`, `--pin`, process isolation |
-| P2.3 | Phase 2: sections (base, pilot, mul, div, sqrt, bin_split + series, consts, trans), presets | **done on the M1 (2026-11-10)**: `presets/aarch64-macos.toml` is a thorough tune through the final flow (eight sections, each kept by the end-to-end gate; no rejected fit; the build resolves it with no warning). Dynamic products and divisions dispatch on fitted equations, every one-input decision is a sweep, static values are approximate, and any checkout can tune itself into `presets/local.toml`. Open: the x86 preset (the user's, on the i7). The series' dispatch equations, rebuilt on fitted equations on 2026-11-10 and marked above the 5% line until 2026-11-13, are under it since ("Horner's and binary splitting's equations under the line, and the beta guard gone": 3.4%, 2.7% and 3.6% held out in the preset of that day's full retune), and nothing in the preset is marked. The history of how it got here is in the log below. Earlier status, kept for the record: in progress (2026-11-10). In `presets/aarch64-macos.toml` (thorough, M1): `base`'s units; mul's schoolbook, Karatsuba-level, recursive-Karatsuba, FFT and static-NTT fitted models; `mul.kara` derived; and seven sweeps (`mul.karatsuba_sqr`, `fft_sqr`, `fft_karatsuba`, `fft_chunking_karatsuba`, `static_ntt_sqr`, `ntt_karatsuba`, `ntt_chunking_karatsuba`). Not done in mul: FFT-to-NTT, high and middle products, the NTT's parallel gates, the cyclic square, `mul_ns` and per-call comparison above an extent. Then every later section and the x86 preset |
+| P2.3 | Phase 2: sections (base, pilot, mul, div, sqrt, bin_split + series, consts, trans), presets | **done on the M1 (2026-11-10)**: `presets/aarch64.toml` (`aarch64-macos.toml` until 2026-11-13, the name the entries below use) is a thorough tune through the final flow (eight sections, each kept by the end-to-end gate; no rejected fit; the build resolves it with no warning). Dynamic products and divisions dispatch on fitted equations, every one-input decision is a sweep, static values are approximate, and any checkout can tune itself into `presets/local.toml`. Open: the x86 preset (the user's, on the i7). The series' dispatch equations, rebuilt on fitted equations on 2026-11-10 and marked above the 5% line until 2026-11-13, are under it since ("Horner's and binary splitting's equations under the line, and the beta guard gone": 3.4%, 2.7% and 3.6% held out in the preset of that day's full retune), and nothing in the preset is marked. The history of how it got here is in the log below. Earlier status, kept for the record: in progress (2026-11-10). In `presets/aarch64-macos.toml` (thorough, M1): `base`'s units; mul's schoolbook, Karatsuba-level, recursive-Karatsuba, FFT and static-NTT fitted models; `mul.kara` derived; and seven sweeps (`mul.karatsuba_sqr`, `fft_sqr`, `fft_karatsuba`, `fft_chunking_karatsuba`, `static_ntt_sqr`, `ntt_karatsuba`, `ntt_chunking_karatsuba`). Not done in mul: FFT-to-NTT, high and middle products, the NTT's parallel gates, the cyclic square, `mul_ns` and per-call comparison above an extent. Then every later section and the x86 preset |
 
 Handoffs to the i7-8750H (x86), tracked here until done:
 - `base` bias check (Stage 4): the ADX cutoffs compile out on AArch64.
@@ -3356,6 +3356,28 @@ workload closures through shared helpers (they are the measuring instrument); an
 fits as one loop over `rem` (three branches in it for a dozen lines). The schema's `doc`
 strings, `work` strings and step functions are data or the plan's, and were left.
 
+#### The M1's preset for every aarch64 target (2026-11-13)
+
+The user: "just make the current presets for this mac universal to all aarch64 for now."
+`presets/aarch64-macos.toml` is `presets/aarch64.toml`: `build.rs` reads
+`presets/<arch>-<os>.toml` first and `presets/<arch>.toml` second, so every aarch64 target
+that has no file of its own name resolves the M1's values (Linux, Windows and iOS on ARM
+resolved the schema's defaults until now). The file's `[meta] target` still says
+`aarch64-macos`, where it was measured; a preset's target is not checked, only a machine's
+own file's is. Every resolved value on this Mac is unchanged (`cargo tune list` byte for
+byte).
+
+`cargo tune tune --write-preset` wrote `presets/<arch>-<os>.toml` whatever existed, which on
+this Mac would now have started a second, partial preset that shadows the universal one
+whole (a build takes the first preset it finds and no other). It writes the preset a build
+resolves, and `<arch>-<os>.toml` only for a target's first. On another aarch64 system it is
+therefore refused, with the file's target named: that machine's own preset goes to
+`--out presets/aarch64-<os>.toml`.
+
+Not measured: whether the M1's values beat the defaults on any other aarch64 hardware
+(another Apple chip, a server core). `cargo tune check --file presets/aarch64.toml` on such a
+machine answers it.
+
 ## Marked problems
 
 The rule (the user's, 2026-11-10): a rejected fit is reported with a proposed form and waits
@@ -3615,6 +3637,20 @@ What this machine could check without an x86 CPU (2026-11-10), with the `x86_64-
 target under Rosetta: the tune build compiles; `cargo test --target x86_64-apple-darwin --lib`
 passes (577, before the BZ change above); `cargo tune tune base` runs and reports that Rosetta
 has no ADX. Nothing was timed: Rosetta's times mean nothing for a preset.
+
+Checked again on 2026-11-13, after the simplification and clean-up passes, on the same target
+under Rosetta, which resolves the schema's defaults as an x86 machine with no preset does:
+the tune build compiles with no warning; `cargo tune status`, `list`, `tune base` (no ADX
+under Rosetta: it tunes nothing) and `tune sqrt --level quick` run; 596 tests pass, and 610
+with `tune`. **One test failed there first and is fixed**: `test_bin_split_finalize_and_x_leaf_terms`
+counted an x-leaf's terms on a 300-term tree that splits across the pool under the default
+gates (its counts are then divided by the parallel gain), which the M1's preset had hidden;
+it counts serial now (`env.par_gain = 0`). A test of counts must not depend on the gates in
+force: run the suite on this target before a handoff, as it is the only run under defaults.
+Two things an x86 machine will print before it is tuned, both expected: a tune of some
+sections alone ends with "dispatch: series_eval_dyn ... PAST the rule's 5%", and
+`cargo tune dispatch` exits non-zero, because the default `series.small` names nothing until
+the series section is tuned.
 
 New for it: `tuner/sections/base.rs` (compiled on x86-64 only, and first in
 `sections::sections()`): two cutoff sweeps with the knob forced to each side, `base.prim_adx`
