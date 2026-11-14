@@ -1246,7 +1246,7 @@ pub fn ln_static_at<const N: usize>(
 }
 
 // θ2(q⁴) = 2 Σ_{k>=0} q^((2k+1)²) and θ3(q⁴) = 1 + 2 Σ_{k>=1} q^((2k)²), for
-// ln(1/q) = π / (4 AGM(θ2², θ3²)) (docs/agm-ln-theta.md). The powers q^(n²) follow a compile-time
+// ln(1/q) = π / (4 AGM(θ2², θ3²)) (docs/ln_agm.md). The powers q^(n²) follow a compile-time
 // plan of squares and products (theta_plan.rs), each value as wide as the terms it feeds.
 
 // For q = u 2^-l, u in [1/2, 1): odd terms go to θ2 2^(64 z) with g2 limbs below 2^-64z (t = z),
@@ -2096,7 +2096,7 @@ pub fn agm_static_at<const N: usize>(
     ))
 }
 
-// The theta–AGM logarithm (docs/agm-ln-exact-chain.md), with q = X 2^-shift, so no reciprocal:
+// The theta–AGM logarithm (docs/ln_agm.md), with q = X 2^-shift, so no reciprocal:
 // ln X = c ln 2 - π / (4 AGM(θ2(q⁴)², θ3(q⁴)²)), c = shift + 64b for X = x 2^(64b).
 
 // Whether the AGM beats the series at P = 64 o bits. Per M(P) the series costs about

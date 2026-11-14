@@ -12,7 +12,7 @@ BigBits is a high-performance arbitrary-precision arithmetic library for Rust. I
 - **Choice of memory model.** Every core operation has a *dynamic* path (heap `Vec<u64>` with pooled scratch space) and a *static* path (`[u64; N]` on the stack, no heap allocation).
 - **Ergonomics.** Number types that work with Rust's standard operators and conversions, while still giving access to the low-level buffer routines.
 - **Correctness.** A broad test suite, differential testing against reference models, and exhaustive checks at tricky algorithm boundaries.
-- **Cutoffs from data.** Algorithm switch points come from Criterion benchmarks and profiling. The reports are in [`docs/`](docs/).
+- **Cutoffs from data.** Algorithm switch points are measured per machine by the built-in tuner (`cargo tune`), not hand-set. The reference for each area is in [`docs/`](docs/).
 
 ## Features
 
@@ -62,11 +62,13 @@ Squaring, high products and middle products are also available. The middle produ
 ## Project layout
 
 ```
-src/utils/      Raw limb-buffer arithmetic (mul, div, sqrt, helpers, cutoffs)
+src/utils/      Raw limb-buffer arithmetic (mul, div, sqrt, series, exp/ln, constants)
+src/tuning/     Performance knobs and the tuner (`cargo tune`)
+presets/        Tuned values per target
 src/bit_nums/   Ergonomic number types built on utils
 src/tests/      Test suite
 benches/        Criterion benchmarks and profiling harnesses
-docs/           Cutoff-tuning and profiling reports
+docs/           The reference for each area, and the tuning system's design
 ```
 
 ## Building and testing
@@ -75,20 +77,19 @@ docs/           Cutoff-tuning and profiling reports
 cargo build
 cargo test --lib
 
-# Benchmarks (these need the internal `_bench_internals` feature)
+# Benchmarks (needs the internal `_bench_internals` feature)
 cargo bench-utils
-cargo bench-cutoffs
 ```
 
 ## Tuning this machine
 
 The crossovers between algorithms (schoolbook, Karatsuba, FFT, NTT; Knuth, Burnikel-Ziegler,
 Newton-Raphson; and so on) depend on the CPU. A build uses, in order: defaults, the preset
-checked in for its target if there is one (`presets/<arch>-<os>.toml`), and this machine's own
+checked in for its target if there is one (`presets/<arch>-<os>.toml`, else `presets/<arch>.toml`), and this machine's own
 measurements if it has taken them. To take them:
 
 ```bash
-cargo tune tune                    # about 6 minutes on an M1 at the default level; --level thorough takes about 30
+cargo tune tune                    # about 6 minutes on an M1 at the default level; --level thorough takes about 35
 cargo build --release              # now built with this machine's values
 cargo tune status                  # which file supplies each section
 ```

@@ -2684,7 +2684,7 @@ pub fn rect_dyn_m<S: WideHyperSeries>(
 // down). Static nodes keep the older model, approximate like every static decision: each
 // algorithm's kernel primitive counts (`Work`), read off the kernels, times one ns constant per
 // primitive shared by the three (`series.ns_*`), with products as mul_work's schoolbook limb
-// products along mul_static's tiers. See docs/series_cutoff_tuning.md.
+// products along mul_static's tiers. See docs/series.md, "Static nodes".
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Family {
